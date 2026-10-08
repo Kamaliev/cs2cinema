@@ -1,55 +1,102 @@
-# cs2-cli — хайлайты из матча FACEIT
+# cs2-cli — хайлайт-ролик из матча FACEIT
 
-```
-export FACEIT_API_KEY=...        # ключ FACEIT Data API с доступом к Downloads API
-cargo run -p cli -- https://www.faceit.com/en/cs2/room/1-<uuid> --length 60
-cargo run -p cli -- demo.dem.zst --list      # локальная демка, только список хайлайтов
-```
+Консольная утилита: даёшь ссылку на матч FACEIT (или файл демки) — получаешь монтажный план хайлайтов
+для CS2: отбор моментов по score, камеры (41 пресет, пролёты, зумы, слоумо) с учётом стен карты,
+скрипт для записи через HLAE и склейку ffmpeg.
 
-## Установка и проверка на Windows
+Статус: разбор демок, хайлайты, режиссёр и стены проверены на реальной демке FACEIT (сверка с demoparser2).
+**Запись в игре через HLAE и сборка на Windows не проверялись** — см. «Что не проверено».
 
-Нужно один раз поставить:
+## Установка (Windows)
 
-1. **Git** — https://git-scm.com/download/win (понадобится и cs2-cli: он вызывает `git` для проверки релизов карт);
-2. **Rust** — https://rustup.rs (rustup-init.exe). Rust на Windows просит **Visual Studio Build Tools** с набором
-   «Desktop development with C++» — согласитесь на установку, без него не соберутся `zstd` и `ring`;
-3. **Python 3.11+** — только для `scripts/update_maps.py` (можно пропустить);
-4. **ffmpeg** (в PATH) — только чтобы склеить итоговый ролик; для HLAE-записи — https://github.com/advancedfx/advancedfx/releases.
+### Вариант А. Готовый exe (проще всего)
 
-Затем (PowerShell):
+1. Откройте https://github.com/Kamaliev/cs2cinema/releases и скачайте `cs2cinema-windows-x64.zip`
+   (релизы собирает GitHub Actions по тегу `v*`; пока релизов нет — берите вариант Б или артефакт из вкладки *Actions*).
+2. Распакуйте в любую папку без пробелов, например `C:\cs2cinema`.
+3. Поставьте то, что нужно в работе:
+   * **Git** — https://git-scm.com/download/win (программа вызывает `git`, чтобы узнать свежий релиз карт);
+   * **ffmpeg** (в `PATH`) — склейка клипов в итоговый ролик, `winget install Gyan.FFmpeg`;
+   * **HLAE** — запись в CS2, https://github.com/advancedfx/advancedfx/releases;
+   * **Python 3.11+** — только для `scripts\update_maps.py` (геометрия карт из файлов игры), необязательно.
+4. Проверка: откройте PowerShell в папке и выполните `.\cs2-cli.exe --list-cameras` — должен напечатать таблицу из 41 камеры.
 
-```powershell
-git clone https://github.com/Kamaliev/cs2cinema; cd cs2cinema
-git apply cs2cinema-changes.patch          # если изменения пришли патчем (см. ниже); иначе просто распакуйте архив поверх
-git lfs pull                               # демка из репозитория (283 МБ)
-cargo test --release                       # все тесты, ~1-2 мин на первую сборку
-$demo = (Get-Item .\1-3e7db9e3-*-1-1.dem).FullName
-cargo run --release -p cli -- $demo --list           # найденные хайлайты
-cargo run --release -p cli -- $demo --out out\test  # полный прогон: монтаж, highlights.cfg, assemble.bat
-cargo run --release -p cli -- --list-cameras         # каталог камер
-```
+### Вариант Б. Сборка из исходников
 
-Проверка с реальной демкой и картой (сверяет позиции, углы, стены):
+1. Поставьте **Git**, **Git LFS** (идёт вместе с Git for Windows) и **Rust** — https://rustup.rs.
+   Rust на Windows попросит **Visual Studio Build Tools** с набором «Desktop development with C++» —
+   согласитесь, без него не соберутся `zstd` и `ring`.
+2. В PowerShell:
 
 ```powershell
+git clone https://github.com/Kamaliev/cs2cinema
+cd cs2cinema
+git lfs pull                               # демка из репозитория, 283 МБ (нужна только для проверки)
+cargo build --release -p cli               # ~2-4 мин в первый раз
+.\target\release\cs2-cli.exe --list-cameras
+```
+
+Все тесты: `cargo test --release` (тесты на реальной демке запустятся только с переменными ниже).
+
+## Быстрый старт
+
+```powershell
+# локальная демка (.dem, .dem.zst, .dem.gz): только список хайлайтов
+.\cs2-cli.exe C:\demos\match.dem --list
+
+# полный прогон: монтаж + файлы для записи в папку out\test
+.\cs2-cli.exe C:\demos\match.dem --out out\test --length 60
+
+# матч по ссылке FACEIT (ключ Data API с доступом к Downloads API: https://developers.faceit.com)
+$env:FACEIT_API_KEY = "ваш-ключ"
+.\cs2-cli.exe https://www.faceit.com/en/cs2/room/1-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+При первом запуске программа сама скачает геометрию карты (~60 МБ на все карты) в `.\maps`.
+Результат в `out\<матч>\`: `plan.json` (монтажный план), `highlights.cfg` (скрипт для CS2/HLAE),
+`campath_*.xml` (пути свободной камеры), `assemble.bat` / `assemble.sh` (склейка через ffmpeg).
+
+| параметр | что делает |
+|----------|------------|
+| `--out <папка>` | куда писать результат (по умолчанию `out\<id матча>`) |
+| `--length <сек>` | целевая длина ролика (60) |
+| `--max-shots <N>` | максимум моментов (12) |
+| `--chronological` | по порядку матча, а не «от слабого к лучшему» |
+| `--demo <N>` | номер карты в bo3 (с нуля) |
+| `--fps <N>` | fps записи (60) |
+| `--list` | только показать хайлайты |
+| `--list-cameras` | каталог камер |
+| `--no-flybys` | без позиций игроков и свободных камер (быстрее) |
+| `--no-walls`, `--maps <папка>`, `--refresh-maps`, `--offline` | геометрия карт, см. «Актуальность геометрии карт» |
+
+## Запись в игре (HLAE)
+
+1. Запустите CS2 через HLAE (с `-insecure`, чтобы не получить блокировку VAC) и откройте демку: `playdemo <файл>`.
+2. Скопируйте `out\<матч>\highlights.cfg` в `game\csgo\cfg` и выполните в консоли `exec highlights`.
+   Скрипт сам перематывает демку, переключает камеры, меняет скорость времени и зум, пишет каждый шот в `clips\`.
+3. В папке с клипами запустите `assemble.bat` — получится `highlights.mp4`.
+
+## Проверка на реальных данных
+
+```powershell
+$demo = (Get-Item .\1-3e7db9e3-*-1-1.dem).FullName   # демка из репозитория (после git lfs pull)
 $env:CS2_TEST_DEMO = $demo
-$env:CS2_TEST_MAPS = (Resolve-Path .\maps)   # появится после первого запуска cs2-cli (геометрия скачивается сама)
+$env:CS2_TEST_MAPS = (Resolve-Path .\maps)            # папка появится после первого запуска cs2-cli
 cargo test --release -p positions --test real_demo -- --nocapture
 ```
 
-Матч по ссылке FACEIT (нужен ключ Data API с доступом к Downloads API):
+Тесты сверяют число убийств, позиции и углы игроков и то, что камеры не пролетают сквозь стены.
 
-```powershell
-$env:FACEIT_API_KEY = "ваш-ключ"
-cargo run --release -p cli -- https://www.faceit.com/en/cs2/room/1-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx --length 60
-```
+## Если что-то не работает
 
-Запись в игре (**эту часть я не мог проверить**): запустить CS2 через HLAE, открыть демку (`playdemo <имя>`),
-скопировать `out\<матч>\highlights.cfg` в `game\csgo\cfg`, выполнить `exec highlights`; клипы появятся в `clips\`,
-затем `assemble.bat` склеит их в `highlights.mp4`. Если какая-то консольная команда не сработает, пришлите
-текст ошибки из консоли игры — команды собраны в `crates/renderer` (`Dialect`).
+* **`linker 'link.exe' not found` при сборке** — не поставлены Visual Studio Build Tools (см. вариант Б).
+* **`не удалось запустить git`** — Git не в `PATH`; перезапустите PowerShell после установки или используйте `--offline`.
+* **`FACEIT отказал в доступе`** — проверьте `FACEIT_API_KEY` и что у ключа есть доступ к Downloads API.
+* **«если файл — LFS-заглушка, сделайте git lfs pull»** — вместо демки лежит указатель Git LFS (134 байта).
+* **Команда в консоли CS2 не сработала** — пришлите текст ошибки; команды собраны в одном месте,
+  `crates/renderer` (`Dialect`), и правятся без изменений в остальной логике.
 
-Пайплайн (по крейтам):
+## Устройство (по крейтам)
 
 | крейт        | что делает |
 |--------------|------------|
@@ -57,12 +104,14 @@ cargo run --release -p cli -- https://www.faceit.com/en/cs2/room/1-xxxxxxxx-xxxx
 | `demo`       | контейнер демки, protobuf, вложенные сообщения пакетов, игровые события, `userinfo` |
 | `cs2`        | модель матча: раунды, убийства, игроки |
 | `highlights` | серии убийств и эффектные одиночки + score |
-| `director`   | монтаж: отбор по score, POV/chase/свободная камера, кривая замедления |
+| `director`   | монтаж: отбор по score, POV/chase/свободная камера, кривая замедления и зума |
 | `positions`  | позиции, взгляд, команда и «жив» по тикам из состояния сущностей (`source2-demo`) |
 | `geometry`   | коллизионные меши карт (awpy-data), BVH, трассировка лучей — для стен |
-| `renderer`   | `plan.json`, `highlights.cfg` для HLAE, `campath_*.xml`, `assemble.sh` (ffmpeg) |
+| `renderer`   | `plan.json`, `highlights.cfg` для HLAE, `campath_*.xml`, `assemble.sh`/`assemble.bat` (ffmpeg) |
 
-Результат в `out/<id матча>/`. Запись: CS2 через HLAE → `playdemo` → `exec highlights`, затем `sh assemble.sh`.
+CI (`.github/workflows`): `ci.yml` гоняет тесты на Linux и Windows и выкладывает `cs2-cli.exe` артефактом;
+`release.yml` по тегу `v*` собирает `cs2cinema-windows-x64.zip` и публикует GitHub Release
+(`git tag v0.1.0 && git push origin v0.1.0`).
 
 ## Камеры (`crates/director/src/rig.rs`)
 

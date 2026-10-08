@@ -23,6 +23,8 @@ pub struct PlayerInfo {
 #[derive(Debug, Default)]
 pub struct Parsed {
     pub map_name: String,
+    /// Игровой тик, с которого начинается демка: игровое время = (тик демки + это) / tick_rate.
+    pub server_start_tick: i32,
     pub playback_ticks: Option<i32>,
     pub playback_time: Option<f32>,
     pub events: Vec<GameEvent>,
@@ -64,7 +66,8 @@ pub fn parse(data: &[u8]) -> io::Result<Parsed> {
             0 => break,
             1 => {
                 let header = CDemoFileHeader::decode(payload.as_slice()).map_err(bad)?;
-                out.map_name = header.map_name.unwrap_or_default();
+                out.map_name = header.map_name.clone().unwrap_or_default();
+                out.server_start_tick = header.server_start_tick.unwrap_or(0);
             }
             2 => {
                 let info = CDemoFileInfo::decode(payload.as_slice()).map_err(bad)?;

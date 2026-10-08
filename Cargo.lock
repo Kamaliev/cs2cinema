@@ -99,6 +99,7 @@ dependencies = [
  "positions",
  "prost",
  "renderer",
+ "serde_json",
 ]
 
 [[package]]

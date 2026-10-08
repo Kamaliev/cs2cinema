@@ -4,3 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cs2 = { path = "../cs2" }
+serde = { version = "1", features = ["derive"] }

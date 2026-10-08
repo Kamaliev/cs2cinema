@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cs2 = { path = "../cs2" }
+director = { path = "../director" }
+serde_json = "1"

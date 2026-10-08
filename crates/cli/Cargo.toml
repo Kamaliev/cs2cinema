@@ -3,8 +3,19 @@ name = "cli"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-demo = {path = "../demo"}
-highlights = {path = "../highlights"}
-prost = "0.14.4"
+[[bin]]
+name = "cs2-cli"
+path = "src/main.rs"
 
+[dependencies]
+demo = { path = "../demo" }
+cs2 = { path = "../cs2" }
+highlights = { path = "../highlights" }
+director = { path = "../director" }
+renderer = { path = "../renderer" }
+faceit = { path = "../faceit" }
+positions = { path = "../positions" }
+geometry = { path = "../geometry" }
+
+[dev-dependencies]
+prost = "0.14.4"

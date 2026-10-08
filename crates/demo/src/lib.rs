@@ -1,4 +1,8 @@
+mod bits;
 mod command;
+pub mod events;
+mod parse;
+pub use parse::{Parsed, PlayerInfo, parse};
 
 use std::{fs::File, io::{self, Read}, path::Path};
 pub use command::{
@@ -12,11 +16,24 @@ pub mod proto {
 
 
 
+/// Читает демку; zstd (`.dem.zst`, FACEIT CS2) и gzip (`.dem.gz`) распознаются по сигнатуре.
 pub fn read_demo<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>>{
     let mut file = File::open(path)?;
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)?;
-    Ok(contents)
+    decompress(contents)
+}
+
+pub fn decompress(contents: Vec<u8>) -> io::Result<Vec<u8>> {
+    if contents.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        zstd::stream::decode_all(contents.as_slice())
+    } else if contents.starts_with(&[0x1F, 0x8B]) {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(contents.as_slice()).read_to_end(&mut out)?;
+        Ok(out)
+    } else {
+        Ok(contents)
+    }
 }
 
 

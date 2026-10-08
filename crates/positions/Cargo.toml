@@ -1,0 +1,15 @@
+[package]
+name = "positions"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cs2 = { path = "../cs2" }
+director = { path = "../director" }
+geometry = { path = "../geometry" }
+source2-demo = { version = "=0.5.9", default-features = false, features = ["cs2"] }
+
+[dev-dependencies]
+demo = { path = "../demo" }
+cs2 = { path = "../cs2" }
+highlights = { path = "../highlights" }

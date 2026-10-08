@@ -1,0 +1,8 @@
+[package]
+name = "faceit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ureq = { version = "3", features = ["json", "platform-verifier"] }
+serde_json = "1"

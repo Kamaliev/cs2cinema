@@ -1,7 +1,7 @@
 /target
-<<<<<<< HEAD
 *.dem
 *.dem.zst
 .idea/
-=======
->>>>>>> origin/main
+/out
+/maps
+__pycache__/

@@ -166,6 +166,9 @@ impl Default for Config {
 pub struct Timeline {
     pub map: String,
     pub tick_rate: f32,
+    /// Игровое время = (тик демки + server_start_tick) / tick_rate; нужно для путей камеры HLAE.
+    #[serde(default)]
+    pub server_start_tick: i32,
     /// В порядке показа в итоговом ролике.
     pub shots: Vec<Shot>,
 }
@@ -203,7 +206,7 @@ pub fn direct(m: &Match, highlights: &[Highlight], cfg: &Config, pos: &dyn Posit
         Order::BuildUp => shots.sort_by(|a, b| a.score.total_cmp(&b.score)),
         Order::Chronological => shots.sort_by_key(|s| s.start_tick),
     }
-    Timeline { map: m.map.clone(), tick_rate: m.tick_rate, shots }
+    Timeline { map: m.map.clone(), tick_rate: m.tick_rate, server_start_tick: m.server_start_tick, shots }
 }
 
 fn tier_of(score: f32) -> Tier {
@@ -324,6 +327,26 @@ pub fn shoot(m: &Match, h: &Highlight, cfg: &Config, pos: &dyn PositionSource, u
         end,
     );
 
+    // 4. вид «глазами игрока» и «из-за спины» — тоже пути камеры по позициям: так запись не зависит
+    // от команд наблюдателя, а зум вшит прямо в FOV ключей. Без позиций остаётся Pov/Chase.
+    let mut segments = segments;
+    let mut all_free = true;
+    for seg in &mut segments {
+        let (mode, name) = match seg.camera {
+            Camera::Pov { .. } => (Follow::Pov, "pov"),
+            Camera::Chase { .. } => (Follow::Chase, "chase"),
+            _ => continue,
+        };
+        match follow_keys(pos, h.player, seg.start_tick, seg.end_tick, mode, tr, &zoom) {
+            Some(keys) => {
+                seg.camera = Camera::Free { keys };
+                seg.style = Some(name.to_owned());
+            }
+            None => all_free = false,
+        }
+    }
+    let zoom = if all_free { Vec::new() } else { zoom };
+
     Shot {
         title: format!("{} — {} (R{})", m.name(h.player), h.tags.join(", "), h.round),
         tier,
@@ -336,6 +359,81 @@ pub fn shoot(m: &Match, h: &Highlight, cfg: &Config, pos: &dyn PositionSource, u
         timescale,
         zoom,
     }
+}
+
+/// Обычный FOV, от которого считается зум (множитель из кривой `zoom`).
+pub const BASE_FOV: f32 = 90.0;
+/// Шаг ключей пути «за игроком»: 2 тика = 32 ключа в секунду, камера повторяет движения мыши.
+const FOLLOW_STEP: i32 = 2;
+/// Камеру «из глаз» чуть выносим вперёд, чтобы не видеть изнутри собственную голову.
+const POV_FORWARD: f32 = 5.0;
+const CHASE_BACK: f32 = 110.0;
+const CHASE_UP: f32 = 22.0;
+const CHASE_WALL_MARGIN: f32 = 16.0;
+
+#[derive(Clone, Copy)]
+enum Follow {
+    Pov,
+    Chase,
+}
+
+/// Единичный вектор взгляда Source: pitch положителен вниз.
+fn forward(ang: [f32; 3]) -> [f32; 3] {
+    let (p, y) = (ang[0].to_radians(), ang[1].to_radians());
+    [p.cos() * y.cos(), p.cos() * y.sin(), -p.sin()]
+}
+
+/// Путь камеры, повторяющий взгляд игрока (`Pov`) или идущий за его плечом (`Chase`).
+/// `None`, если для какого-то кадра нет позиции игрока.
+fn follow_keys(
+    pos: &dyn PositionSource,
+    player: PlayerId,
+    a: i32,
+    b: i32,
+    mode: Follow,
+    tick_rate: f32,
+    zoom: &[ScaleKey],
+) -> Option<Vec<CamKey>> {
+    let _ = tick_rate;
+    if b <= a {
+        return None;
+    }
+    let mut ticks: Vec<i32> = (a..b).step_by(FOLLOW_STEP as usize).collect();
+    ticks.push(b);
+    let mut keys = Vec::with_capacity(ticks.len());
+    for t in ticks {
+        let eye = pos.eye_pose(player, t)?;
+        let dir = forward(eye.ang);
+        let cam = match mode {
+            Follow::Pov => [
+                eye.pos[0] + dir[0] * POV_FORWARD,
+                eye.pos[1] + dir[1] * POV_FORWARD,
+                eye.pos[2] + dir[2] * POV_FORWARD,
+            ],
+            Follow::Chase => {
+                let want = [
+                    eye.pos[0] - dir[0] * CHASE_BACK,
+                    eye.pos[1] - dir[1] * CHASE_BACK,
+                    eye.pos[2] - dir[2] * CHASE_BACK + CHASE_UP,
+                ];
+                // не заезжаем за стену: подтягиваемся к игроку
+                match pos.raycast(eye.pos, want) {
+                    Some(f) => {
+                        let len = ((want[0] - eye.pos[0]).powi(2) + (want[1] - eye.pos[1]).powi(2) + (want[2] - eye.pos[2]).powi(2)).sqrt().max(1.0);
+                        let keep = ((f * len - CHASE_WALL_MARGIN) / len).max(0.0);
+                        [
+                            eye.pos[0] + (want[0] - eye.pos[0]) * keep,
+                            eye.pos[1] + (want[1] - eye.pos[1]) * keep,
+                            eye.pos[2] + (want[2] - eye.pos[2]) * keep,
+                        ]
+                    }
+                    None => want,
+                }
+            }
+        };
+        keys.push(CamKey { tick: t, pos: cam, ang: [eye.ang[0], eye.ang[1], 0.0], fov: BASE_FOV * scale_at(zoom, t) });
+    }
+    Some(keys)
 }
 
 /// Окно «акцента» вокруг убийства: замедление времени и приближение.
@@ -505,9 +603,10 @@ mod tests {
         assert_contiguous(&shot);
         let free: Vec<_> = shot.segments.iter().filter(|s| matches!(s.camera, Camera::Free { .. })).collect();
         assert!(free.len() >= 3, "интро, нарезка на средних киллах и аутро: {}", free.len());
-        assert!(free.iter().all(|s| s.style.is_some() && s.colorfulness.unwrap() > 0.0));
+        let presets: Vec<_> = free.iter().filter(|s| s.colorfulness.is_some()).collect();
+        assert!(presets.len() >= 3 && presets.iter().all(|s| s.colorfulness.unwrap() > 0.0));
         // разные ракурсы подряд не повторяются
-        let styles: Vec<_> = free.iter().map(|s| s.style.clone().unwrap()).collect();
+        let styles: Vec<_> = presets.iter().map(|s| s.style.clone().unwrap()).collect();
         let mut uniq = styles.clone();
         uniq.sort();
         uniq.dedup();
@@ -556,10 +655,71 @@ mod tests {
         let hs: Vec<_> = (0..4).map(|i| hl(200.0 - i as f32, &[2000 * (i + 1), 2000 * (i + 1) + 120, 2000 * (i + 1) + 240])).collect();
         let cfg = Config { target_secs: 600.0, max_shots: 4, ..Config::default() };
         let t = direct(&m, &hs, &cfg, &Duel);
-        let styles: Vec<String> = t.shots.iter().flat_map(|s| s.segments.iter().filter_map(|x| x.style.clone())).collect();
+        let styles: Vec<String> = t.shots.iter().flat_map(|s| s.segments.iter().filter(|x| x.colorfulness.is_some()).filter_map(|x| x.style.clone())).collect();
         let mut uniq = styles.clone();
         uniq.sort();
         uniq.dedup();
         assert!(uniq.len() * 10 >= styles.len() * 8, "слишком много повторов: {styles:?}");
+    }
+
+    #[test]
+    fn pov_and_chase_become_free_paths_with_zoom_baked_into_fov() {
+        let m = mat();
+        let shot = shoot(&m, &hl(200.0, &[1000, 1100, 1200]), &Config::default(), &Duel, &mut vec![]);
+        assert!(shot.segments.iter().all(|s| matches!(s.camera, Camera::Free { .. })));
+        assert!(shot.zoom.is_empty(), "зум вшит в ключи, mirv_fov не нужен");
+        assert_contiguous(&shot);
+
+        // «глазами игрока»: камера в точке глаз + небольшой вынос вперёд, углы игрока
+        let pov = shot.segments.iter().find(|s| s.style.as_deref() == Some("pov")).expect("есть POV-сегмент");
+        let Camera::Free { keys } = &pov.camera else { unreachable!() };
+        let k = keys[keys.len() / 2];
+        let eye = Duel.eye_pose(PlayerId(0), k.tick).unwrap();
+        let d = forward(eye.ang);
+        for i in 0..3 {
+            assert!((k.pos[i] - (eye.pos[i] + d[i] * POV_FORWARD)).abs() < 1e-3);
+        }
+        assert_eq!(k.ang, [eye.ang[0], eye.ang[1], 0.0]);
+
+        // на первом убийстве (оно в виде от первого лица) FOV уменьшен приближением
+        let fovs: Vec<f32> = shot
+            .segments
+            .iter()
+            .filter(|s| s.style.as_deref() == Some("pov"))
+            .flat_map(|s| match &s.camera { Camera::Free { keys } => keys.iter().filter(|k| (k.tick - 1000).abs() <= 4).map(|k| k.fov).collect::<Vec<_>>(), _ => vec![] })
+            .collect();
+        assert!(fovs.iter().any(|f| *f < BASE_FOV * 0.85), "{fovs:?}");
+        // а до убийств FOV обычный
+        assert!(keys.first().unwrap().fov > BASE_FOV * 0.99);
+    }
+
+    #[test]
+    fn without_positions_pov_stays_a_spectator_camera_and_zoom_is_kept() {
+        let m = mat();
+        let shot = shoot(&m, &hl(60.0, &[1000, 1100]), &Config::default(), &NoPositions, &mut vec![]);
+        assert!(shot.segments.iter().any(|s| matches!(s.camera, Camera::Pov { .. })));
+        assert!(!shot.zoom.is_empty());
+    }
+
+    /// Бесконечная стена x = -50: цепляет и лучи камеры за спиной.
+    struct Wall;
+    impl PositionSource for Wall {
+        fn eye_pose(&self, p: PlayerId, t: i32) -> Option<Pose> {
+            Duel.eye_pose(p, t)
+        }
+        fn raycast(&self, a: [f32; 3], b: [f32; 3]) -> Option<f32> {
+            let (da, db) = (a[0] + 50.0, b[0] + 50.0);
+            (da * db < 0.0).then(|| da / (da - db))
+        }
+    }
+
+    #[test]
+    fn chase_camera_does_not_go_behind_a_wall() {
+        // игрок смотрит вдоль +X, «сзади» — отрицательные x; стена на x = -50
+        let keys = follow_keys(&Wall, PlayerId(0), 100, 140, Follow::Chase, 64.0, &[]).unwrap();
+        // игрок на x ≈ 50..70, без стены камера была бы на x ≈ -60..-40 и ниже; со стеной — не дальше стены
+        assert!(keys.iter().all(|k| k.pos[0] >= -50.0), "{:?}", keys.iter().map(|k| k.pos[0]).collect::<Vec<_>>());
+        let free = follow_keys(&Duel, PlayerId(0), 100, 140, Follow::Chase, 64.0, &[]).unwrap();
+        assert!(free.iter().any(|k| k.pos[0] < -30.0));
     }
 }

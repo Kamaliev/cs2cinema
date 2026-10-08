@@ -11,6 +11,14 @@
 
 ### Вариант А. Готовый exe (проще всего)
 
+Одной командой в PowerShell (скачает последний релиз, проверит хэш, добавит `cs2-cli` в PATH):
+
+```powershell
+irm https://raw.githubusercontent.com/Kamaliev/cs2cinema/main/install.ps1 | iex
+```
+
+Или вручную:
+
 1. Откройте https://github.com/Kamaliev/cs2cinema/releases и скачайте `cs2cinema-windows-x64.zip`
    (релизы собирает GitHub Actions по тегу `v*`; пока релизов нет — берите вариант Б или артефакт из вкладки *Actions*).
 2. Распакуйте в любую папку без пробелов, например `C:\cs2cinema`.
@@ -34,6 +42,12 @@ cd cs2cinema
 git lfs pull                               # демка из репозитория, 283 МБ (нужна только для проверки)
 cargo build --release -p cli               # ~2-4 мин в первый раз
 .\target\release\cs2-cli.exe --list-cameras
+```
+
+Или одной командой, если Rust уже стоит (бинарь попадёт в `~\.cargo\bin`, он уже в PATH):
+
+```powershell
+cargo install --git https://github.com/Kamaliev/cs2cinema cli
 ```
 
 Все тесты: `cargo test --release` (тесты на реальной демке запустятся только с переменными ниже).

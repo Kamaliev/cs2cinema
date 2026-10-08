@@ -111,7 +111,7 @@ cargo test --release -p positions --test real_demo -- --nocapture
 
 CI (`.github/workflows`): `ci.yml` гоняет тесты на Linux и Windows и выкладывает `cs2-cli.exe` артефактом;
 `release.yml` по тегу `v*` собирает `cs2cinema-windows-x64.zip` и публикует GitHub Release
-(`git tag v0.1.0 && git push origin v0.1.0`).
+(`git tag v0.1.0 && git push origin v0.1.0`) или кнопкой: *Actions → Release (Windows) → Run workflow*, поле `tag`.
 
 ## Камеры (`crates/director/src/rig.rs`)
 

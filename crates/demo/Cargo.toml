@@ -1,0 +1,10 @@
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+prost = "0.14.4"
+snap = "1.1.2"
+[build-dependencies]
+prost-build = "0.14.4"

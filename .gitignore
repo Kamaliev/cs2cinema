@@ -1,1 +1,4 @@
 /target
+*.dem
+*.dem.zst
+.idea/

@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "crates/demo",
+    "crates/highlights",
+    "crates/director",
+    "crates/cs2",
+    "crates/renderer",
+    "crates/cli",
+]

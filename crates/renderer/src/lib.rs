@@ -450,6 +450,20 @@ fn assembly(t: &Timeline, cfg: &Config, take_of: &[usize]) -> Option<Assembly> {
 
 const ENCODE: &str = "-c:v libx264 -crf 16 -preset slow -pix_fmt yuv420p -c:a aac -b:a 192k highlights.mp4";
 
+/// Аргументы ffmpeg для склейки (запускать в папке результата, где лежат `clips/` и `assemble.ffgraph`).
+pub fn ffmpeg_args(t: &Timeline, cfg: &Config) -> Option<Vec<String>> {
+    let take_of: Vec<usize> = (0..t.shots.len()).collect();
+    let a = assembly(t, cfg, &take_of)?;
+    let mut v = vec!["-y".to_owned()];
+    for p in &a.inputs {
+        v.push("-i".into());
+        v.push(p.clone());
+    }
+    v.extend(["-/filter_complex", "assemble.ffgraph", "-map", "[v]", "-map", "[a]"].map(String::from));
+    v.extend(ENCODE.split_whitespace().map(String::from));
+    Some(v)
+}
+
 fn assemble_script(a: &Assembly) -> String {
     let mut s = String::from("#!/bin/sh\n# Склейка дублей HLAE в ролик (нужен ffmpeg 7+).\nset -e\ncd \"$(dirname \"$0\")\"\n");
     let inputs: Vec<String> = a.inputs.iter().map(|p| format!("-i {p}")).collect();

@@ -138,7 +138,14 @@ fn run(a: &mut Analysis, sel: &[usize], s: &Settings, out_dir: &Path, record: bo
         return Err("в пути результатов есть пробелы — HLAE не загрузит campath; выберите папку без пробелов".into());
     }
     p.stage(Stage::Record);
-    let last = plan.timeline.shots.iter().enumerate().max_by_key(|(_, sh)| sh.start_tick).map(|(i, _)| i).unwrap_or(0);
+    // дубли HLAE нумерует по порядку записи, а шоты пишутся в порядке показа: последний дубль — последний шот
+    let last = plan.timeline.shots.len().saturating_sub(1);
+    // старые дубли сбили бы нумерацию takeNNNN — откладываем в сторону (запись дорогая, не удаляем)
+    let clips = out_dir.join("clips");
+    if clips.is_dir() {
+        let stamp = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+        std::fs::rename(&clips, out_dir.join(format!("clips_old_{stamp}"))).map_err(|e| format!("не удалось отложить прошлые дубли: {e}"))?;
+    }
     let demo_name = format!("cs2cinema_{}", pipeline::console_name(&a.label));
     launch::install_files(&s.cs2_dir, out_dir, &demo_name, |path| a.write_demo(path))?;
 
@@ -151,16 +158,26 @@ fn run(a: &mut Analysis, sel: &[usize], s: &Settings, out_dir: &Path, record: bo
         Ok(()) => p.log("скрипт запущен, идёт запись…"),
         Err(e) => p.log(&format!("{e}. Откройте консоль игры (~) и выполните: exec highlights")),
     }
-    let root = launch::clips_root(&s.cs2_dir);
     let log = |m: &str| p.log(m);
-    launch::wait_for_clips(&root, last, since, &mut || child.try_wait().map(|r| r.is_none()).unwrap_or(false), &log)?;
+    launch::wait_for_clips(out_dir, last, since, &mut || child.try_wait().map(|r| r.is_none()).unwrap_or(false), &log)?;
 
     p.stage(Stage::Assemble);
     p.log("склеиваю ролик через ffmpeg…");
     let out = out_dir.join("highlights.mp4");
-    let opts = renderer::assemble::Options { fps: s.fps, fade_secs: 0.35, out: out.clone() };
-    let report = renderer::assemble::assemble(&root, plan.timeline.shots.len(), &opts)?;
-    p.log(&format!("ролик {:.0} с: {}", report.total_secs, out.display()));
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.current_dir(out_dir).args(&plan.ffmpeg_args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // без чёрного окна консоли
+    }
+    let res = cmd.output().map_err(|e| format!("не удалось запустить ffmpeg (он должен быть в PATH): {e}"))?;
+    if !res.status.success() {
+        let err = String::from_utf8_lossy(&res.stderr);
+        let tail: Vec<&str> = err.lines().rev().take(6).collect();
+        return Err(format!("ffmpeg завершился с ошибкой: {}", tail.into_iter().rev().collect::<Vec<_>>().join(" | ")));
+    }
+    p.log(&format!("ролик готов: {}", out.display()));
     ui::open_path(&out);
     Ok(out)
 }

@@ -122,6 +122,8 @@ impl Default for PlanOptions {
 pub struct Plan {
     pub timeline: Timeline,
     pub out_dir: PathBuf,
+    /// Аргументы ffmpeg для склейки дублей (запускать в `out_dir`).
+    pub ffmpeg_args: Vec<String>,
 }
 
 /// Строит план по выбранным вручную моментам (индексы в `a.found`) и пишет файлы в `out_dir`.
@@ -176,9 +178,21 @@ pub fn plan(a: &mut Analysis, selected: &[usize], o: &PlanOptions, out_dir: &Pat
     std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
     // HLAE ищет campath относительно game\bin\win64, поэтому в скрипте нужен абсолютный путь
     let abs = absolute_slash(out_dir);
-    let out = renderer::render(&a.m, &timeline, &renderer::Config { fps: o.fps, out_dir: abs, ..Default::default() });
+    let rcfg = renderer::Config { fps: o.fps, out_dir: abs, font_file: font_file(), ..Default::default() };
+    let out = renderer::render(&a.m, &timeline, &rcfg);
+    let ffmpeg_args = renderer::ffmpeg_args(&timeline, &rcfg).unwrap_or_default();
     out.write_to(out_dir).map_err(|e| format!("запись в {}: {e}", out_dir.display()))?;
-    Ok(Plan { timeline, out_dir: out_dir.to_path_buf() })
+    Ok(Plan { timeline, out_dir: out_dir.to_path_buf(), ffmpeg_args })
+}
+
+/// Шрифт подписей в ролике (Arial Bold из Windows; `CS2CINEMA_FONT` — свой).
+fn font_file() -> Option<String> {
+    let candidates = [
+        std::env::var("CS2CINEMA_FONT").ok(),
+        Some(r"C:\Windows\Fonts\arialbd.ttf".to_owned()),
+        Some(r"C:\Windows\Fonts\arial.ttf".to_owned()),
+    ];
+    candidates.into_iter().flatten().find(|p| Path::new(p).is_file()).map(|p| p.replace('\\', "/"))
 }
 
 /// Абсолютный путь с `/` — так его понимает консоль CS2.

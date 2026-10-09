@@ -39,11 +39,6 @@ pub fn cs2_exe(cs2_dir: &str) -> PathBuf {
     Path::new(cs2_dir).join("game/bin/win64/cs2.exe")
 }
 
-/// Где HLAE хранит клипы: `game/bin/win64` (внутри `clips/shot_NN/takeNNNN`).
-pub fn clips_root(cs2_dir: &str) -> PathBuf {
-    Path::new(cs2_dir).join("game/bin/win64")
-}
-
 /// Проверка путей перед запуском; возвращает понятное сообщение об ошибке.
 pub fn check_paths(hlae_dir: &str, cs2_dir: &str) -> Result<(), String> {
     if !Path::new(hlae_dir).join("HLAE.exe").is_file() {
@@ -63,14 +58,21 @@ pub fn install_files(cs2_dir: &str, out_dir: &Path, demo_name: &str, write_demo:
     let csgo = Path::new(cs2_dir).join("game/csgo");
     let cfg_dir = csgo.join("cfg");
     std::fs::create_dir_all(&cfg_dir).map_err(|e| format!("{}: {e}", cfg_dir.display()))?;
-    std::fs::copy(out_dir.join("highlights.cfg"), cfg_dir.join("highlights.cfg")).map_err(|e| format!("копирование highlights.cfg: {e}"))?;
+    // highlights.cfg, скрипты шотов cs2c_NN.cfg и пути камер cs2c_NN_K.xml (HLAE грузит их от game/bin/win64)
+    for e in std::fs::read_dir(out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let ours = name == "highlights.cfg" || (name.starts_with("cs2c_") && (name.ends_with(".cfg") || name.ends_with(".xml")));
+        if ours {
+            std::fs::copy(e.path(), cfg_dir.join(&name)).map_err(|e| format!("копирование {name}: {e}"))?;
+        }
+    }
     write_demo(&csgo.join(format!("{demo_name}.dem")))
 }
 
 pub fn launch(hlae_dir: &str, cs2_dir: &str, demo_name: &str) -> Result<Child, String> {
     let hook = Path::new(hlae_dir).join("x64/AfxHookSource2.dll");
     let cmdline = format!(
-        "-insecure -steam -novid -allow_third_party_software -netconport {NETCON_PORT} -windowed -w 1920 -h 1080 +playdemo {demo_name}"
+        "-insecure -steam -novid -allow_third_party_software -netconport {NETCON_PORT} -windowed -w 1920 -h 1080 +demo_ui_mode 0 +playdemo {demo_name}"
     );
     let mut cmd = Command::new(Path::new(hlae_dir).join("HLAE.exe"));
     cmd.current_dir(hlae_dir)
@@ -120,8 +122,8 @@ fn newest_mtime(dir: &Path) -> Option<(SystemTime, usize)> {
 
 /// Ждёт, пока HLAE допишет клип последнего шота (папка появилась после `since` и перестала меняться).
 /// `alive` — вернуть false, если игра закрыта: тогда ждать дальше нечего.
-pub fn wait_for_clips(root: &Path, last_shot: usize, since: SystemTime, alive: &mut dyn FnMut() -> bool, progress: &dyn Fn(&str)) -> Result<(), String> {
-    let dir = root.join("clips").join(format!("shot_{:02}", last_shot + 1));
+pub fn wait_for_clips(out_dir: &Path, last_shot: usize, since: SystemTime, alive: &mut dyn FnMut() -> bool, progress: &dyn Fn(&str)) -> Result<(), String> {
+    let dir = out_dir.join("clips").join(format!("take{last_shot:04}"));
     let mut last_seen: Option<(SystemTime, usize, Instant)> = None;
     loop {
         if let Some((t, n)) = newest_mtime(&dir) {

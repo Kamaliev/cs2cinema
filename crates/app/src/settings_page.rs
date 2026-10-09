@@ -59,6 +59,12 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
                         None => status_note = Some("CS2 в библиотеках Steam не найден"),
                     }
                 }
+                if ui.small_button("Найти HLAE на компьютере").clicked() {
+                    match launch::find_hlae() {
+                        Some(p) => d.hlae_dir = p.to_string_lossy().into_owned(),
+                        None => status_note = Some("HLAE.exe не найден — укажите папку вручную или скачайте HLAE"),
+                    }
+                }
                 if ui.small_button("Скачать HLAE").clicked() {
                     ui::open_url("https://github.com/advancedfx/advancedfx/releases");
                 }

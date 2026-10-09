@@ -110,6 +110,14 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
 fn start(app: &mut App, record: bool) {
     let sel: Vec<usize> = app.montage.checked.iter().enumerate().filter(|(_, c)| **c).map(|(i, _)| i).collect();
     if record {
+        // путь к HLAE не задан или устарел — ищем сами и запоминаем
+        if !Path::new(&app.s.hlae_dir).join("HLAE.exe").is_file() {
+            if let Some(p) = launch::find_hlae() {
+                app.s.hlae_dir = p.to_string_lossy().into_owned();
+                app.draft.hlae_dir = app.s.hlae_dir.clone();
+                app.s.save();
+            }
+        }
         if let Err(e) = launch::check_paths(&app.s.hlae_dir, &app.s.cs2_dir) {
             app.status.finish(Err(e));
             app.page = crate::app::Page::Settings;

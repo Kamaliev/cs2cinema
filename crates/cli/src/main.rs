@@ -250,7 +250,7 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
         &NoPositions
     };
     let timeline = match hero {
-        Some(_) => director::direct_all(&m, &found, &utility, &cfg, pos),
+        Some(id) => director::direct_all(&m, id, &found, &utility, &cfg, pos),
         None => director::direct(&m, &found, &cfg, pos),
     };
     let out_dir = args.out.unwrap_or_else(|| PathBuf::from("out").join(&label));

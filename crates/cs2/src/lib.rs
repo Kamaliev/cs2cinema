@@ -38,6 +38,9 @@ pub struct Kill {
     pub no_scope: bool,
     pub attacker_blind: bool,
     pub attacker_in_air: bool,
+    /// Ассист — флешкой (`assistedflash`): такой ассист показывается как убийство под флешку.
+    #[serde(default)]
+    pub assisted_flash: bool,
     pub distance: f32,
 }
 
@@ -221,6 +224,7 @@ impl Match {
                         no_scope: e.bool("noscope"),
                         attacker_blind: e.bool("attackerblind"),
                         attacker_in_air: e.bool("attackerinair"),
+                        assisted_flash: e.bool("assistedflash"),
                         distance: e.float("distance").unwrap_or(0.0),
                     });
                 }

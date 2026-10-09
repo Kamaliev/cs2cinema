@@ -163,10 +163,10 @@ pub fn plan_player(a: &mut Analysis, hero: PlayerId, o: &PlanOptions, out_dir: &
     let timeline = match (&a.track, &mesh) {
         (Some(t), Some(mesh)) => {
             let p = positions::WithGeometry { track: t, mesh };
-            director::direct_all(&a.m, &found, &utility, &cfg, &p as &dyn PositionSource)
+            director::direct_all(&a.m, hero, &found, &utility, &cfg, &p as &dyn PositionSource)
         }
-        (Some(t), None) => director::direct_all(&a.m, &found, &utility, &cfg, t as &dyn PositionSource),
-        _ => director::direct_all(&a.m, &found, &utility, &cfg, &director::NoPositions),
+        (Some(t), None) => director::direct_all(&a.m, hero, &found, &utility, &cfg, t as &dyn PositionSource),
+        _ => director::direct_all(&a.m, hero, &found, &utility, &cfg, &director::NoPositions),
     };
 
     std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;

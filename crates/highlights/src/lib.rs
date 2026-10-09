@@ -211,6 +211,7 @@ mod tests {
             no_scope: false,
             attacker_blind: false,
             attacker_in_air: false,
+            assisted_flash: false,
             distance: 10.0,
         }
     }

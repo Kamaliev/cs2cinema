@@ -1,15 +1,15 @@
-//! Шоты гранаты: камера за гранатой -> общий план на пострадавших,
-//! затем взрыв глазами каждого пострадавшего (видно, сработала ли) и, для флешки, убийства
-//! под неё глазами тиммейтов.
+//! Шоты гранаты: камера из-за плеча бросающего (саму гранату игра рендерит — траектория настоящая),
+//! с подъездом по земле к точке взрыва, если путь свободен, -> общий план на взрыв и пострадавших
+//! вблизи и невысоко; затем взрыв глазами тех, кого она решила (видно, сработала ли), и, для флешки,
+//! убийства под неё — повтором со стороны, где видно и убийцу, и ослеплённого.
 //!
-//! Позиций самой гранаты в демке мы не снимаем: полёт — баллистическая дуга от глаз бросающего
-//! до точки взрыва. Если дуга проходит сквозь стены (рикошет), полёта нет — бросок
-//! уже показан в отрезке раунда от первого лица.
+//! Камера нигде не отрывается от земли выше роста и не проходит сквозь стены: каждый шаг
+//! проверяется лучом по геометрии карты.
 
 use cs2::{GrenadeKind, Match, PlayerId};
 use highlights::Utility;
 
-use crate::{Camera, CamKey, Config, PositionSource, ScaleKey, Segment, Shot, look_at, tier_of};
+use crate::{Camera, CamKey, Config, Pose, PositionSource, ScaleKey, Segment, Shot, look_at, rig, tier_of};
 
 /// Шаг ключей камеры: полёт быстрый, ключи чаще, чем у пресетов.
 const KEY_EVERY_SECS: f32 = 0.1;
@@ -38,7 +38,8 @@ pub fn shoot_grenade(m: &Match, u: &Utility, cfg: &Config, pos: &dyn PositionSou
         p.extend(affected.iter().filter_map(|&v| pos.eye_pose(v, seen_at).or_else(|| pos.eye_pose(v, det)).map(|e| e.pos)));
         p
     };
-    let wide = wide_view(pos, &points, affected.len());
+    let thrower_at_det = pos.eye_pose(g.thrower, det).map(|e| e.pos);
+    let wide = wide_view(pos, &points, affected.len(), thrower_at_det);
     let after = match (g.kind, wide.is_some()) {
         (GrenadeKind::Fire | GrenadeKind::Smoke, true) => 2.4,
         (_, true) => 1.6,
@@ -58,7 +59,7 @@ pub fn shoot_grenade(m: &Match, u: &Utility, cfg: &Config, pos: &dyn PositionSou
             }
             None => segments.push(seg(release, end, Camera::Free { keys }, Some("grenade_chase"))),
         },
-        // дуга сквозь стены (рикошет) — полёт показать нечем, бросок уже был в отрезке раунда
+        // нет позиции бросающего — полёт показать не из чего
         None => return None,
     }
 
@@ -84,9 +85,11 @@ pub fn shoot_grenade(m: &Match, u: &Utility, cfg: &Config, pos: &dyn PositionSou
     })
 }
 
-/// Взрыв залпа глазами каждого пострадавшего (ослеплённого, раненого) — с замедлением,
-/// чтобы было видно, сработала ли граната; для флешек — ещё убийства тиммейтов под неё их глазами.
-pub fn grenade_victims(m: &Match, volley: &[&Utility], cfg: &Config) -> Vec<Shot> {
+/// Взрыв залпа глазами тех, кого он решил (убитых ослеплёнными, иначе — самого «наглухо»
+/// ослеплённого; раненых и убитых HE/огнём), с замедлением, чтобы было видно, сработала ли граната.
+/// Для флешек — ещё убийства под неё: повтор со стороны, где видно и убийцу, и ослеплённого
+/// (если чистого ракурса нет — глазами убийцы). `used` — уже занятые пресеты камер.
+pub fn grenade_victims(m: &Match, volley: &[&Utility], cfg: &Config, pos: &dyn PositionSource, used: &mut Vec<String>) -> Vec<Shot> {
     let (Some(first), Some(last)) = (volley.first(), volley.last()) else { return Vec::new() };
     let tr = m.tick_rate;
     let secs = |s: f32| (s * tr).round() as i32;
@@ -129,8 +132,20 @@ pub fn grenade_victims(m: &Match, volley: &[&Utility], cfg: &Config) -> Vec<Shot
     };
     let pov = |a, b, player, style: &str| Segment { start_tick: a, end_tick: b, camera: Camera::Pov { player }, style: Some(style.to_owned()), colorfulness: None };
 
-    let mut victims: Vec<PlayerId> = volley.iter().flat_map(|u| affected(&u.grenade)).collect();
-    victims.dedup();
+    // чьими глазами: белый экран на 5 секунд у каждого ослеплённого — скучно, берём только тех,
+    // кого это решило: убитых под гранатой, иначе одного самого «наглухо» ослеплённого / раненых
+    let killed: Vec<PlayerId> = volley.iter().flat_map(|u| u.grenade.kills.iter().copied()).collect();
+    let mut victims: Vec<PlayerId> = volley.iter().flat_map(|u| affected(&u.grenade)).filter(|p| killed.contains(p)).collect();
+    if victims.is_empty() {
+        let mut rest: Vec<PlayerId> = volley.iter().flat_map(|u| affected(&u.grenade)).collect();
+        if kind == GrenadeKind::Flash {
+            rest.sort_by(|a, b| blind_for(*b).unwrap_or(0.0).total_cmp(&blind_for(*a).unwrap_or(0.0)));
+            rest.truncate(1);
+        } else {
+            rest.truncate(2);
+        }
+        victims = rest;
+    }
     let mut seen = Vec::new();
     victims.retain(|p| {
         let new = !seen.contains(p);
@@ -168,17 +183,34 @@ pub fn grenade_victims(m: &Match, volley: &[&Utility], cfg: &Config) -> Vec<Shot
             .filter(|k| blind_for(k.victim).is_some_and(|d| k.tick - det1 <= secs(d + 0.3)))
             .collect();
         assists.dedup_by_key(|k| k.tick);
-        shots.extend(assists.into_iter().map(|k| {
-            let (a, b) = (k.tick - secs(1.5), k.tick + secs(0.4));
-            Shot {
+        for k in assists {
+            let (a, b) = (k.tick - secs(1.6), k.tick + secs(0.7));
+            // кто и как: ракурс со стороны, на котором видно и убийцу, и ослеплённого
+            let scene = rig::Scene { killer: k.attacker, victim: k.victim, focus_tick: k.tick, tick_rate: tr };
+            let segment = match rig::best_replay(pos, &scene, a, b, used, false) {
+                Some(pick) => {
+                    used.push(pick.preset.name.to_owned());
+                    Segment { start_tick: a, end_tick: b, camera: Camera::Free { keys: pick.keys }, style: Some(pick.preset.name.to_owned()), colorfulness: Some(pick.score.total) }
+                }
+                None => pov(a, b, k.attacker, "assist_pov"),
+            };
+            let ramp = secs(0.15);
+            shots.push(Shot {
                 title: format!("{what} {} (R{}): {} убивает ослеплённого {}", m.name(thrower), first.grenade.round, m.name(k.attacker), m.name(k.victim)),
                 start_tick: a,
                 end_tick: b,
-                segments: vec![pov(a, b, k.attacker, "assist_pov")],
-                caption: format!("{} добивает ослеплённого {}", m.name(k.attacker), m.name(k.victim)),
+                segments: vec![segment],
+                // само убийство — с замедлением, чтобы прочитать, кто кого
+                timescale: vec![
+                    ScaleKey { tick: k.tick - secs(0.35) - ramp, scale: 1.0 },
+                    ScaleKey { tick: k.tick - secs(0.35), scale: cfg.slow },
+                    ScaleKey { tick: k.tick + secs(0.25), scale: cfg.slow },
+                    ScaleKey { tick: k.tick + secs(0.25) + ramp, scale: 1.0 },
+                ],
+                caption: format!("Под флешку {} · {} убивает {}", m.name(thrower), m.name(k.attacker), m.name(k.victim)),
                 ..base(k.attacker)
-            }
-        }));
+            });
+        }
     }
     shots
 }
@@ -225,32 +257,47 @@ fn affected(g: &cs2::Grenade) -> Vec<PlayerId> {
     v
 }
 
-/// Ключи камеры на `[t0, t1]`: до взрыва — за гранатой, после — общий план; `None` — дуга сквозь стены.
-fn flight(m: &Match, g: &cs2::Grenade, pos: &dyn PositionSource, t0: i32, det: i32, t1: i32, wide: Option<&Wide>) -> Option<Vec<CamKey>> {
-    let eye = pos.eye_pose(g.thrower, t0)?;
-    let fwd = dir(eye.ang);
-    let p0 = add(eye.pos, scale(fwd, 30.0));
-    let p1 = add(g.pos, [0.0, 0.0, 8.0]);
-    let apex = (0.25 * dist(p0, p1)).clamp(20.0, 220.0);
-    let arc = |u: f32| {
-        let u = u.clamp(0.0, 1.0);
-        let p = lerp3(p0, p1, u);
-        [p[0], p[1], p[2] + 4.0 * apex * u * (1.0 - u)]
-    };
-    let chase_cam = |u: f32| {
-        let at = arc(u);
-        let behind = normalize(sub(arc(u - 0.08), at)).unwrap_or_else(|| scale(fwd, -1.0));
-        add(add(at, scale(behind, 90.0)), [0.0, 0.0, 25.0])
-    };
-    // дуга и камера за ней не должны проходить сквозь стены (рикошет мы не повторяем)
-    let steps = 24;
-    let flies = (0..steps).all(|i| {
-        let (a, b) = (i as f32 / steps as f32, (i + 1) as f32 / steps as f32);
-        pos.raycast(arc(a), arc(b)).is_none() && pos.raycast(chase_cam(a), chase_cam(b)).is_none() && pos.raycast(arc(b), chase_cam(b)).is_none()
+/// Камера из-за плеча `eye`, развёрнутая в сторону `toward` (по горизонтали): позади, чуть сбоку
+/// и выше глаз. К стене не прижимается: если сзади стена — пробуем другое плечо, иначе встаём
+/// вплотную к игроку.
+pub(crate) fn shoulder(pos: &dyn PositionSource, eye: &Pose, toward: [f32; 3]) -> [f32; 3] {
+    let f = normalize([toward[0], toward[1], 0.0]).unwrap_or_else(|| {
+        let d = dir(eye.ang);
+        normalize([d[0], d[1], 0.0]).unwrap_or([1.0, 0.0, 0.0])
     });
-    if !flies {
-        return None;
+    let right = [f[1], -f[0], 0.0];
+    let want = |side: f32| add(add(eye.pos, scale(f, -72.0)), add(scale(right, 24.0 * side), [0.0, 0.0, 20.0]));
+    let a = pull(pos, eye.pos, want(1.0));
+    if dist(a, eye.pos) >= 40.0 {
+        return a;
     }
+    let b = pull(pos, eye.pos, want(-1.0));
+    if dist(b, eye.pos) > dist(a, eye.pos) { b } else { a }
+}
+
+/// Ключи камеры на `[t0, t1]`: до взрыва — из-за плеча бросающего, с подъездом по земле к точке
+/// взрыва, пока путь свободен (саму гранату рендерит игра); после — общий план.
+/// `None` — нет позиции бросающего.
+fn flight(m: &Match, g: &cs2::Grenade, pos: &dyn PositionSource, t0: i32, det: i32, t1: i32, wide: Option<&Wide>) -> Option<Vec<CamKey>> {
+    let eye0 = pos.eye_pose(g.thrower, t0)?;
+    let p1 = add(g.pos, [0.0, 0.0, 8.0]);
+    // куда смотрит камера: от направления броска к точке взрыва по пологой дуге —
+    // примерно так и летит граната, а на рикошете взгляд просто приходит к взрыву
+    let aim = add(eye0.pos, scale(dir(eye0.ang), 400.0));
+    let look = |u: f32| {
+        let u = u.clamp(0.0, 1.0);
+        let p = lerp3(aim, p1, smooth(u));
+        [p[0], p[1], p[2] + 60.0 * u * (1.0 - u)]
+    };
+    let ground = sub(p1, eye0.pos);
+    let base = shoulder(pos, &eye0, ground);
+    // докуда можно подъехать: по земле к взрыву, не ближе 140 юнитов и не дальше первой стены
+    let reach = {
+        let far = ground[0].hypot(ground[1]);
+        let f = normalize([ground[0], ground[1], 0.0]).unwrap_or([0.0; 3]);
+        let want = add(base, scale(f, (far - 140.0).clamp(0.0, 0.6 * far)));
+        pull(pos, base, want)
+    };
 
     let step = ((KEY_EVERY_SECS * m.tick_rate) as usize).max(1);
     let mut ticks: Vec<i32> = (t0..t1).step_by(step).collect();
@@ -258,19 +305,24 @@ fn flight(m: &Match, g: &cs2::Grenade, pos: &dyn PositionSource, t0: i32, det: i
     ticks.sort_unstable();
     ticks.dedup();
 
-    let last_flight = chase_cam(1.0);
+    let mut keys = Vec::with_capacity(ticks.len() + 1);
+    let mut cam_prev = base;
+    for &t in ticks.iter().filter(|&&t| t <= det) {
+        let u = (t - t0) as f32 / (det - t0).max(1) as f32;
+        // бросающий может двигаться — держимся за его плечом, постепенно подъезжая к взрыву
+        let e = pos.eye_pose(g.thrower, t).unwrap_or(eye0);
+        let want = lerp3(shoulder(pos, &e, ground), reach, smooth(u));
+        // шаг делаем, только если на пути и до точки взгляда нет стены; иначе стоим
+        let cam = if pos.raycast(cam_prev, want).is_none() && pos.raycast(want, look(u)).is_none() { want } else { cam_prev };
+        keys.push(CamKey { tick: t, pos: cam, ang: look_at(cam, look(u)), fov: 90.0 });
+        cam_prev = cam;
+    }
+    let last_flight = cam_prev;
     // плавный переезд к общему плану — только если по пути нет стен, иначе склейка
     let glide = wide.is_some_and(|w| pos.raycast(last_flight, w.cam).is_none() && pos.raycast(w.cam, last_flight).is_none());
     let reveal = (0.6 * m.tick_rate).max(1.0);
 
-    let mut keys = Vec::with_capacity(ticks.len() + 1);
-    for t in ticks {
-        if t <= det {
-            let u = (t - t0) as f32 / (det - t0).max(1) as f32;
-            let cam = chase_cam(u);
-            keys.push(CamKey { tick: t, pos: cam, ang: look_at(cam, arc(u + 0.06)), fov: 90.0 });
-            continue;
-        }
+    for t in ticks.into_iter().filter(|&t| t > det) {
         let Some(w) = wide else {
             // общего плана нет: держим последний ракурс на точке взрыва
             keys.push(CamKey { tick: t, pos: last_flight, ang: look_at(last_flight, p1), fov: 85.0 });
@@ -303,9 +355,10 @@ struct Wide {
     fov: f32,
 }
 
-/// Общий план на взрыв и пострадавших: камера близко (≤ 550), невысоко, без стен до каждого.
-/// `None` — чистого ракурса нет (тогда показываем глазами пострадавших).
-fn wide_view(pos: &dyn PositionSource, points: &[[f32; 3]], victims: usize) -> Option<Wide> {
+/// Общий план на взрыв и пострадавших: камера близко (≤ 320), на высоте чуть выше роста,
+/// без стен до каждого; при прочих равных — со стороны бросавшего (`from`), чтобы было видно,
+/// как граната пришла. `None` — чистого ракурса нет (тогда показываем глазами пострадавших).
+fn wide_view(pos: &dyn PositionSource, points: &[[f32; 3]], victims: usize, from: Option<[f32; 3]>) -> Option<Wide> {
     let n = points.len().max(1) as f32;
     let mut target = scale(points.iter().fold([0.0; 3], |a, p| add(a, *p)), 1.0 / n);
     target[2] -= 10.0;
@@ -313,12 +366,13 @@ fn wide_view(pos: &dyn PositionSource, points: &[[f32; 3]], victims: usize) -> O
     let fov: f32 = 90.0;
     // вертикальный полуугол кадра 16:9 при горизонтальном FOV
     let half_v = ((fov / 2.0).to_radians().tan() * 9.0 / 16.0).atan();
-    let fit = (spread / (0.8 * half_v).tan()).clamp(160.0, 550.0);
+    let fit = (spread / (0.8 * half_v).tan()).clamp(140.0, 320.0);
+    let from_az = from.map(|f| (f[1] - target[1]).atan2(f[0] - target[0]));
 
     let mut best: Option<(f32, Wide)> = None;
     for step in 0..16 {
         let az = (step as f32 * 22.5).to_radians();
-        for lift in [0.15, 0.3, 0.45] {
+        for lift in [0.08, 0.16, 0.26] {
             let want = [target[0] + fit * az.cos(), target[1] + fit * az.sin(), target[2] + fit * lift];
             let cam = pull(pos, target, want);
             let reach = dist(cam, target);
@@ -333,7 +387,9 @@ fn wide_view(pos: &dyn PositionSource, points: &[[f32; 3]], victims: usize) -> O
             let framed = |p: &[f32; 3]| dist(*p, target) <= reach * (0.9 * half_v).tan() + 20.0;
             let seen = points.iter().skip(1).filter(|p| clear(p) && framed(p)).count();
             let blast = clear(&points[0]) as usize;
-            let score = 3.0 * seen as f32 + blast as f32 + reach / 1000.0;
+            // со стороны бросавшего (±60°) — небольшой бонус, ближе — тоже
+            let side = from_az.map_or(0.0, |f| if ((az - f + std::f32::consts::PI).rem_euclid(2.0 * std::f32::consts::PI) - std::f32::consts::PI).abs() <= 1.05 { 0.5 } else { 0.0 });
+            let score = 3.0 * seen as f32 + blast as f32 + side + (320.0 - reach) / 1000.0;
             if best.as_ref().is_none_or(|(s, _)| score > *s) {
                 best = Some((score, Wide { cam, target, fov }));
             }
@@ -383,7 +439,7 @@ fn scale(a: [f32; 3], k: f32) -> [f32; 3] {
     [a[0] * k, a[1] * k, a[2] * k]
 }
 
-fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
+pub(crate) fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
     let d = sub(a, b);
     (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
 }

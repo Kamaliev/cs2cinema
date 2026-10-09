@@ -476,10 +476,17 @@ pub fn frames_kill(keys: &[CamKey], pos: &dyn PositionSource, s: &Scene) -> bool
     ok * 4 >= around.len() * 3
 }
 
+/// Пресет с приближением (зум, долли-зум) — уместен только на дальних дуэлях.
+pub fn is_zoom(p: &Preset) -> bool {
+    matches!(p.category, Category::Zoom) || p.name.starts_with("dolly_zoom")
+}
+
 /// Ракурс для повтора убийства: лучший путь, на котором убийство действительно видно.
-pub fn best_replay(pos: &dyn PositionSource, s: &Scene, t0: i32, t1: i32, used: &[String]) -> Option<Pick> {
+/// `zoom_ok` — можно ли брать пресеты с приближением.
+pub fn best_replay(pos: &dyn PositionSource, s: &Scene, t0: i32, t1: i32, used: &[String], zoom_ok: bool) -> Option<Pick> {
     rank(pos, s, t0, t1, ANY, Tier::Epic, used)
         .into_iter()
+        .filter(|p| zoom_ok || !is_zoom(p.preset))
         .filter(|p| !p.score.through_wall && frames_kill(&p.keys, pos, s))
         .max_by(|a, b| {
             // жертва в кадре весит больше общей «красочности»

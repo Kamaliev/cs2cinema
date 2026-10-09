@@ -78,8 +78,12 @@ impl Client {
 
     /// Полная статистика матча (по картам, командам и игрокам).
     pub fn match_stats(&self, match_id: &str) -> Result<stats::MatchStats> {
-        let v = self.get(&format!("/matches/{match_id}/stats"), "статистика матча")?;
-        Ok(stats::MatchStats::from_json(&v))
+        Ok(stats::MatchStats::from_json(&self.match_stats_json(match_id)?))
+    }
+
+    /// То же сырым JSON — чтобы положить в кэш (статистика сыгранного матча не меняется).
+    pub fn match_stats_json(&self, match_id: &str) -> Result<serde_json::Value> {
+        self.get(&format!("/matches/{match_id}/stats"), "статистика матча")
     }
 
     /// Ссылки на демки матча (в bo3 их несколько — по одной на карту).

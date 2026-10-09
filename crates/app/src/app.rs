@@ -12,13 +12,20 @@ use cs2::{PlayerId, report::Report};
 use faceit::stats::{MatchStats, MatchSummary, Player};
 use highlights::{Highlight, Utility};
 use pipeline::{Analysis, Stage};
+use store::{Job, JobKind, JobSource, NewJob, Store};
 
-use crate::{settings::Settings, status::Status, ui, update};
+use crate::{
+    jobs::{self, CancelToken},
+    settings::{self, Settings},
+    status::Status,
+    ui, update,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Player,
     Match,
+    Jobs,
     Settings,
 }
 
@@ -26,8 +33,8 @@ pub enum Msg {
     Log(String),
     Stage(Stage),
     Analyzed(Result<Analysis, String>),
-    /// Анализ возвращается владельцу после планирования/записи.
-    Finished { analysis: Analysis, result: Result<PathBuf, String> },
+    /// Задача на монтаж завершилась (успех — путь к ролику или папке плана; `CANCELLED` — отмена).
+    JobDone { id: i64, result: Result<PathBuf, String> },
     Player(Result<(Player, Vec<MatchSummary>), String>),
     Stats(String, Result<MatchStats, String>),
     UpdateFound(Result<Option<update::Release>, String>),
@@ -78,7 +85,18 @@ pub struct MatchState {
     pub report: Option<Report>,
     pub moments: Vec<Highlight>,
     pub utility: Vec<Utility>,
-    pub result: Option<PathBuf>,
+}
+
+/// Очередь и история задач на монтаж (сами задачи живут в базе).
+#[derive(Default)]
+pub struct JobsState {
+    pub list: Vec<Job>,
+    /// Выполняемая сейчас задача и её токен отмены.
+    pub running: Option<(i64, CancelToken)>,
+    /// Чей журнал развёрнут на странице задач.
+    pub open_log: Option<i64>,
+    /// Список надо перечитать из базы (пришли новые строки журнала).
+    pub dirty: bool,
 }
 
 impl MatchState {
@@ -105,6 +123,8 @@ pub struct App {
     pub status: Status,
     pub matches: MatchesState,
     pub game: MatchState,
+    pub jobs: JobsState,
+    pub store: Store,
     pub update: Option<update::Release>,
     pub update_note: Option<String>,
     rx: Receiver<Msg>,
@@ -121,6 +141,12 @@ impl App {
         let s = Settings::load();
         cleanup_old();
         let first_run = s.hlae_dir.is_empty() || s.faceit_key.is_empty();
+        // база: задачи, кэш FACEIT, реестр демок; если не открылась — работаем в памяти
+        let (store, store_note) = match Store::open(&settings::data_dir().join("cs2cinema.db")) {
+            Ok(st) => (st, None),
+            Err(e) => (Store::in_memory().expect("sqlite в памяти"), Some(e)),
+        };
+        let interrupted = store.reset_running().unwrap_or(0);
         let mut app = Self {
             draft: s.clone(),
             matches: MatchesState { nickname: s.nickname.clone(), ..Default::default() },
@@ -128,6 +154,8 @@ impl App {
             page: if first_run { Page::Settings } else { Page::Player },
             status: Status::default(),
             game: MatchState::default(),
+            jobs: JobsState::default(),
+            store,
             update: None,
             update_note: None,
             rx,
@@ -147,9 +175,19 @@ impl App {
             app.load_matches();
         }
         app.status.last = "Готов к работе".into();
+        if let Some(e) = store_note {
+            app.status.push(&format!("база не открылась ({e}) — задачи не сохранятся"));
+        }
+        if interrupted > 0 {
+            app.status.push(&format!("задач прервано при прошлом запуске: {interrupted}"));
+        }
+        app.refresh_jobs();
         // `cs2cinema.exe demo.dem` — открыть демку сразу (и для «Открыть с помощью»)
         if let Some(p) = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file()) {
             app.open_source(pipeline::Source::File(p));
+        } else if !first_run {
+            // задачи, оставшиеся в очереди, продолжаем
+            jobs::run_next(&mut app);
         }
         #[cfg(debug_assertions)]
         if std::env::var_os("CS2CINEMA_MOCK").is_some() {
@@ -159,6 +197,7 @@ impl App {
         app.page = match std::env::var("CS2CINEMA_PAGE").as_deref() {
             Ok("player") => Page::Player,
             Ok("match") => Page::Match,
+            Ok("jobs") => Page::Jobs,
             Ok("settings") => Page::Settings,
             _ => app.page,
         };
@@ -214,13 +253,77 @@ impl App {
             return;
         }
         let key = self.s.faceit_key.clone();
+        let store = self.store.clone();
         self.spawn(move |r| {
             let client = faceit::Client::new(key);
             for id in ids {
-                let res = client.match_stats(&id).map_err(|e| e.to_string());
+                // статистика сыгранного матча не меняется — после первого запроса живёт в базе
+                let cache_key = format!("stats:{id}");
+                let res = match store.cache_get(&cache_key) {
+                    Ok(Some(v)) => Ok(MatchStats::from_json(&v)),
+                    _ => client.match_stats_json(&id).map_err(|e| e.to_string()).map(|v| {
+                        let _ = store.cache_put(&cache_key, &v);
+                        MatchStats::from_json(&v)
+                    }),
+                };
                 r.send(Msg::Stats(id, res));
             }
         });
+    }
+
+    pub fn refresh_jobs(&mut self) {
+        match self.store.jobs() {
+            Ok(list) => self.jobs.list = list,
+            Err(e) => self.status.push(&e),
+        }
+        self.jobs.dirty = false;
+    }
+
+    /// Поставить задачу на открытый матч и выбранного игрока; возвращает её id.
+    pub fn enqueue(&mut self, kind: JobKind) -> Result<i64, String> {
+        let (Some(a), Some(hero)) = (&self.game.analysis, self.game.hero) else { return Err("сначала разберите демку и выберите игрока".into()) };
+        let source = match &self.game.match_id {
+            Some(id) => {
+                let _ = self.store.remember_demo(id, &a.demo_path);
+                JobSource::Faceit(id.clone())
+            }
+            None => JobSource::File(a.demo_path.clone()),
+        };
+        let label = self
+            .game
+            .match_id
+            .as_ref()
+            .and_then(|id| self.matches.list.iter().find(|m| &m.match_id == id))
+            .map(|m| ui::date(m.started_at))
+            .unwrap_or_else(|| a.label.clone());
+        let job = NewJob {
+            kind,
+            source,
+            label,
+            hero_name: a.m.name(hero),
+            hero_steam: a.m.player(hero).map_or(0, |p| p.xuid),
+            map: a.m.map.clone(),
+        };
+        let id = self.store.add_job(&job)?;
+        self.refresh_jobs();
+        jobs::run_next(self);
+        Ok(id)
+    }
+
+    /// Отменить задачу: из очереди — сразу, выполняемую — через токен (поток сам остановится).
+    pub fn cancel_job(&mut self, id: i64) {
+        match &self.jobs.running {
+            Some((rid, token)) if *rid == id => {
+                token.cancel();
+                self.status.push("отменяю задачу…");
+            }
+            _ => {
+                if let Err(e) = self.store.cancel_job(id) {
+                    self.status.push(&e);
+                }
+            }
+        }
+        self.refresh_jobs();
     }
 
     /// Разобрать демку; для файла страница матча открывается без FACEIT-шапки.
@@ -264,8 +367,14 @@ impl App {
     fn poll(&mut self) {
         while let Ok(m) = self.rx.try_recv() {
             match m {
-                Msg::Log(t) => self.status.push(&t),
-                Msg::Stage(s) => self.status.set_stage(s),
+                Msg::Log(t) => {
+                    self.status.push(&t);
+                    self.jobs.dirty = self.jobs.running.is_some();
+                }
+                Msg::Stage(s) => {
+                    self.status.set_stage(s);
+                    self.jobs.dirty = self.jobs.running.is_some();
+                }
                 Msg::Analyzed(r) => match r {
                     Ok(a) => {
                         self.status.finish(Ok(format!("{}: игроков {}, раундов {}", a.m.map, a.m.players.len(), a.m.rounds.len())));
@@ -275,15 +384,21 @@ impl App {
                     }
                     Err(e) => self.status.finish(Err(e)),
                 },
-                Msg::Finished { analysis, result } => {
-                    self.game.analysis = Some(analysis);
-                    match result {
-                        Ok(p) => {
-                            self.status.finish(Ok(format!("Готово: {}", p.display())));
-                            self.game.result = Some(p);
-                        }
-                        Err(e) => self.status.finish(Err(e)),
+                Msg::JobDone { id, result } => {
+                    if self.jobs.running.as_ref().is_some_and(|(rid, _)| *rid == id) {
+                        self.jobs.running = None;
                     }
+                    match result {
+                        Ok(p) => self.status.finish(Ok(format!("Задача #{id} готова: {}", p.display()))),
+                        Err(e) if e == pipeline::CANCELLED => {
+                            self.status.busy = false;
+                            self.status.stage = None;
+                            self.status.push(&format!("задача #{id} отменена"));
+                        }
+                        Err(e) => self.status.finish(Err(format!("задача #{id}: {e}"))),
+                    }
+                    self.refresh_jobs();
+                    jobs::run_next(self);
                 }
                 Msg::Player(r) => {
                     self.matches.loading = false;
@@ -324,7 +439,9 @@ impl App {
         });
         ui.label(RichText::new(update::current().unwrap_or("dev")).weak().small());
         ui.add_space(12.0);
-        for (page, title) in [(Page::Player, "Игрок"), (Page::Match, "Матч"), (Page::Settings, "Настройки")] {
+        let active = self.jobs.list.iter().filter(|j| j.is_active()).count();
+        let jobs_title = if active > 0 { format!("Задачи · {active}") } else { "Задачи".to_owned() };
+        for (page, title) in [(Page::Player, "Игрок".to_owned()), (Page::Match, "Матч".to_owned()), (Page::Jobs, jobs_title), (Page::Settings, "Настройки".to_owned())] {
             let sel = self.page == page;
             if ui.add_sized([ui.available_width(), 32.0], egui::SelectableLabel::new(sel, RichText::new(title).size(15.0))).clicked() {
                 self.page = page;
@@ -350,6 +467,9 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll();
+        if self.jobs.dirty {
+            self.refresh_jobs();
+        }
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
         if let Some(p) = dropped {
             if !self.status.busy {
@@ -365,6 +485,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| match self.page {
             Page::Player => crate::player::ui(self, ui),
             Page::Match => crate::match_page::ui(self, ui),
+            Page::Jobs => crate::jobs_page::ui(self, ui),
             Page::Settings => crate::settings_page::ui(self, ui),
         });
         if self.status.busy || self.matches.loading || self.matches.requested.len() > self.matches.stats.len() {

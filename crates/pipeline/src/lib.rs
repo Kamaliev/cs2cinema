@@ -39,10 +39,22 @@ impl Stage {
     }
 }
 
-/// Куда конвейер сообщает о ходе работы.
+/// Куда конвейер сообщает о ходе работы — и откуда узнаёт, что работу отменили.
 pub trait Progress: Sync {
     fn stage(&self, s: Stage);
     fn log(&self, msg: &str);
+    /// Пользователь отменил задачу: конвейер останавливается на ближайшей границе этапа.
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// Сообщение об отмене — по нему окно отличает отмену от ошибки.
+pub const CANCELLED: &str = "отменено";
+
+/// Проверка отмены между этапами.
+pub fn check(p: &dyn Progress) -> Result<()> {
+    if p.cancelled() { Err(CANCELLED.to_owned()) } else { Ok(()) }
 }
 
 /// Молчаливый вариант для тестов и консоли.
@@ -77,6 +89,7 @@ pub fn analyze(src: &Source, p: &dyn Progress) -> Result<Analysis> {
             (p.clone(), label)
         }
         Source::Faceit { link, key, demo_index, dir } => {
+            check(p)?;
             p.stage(Stage::Download);
             let id = faceit::parse_match_id(link).ok_or("не похоже на ссылку матча FACEIT")?;
             let client = if key.trim().is_empty() { faceit::Client::from_env().map_err(|e| e.to_string())? } else { faceit::Client::new(key.trim()) };
@@ -90,6 +103,7 @@ pub fn analyze(src: &Source, p: &dyn Progress) -> Result<Analysis> {
             (path, id)
         }
     };
+    check(p)?;
     p.stage(Stage::Parse);
     p.log("разбираю демку…");
     let data = demo::read_demo(&demo_path).map_err(|e| format!("{}: {e}", demo_path.display()))?;
@@ -158,6 +172,7 @@ pub fn plan_player(a: &mut Analysis, hero: PlayerId, o: &PlanOptions, out_dir: &
     };
     let mesh = load_positions(a, o, p)?;
 
+    check(p)?;
     p.stage(Stage::Plan);
     p.log("строю монтаж…");
     let timeline = match (&a.track, &mesh) {
@@ -186,6 +201,7 @@ fn load_positions(a: &mut Analysis, o: &PlanOptions, p: &dyn Progress) -> Result
         return Ok(None);
     }
     if a.track.is_none() {
+        check(p)?;
         p.stage(Stage::Positions);
         p.log("снимаю позиции игроков…");
         a.track = Some(positions::track(&a.data, 4).map_err(|e| e.to_string())?);
@@ -194,6 +210,7 @@ fn load_positions(a: &mut Analysis, o: &PlanOptions, p: &dyn Progress) -> Result
         return Ok(None);
     }
     let dir = o.maps_dir.clone().unwrap_or_else(geometry::default_dir);
+    check(p)?;
     p.stage(Stage::Geometry);
     p.log(&format!("геометрия карты {}…", a.m.map));
     let opts = geometry::Options { refresh: o.refresh_maps, offline: o.offline, ..Default::default() };

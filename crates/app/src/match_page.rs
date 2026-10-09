@@ -1,20 +1,16 @@
 //! Страница «Матч»: таблица FACEIT, разбор своей игры по демке и ролик про себя.
 
-use std::{
-    path::{Path, PathBuf},
-    time::{Duration, SystemTime},
-};
+use std::path::Path;
 
 use cs2::{GrenadeKind, PlayerId, report::Report};
 use eframe::egui::{self, RichText, Ui};
 use faceit::stats::TeamStats;
-use pipeline::{Analysis, PlanOptions, Progress, Stage};
+use store::JobKind;
 
 use crate::{
-    app::{App, Msg, Page},
+    app::{App, Page},
     launch,
     player::kd_color,
-    settings::Settings,
     ui::{self, BAD, MUTED, OK},
 };
 
@@ -171,7 +167,6 @@ fn analysis(app: &mut App, ui: &mut Ui) {
     });
     if hero != app.game.hero {
         app.game.set_hero(hero);
-        app.game.result = None;
     }
     let (Some(hero), Some(r)) = (app.game.hero, app.game.report.clone()) else {
         ui.label(RichText::new("Ваш ник в демке не нашёлся — выберите игрока в списке.").color(BAD));
@@ -187,17 +182,24 @@ fn analysis(app: &mut App, ui: &mut Ui) {
 
 fn actions(app: &mut App, ui: &mut Ui, hero: PlayerId) {
     ui.add_space(6.0);
+    let _ = hero;
     ui.horizontal(|ui| {
-        let ready = !app.status.busy && !(app.game.moments.is_empty() && app.game.utility.is_empty());
+        let ready = !(app.game.moments.is_empty() && app.game.utility.is_empty());
+        let mut kind = None;
         if ui::primary(ui, ready, "Собрать ролик про меня") {
-            start(app, hero, true);
+            kind = Some(JobKind::Record);
         }
         if ui.add_enabled(ready, egui::Button::new("Только план и скрипты")).clicked() {
-            start(app, hero, false);
+            kind = Some(JobKind::Plan);
         }
-        if let Some(p) = app.game.result.clone() {
-            if ui.button("Открыть результат").clicked() {
-                ui::open_path(&p);
+        if let Some(kind) = kind {
+            enqueue(app, kind);
+        }
+        let queued = app.jobs.list.iter().filter(|j| j.is_active()).count();
+        if queued > 0 {
+            ui.label(RichText::new(format!("в работе задач: {queued}")).weak());
+            if ui.small_button("К задачам").clicked() {
+                app.page = Page::Jobs;
             }
         }
     });
@@ -206,6 +208,31 @@ fn actions(app: &mut App, ui: &mut Ui, hero: PlayerId) {
             .weak()
             .small(),
     );
+}
+
+/// Поставить задачу на монтаж; для записи сначала проверяем HLAE и CS2 (путь к HLAE ищем сами).
+fn enqueue(app: &mut App, kind: JobKind) {
+    if kind == JobKind::Record {
+        if !Path::new(&app.s.hlae_dir).join("HLAE.exe").is_file() {
+            if let Some(p) = launch::find_hlae() {
+                app.s.hlae_dir = p.to_string_lossy().into_owned();
+                app.draft.hlae_dir = app.s.hlae_dir.clone();
+                app.s.save();
+            }
+        }
+        if let Err(e) = launch::check_paths(&app.s.hlae_dir, &app.s.cs2_dir) {
+            app.status.finish(Err(e));
+            app.page = Page::Settings;
+            return;
+        }
+    }
+    match app.enqueue(kind) {
+        Ok(id) => {
+            app.status.push(&format!("задача #{id} поставлена в очередь"));
+            app.page = Page::Jobs;
+        }
+        Err(e) => app.status.finish(Err(e)),
+    }
 }
 
 /// Сетка «название — значение» в несколько колонок.
@@ -350,82 +377,3 @@ fn moments(app: &App, ui: &mut Ui) {
     });
 }
 
-fn start(app: &mut App, hero: PlayerId, record: bool) {
-    if record {
-        // путь к HLAE не задан или устарел — ищем сами и запоминаем
-        if !Path::new(&app.s.hlae_dir).join("HLAE.exe").is_file() {
-            if let Some(p) = launch::find_hlae() {
-                app.s.hlae_dir = p.to_string_lossy().into_owned();
-                app.draft.hlae_dir = app.s.hlae_dir.clone();
-                app.s.save();
-            }
-        }
-        if let Err(e) = launch::check_paths(&app.s.hlae_dir, &app.s.cs2_dir) {
-            app.status.finish(Err(e));
-            app.page = Page::Settings;
-            return;
-        }
-    }
-    let Some(mut a) = app.game.analysis.take() else { return };
-    app.status.start(if record { "Готовлю запись…" } else { "Строю план…" });
-    let s = app.s.clone();
-    let name = pipeline::console_name(&format!("{}_{}", a.label, a.m.name(hero)));
-    let out_dir = Path::new(&s.out_root).join(name);
-    app.spawn(move |r| {
-        let result = run(&mut a, hero, &s, &out_dir, record, r);
-        r.send(Msg::Finished { analysis: a, result });
-    });
-}
-
-/// Весь путь от плана до готового ролика; исполняется в фоновом потоке.
-fn run(a: &mut Analysis, hero: PlayerId, s: &Settings, out_dir: &Path, record: bool, p: &dyn Progress) -> Result<PathBuf, String> {
-    let o = PlanOptions { fps: s.fps, chronological: s.chronological, flybys: s.flybys, walls: s.walls, ..Default::default() };
-    let plan = pipeline::plan_player(a, hero, &o, out_dir, p)?;
-    p.log(&format!("план: {} шотов, ~{:.0} с", plan.timeline.shots.len(), plan.timeline.total_secs()));
-    if !record {
-        return Ok(out_dir.to_path_buf());
-    }
-    if !renderer::console_safe(&pipeline::absolute_slash(out_dir)) {
-        return Err("в пути результатов есть пробелы — HLAE не загрузит campath; выберите папку без пробелов".into());
-    }
-    p.stage(Stage::Record);
-    // дубли HLAE нумерует по порядку записи, а шоты пишутся в порядке показа: последний дубль — последний шот
-    let last = plan.timeline.shots.len().saturating_sub(1);
-    // старые дубли сбили бы нумерацию takeNNNN — откладываем в сторону (запись дорогая, не удаляем)
-    let clips = out_dir.join("clips");
-    if clips.is_dir() {
-        let stamp = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-        std::fs::rename(&clips, out_dir.join(format!("clips_old_{stamp}"))).map_err(|e| format!("не удалось отложить прошлые дубли: {e}"))?;
-    }
-    let demo_name = format!("cs2cinema_{}", pipeline::console_name(&a.label));
-    launch::install_files(&s.cs2_dir, out_dir, &demo_name, |path| a.write_demo(path))?;
-
-    let since = SystemTime::now();
-    p.log("запускаю CS2 через HLAE…");
-    let mut child = launch::launch(&s.hlae_dir, &s.cs2_dir, &demo_name)?;
-    p.log(&format!("жду загрузки демки ({} с)…", s.load_wait_secs));
-    std::thread::sleep(Duration::from_secs(s.load_wait_secs as u64));
-    match launch::send_console(&["exec highlights"], Duration::from_secs(90)) {
-        Ok(()) => p.log("скрипт запущен, идёт запись…"),
-        Err(e) => p.log(&format!("{e}. Откройте консоль игры (~) и выполните: exec highlights")),
-    }
-    let log = |m: &str| p.log(m);
-    launch::wait_for_clips(out_dir, last, since, &mut || child.try_wait().map(|r| r.is_none()).unwrap_or(false), &log)?;
-
-    p.stage(Stage::Assemble);
-    p.log("склеиваю ролик через ffmpeg…");
-    let out = out_dir.join("highlights.mp4");
-    let mut cmd = std::process::Command::new("ffmpeg");
-    cmd.current_dir(out_dir).args(&plan.ffmpeg_args);
-    #[cfg(windows)]
-    launch::no_window(&mut cmd);
-    let res = cmd.output().map_err(|e| format!("не удалось запустить ffmpeg (он должен быть в PATH): {e}"))?;
-    if !res.status.success() {
-        let err = String::from_utf8_lossy(&res.stderr);
-        let tail: Vec<&str> = err.lines().rev().take(6).collect();
-        return Err(format!("ffmpeg завершился с ошибкой: {}", tail.into_iter().rev().collect::<Vec<_>>().join(" | ")));
-    }
-    p.log(&format!("ролик готов: {}", out.display()));
-    ui::open_path(&out);
-    Ok(out)
-}

@@ -13,6 +13,7 @@ renderer = { path = "../renderer" }
 director = { path = "../director" }
 cs2 = { path = "../cs2" }
 highlights = { path = "../highlights" }
+store = { path = "../store" }
 eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 rfd = "0.15"
 faceit = { path = "../faceit" }

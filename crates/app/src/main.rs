@@ -1,6 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod jobs;
+mod jobs_page;
 mod launch;
 mod match_page;
 #[cfg(debug_assertions)]

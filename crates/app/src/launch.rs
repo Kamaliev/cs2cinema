@@ -170,12 +170,50 @@ fn newest_mtime(dir: &Path) -> Option<(SystemTime, usize)> {
     best.map(|b| (b, n))
 }
 
+/// Запущена ли игра. HLAE.exe — только лаунчер и завершается сразу после старта cs2,
+/// поэтому смотрим на сам процесс cs2.exe.
+pub fn game_alive() -> bool {
+    #[cfg(windows)]
+    {
+        let mut c = Command::new("tasklist");
+        c.args(["/FI", "IMAGENAME eq cs2.exe", "/NH", "/FO", "CSV"]);
+        match no_window(&mut c).output() {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).contains("cs2.exe"),
+            Err(_) => true, // не смогли спросить — считаем, что жива, и ждём дальше
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// Закрыть игру (при отмене записи).
+pub fn kill_game() {
+    #[cfg(windows)]
+    {
+        let mut c = Command::new("taskkill");
+        c.args(["/IM", "cs2.exe", "/F"]);
+        let _ = no_window(&mut c).output();
+    }
+}
+
 /// Ждёт, пока HLAE допишет клип последнего шота (папка появилась после `since` и перестала меняться).
-/// `alive` — вернуть false, если игра закрыта: тогда ждать дальше нечего.
-pub fn wait_for_clips(out_dir: &Path, last_shot: usize, since: SystemTime, alive: &mut dyn FnMut() -> bool, progress: &dyn Fn(&str)) -> Result<(), String> {
+/// `alive` — вернуть false, если игра закрыта: тогда ждать дальше нечего; `cancelled` — отмена задачи.
+pub fn wait_for_clips(
+    out_dir: &Path,
+    last_shot: usize,
+    since: SystemTime,
+    alive: &dyn Fn() -> bool,
+    cancelled: &dyn Fn() -> bool,
+    progress: &dyn Fn(&str),
+) -> Result<(), String> {
     let dir = out_dir.join("clips").join(format!("take{last_shot:04}"));
     let mut last_seen: Option<(SystemTime, usize, Instant)> = None;
     loop {
+        if cancelled() {
+            return Err(pipeline::CANCELLED.to_owned());
+        }
         if let Some((t, n)) = newest_mtime(&dir) {
             if t >= since {
                 progress(&format!("записано кадров: {n}"));

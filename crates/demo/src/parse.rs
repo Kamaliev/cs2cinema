@@ -25,6 +25,9 @@ pub struct Parsed {
     pub map_name: String,
     pub playback_ticks: Option<i32>,
     pub playback_time: Option<f32>,
+    /// Тик сервера, с которого началась запись (`CDemoFileHeader`). Тики демки идут от нуля,
+    /// а время игры (`curtime`, по нему работает campath HLAE) — от `server_start_tick`.
+    pub server_start_tick: i32,
     pub events: Vec<GameEvent>,
     pub players: Vec<PlayerInfo>,
 }
@@ -65,6 +68,7 @@ pub fn parse(data: &[u8]) -> io::Result<Parsed> {
             1 => {
                 let header = CDemoFileHeader::decode(payload.as_slice()).map_err(bad)?;
                 out.map_name = header.map_name.unwrap_or_default();
+                out.server_start_tick = header.server_start_tick.unwrap_or_default();
             }
             2 => {
                 let info = CDemoFileInfo::decode(payload.as_slice()).map_err(bad)?;

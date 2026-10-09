@@ -15,6 +15,9 @@ pub struct PlayerId(pub i32);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Player {
     pub id: PlayerId,
+    /// Слот в таблице `userinfo`; `spec_player` в CS2 принимает слот + 1.
+    #[serde(default)]
+    pub slot: i32,
     pub name: String,
     pub xuid: u64,
 }
@@ -36,6 +39,37 @@ pub struct Kill {
     pub distance: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrenadeKind {
+    He,
+    Flash,
+    /// Молотов или зажигательная.
+    Fire,
+    Smoke,
+}
+
+/// Брошенная граната и что она сделала (только по противникам).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Grenade {
+    pub kind: GrenadeKind,
+    pub thrower: PlayerId,
+    pub round: u32,
+    /// Тик броска (`weapon_fire`), если нашёлся.
+    pub throw_tick: Option<i32>,
+    /// Взрыв / начало горения / дым.
+    pub detonate_tick: i32,
+    pub pos: [f32; 3],
+    /// Урон противникам (HE, огонь).
+    pub damage: i32,
+    /// Кому из противников нанесён урон.
+    #[serde(default)]
+    pub hurt: Vec<PlayerId>,
+    /// Ослеплённые противники и длительность, секунды (флешка).
+    pub blinded: Vec<(PlayerId, f32)>,
+    /// Противники, убитые гранатой, — или, для флешки, убитые командой, пока были ослеплены.
+    pub kills: Vec<PlayerId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Round {
     pub number: u32,
@@ -52,6 +86,11 @@ pub struct Match {
     pub players: Vec<Player>,
     pub rounds: Vec<Round>,
     pub kills: Vec<Kill>,
+    #[serde(default)]
+    pub grenades: Vec<Grenade>,
+    /// См. `demo::Parsed::server_start_tick`.
+    #[serde(default)]
+    pub server_start_tick: i32,
     /// `(tick, team)` по игрокам — для отсева тимкиллов, если команды известны.
     #[serde(skip)]
     teams: HashMap<PlayerId, Vec<(i32, u8)>>,
@@ -64,7 +103,9 @@ impl Match {
             .iter()
             .map(|p| (p.userid, p.slot, p.name.clone(), p.xuid))
             .collect();
-        Self::build(parsed.map_name.clone(), parsed.tick_rate(), players, &parsed.events)
+        let mut m = Self::build(parsed.map_name.clone(), parsed.tick_rate(), players, &parsed.events);
+        m.server_start_tick = parsed.server_start_tick;
+        m
     }
 
     /// `players`: `(userid, slot, name, xuid)`.
@@ -81,7 +122,7 @@ impl Match {
             let id = PlayerId(userid);
             known.insert(slot, id);
             known.insert(userid, id);
-            list.push(Player { id, name, xuid });
+            list.push(Player { id, slot, name, xuid });
         }
         let resolve = |e: &GameEvent, key: &str| -> Option<PlayerId> {
             e.int(key).and_then(|v| i32::try_from(v).ok()).and_then(|v| known.get(&v).copied())
@@ -93,6 +134,8 @@ impl Match {
             players: list,
             rounds: Vec::new(),
             kills: Vec::new(),
+            grenades: Vec::new(),
+            server_start_tick: 0,
             teams: HashMap::new(),
         };
 
@@ -103,11 +146,13 @@ impl Match {
         let end_event = if has("round_end") { "round_end" } else { "round_officially_ended" };
 
         let mut last_start: Option<i32> = None;
+        let mut live_from = i32::MIN;
         for e in events {
             match e.name.as_str() {
                 // перезапуск матча после разминки — всё, что было раньше, не считается
                 // (раунд, начавшийся прямо перед перезапуском, остаётся: round_prestart идёт раньше)
                 "begin_new_match" => {
+                    live_from = e.tick;
                     m.rounds.clear();
                     m.kills.clear();
                     if let Some(start_tick) = last_start.filter(|t| e.tick - t <= (5.0 * tick_rate) as i32) {
@@ -183,6 +228,7 @@ impl Match {
                 _ => true,
             }
         });
+        m.grenades = grenades(&m, events, live_from, &resolve, &team_at);
         m.teams = teams;
         m
     }
@@ -198,6 +244,126 @@ impl Match {
     pub fn round(&self, number: u32) -> Option<&Round> {
         self.rounds.get(number.checked_sub(1)? as usize)
     }
+}
+
+/// Гранаты из событий: бросок (`weapon_fire`) -> взрыв (`*_detonate` / `inferno_startburn`),
+/// затем урон (`player_hurt`), ослепления (`player_blind`) и убийства — только по противникам.
+fn grenades(
+    m: &Match,
+    events: &[GameEvent],
+    live_from: i32,
+    resolve: &dyn Fn(&GameEvent, &str) -> Option<PlayerId>,
+    team_at: &dyn Fn(PlayerId, i32) -> Option<u8>,
+) -> Vec<Grenade> {
+    let tr = m.tick_rate;
+    let secs = |s: f32| (s * tr) as i32;
+    let enemies = |a: PlayerId, v: PlayerId, tick: i32| {
+        a != v && !matches!((team_at(a, tick), team_at(v, tick)), (Some(x), Some(y)) if x == y)
+    };
+    let round_at = |tick: i32| m.rounds.iter().rev().find(|r| r.start_tick <= tick).map_or(0, |r| r.number);
+    let pos = |e: &GameEvent| [e.float("x").unwrap_or(0.0), e.float("y").unwrap_or(0.0), e.float("z").unwrap_or(0.0)];
+    let live = || events.iter().filter(|e| e.tick >= live_from);
+
+    // (бросивший, вид, тик) — ещё не взорвавшиеся броски
+    let mut throws: Vec<(PlayerId, GrenadeKind, i32)> = Vec::new();
+    let mut out: Vec<(i64, Grenade)> = Vec::new(); // (entityid, граната)
+    let mut add = |kind, thrower: PlayerId, entity: i64, tick: i32, p: [f32; 3], throws: &mut Vec<(PlayerId, GrenadeKind, i32)>| {
+        // самый ранний подходящий бросок этого игрока (огонь — любого: у inferno_startburn нет userid)
+        let i = throws.iter().position(|&(who, k, t)| {
+            k == kind && (kind == GrenadeKind::Fire || who == thrower) && t <= tick && tick - t <= secs(8.0)
+        });
+        let (thrower, throw_tick) = match i.map(|i| throws.remove(i)) {
+            Some((who, _, t)) => (who, Some(t)),
+            None => (thrower, None),
+        };
+        let g = Grenade { kind, thrower, round: round_at(tick), throw_tick, detonate_tick: tick, pos: p, damage: 0, hurt: vec![], blinded: vec![], kills: vec![] };
+        out.push((entity, g));
+    };
+    for e in live() {
+        let kind = match e.name.as_str() {
+            "weapon_fire" => {
+                let kind = match e.str("weapon").unwrap_or_default().trim_start_matches("weapon_") {
+                    "hegrenade" => GrenadeKind::He,
+                    "flashbang" => GrenadeKind::Flash,
+                    "molotov" | "incgrenade" => GrenadeKind::Fire,
+                    "smokegrenade" => GrenadeKind::Smoke,
+                    _ => continue,
+                };
+                if let Some(p) = resolve(e, "userid") {
+                    throws.retain(|&(_, _, t)| e.tick - t <= secs(8.0));
+                    throws.push((p, kind, e.tick));
+                }
+                continue;
+            }
+            "hegrenade_detonate" => GrenadeKind::He,
+            "flashbang_detonate" => GrenadeKind::Flash,
+            "smokegrenade_detonate" => GrenadeKind::Smoke,
+            "inferno_startburn" => GrenadeKind::Fire,
+            _ => continue,
+        };
+        let thrower = resolve(e, "userid").unwrap_or(PlayerId(-1));
+        add(kind, thrower, e.int("entityid").unwrap_or(-1), e.tick, pos(e), &mut throws);
+    }
+    out.retain(|(_, g)| g.thrower.0 >= 0);
+
+    for e in live() {
+        match e.name.as_str() {
+            "player_hurt" => {
+                let kind = match e.str("weapon").unwrap_or_default() {
+                    "hegrenade" => GrenadeKind::He,
+                    "inferno" => GrenadeKind::Fire,
+                    _ => continue,
+                };
+                let (Some(a), Some(v)) = (resolve(e, "attacker"), resolve(e, "userid")) else { continue };
+                if !enemies(a, v, e.tick) {
+                    continue;
+                }
+                // HE бьёт в тик взрыва, огонь горит ~7 с
+                let window = if kind == GrenadeKind::He { secs(0.2) } else { secs(8.0) };
+                if let Some((_, g)) = out
+                    .iter_mut()
+                    .rev()
+                    .find(|(_, g)| g.kind == kind && g.thrower == a && g.detonate_tick <= e.tick + 1 && e.tick - g.detonate_tick <= window)
+                {
+                    g.damage += e.int("dmg_health").unwrap_or(0) as i32;
+                    if !g.hurt.contains(&v) {
+                        g.hurt.push(v);
+                    }
+                }
+            }
+            "player_blind" => {
+                let (Some(a), Some(v)) = (resolve(e, "attacker"), resolve(e, "userid")) else { continue };
+                let ent = e.int("entityid").unwrap_or(-2);
+                let dur = e.float("blind_duration").unwrap_or(0.0);
+                if !enemies(a, v, e.tick) || dur < 0.5 {
+                    continue;
+                }
+                if let Some((_, g)) = out.iter_mut().find(|(id, g)| *id == ent && g.kind == GrenadeKind::Flash && (e.tick - g.detonate_tick).abs() <= secs(0.5)) {
+                    g.blinded.push((v, dur));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out: Vec<Grenade> = out.into_iter().map(|(_, g)| g).collect();
+    for g in &mut out {
+        let det = g.detonate_tick;
+        g.kills = m
+            .kills
+            .iter()
+            .filter(|k| match g.kind {
+                GrenadeKind::He => k.weapon == "hegrenade" && k.attacker == g.thrower && k.tick >= det && k.tick - det <= secs(0.3),
+                GrenadeKind::Fire => k.weapon == "inferno" && k.attacker == g.thrower && k.tick >= det && k.tick - det <= secs(8.0),
+                // убит, пока был ослеплён этой флешкой
+                GrenadeKind::Flash => g.blinded.iter().any(|&(v, d)| v == k.victim && k.tick >= det && k.tick - det <= secs(d + 0.3)),
+                GrenadeKind::Smoke => false,
+            })
+            .map(|k| k.victim)
+            .collect();
+    }
+    out.sort_by_key(|g| g.detonate_tick);
+    out
 }
 
 #[cfg(test)]

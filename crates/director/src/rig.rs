@@ -454,6 +454,40 @@ pub fn rank(
     picks
 }
 
+/// Видно ли само убийство: на ключах около выстрела (±0.3 с) и убийца, и жертва в кадре,
+/// не закрыты стенами и не крошечные вдали.
+pub fn frames_kill(keys: &[CamKey], pos: &dyn PositionSource, s: &Scene) -> bool {
+    let near = (0.3 * s.tick_rate) as i32;
+    let around: Vec<&CamKey> = keys.iter().filter(|k| (k.tick - s.focus_tick).abs() <= near).collect();
+    if around.is_empty() {
+        return false;
+    }
+    let ok = around
+        .iter()
+        .filter(|key| {
+            let Some(a) = actors(pos, s, key.tick) else { return false };
+            [a.killer, a.victim].iter().all(|p| {
+                let t = chest(*p);
+                let d = dist(key.pos, t);
+                (40.0..1400.0).contains(&d) && visibility(key, t) >= 0.95 && pos.raycast(key.pos, t).is_none()
+            })
+        })
+        .count();
+    ok * 4 >= around.len() * 3
+}
+
+/// Ракурс для повтора убийства: лучший путь, на котором убийство действительно видно.
+pub fn best_replay(pos: &dyn PositionSource, s: &Scene, t0: i32, t1: i32, used: &[String]) -> Option<Pick> {
+    rank(pos, s, t0, t1, ANY, Tier::Epic, used)
+        .into_iter()
+        .filter(|p| !p.score.through_wall && frames_kill(&p.keys, pos, s))
+        .max_by(|a, b| {
+            // жертва в кадре весит больше общей «красочности»
+            let k = |p: &Pick| p.score.total + 0.3 * p.score.kill_visible;
+            k(a).total_cmp(&k(b))
+        })
+}
+
 pub fn best(
     pos: &dyn PositionSource,
     s: &Scene,

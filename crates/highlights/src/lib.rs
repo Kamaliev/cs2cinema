@@ -3,7 +3,7 @@
 //! Score нужен режиссёру: чем он выше, тем эффектнее подача
 //! (замедление, пролёты камеры) и тем больше шанс попасть в ролик.
 
-use cs2::{Kill, Match, PlayerId};
+use cs2::{Grenade, GrenadeKind, Kill, Match, PlayerId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +103,55 @@ pub fn find(m: &Match, cfg: &Config) -> Vec<Highlight> {
     }
 
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
+    out
+}
+
+/// Граната, которая что-то решила: урон, ослепление, убийство.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Utility {
+    pub grenade: Grenade,
+    pub score: f32,
+    pub tags: Vec<String>,
+}
+
+/// Оценка гранаты; `None` — ничего важного не сделала.
+pub fn score_grenade(g: &Grenade) -> Option<Utility> {
+    let kills = g.kills.len() as f32;
+    let (score, tags, important) = match g.kind {
+        GrenadeKind::He => {
+            let s = 8.0 + g.damage as f32 / 4.0 + 15.0 * kills;
+            (s, vec![format!("HE {} урона", g.damage)], g.damage >= 40 || kills > 0.0)
+        }
+        GrenadeKind::Fire => {
+            let s = 8.0 + g.damage as f32 / 5.0 + 15.0 * kills;
+            (s, vec![format!("молотов {} урона", g.damage)], g.damage >= 30 || kills > 0.0)
+        }
+        GrenadeKind::Flash => {
+            let n = g.blinded.len();
+            let longest = g.blinded.iter().map(|b| b.1).fold(0.0, f32::max);
+            let s = 6.0 + 7.0 * n as f32 + 2.0 * longest + 12.0 * kills;
+            (s, vec![format!("флешка: ослепила {n}")], n >= 2 || kills > 0.0)
+        }
+        GrenadeKind::Smoke => return None,
+    };
+    let mut tags = tags;
+    if kills > 0.0 {
+        tags.push(format!("{} убит(о)", g.kills.len()));
+    }
+    important.then(|| Utility { grenade: g.clone(), score, tags })
+}
+
+/// Важные гранаты игрока по порядку матча.
+pub fn utility_for(m: &Match, player: PlayerId) -> Vec<Utility> {
+    m.grenades.iter().filter(|g| g.thrower == player).filter_map(score_grenade).collect()
+}
+
+/// Все убийства одного игрока — каждое попадает в какой-нибудь момент (серии склеиваются),
+/// по порядку матча.
+pub fn for_player(m: &Match, player: PlayerId, cfg: &Config) -> Vec<Highlight> {
+    let all = Config { min_single_score: f32::NEG_INFINITY, ..cfg.clone() };
+    let mut out: Vec<Highlight> = find(m, &all).into_iter().filter(|h| h.player == player).collect();
+    out.sort_by_key(|h| h.first_tick());
     out
 }
 

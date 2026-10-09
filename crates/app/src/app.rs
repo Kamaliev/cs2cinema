@@ -8,15 +8,17 @@ use std::{
 };
 
 use eframe::egui::{self, RichText};
+use cs2::{PlayerId, report::Report};
 use faceit::stats::{MatchStats, MatchSummary, Player};
+use highlights::{Highlight, Utility};
 use pipeline::{Analysis, Stage};
 
 use crate::{settings::Settings, status::Status, ui, update};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Page {
-    Matches,
-    Montage,
+    Player,
+    Match,
     Settings,
 }
 
@@ -61,18 +63,38 @@ pub struct MatchesState {
     pub list: Vec<MatchSummary>,
     pub loading: bool,
     pub error: Option<String>,
-    pub selected: Option<String>,
     pub stats: HashMap<String, Result<MatchStats, String>>,
     /// Матчи, статистика которых уже запрошена (чтобы не ходить дважды).
     pub requested: std::collections::HashSet<String>,
 }
 
+/// Открытый матч: FACEIT-матч из списка или перетащенная демка (`match_id` = `None`).
 #[derive(Default)]
-pub struct MontageState {
+pub struct MatchState {
+    pub match_id: Option<String>,
     pub analysis: Option<Analysis>,
-    pub checked: Vec<bool>,
-    pub link: String,
+    /// Про кого разбор и ролик.
+    pub hero: Option<PlayerId>,
+    pub report: Option<Report>,
+    pub moments: Vec<Highlight>,
+    pub utility: Vec<Utility>,
     pub result: Option<PathBuf>,
+}
+
+impl MatchState {
+    /// Пересчитать разбор под выбранного игрока.
+    pub fn set_hero(&mut self, hero: Option<PlayerId>) {
+        self.hero = hero;
+        let (Some(a), Some(id)) = (&self.analysis, hero) else {
+            self.report = None;
+            self.moments.clear();
+            self.utility.clear();
+            return;
+        };
+        self.report = Some(cs2::report::player_report(&a.m, id));
+        self.moments = highlights::for_player(&a.m, id, &highlights::Config::default());
+        self.utility = highlights::utility_for(&a.m, id);
+    }
 }
 
 pub struct App {
@@ -82,7 +104,7 @@ pub struct App {
     pub page: Page,
     pub status: Status,
     pub matches: MatchesState,
-    pub montage: MontageState,
+    pub game: MatchState,
     pub update: Option<update::Release>,
     pub update_note: Option<String>,
     rx: Receiver<Msg>,
@@ -103,9 +125,9 @@ impl App {
             draft: s.clone(),
             matches: MatchesState { nickname: s.nickname.clone(), ..Default::default() },
             s,
-            page: if first_run { Page::Settings } else { Page::Matches },
+            page: if first_run { Page::Settings } else { Page::Player },
             status: Status::default(),
-            montage: MontageState::default(),
+            game: MatchState::default(),
             update: None,
             update_note: None,
             rx,
@@ -133,10 +155,10 @@ impl App {
         if std::env::var_os("CS2CINEMA_MOCK").is_some() {
             crate::mock::fill(&mut app);
         }
-        // для отладки: CS2CINEMA_PAGE=matches|montage|settings
+        // для отладки: CS2CINEMA_PAGE=player|match|settings
         app.page = match std::env::var("CS2CINEMA_PAGE").as_deref() {
-            Ok("matches") => Page::Matches,
-            Ok("montage") => Page::Montage,
+            Ok("player") => Page::Player,
+            Ok("match") => Page::Match,
             Ok("settings") => Page::Settings,
             _ => app.page,
         };
@@ -201,21 +223,42 @@ impl App {
         });
     }
 
+    /// Разобрать демку; для файла страница матча открывается без FACEIT-шапки.
     pub fn open_source(&mut self, src: pipeline::Source) {
         self.status.start("Открываю демку…");
-        self.montage.analysis = None;
-        self.montage.checked.clear();
-        self.montage.result = None;
-        self.page = Page::Montage;
+        let match_id = match &src {
+            pipeline::Source::Faceit { link, .. } => faceit::parse_match_id(link),
+            pipeline::Source::File(_) => None,
+        };
+        self.game = MatchState { match_id, ..Default::default() };
+        self.page = Page::Match;
         self.spawn(move |r| {
             let res = pipeline::analyze(&src, r);
             r.send(Msg::Analyzed(res));
         });
     }
 
-    pub fn open_faceit(&mut self, link: &str) {
+    /// Страница FACEIT-матча; демка качается по кнопке (если уже разобрана — остаётся).
+    pub fn open_match(&mut self, id: &str) {
+        if self.game.match_id.as_deref() != Some(id) {
+            self.game = MatchState { match_id: Some(id.to_owned()), ..Default::default() };
+        }
+        self.load_stats(&[id.to_owned()]);
+        self.page = Page::Match;
+    }
+
+    /// Скачать и разобрать демку открытого матча.
+    pub fn analyze_match(&mut self) {
+        let Some(id) = self.game.match_id.clone() else { return };
         let dir = Path::new(&self.s.out_root).join("demos");
-        self.open_source(pipeline::Source::Faceit { link: link.to_owned(), key: self.s.faceit_key.clone(), demo_index: 0, dir });
+        self.open_source(pipeline::Source::Faceit { link: id, key: self.s.faceit_key.clone(), demo_index: 0, dir });
+    }
+
+    /// Кого разбирать по умолчанию: игрок с FACEIT-аккаунтом из настроек (по SteamID, затем по нику).
+    fn default_hero(&self, a: &Analysis) -> Option<PlayerId> {
+        let steam = self.matches.player.as_ref().map(|p| p.steam_id);
+        let nick = self.matches.player.as_ref().map_or(self.s.nickname.as_str(), |p| p.nickname.as_str());
+        pipeline::find_player(&a.m, steam, nick)
     }
 
     fn poll(&mut self) {
@@ -225,18 +268,19 @@ impl App {
                 Msg::Stage(s) => self.status.set_stage(s),
                 Msg::Analyzed(r) => match r {
                     Ok(a) => {
-                        self.status.finish(Ok(format!("{}: игроков {}, раундов {}, моментов {}", a.m.map, a.m.players.len(), a.m.rounds.len(), a.found.len())));
-                        self.montage.checked = (0..a.found.len()).map(|i| i < 8).collect();
-                        self.montage.analysis = Some(a);
+                        self.status.finish(Ok(format!("{}: игроков {}, раундов {}", a.m.map, a.m.players.len(), a.m.rounds.len())));
+                        let hero = self.default_hero(&a);
+                        self.game.analysis = Some(a);
+                        self.game.set_hero(hero);
                     }
                     Err(e) => self.status.finish(Err(e)),
                 },
                 Msg::Finished { analysis, result } => {
-                    self.montage.analysis = Some(analysis);
+                    self.game.analysis = Some(analysis);
                     match result {
                         Ok(p) => {
                             self.status.finish(Ok(format!("Готово: {}", p.display())));
-                            self.montage.result = Some(p);
+                            self.game.result = Some(p);
                         }
                         Err(e) => self.status.finish(Err(e)),
                     }
@@ -280,7 +324,7 @@ impl App {
         });
         ui.label(RichText::new(update::current().unwrap_or("dev")).weak().small());
         ui.add_space(12.0);
-        for (page, title) in [(Page::Matches, "Матчи"), (Page::Montage, "Монтаж"), (Page::Settings, "Настройки")] {
+        for (page, title) in [(Page::Player, "Игрок"), (Page::Match, "Матч"), (Page::Settings, "Настройки")] {
             let sel = self.page == page;
             if ui.add_sized([ui.available_width(), 32.0], egui::SelectableLabel::new(sel, RichText::new(title).size(15.0))).clicked() {
                 self.page = page;
@@ -319,8 +363,8 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status.ui(ui));
         egui::SidePanel::left("nav").exact_width(170.0).show(ctx, |ui| self.sidebar(ui));
         egui::CentralPanel::default().show(ctx, |ui| match self.page {
-            Page::Matches => crate::matches::ui(self, ui),
-            Page::Montage => crate::montage::ui(self, ui),
+            Page::Player => crate::player::ui(self, ui),
+            Page::Match => crate::match_page::ui(self, ui),
             Page::Settings => crate::settings_page::ui(self, ui),
         });
         if self.status.busy || self.matches.loading || self.matches.requested.len() > self.matches.stats.len() {

@@ -10,6 +10,8 @@ pub struct Player {
     pub country: String,
     pub elo: u32,
     pub level: u32,
+    /// SteamID64 (`games.cs2.game_player_id`) — по нему игрок находится в демке.
+    pub steam_id: u64,
 }
 
 impl Player {
@@ -22,6 +24,7 @@ impl Player {
             country: v["country"].as_str().unwrap_or("").to_owned(),
             elo: cs2["faceit_elo"].as_u64().unwrap_or(0) as u32,
             level: cs2["skill_level"].as_u64().unwrap_or(0) as u32,
+            steam_id: cs2["game_player_id"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0),
         })
     }
 }
@@ -185,10 +188,103 @@ impl MatchStats {
     }
 }
 
+impl MatchStats {
+    /// Строка игрока и исход его команды (по первой карте, где он есть).
+    pub fn find(&self, player_id: &str) -> Option<(&MapStats, &PlayerStats, bool)> {
+        self.maps.iter().find_map(|m| {
+            m.teams.iter().find_map(|t| t.players.iter().find(|p| p.player_id == player_id).map(|p| (m, p, t.won)))
+        })
+    }
+}
+
+/// Средние показатели по группе матчей.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Totals {
+    pub matches: u32,
+    pub wins: u32,
+    pub kills: u32,
+    pub deaths: u32,
+    pub kd: f32,
+    pub adr: f32,
+    pub hs_pct: f32,
+    pub kr: f32,
+}
+
+impl Totals {
+    fn add(&mut self, p: &PlayerStats, won: bool) {
+        self.matches += 1;
+        self.wins += u32::from(won);
+        self.kills += p.kills;
+        self.deaths += p.deaths;
+        self.adr += p.adr;
+        self.hs_pct += p.headshots_pct as f32;
+        self.kr += p.kr;
+    }
+
+    fn finish(&mut self) {
+        let n = self.matches.max(1) as f32;
+        self.kd = self.kills as f32 / self.deaths.max(1) as f32;
+        self.adr /= n;
+        self.hs_pct /= n;
+        self.kr /= n;
+    }
+
+    pub fn winrate(&self) -> f32 {
+        100.0 * self.wins as f32 / self.matches.max(1) as f32
+    }
+}
+
+/// Сводка игрока: итог и по картам (карты — по числу матчей, больше сверху).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Summary {
+    pub total: Totals,
+    pub maps: Vec<(String, Totals)>,
+}
+
+pub fn summarize(player_id: &str, matches: &[&MatchStats]) -> Summary {
+    let mut s = Summary::default();
+    for m in matches {
+        let Some((map, p, won)) = m.find(player_id) else { continue };
+        s.total.add(p, won);
+        match s.maps.iter_mut().find(|(name, _)| *name == map.map) {
+            Some((_, t)) => t.add(p, won),
+            None => {
+                let mut t = Totals::default();
+                t.add(p, won);
+                s.maps.push((map.map.clone(), t));
+            }
+        }
+    }
+    s.total.finish();
+    s.maps.iter_mut().for_each(|(_, t)| t.finish());
+    s.maps.sort_by_key(|(_, t)| std::cmp::Reverse(t.matches));
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn one(map: &str, won: bool, kills: u32, deaths: u32, adr: f32) -> MatchStats {
+        let me = PlayerStats { player_id: "me".into(), kills, deaths, adr, headshots_pct: 50, ..Default::default() };
+        let team = TeamStats { won, players: vec![me], ..Default::default() };
+        MatchStats { maps: vec![MapStats { map: map.into(), teams: vec![team], ..Default::default() }] }
+    }
+
+    #[test]
+    fn summary_totals_and_maps() {
+        let a = one("de_mirage", true, 20, 10, 100.0);
+        let b = one("de_mirage", false, 10, 20, 60.0);
+        let c = one("de_nuke", true, 15, 15, 80.0);
+        let s = summarize("me", &[&a, &b, &c]);
+        assert_eq!((s.total.matches, s.total.wins), (3, 2));
+        assert!((s.total.kd - 1.0).abs() < 1e-4);
+        assert!((s.total.adr - 80.0).abs() < 1e-4);
+        assert_eq!(s.maps[0].0, "de_mirage");
+        assert!((s.maps[0].1.winrate() - 50.0).abs() < 1e-4);
+        assert_eq!(summarize("nobody", &[&a]).total.matches, 0);
+    }
 
     #[test]
     fn history_marks_my_result() {

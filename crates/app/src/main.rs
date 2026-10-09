@@ -2,10 +2,10 @@
 
 mod app;
 mod launch;
-mod matches;
+mod match_page;
 #[cfg(debug_assertions)]
 mod mock;
-mod montage;
+mod player;
 mod settings;
 mod settings_page;
 mod status;

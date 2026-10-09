@@ -97,9 +97,11 @@ name = "app"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "cs2",
  "director",
  "eframe",
  "faceit",
+ "highlights",
  "pipeline",
  "renderer",
  "rfd",

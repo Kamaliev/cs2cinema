@@ -5,7 +5,7 @@ use faceit::stats::{MapStats, MatchStats, MatchSummary, Player, PlayerStats, Tea
 use crate::app::App;
 
 pub fn fill(app: &mut App) {
-    app.matches.player = Some(Player { id: "me".into(), nickname: "Kamaliev".into(), avatar: String::new(), country: "ru".into(), elo: 2140, level: 8 });
+    app.matches.player = Some(Player { id: "me".into(), nickname: "Kamaliev".into(), avatar: String::new(), country: "ru".into(), elo: 2140, level: 8, steam_id: 0 });
     let now = chrono::Local::now().timestamp();
     app.matches.list = (0..20)
         .map(|i| MatchSummary {
@@ -47,6 +47,6 @@ pub fn fill(app: &mut App) {
     };
     app.matches.stats.insert(id.clone(), Ok(stats));
     if std::env::var("CS2CINEMA_MOCK").as_deref() == Ok("details") {
-        app.matches.selected = Some(id);
+        app.open_match(&id);
     }
 }

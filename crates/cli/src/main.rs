@@ -395,13 +395,6 @@ fn list_cameras() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Абсолютный путь с `/` и без префикса `\\?\` (Windows) — в таком виде его принимает консоль HLAE.
-fn absolute_slashes(p: &std::path::Path) -> String {
-    let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let s = abs.to_string_lossy().replace('\\', "/");
-    s.strip_prefix("//?/").map(str::to_owned).unwrap_or(s)
-}
-
 /// `cs2-cli assemble`: склеивает клипы, записанные HLAE по плану, в один ролик.
 fn assemble_cmd() -> Result<(), Box<dyn Error>> {
     let mut plan: Option<PathBuf> = None;

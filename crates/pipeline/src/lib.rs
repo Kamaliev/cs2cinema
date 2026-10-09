@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cs2::Match;
+use cs2::{Match, PlayerId};
 use director::{Order, PositionSource, Timeline};
 use highlights::Highlight;
 
@@ -126,63 +126,84 @@ pub struct Plan {
     pub ffmpeg_args: Vec<String>,
 }
 
-/// Строит план по выбранным вручную моментам (индексы в `a.found`) и пишет файлы в `out_dir`.
-pub fn plan(a: &mut Analysis, selected: &[usize], o: &PlanOptions, out_dir: &Path, p: &dyn Progress) -> Result<Plan> {
-    let chosen: Vec<Highlight> = selected.iter().filter_map(|&i| a.found.get(i).cloned()).collect();
-    if chosen.is_empty() {
-        return Err("не выбрано ни одного момента".into());
+/// Игрок демки по FACEIT: сначала по SteamID, затем по нику (точно, потом подстрокой без учёта регистра).
+pub fn find_player(m: &Match, steam_id: Option<u64>, nick: &str) -> Option<PlayerId> {
+    if let Some(p) = steam_id.filter(|&s| s != 0).and_then(|s| m.players.iter().find(|p| p.xuid == s)) {
+        return Some(p.id);
     }
+    let want = nick.trim().to_lowercase();
+    if want.is_empty() {
+        return None;
+    }
+    m.players
+        .iter()
+        .find(|p| p.name.to_lowercase() == want)
+        .or_else(|| m.players.iter().find(|p| p.name.to_lowercase().contains(&want)))
+        .map(|p| p.id)
+}
+
+/// Ролик про одного игрока (как `cs2-cli --player`): по раундам его глазами, повторы сильных
+/// моментов, гранаты и их эффект глазами противников. Файлы для HLAE пишутся в `out_dir`.
+pub fn plan_player(a: &mut Analysis, hero: PlayerId, o: &PlanOptions, out_dir: &Path, p: &dyn Progress) -> Result<Plan> {
+    let found = highlights::for_player(&a.m, hero, &highlights::Config::default());
+    let utility = highlights::utility_for(&a.m, hero);
+    if found.is_empty() && utility.is_empty() {
+        return Err(format!("у игрока {} в этом матче нет ни убийств, ни полезных гранат", a.m.name(hero)));
+    }
+    p.log(&format!("{}: моментов {}, полезных гранат {}", a.m.name(hero), found.len(), utility.len()));
     let cfg = director::Config {
-        target_secs: f32::MAX,
-        max_shots: chosen.len(),
         order: if o.chronological { Order::Chronological } else { Order::BuildUp },
+        cinematic: true,
         ..Default::default()
     };
-
-    let mesh = if o.flybys {
-        if a.track.is_none() {
-            p.stage(Stage::Positions);
-            p.log("снимаю позиции игроков…");
-            a.track = Some(positions::track(&a.data, 4).map_err(|e| e.to_string())?);
-        }
-        if o.walls {
-            let dir = o.maps_dir.clone().unwrap_or_else(geometry::default_dir);
-            p.stage(Stage::Geometry);
-            p.log(&format!("геометрия карты {}…", a.m.map));
-            let opts = geometry::Options { refresh: o.refresh_maps, offline: o.offline, ..Default::default() };
-            match geometry::load_map(&dir, &a.m.map, &opts) {
-                Ok(l) => Some(l.mesh),
-                Err(e) => {
-                    p.log(&format!("предупреждение: без стен — {e}"));
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let mesh = load_positions(a, o, p)?;
 
     p.stage(Stage::Plan);
     p.log("строю монтаж…");
     let timeline = match (&a.track, &mesh) {
         (Some(t), Some(mesh)) => {
             let p = positions::WithGeometry { track: t, mesh };
-            director::direct(&a.m, &chosen, &cfg, &p as &dyn PositionSource)
+            director::direct_all(&a.m, &found, &utility, &cfg, &p as &dyn PositionSource)
         }
-        (Some(t), None) => director::direct(&a.m, &chosen, &cfg, t as &dyn PositionSource),
-        _ => director::direct(&a.m, &chosen, &cfg, &director::NoPositions),
+        (Some(t), None) => director::direct_all(&a.m, &found, &utility, &cfg, t as &dyn PositionSource),
+        _ => director::direct_all(&a.m, &found, &utility, &cfg, &director::NoPositions),
     };
 
     std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
+    let kills = a.m.kills.iter().filter(|k| k.attacker == hero).count();
+    let title = (a.m.name(hero), format!("{} · {}", a.m.map, director::plural(kills, "убийство", "убийства", "убийств")));
     // HLAE ищет campath относительно game\bin\win64, поэтому в скрипте нужен абсолютный путь
-    let abs = absolute_slash(out_dir);
-    let rcfg = renderer::Config { fps: o.fps, out_dir: abs, font_file: font_file(), ..Default::default() };
+    let rcfg = renderer::Config { fps: o.fps, out_dir: absolute_slash(out_dir), font_file: font_file(), title: Some(title), ..Default::default() };
     let out = renderer::render(&a.m, &timeline, &rcfg);
     let ffmpeg_args = renderer::ffmpeg_args(&timeline, &rcfg).unwrap_or_default();
     out.write_to(out_dir).map_err(|e| format!("запись в {}: {e}", out_dir.display()))?;
     Ok(Plan { timeline, out_dir: out_dir.to_path_buf(), ffmpeg_args })
+}
+
+/// Позиции игроков (для пролётов) и геометрия карты (чтобы камера не смотрела сквозь стены).
+fn load_positions(a: &mut Analysis, o: &PlanOptions, p: &dyn Progress) -> Result<Option<geometry::Mesh>> {
+    if !o.flybys {
+        return Ok(None);
+    }
+    if a.track.is_none() {
+        p.stage(Stage::Positions);
+        p.log("снимаю позиции игроков…");
+        a.track = Some(positions::track(&a.data, 4).map_err(|e| e.to_string())?);
+    }
+    if !o.walls {
+        return Ok(None);
+    }
+    let dir = o.maps_dir.clone().unwrap_or_else(geometry::default_dir);
+    p.stage(Stage::Geometry);
+    p.log(&format!("геометрия карты {}…", a.m.map));
+    let opts = geometry::Options { refresh: o.refresh_maps, offline: o.offline, ..Default::default() };
+    match geometry::load_map(&dir, &a.m.map, &opts) {
+        Ok(l) => Ok(Some(l.mesh)),
+        Err(e) => {
+            p.log(&format!("предупреждение: без стен — {e}"));
+            Ok(None)
+        }
+    }
 }
 
 /// Шрифт подписей в ролике (Arial Bold из Windows; `CS2CINEMA_FONT` — свой).
@@ -226,9 +247,9 @@ mod tests {
     }
 
     /// Реальная демка (CS2_TEST_DEMO или демка из репозитория, если она скачана из LFS, а не указатель):
-    /// разбор → ручной выбор → план и файлы.
+    /// разбор → игрок → план ролика про него и файлы.
     #[test]
-    fn analyze_select_plan() {
+    fn analyze_player_plan() {
         let demo = std::env::var_os("CS2_TEST_DEMO")
             .map(PathBuf::from)
             .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../1-3e7db9e3-8e92-4761-a1db-3729fb7de11c-1-1.dem.zst"));
@@ -240,10 +261,12 @@ mod tests {
         assert!(!a.found.is_empty());
         let out = std::env::temp_dir().join(format!("cs2cinema-pipeline-{}", std::process::id()));
         let o = PlanOptions { walls: false, ..Default::default() };
-        let p = plan(&mut a, &[0, 1], &o, &out, &Quiet).unwrap();
-        assert_eq!(p.timeline.shots.len(), 2);
+        let hero = a.found[0].player;
+        let name = a.m.name(hero);
+        assert_eq!(find_player(&a.m, None, &name.to_uppercase()), Some(hero));
+        let p = plan_player(&mut a, hero, &o, &out, &Quiet).unwrap();
+        assert!(!p.timeline.shots.is_empty() && !p.ffmpeg_args.is_empty());
         assert!(out.join("highlights.cfg").is_file() && out.join("plan.json").is_file());
-        assert!(plan(&mut a, &[], &o, &out, &Quiet).is_err());
         let _ = std::fs::remove_dir_all(out);
     }
 }

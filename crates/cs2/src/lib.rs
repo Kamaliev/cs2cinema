@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+pub mod report;
+
 use demo::{
     Parsed,
     events::GameEvent,
@@ -178,7 +180,16 @@ impl Match {
                 n if n == end_event => {
                     if let Some(r) = m.rounds.last_mut() {
                         r.end_tick = Some(e.tick);
-                        r.winner_team = e.int("winner").and_then(|w| u8::try_from(w).ok());
+                        // без поля winner (FACEIT) не затираем победителя, выведенного по бомбе
+                        if let Some(w) = e.int("winner").and_then(|w| u8::try_from(w).ok()) {
+                            r.winner_team = Some(w);
+                        }
+                    }
+                }
+                // в FACEIT-демках у конца раунда нет победителя — бомба его выдаёт
+                "bomb_exploded" | "bomb_defused" => {
+                    if let Some(r) = m.rounds.last_mut() {
+                        r.winner_team.get_or_insert(if e.name == "bomb_exploded" { 2 } else { 3 });
                     }
                 }
                 "player_team" => {
@@ -230,7 +241,34 @@ impl Match {
         });
         m.grenades = grenades(&m, events, live_from, &resolve, &team_at);
         m.teams = teams;
+        m.infer_winners();
         m
+    }
+
+    /// Победитель раунда без `winner` в демке: команда, выбившая всех соперников, иначе CT (время вышло).
+    /// Бомба (взрыв/разминирование) уже учтена при разборе событий. У последнего раунда матча
+    /// конца в демке нет — для него только «всех выбили».
+    fn infer_winners(&mut self) {
+        let mut winners = Vec::new();
+        for r in &self.rounds {
+            if r.winner_team.is_some() {
+                winners.push(r.winner_team);
+                continue;
+            }
+            let on = |team: u8| self.players.iter().filter(|p| self.team_at(p.id, r.start_tick) == Some(team)).count();
+            let dead = |team: u8| self.kills.iter().filter(|k| k.round == r.number && self.team_at(k.victim, k.tick) == Some(team)).count();
+            let (t, ct) = (on(2), on(3));
+            winners.push(match () {
+                _ if t == 0 || ct == 0 => None,
+                _ if dead(2) >= t => Some(3),
+                _ if dead(3) >= ct => Some(2),
+                _ if r.end_tick.is_none() => None,
+                _ => Some(3),
+            });
+        }
+        for (r, w) in self.rounds.iter_mut().zip(winners) {
+            r.winner_team = w;
+        }
     }
 
     pub fn player(&self, id: PlayerId) -> Option<&Player> {
@@ -239,6 +277,12 @@ impl Match {
 
     pub fn name(&self, id: PlayerId) -> String {
         self.player(id).map_or_else(|| format!("player {}", id.0), |p| p.name.clone())
+    }
+
+    /// Команда игрока на тике (2 — T, 3 — CT), если демка её сообщила.
+    pub fn team_at(&self, id: PlayerId, tick: i32) -> Option<u8> {
+        let list = self.teams.get(&id)?;
+        list.iter().rev().find(|(t, _)| *t <= tick).or(list.first()).map(|(_, team)| *team)
     }
 
     pub fn round(&self, number: u32) -> Option<&Round> {
@@ -406,6 +450,27 @@ mod tests {
         assert_eq!(m.rounds[0].winner_team, Some(3));
         assert_eq!(m.kills.iter().map(|k| (k.tick, k.round)).collect::<Vec<_>>(), vec![(1050, 1), (1080, 2)]);
         assert_eq!(m.kills[0].weapon, "ak47");
+    }
+
+    /// FACEIT: у `round_officially_ended` нет winner — победитель по бомбе, по «всех выбили», иначе CT.
+    #[test]
+    fn winners_without_winner_field() {
+        let mut events: Vec<GameEvent> = (0..4).map(|p| ev(0, "player_team", &[("userid", p), ("team", if p < 2 { 2 } else { 3 })])).collect();
+        events.extend([
+            ev(10, "round_prestart", &[]),
+            ev(50, "bomb_exploded", &[]),
+            ev(60, "round_officially_ended", &[]),
+            ev(70, "round_prestart", &[]),
+            death(80, 2, 0),
+            death(90, 3, 1),
+            ev(100, "round_officially_ended", &[]),
+            ev(110, "round_prestart", &[]),
+            ev(150, "round_officially_ended", &[]),
+            ev(160, "round_prestart", &[]),
+        ]);
+        let m = Match::build("de_nuke".into(), 64.0, players(), &events);
+        let w: Vec<_> = m.rounds.iter().map(|r| r.winner_team).collect();
+        assert_eq!(w, vec![Some(2), Some(2), Some(3), None]);
     }
 
     #[test]

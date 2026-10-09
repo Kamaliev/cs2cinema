@@ -58,10 +58,6 @@ pub fn date(ts: i64) -> String {
     chrono::Local.timestamp_opt(ts, 0).single().map(|d| d.format("%d.%m.%Y %H:%M").to_string()).unwrap_or_default()
 }
 
-pub fn duration(secs: i64) -> String {
-    format!("{}:{:02}", secs / 60, secs % 60)
-}
-
 pub fn open_path(p: &std::path::Path) {
     #[cfg(windows)]
     {

@@ -9,6 +9,49 @@ use highlights::Highlight;
 
 pub type Result<T> = std::result::Result<T, String>;
 
+/// Этапы конвейера — для строки состояния в окне.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stage {
+    Download,
+    Parse,
+    Positions,
+    Geometry,
+    Plan,
+    Record,
+    Assemble,
+    Done,
+}
+
+impl Stage {
+    pub const ALL: [Stage; 8] = [Stage::Download, Stage::Parse, Stage::Positions, Stage::Geometry, Stage::Plan, Stage::Record, Stage::Assemble, Stage::Done];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Stage::Download => "Скачивание",
+            Stage::Parse => "Разбор",
+            Stage::Positions => "Позиции",
+            Stage::Geometry => "Геометрия",
+            Stage::Plan => "План",
+            Stage::Record => "Запись",
+            Stage::Assemble => "Склейка",
+            Stage::Done => "Готово",
+        }
+    }
+}
+
+/// Куда конвейер сообщает о ходе работы.
+pub trait Progress: Sync {
+    fn stage(&self, s: Stage);
+    fn log(&self, msg: &str);
+}
+
+/// Молчаливый вариант для тестов и консоли.
+pub struct Quiet;
+impl Progress for Quiet {
+    fn stage(&self, _: Stage) {}
+    fn log(&self, _: &str) {}
+}
+
 /// Разобранный матч: то, что показывается в списке моментов.
 pub struct Analysis {
     pub label: String,
@@ -26,7 +69,7 @@ pub enum Source {
     Faceit { link: String, key: String, demo_index: usize, dir: PathBuf },
 }
 
-pub fn analyze(src: &Source, progress: &dyn Fn(&str)) -> Result<Analysis> {
+pub fn analyze(src: &Source, p: &dyn Progress) -> Result<Analysis> {
     let (demo_path, label) = match src {
         Source::File(p) => {
             let label = p.file_stem().and_then(|s| s.to_str()).unwrap_or("match");
@@ -34,19 +77,21 @@ pub fn analyze(src: &Source, progress: &dyn Fn(&str)) -> Result<Analysis> {
             (p.clone(), label)
         }
         Source::Faceit { link, key, demo_index, dir } => {
+            p.stage(Stage::Download);
             let id = faceit::parse_match_id(link).ok_or("не похоже на ссылку матча FACEIT")?;
             let client = if key.trim().is_empty() { faceit::Client::from_env().map_err(|e| e.to_string())? } else { faceit::Client::new(key.trim()) };
-            progress(&format!("матч {id}: ищу демку…"));
+            p.log(&format!("матч {id}: ищу демку…"));
             let urls = client.demo_urls(&id).map_err(|e| e.to_string())?;
             let url = urls
                 .get(*demo_index)
                 .ok_or_else(|| format!("в матче {} демок, а запрошена #{demo_index}", urls.len()))?;
-            progress("качаю демку…");
+            p.log("качаю демку…");
             let path = client.download(url, dir).map_err(|e| e.to_string())?;
             (path, id)
         }
     };
-    progress("разбираю демку…");
+    p.stage(Stage::Parse);
+    p.log("разбираю демку…");
     let data = demo::read_demo(&demo_path).map_err(|e| format!("{}: {e}", demo_path.display()))?;
     let parsed = demo::parse(&data).map_err(|e| e.to_string())?;
     let m = Match::from_parsed(&parsed);
@@ -80,7 +125,7 @@ pub struct Plan {
 }
 
 /// Строит план по выбранным вручную моментам (индексы в `a.found`) и пишет файлы в `out_dir`.
-pub fn plan(a: &mut Analysis, selected: &[usize], o: &PlanOptions, out_dir: &Path, progress: &dyn Fn(&str)) -> Result<Plan> {
+pub fn plan(a: &mut Analysis, selected: &[usize], o: &PlanOptions, out_dir: &Path, p: &dyn Progress) -> Result<Plan> {
     let chosen: Vec<Highlight> = selected.iter().filter_map(|&i| a.found.get(i).cloned()).collect();
     if chosen.is_empty() {
         return Err("не выбрано ни одного момента".into());
@@ -94,17 +139,19 @@ pub fn plan(a: &mut Analysis, selected: &[usize], o: &PlanOptions, out_dir: &Pat
 
     let mesh = if o.flybys {
         if a.track.is_none() {
-            progress("снимаю позиции игроков…");
+            p.stage(Stage::Positions);
+            p.log("снимаю позиции игроков…");
             a.track = Some(positions::track(&a.data, 4).map_err(|e| e.to_string())?);
         }
         if o.walls {
             let dir = o.maps_dir.clone().unwrap_or_else(geometry::default_dir);
-            progress(&format!("геометрия карты {}…", a.m.map));
+            p.stage(Stage::Geometry);
+            p.log(&format!("геометрия карты {}…", a.m.map));
             let opts = geometry::Options { refresh: o.refresh_maps, offline: o.offline, ..Default::default() };
             match geometry::load_map(&dir, &a.m.map, &opts) {
                 Ok(l) => Some(l.mesh),
                 Err(e) => {
-                    progress(&format!("предупреждение: без стен — {e}"));
+                    p.log(&format!("предупреждение: без стен — {e}"));
                     None
                 }
             }
@@ -115,7 +162,8 @@ pub fn plan(a: &mut Analysis, selected: &[usize], o: &PlanOptions, out_dir: &Pat
         None
     };
 
-    progress("строю монтаж…");
+    p.stage(Stage::Plan);
+    p.log("строю монтаж…");
     let timeline = match (&a.track, &mesh) {
         (Some(t), Some(mesh)) => {
             let p = positions::WithGeometry { track: t, mesh };
@@ -170,14 +218,14 @@ mod tests {
         if !demo.exists() {
             return;
         }
-        let mut a = analyze(&Source::File(demo), &|_| {}).unwrap();
+        let mut a = analyze(&Source::File(demo), &Quiet).unwrap();
         assert!(!a.found.is_empty());
         let out = std::env::temp_dir().join(format!("cs2cinema-pipeline-{}", std::process::id()));
         let o = PlanOptions { walls: false, ..Default::default() };
-        let p = plan(&mut a, &[0, 1], &o, &out, &|_| {}).unwrap();
+        let p = plan(&mut a, &[0, 1], &o, &out, &Quiet).unwrap();
         assert_eq!(p.timeline.shots.len(), 2);
         assert!(out.join("highlights.cfg").is_file() && out.join("plan.json").is_file());
-        assert!(plan(&mut a, &[], &o, &out, &|_| {}).is_err());
+        assert!(plan(&mut a, &[], &o, &out, &Quiet).is_err());
         let _ = std::fs::remove_dir_all(out);
     }
 }

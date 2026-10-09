@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Папка с `HLAE.exe`.
@@ -12,6 +12,8 @@ pub struct Settings {
     /// Куда складывать планы, скрипты и готовые ролики.
     pub out_root: String,
     pub faceit_key: String,
+    /// Ник на FACEIT — для списка матчей.
+    pub nickname: String,
     pub fps: u32,
     pub chronological: bool,
     pub flybys: bool,
@@ -29,6 +31,7 @@ impl Default for Settings {
             cs2_dir: crate::launch::find_cs2().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
             out_root: default_out_root().to_string_lossy().into_owned(),
             faceit_key: String::new(),
+            nickname: String::new(),
             fps: 60,
             chronological: false,
             flybys: true,

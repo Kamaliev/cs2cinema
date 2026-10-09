@@ -106,8 +106,19 @@ fn best_sequence(files: &[PathBuf]) -> Option<Sequence> {
     best
 }
 
+/// Не показывать чёрное окно консоли, когда ffmpeg запускает оконное приложение.
+fn quiet(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000)
+    }
+    #[cfg(not(windows))]
+    cmd
+}
+
 fn video_secs(path: &Path) -> Result<f32, String> {
-    let out = Command::new("ffprobe")
+    let out = quiet(&mut Command::new("ffprobe"))
         .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
         .arg(path)
         .output()
@@ -193,7 +204,7 @@ pub fn assemble(root: &Path, shots: usize, o: &Options) -> Result<Report, String
     let fade = o.fade_secs.min(clips.iter().map(|c| c.secs).fold(f32::INFINITY, f32::min) / 2.0).max(0.0);
     let total_secs = clips.iter().map(|c| c.secs).sum::<f32>() - fade * (clips.len() - 1) as f32;
 
-    let status = Command::new("ffmpeg")
+    let status = quiet(&mut Command::new("ffmpeg"))
         .args(ffmpeg_args(&clips, o))
         .status()
         .map_err(|e| format!("не удалось запустить ffmpeg (winget install Gyan.FFmpeg, затем перезапустите PowerShell): {e}"))?;

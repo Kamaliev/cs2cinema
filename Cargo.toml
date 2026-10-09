@@ -10,5 +10,7 @@ members = [
     "crates/faceit",
     "crates/positions",
     "crates/geometry",
+    "crates/pipeline",
+    "crates/app",
     "crates/cli",
 ]

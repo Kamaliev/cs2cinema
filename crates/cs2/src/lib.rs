@@ -49,6 +49,9 @@ pub struct Round {
 pub struct Match {
     pub map: String,
     pub tick_rate: f32,
+    /// Смещение игровых тиков относительно тиков демки (из заголовка демки).
+    #[serde(default)]
+    pub server_start_tick: i32,
     pub players: Vec<Player>,
     pub rounds: Vec<Round>,
     pub kills: Vec<Kill>,
@@ -64,7 +67,9 @@ impl Match {
             .iter()
             .map(|p| (p.userid, p.slot, p.name.clone(), p.xuid))
             .collect();
-        Self::build(parsed.map_name.clone(), parsed.tick_rate(), players, &parsed.events)
+        let mut m = Self::build(parsed.map_name.clone(), parsed.tick_rate(), players, &parsed.events);
+        m.server_start_tick = parsed.server_start_tick;
+        m
     }
 
     /// `players`: `(userid, slot, name, xuid)`.
@@ -90,6 +95,7 @@ impl Match {
         let mut m = Match {
             map,
             tick_rate,
+            server_start_tick: 0,
             players: list,
             rounds: Vec::new(),
             kills: Vec::new(),

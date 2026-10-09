@@ -23,6 +23,9 @@ cs2-cli — хайлайт-ролик из матча FACEIT
   --maps <папка>    где лежат меши карт (по умолчанию ./maps или $CS2CINEMA_MAPS)
   --list-cameras    каталог камер и их красочность на тестовой сцене
 
+Склейка записанных клипов (после записи в HLAE):
+  cs2-cli assemble --plan <plan.json> --clips <game\\bin\\win64 или папка clips> [--out highlights.mp4] [--fps 60] [--fade 0.35]
+
 Ключ FACEIT берётся из переменной FACEIT_API_KEY.";
 
 struct Args {
@@ -89,6 +92,15 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
+    if env::args().nth(1).as_deref() == Some("assemble") {
+        return match assemble_cmd() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("ошибка: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(msg) => {
@@ -188,7 +200,16 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     };
     let timeline = director::direct(&m, &found, &cfg, pos);
     let out_dir = args.out.unwrap_or_else(|| PathBuf::from("out").join(&label));
-    let out = renderer::render(&m, &timeline, &renderer::Config { fps: args.fps, ..Default::default() });
+    std::fs::create_dir_all(&out_dir)?;
+    // HLAE ищет campath относительно game\bin\win64, поэтому в скрипте нужен абсолютный путь
+    let campath_dir = absolute_slashes(&out_dir);
+    if !renderer::console_safe(&campath_dir) {
+        eprintln!(
+            "предупреждение: в пути {campath_dir} есть пробелы или кавычки — HLAE не загрузит campath. \
+             Укажите --out без пробелов (например C:\\cs2out\\test)"
+        );
+    }
+    let out = renderer::render(&m, &timeline, &renderer::Config { fps: args.fps, campath_dir: Some(campath_dir), ..Default::default() });
     out.write_to(&out_dir)?;
 
     println!("\nМонтаж: {} шотов, ~{:.0} c", timeline.shots.len(), timeline.total_secs());
@@ -223,5 +244,43 @@ fn list_cameras() -> Result<(), Box<dyn Error>> {
             b.kill_visible, b.crowd, b.framing, b.smooth, b.drama_fit, b.total
         );
     }
+    Ok(())
+}
+
+/// Абсолютный путь с `/` и без префикса `\\?\` (Windows) — в таком виде его принимает консоль HLAE.
+fn absolute_slashes(p: &std::path::Path) -> String {
+    let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let s = abs.to_string_lossy().replace('\\', "/");
+    s.strip_prefix("//?/").map(str::to_owned).unwrap_or(s)
+}
+
+/// `cs2-cli assemble`: склеивает клипы, записанные HLAE по плану, в один ролик.
+fn assemble_cmd() -> Result<(), Box<dyn Error>> {
+    let mut plan: Option<PathBuf> = None;
+    let mut clips: Option<PathBuf> = None;
+    let mut out = PathBuf::from("highlights.mp4");
+    let (mut fps, mut fade) = (60u32, 0.35f32);
+    let mut it = env::args().skip(2);
+    while let Some(a) = it.next() {
+        let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} требует значение"));
+        match a.as_str() {
+            "--plan" => plan = Some(value("--plan")?.into()),
+            "--clips" => clips = Some(value("--clips")?.into()),
+            "--out" => out = value("--out")?.into(),
+            "--fps" => fps = value("--fps")?.parse().map_err(|_| "--fps: нужно число")?,
+            "--fade" => fade = value("--fade")?.parse().map_err(|_| "--fade: нужно число")?,
+            other => return Err(format!("неизвестный параметр {other}").into()),
+        }
+    }
+    let plan = plan.ok_or("укажите --plan <plan.json>")?;
+    let clips = clips.ok_or("укажите --clips <папка game\\bin\\win64 или clips>")?;
+
+    let timeline: director::Timeline = serde_json::from_str(&std::fs::read_to_string(&plan)?)?;
+    eprintln!("шотов в плане: {}; ищу клипы в {}", timeline.shots.len(), clips.display());
+    let report = renderer::assemble::assemble(&clips, timeline.shots.len(), &renderer::assemble::Options { fps, fade_secs: fade, out: out.clone() })?;
+    for (i, c) in report.clips.iter().enumerate() {
+        println!("  шот {}: {:.1} c{}", i + 1, c.secs, c.frames.map(|f| format!(" ({f} кадров)")).unwrap_or_default());
+    }
+    println!("\nГотово: {} ({:.1} c)", out.display(), report.total_secs);
     Ok(())
 }

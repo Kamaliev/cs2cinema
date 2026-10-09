@@ -49,6 +49,17 @@ if (($userPath -split ";") -notcontains $dir) {
 }
 if (($env:Path -split ";") -notcontains $dir) { $env:Path += ";" + $dir }
 
+# ярлык в меню «Пуск» для оконного приложения
+$exe = Join-Path $dir "cs2cinema.exe"
+if (Test-Path $exe) {
+    $lnk = Join-Path ([Environment]::GetFolderPath("Programs")) "CS2 Cinema.lnk"
+    $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+    $sc.TargetPath = $exe
+    $sc.WorkingDirectory = $dir
+    $sc.Save()
+    Write-Host "Ярлык «CS2 Cinema» добавлен в меню Пуск."
+}
+
 Write-Host ""
 Write-Host "Установлено в $dir"
 Write-Host "Проверка:  cs2-cli --list-cameras"

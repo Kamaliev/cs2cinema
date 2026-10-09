@@ -16,6 +16,7 @@ renderer = { path = "../renderer" }
 faceit = { path = "../faceit" }
 positions = { path = "../positions" }
 geometry = { path = "../geometry" }
+serde_json = "1"
 
 [dev-dependencies]
 prost = "0.14.4"

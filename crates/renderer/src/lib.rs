@@ -20,6 +20,8 @@
 //!
 //! Команды HLAE/CS2 собраны в `Dialect` и в `preamble` — правьте их здесь, а не в логике режиссёра.
 
+pub mod assemble;
+
 use std::{fmt::Write as _, io, path::Path};
 
 use cs2::Match;
@@ -107,6 +109,11 @@ impl Output {
 pub fn capture_fps(shot: &Shot, cfg: &Config) -> u32 {
     let slowest = shot.timescale.iter().map(|k| k.scale).fold(1.0f32, f32::min).max(0.05);
     ((cfg.fps as f32 / slowest).ceil() as u32).clamp(cfg.fps, cfg.max_capture_fps.max(cfg.fps))
+}
+
+/// Безопасно ли путь/имя вставлять в команду консоли внутри `mirv_cmd ... "..."` без кавычек.
+pub fn console_safe(s: &str) -> bool {
+    !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || matches!(c, '"' | ';' | '\''))
 }
 
 pub fn render(m: &Match, t: &Timeline, cfg: &Config) -> Output {
@@ -493,6 +500,7 @@ mod tests {
         let t = Timeline {
             map: "de_test".into(),
             tick_rate: 64.0,
+            server_start_tick: 9376,
             // порядок показа: сначала позднее по времени
             shots: vec![
                 shot(5000, 5400, Camera::Pov { player: PlayerId(7) }, vec![]),

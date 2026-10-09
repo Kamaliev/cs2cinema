@@ -83,14 +83,14 @@ pub struct Round {
 pub struct Match {
     pub map: String,
     pub tick_rate: f32,
+    /// Смещение игровых тиков относительно тиков демки (из заголовка демки).
+    #[serde(default)]
+    pub server_start_tick: i32,
     pub players: Vec<Player>,
     pub rounds: Vec<Round>,
     pub kills: Vec<Kill>,
     #[serde(default)]
     pub grenades: Vec<Grenade>,
-    /// См. `demo::Parsed::server_start_tick`.
-    #[serde(default)]
-    pub server_start_tick: i32,
     /// `(tick, team)` по игрокам — для отсева тимкиллов, если команды известны.
     #[serde(skip)]
     teams: HashMap<PlayerId, Vec<(i32, u8)>>,
@@ -131,11 +131,11 @@ impl Match {
         let mut m = Match {
             map,
             tick_rate,
+            server_start_tick: 0,
             players: list,
             rounds: Vec::new(),
             kills: Vec::new(),
             grenades: Vec::new(),
-            server_start_tick: 0,
             teams: HashMap::new(),
         };
 

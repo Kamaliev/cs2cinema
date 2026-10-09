@@ -1,6 +1,8 @@
-//! Скачивание демки матча FACEIT по ссылке.
+//! FACEIT Data API: игрок по нику, история матчей, статистика матча, скачивание демки.
 //!
-//! Нужен ключ FACEIT Data API (`FACEIT_API_KEY`) с доступом к Downloads API.
+//! Нужен ключ FACEIT Data API (`FACEIT_API_KEY`); для скачивания демок — с доступом к Downloads API.
+
+pub mod stats;
 
 use std::{
     error::Error,
@@ -19,7 +21,7 @@ const DOWNLOAD_API: &str = "https://open.faceit.com/download/v2/demos/download";
 pub fn parse_match_id(input: &str) -> Option<String> {
     input
         .trim()
-        .split(|c: char| matches!(c, '/' | '?' | '#' | ' '))
+        .split(['/', '?', '#', ' '])
         .find(|part| is_match_id(part))
         .map(str::to_owned)
 }
@@ -56,15 +58,33 @@ impl Client {
         Ok(Self::new(key))
     }
 
+    fn get(&self, path: &str, what: &str) -> Result<serde_json::Value> {
+        let mut resp = self.agent.get(&format!("{DATA_API}{path}")).header("Authorization", &format!("Bearer {}", self.key)).call()?;
+        check(resp.status().as_u16(), what)?;
+        Ok(resp.body_mut().read_json()?)
+    }
+
+    /// Профиль игрока по нику.
+    pub fn player(&self, nickname: &str) -> Result<stats::Player> {
+        let v = self.get(&format!("/players?nickname={}", urlencode(nickname.trim())), "игрок")?;
+        stats::Player::from_json(&v).ok_or_else(|| "FACEIT вернул профиль без id".into())
+    }
+
+    /// Последние `limit` матчей игрока в CS2 (самые новые первыми).
+    pub fn history(&self, player_id: &str, limit: usize) -> Result<Vec<stats::MatchSummary>> {
+        let v = self.get(&format!("/players/{player_id}/history?game=cs2&offset=0&limit={limit}"), "история матчей")?;
+        Ok(stats::MatchSummary::list_from_json(&v, player_id))
+    }
+
+    /// Полная статистика матча (по картам, командам и игрокам).
+    pub fn match_stats(&self, match_id: &str) -> Result<stats::MatchStats> {
+        let v = self.get(&format!("/matches/{match_id}/stats"), "статистика матча")?;
+        Ok(stats::MatchStats::from_json(&v))
+    }
+
     /// Ссылки на демки матча (в bo3 их несколько — по одной на карту).
     pub fn demo_urls(&self, match_id: &str) -> Result<Vec<String>> {
-        let mut resp = self
-            .agent
-            .get(&format!("{DATA_API}/matches/{match_id}"))
-            .header("Authorization", &format!("Bearer {}", self.key))
-            .call()?;
-        check(resp.status().as_u16(), "матч")?;
-        let json: serde_json::Value = resp.body_mut().read_json()?;
+        let json = self.get(&format!("/matches/{match_id}"), "матч")?;
         let urls: Vec<String> = json["demo_url"]
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
@@ -101,6 +121,15 @@ impl Client {
         fs::rename(&tmp, &path)?;
         Ok(path)
     }
+}
+
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 fn check(status: u16, what: &str) -> Result<()> {

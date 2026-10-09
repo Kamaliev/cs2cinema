@@ -31,7 +31,9 @@ jobs:
         run: cargo test --release --workspace
 
       - name: Build
-        run: cargo build --release -p cli
+        env:
+          CS2CINEMA_VERSION: ${{ inputs.tag || github.ref_name }}
+        run: cargo build --release -p cli -p app
 
       - name: Package
         shell: pwsh
@@ -39,6 +41,7 @@ jobs:
           $dir = "dist/cs2cinema"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item target/release/cs2-cli.exe $dir
+          Copy-Item target/release/cs2cinema.exe $dir
           Copy-Item README.md $dir
           Copy-Item -Recurse scripts "$dir/scripts"
           Compress-Archive -Path $dir -DestinationPath cs2cinema-windows-x64.zip -Force

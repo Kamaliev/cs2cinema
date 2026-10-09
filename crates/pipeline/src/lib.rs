@@ -211,11 +211,15 @@ mod tests {
         assert_eq!(console_name(""), "match");
     }
 
-    /// Демка из репозитория: разбор → ручной выбор → план и файлы.
+    /// Реальная демка (CS2_TEST_DEMO или демка из репозитория, если она скачана из LFS, а не указатель):
+    /// разбор → ручной выбор → план и файлы.
     #[test]
     fn analyze_select_plan() {
-        let demo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../1-3e7db9e3-8e92-4761-a1db-3729fb7de11c-1-1.dem.zst");
-        if !demo.exists() {
+        let demo = std::env::var_os("CS2_TEST_DEMO")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../1-3e7db9e3-8e92-4761-a1db-3729fb7de11c-1-1.dem.zst"));
+        if !demo.metadata().is_ok_and(|m| m.len() > 1 << 20) {
+            eprintln!("нет реальной демки — тест пропущен");
             return;
         }
         let mut a = analyze(&Source::File(demo), &Quiet).unwrap();

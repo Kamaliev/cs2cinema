@@ -47,7 +47,11 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
                 ui.add_sized([240.0, 24.0], egui::TextEdit::singleline(&mut d.nickname));
                 ui.end_row();
             });
-            ui.label(RichText::new("Ключ нужен для списка матчей и статистики; для скачивания демок у ключа должен быть доступ к Downloads API.").color(MUTED).size(12.5));
+            ui.label(
+                RichText::new("Ключ нужен для списка матчей и статистики; для скачивания демок у ключа должен быть доступ к Downloads API.")
+                    .color(MUTED)
+                    .size(12.5),
+            );
         });
 
         let mut status_note: Option<&str> = None;
@@ -103,6 +107,32 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
             ui.checkbox(&mut d.gpu_encode, "Кодировать на видеокарте NVIDIA (NVENC) — запись и склейка в разы быстрее");
         });
 
+        // действие откладывается флагом: `d` занимает `app.draft`, а запуск проверки берёт `&mut app`
+        let mut run_precheck = false;
+        let (busy, job_running) = (app.precheck_busy, app.jobs.running.is_some());
+        ui::section(ui, "Проверка окружения", |ui| {
+            ui.horizontal(|ui| {
+                let btn = ui.add_enabled(!busy && !job_running, egui::Button::new("Проверить окружение"));
+                run_precheck = btn.on_disabled_hover_text("Во время задачи проверка недоступна: её игра выглядела бы чужим CS2").clicked();
+                if busy {
+                    ui.spinner();
+                    ui.label(RichText::new("проверяю…").color(MUTED));
+                }
+            });
+            ui.label(RichText::new("проверяются значения на этой странице, даже несохранённые").color(MUTED).size(12.5));
+            match &app.precheck {
+                Some(Ok(r)) => crate::jobs_page::precheck_view(ui, "settings-precheck", r, true),
+                Some(Err(e)) => {
+                    ui.add(egui::Label::new(RichText::new(e).color(BAD)).wrap());
+                }
+                None => {}
+            }
+        });
+        if run_precheck {
+            app.run_precheck();
+        }
+
+        let d = &mut app.draft;
         ui::section(ui, "Монтаж", |ui| {
             ui.checkbox(&mut d.detailed, "Подробный ролик: весь KAST (ассисты, размены) и все ракурсы на каждое убийство — в ~2 раза длиннее");
             ui.checkbox(&mut d.chronological, "Строго по порядку матча (иначе лучший раунд — в финале)");

@@ -42,6 +42,8 @@ pub enum Msg {
     Stats(String, Result<MatchStats, String>),
     UpdateFound(Result<Option<update::Release>, String>),
     Updated(Result<PathBuf, String>),
+    /// Отчёт кнопки «Проверить окружение» в настройках (D-01).
+    Precheck(Result<pipeline::precheck::Report, String>),
     /// Кадр готового ролика для карточки задачи (RGBA).
     Thumb {
         id: i64,
@@ -152,6 +154,9 @@ pub struct App {
     pub store: Store,
     pub update: Option<update::Release>,
     pub update_note: Option<String>,
+    /// Последний отчёт кнопки «Проверить окружение» в настройках.
+    pub precheck: Option<Result<pipeline::precheck::Report, String>>,
+    pub precheck_busy: bool,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
     ctx: egui::Context,
@@ -192,6 +197,8 @@ impl App {
             store,
             update: None,
             update_note: None,
+            precheck: None,
+            precheck_busy: false,
             rx,
             tx,
             ctx: cc.egui_ctx.clone(),
@@ -254,6 +261,17 @@ impl App {
         }
         self.update_note = Some("проверяю…".into());
         self.spawn(|r| r.send(Msg::UpdateFound(update::check())));
+    }
+
+    /// «Проверить окружение» в настройках: тот же `precheck::run` и те же входы, что у задачи (D-01),
+    /// но по значениям черновика страницы и без демки. Во время задачи не запускается (T-02-25).
+    pub fn run_precheck(&mut self) {
+        if self.precheck_busy || self.jobs.running.is_some() {
+            return;
+        }
+        self.precheck_busy = true;
+        let inputs = jobs::precheck_inputs(&self.draft, pipeline::precheck::Demo::NotApplicable, self.store.last_good().ok().flatten());
+        self.spawn(move |r| r.send(Msg::Precheck(pipeline::precheck::run(&*pipeline::host::default_host(), &inputs, r))));
     }
 
     pub fn load_matches(&mut self) {
@@ -514,6 +532,10 @@ impl App {
                     std::process::exit(0);
                 }
                 Msg::Updated(Err(e)) => self.status.finish(Err(format!("обновление не удалось: {e}"))),
+                Msg::Precheck(r) => {
+                    self.precheck = Some(r);
+                    self.precheck_busy = false;
+                }
                 Msg::Thumb { id, size, rgba } => {
                     let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
                     let tex = self.ctx.load_texture(format!("thumb-{id}"), img, egui::TextureOptions::LINEAR);

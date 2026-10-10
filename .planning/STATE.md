@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 03
 current_phase_name: Проверенные дубли, повтор и восстановление
 status: executing
-stopped_at: Completed 03-05-PLAN.md
-last_updated: "2026-10-10T20:07:09.485Z"
+stopped_at: Completed 03-06-PLAN.md
+last_updated: "2026-10-10T20:17:10.830Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 03 execution started
-state_head: f93ff96ff64c78ff6f224712b20ca22bca09619b
+state_head: 1c338a054c28aac847c93901432aab20319235e1
 progress:
   total_phases: 4
   completed_phases: 1
   total_plans: 24
-  completed_plans: 21
+  completed_plans: 22
   percent: 25
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 03 (Проверенные дубли, повтор и восстановление) — EXECUTING
-Plan: 6 of 8
+Plan: 7 of 8
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 03 execution started
 
@@ -76,6 +76,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 03 P03 | 35min | 3 tasks | 8 files |
 | Phase 03 P04 | 50min | 3 tasks | 6 files |
 | Phase 03 P05 | 20min | 2 tasks | 1 files |
+| Phase 03 P06 | 40min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -119,6 +120,7 @@ Recent decisions affecting current work:
 - [Phase 03]: kill_if_same: выход процесса проверяется до чтения образа (у вышедшего образ не читается); завершение по PID только через Host::kill_orphan(&ProcIdentity)
 - [Phase 03]: 03-03: звук проверяется в audio.wav, разрешение и видео в video.mp4; допуск длительности ±10% но не меньше ±0.5 с; NotReady отличается от Invalid по тексту stderr ffprobe
 - [Phase 03]: 03-04: проверки дублей идут по одной за шаг цикла драйвера; после закрытия игры оставшиеся дубли проверяются по разу без повторов
+- [Phase 03]: 03-06: повтор с невалидным дублем записывает все дубли заново, прежний clips уходит в clips_old_<ts> (D-07, запасной вариант)
 
 ### Pending Todos
 
@@ -141,6 +143,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-10T20:07:09.359Z
-Stopped at: Completed 03-05-PLAN.md
+Last session: 2026-10-10T20:17:10.703Z
+Stopped at: Completed 03-06-PLAN.md
 Resume file: None

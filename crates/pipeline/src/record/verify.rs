@@ -5,7 +5,10 @@
 //! ffprobe — недоверенный текст чужого процесса: он ограничен по длине и разбирается типизированно.
 
 use std::path::Path;
+use std::time::Duration;
 
+use host::{CmdSpec, Host, HostError};
+use renderer::TakePlan;
 use serde::Deserialize;
 
 use super::deadlines::{TAKE_TOLERANCE_MIN_SECS, TAKE_TOLERANCE_REL};
@@ -195,6 +198,135 @@ pub fn judge(
     })
 }
 
+/// Потолок stdout одного вызова ffprobe: настоящий ответ по одному файлу — меньше килобайта.
+pub const PROBE_STDOUT_MAX: usize = 64 * 1024;
+
+/// Итог проверки дубля.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProbeOutcome {
+    /// Дубль годен.
+    Valid(TakeFacts),
+    /// Файла нет или ffmpeg HLAE ещё дописывает его: повторять до `Deadlines::take_finalize`.
+    NotReady(String),
+    /// Файл прочитан и негоден, либо ffprobe не работает.
+    Invalid(String),
+    /// Пользователь отменил задачу.
+    Cancelled,
+}
+
+/// Проверить дубль `take`: размеры файлов, два вызова ffprobe через `host` (с дедлайном и отменой)
+/// и решение [`judge`]. `clips` — папка `clips/` задачи, `frame` — заданный размер кадра.
+pub fn probe_take(
+    host: &dyn Host,
+    ffprobe: &Path,
+    clips: &Path,
+    take: &TakePlan,
+    frame: (u32, u32),
+    deadline: Duration,
+    cancel: &dyn Fn() -> bool,
+) -> ProbeOutcome {
+    if cancel() {
+        return ProbeOutcome::Cancelled;
+    }
+    let dir = take.dir_name();
+    let mut sizes = [0u64; 2];
+    for (size, file) in sizes.iter_mut().zip(TakePlan::FILES) {
+        match std::fs::metadata(clips.join(&dir).join(file)) {
+            Ok(m) if m.is_file() => *size = m.len(),
+            _ => return ProbeOutcome::NotReady(format!("{dir}/{file}: файла нет")),
+        }
+    }
+    let mut probes = Vec::with_capacity(2);
+    for file in TakePlan::FILES {
+        let path = clips.join(&dir).join(file);
+        match probe_file(host, ffprobe, &path, file, deadline, cancel) {
+            Ok(p) => probes.push(p),
+            Err(outcome) => return outcome,
+        }
+    }
+    match judge(
+        &probes[0],
+        &probes[1],
+        take.game_secs,
+        frame,
+        (sizes[0], sizes[1]),
+    ) {
+        Ok(facts) => ProbeOutcome::Valid(facts),
+        Err(reason) => ProbeOutcome::Invalid(reason),
+    }
+}
+
+/// Один вызов ffprobe по файлу; `Err` — готовый исход, при котором дальше идти нельзя.
+fn probe_file(
+    host: &dyn Host,
+    ffprobe: &Path,
+    path: &Path,
+    file: &str,
+    deadline: Duration,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Probe, ProbeOutcome> {
+    let spec = CmdSpec {
+        program: ffprobe.to_path_buf(),
+        args: probe_args(path),
+        cwd: None,
+        deadline,
+    };
+    let mut text = String::new();
+    let mut too_long = false;
+    let result = host.run(&spec, cancel, &mut |line| {
+        if text.len() + line.len() + 1 > PROBE_STDOUT_MAX {
+            too_long = true;
+            return;
+        }
+        text.push_str(line);
+        text.push('\n');
+    });
+    let out = match result {
+        Ok(out) => out,
+        Err(HostError::Cancelled) => return Err(ProbeOutcome::Cancelled),
+        Err(HostError::Timeout) => {
+            return Err(ProbeOutcome::Invalid(format!(
+                "{file}: ffprobe не уложился в {} с",
+                deadline.as_secs()
+            )));
+        }
+        Err(e) => {
+            return Err(ProbeOutcome::Invalid(format!(
+                "ffprobe не запустился: {}",
+                one_line(&e.to_string())
+            )));
+        }
+    };
+    if out.code != Some(0) {
+        let tail: Vec<String> = out
+            .stderr_tail
+            .iter()
+            .map(|l| one_line(l.trim()))
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let tail = tail[tail.len().saturating_sub(3)..].join(" / ");
+        let lower = tail.to_lowercase();
+        let unfinished = ["moov atom not found", "invalid data found", "no such file"]
+            .iter()
+            .any(|m| lower.contains(m));
+        return Err(if unfinished {
+            ProbeOutcome::NotReady(format!("{file}: ffprobe не прочитал файл: {tail}"))
+        } else {
+            let code = out
+                .code
+                .map_or_else(|| "процесс остановлен".to_owned(), |c| format!("код {c}"));
+            ProbeOutcome::Invalid(format!("{file}: ffprobe завершился ({code}): {tail}"))
+        });
+    }
+    if too_long {
+        return Err(ProbeOutcome::Invalid(format!(
+            "{file}: ответ ffprobe слишком длинный (больше {} КиБ)",
+            PROBE_STDOUT_MAX / 1024
+        )));
+    }
+    parse_probe(&text).map_err(|e| ProbeOutcome::Invalid(format!("{file}: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +455,196 @@ mod tests {
         assert!(judge(&v, &audio(5.0), 5.0, (1280, 720), (1, 1)).is_ok());
         v.duration = None;
         assert!(judge(&v, &audio(5.0), 5.0, (1280, 720), (1, 1)).is_err());
+    }
+
+    // --- probe_take на фейковом хосте ---
+
+    use host::CmdOutput;
+    use host::fake::{FakeHost, Scenario};
+
+    const BOTH: [&str; 1] = [
+        r#"{"streams":[{"codec_type":"video","width":1280,"height":720,"duration":"5.0"},{"codec_type":"audio","duration":"5.0"}],"format":{"duration":"5.000000"}}"#,
+    ];
+
+    fn plan() -> TakePlan {
+        TakePlan {
+            index: 0,
+            shot: 0,
+            game_secs: 5.0,
+            capture_fps: 60,
+        }
+    }
+
+    /// Папка `clips/` с файлами дубля 0 (содержимое не важно: читает фейк).
+    fn clips(name: &str) -> std::path::PathBuf {
+        let clips = std::env::temp_dir()
+            .join(format!("cs2cinema-verify-{}-{name}", std::process::id()))
+            .join("clips");
+        let _ = std::fs::remove_dir_all(&clips);
+        std::fs::create_dir_all(clips.join("take0000")).unwrap();
+        std::fs::write(clips.join("take0000/video.mp4"), b"video-bytes").unwrap();
+        std::fs::write(clips.join("take0000/audio.wav"), b"audio").unwrap();
+        clips
+    }
+
+    fn exit(code: i32, stderr: &[&str]) -> Result<CmdOutput, HostError> {
+        Ok(CmdOutput {
+            code: Some(code),
+            stderr_tail: stderr.iter().map(|s| (*s).to_owned()).collect(),
+            elapsed: Duration::ZERO,
+        })
+    }
+
+    fn probe_with(
+        name: &str,
+        scenario: Scenario,
+        cancel: &dyn Fn() -> bool,
+    ) -> (ProbeOutcome, FakeHost) {
+        let host = FakeHost::new(scenario);
+        let out = probe_take(
+            &host,
+            Path::new("ffprobe"),
+            &clips(name),
+            &plan(),
+            (1280, 720),
+            Duration::from_secs(30),
+            cancel,
+        );
+        (out, host)
+    }
+
+    fn never() -> bool {
+        false
+    }
+
+    #[test]
+    fn take_with_both_streams_is_valid_and_carries_file_sizes() {
+        let sc = Scenario::happy(1).program("ffprobe", &BOTH, exit(0, &[]));
+        let (out, host) = probe_with("valid", sc, &never);
+        let ProbeOutcome::Valid(f) = out else {
+            panic!("ожидался Valid, получено {out:?}");
+        };
+        assert_eq!((f.video_bytes, f.audio_bytes), (11, 5));
+        assert_eq!((f.width, f.height), (1280, 720));
+        let runs = host.runs();
+        assert_eq!(runs.len(), 2, "по вызову на файл");
+        assert!(runs[0].2.last().unwrap().ends_with("video.mp4"));
+        assert!(runs[1].2.last().unwrap().ends_with("audio.wav"));
+    }
+
+    #[test]
+    fn unfinished_file_is_not_ready_but_other_failures_are_invalid() {
+        let sc = Scenario::happy(1).program(
+            "ffprobe",
+            &[],
+            exit(1, &[r"C:\Users\kamal\x\video.mp4: moov atom not found"]),
+        );
+        let (out, _) = probe_with("moov", sc, &never);
+        let ProbeOutcome::NotReady(why) = out else {
+            panic!("ожидался NotReady, получено {out:?}");
+        };
+        assert!(
+            why.contains("video.mp4") && why.contains("moov atom not found"),
+            "{why}"
+        );
+        assert!(!why.contains("kamal"), "профиль скрыт: {why}");
+
+        let sc = Scenario::happy(1).program("ffprobe", &[], exit(1, &["Unsupported codec"]));
+        let (out, _) = probe_with("other", sc, &never);
+        assert!(
+            matches!(out, ProbeOutcome::Invalid(ref s) if s.contains("Unsupported codec")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn missing_file_is_not_ready_and_ffprobe_is_not_started() {
+        let host = FakeHost::new(Scenario::happy(1));
+        let empty =
+            std::env::temp_dir().join(format!("cs2cinema-verify-{}-none", std::process::id()));
+        let out = probe_take(
+            &host,
+            Path::new("ffprobe"),
+            &empty,
+            &plan(),
+            (1280, 720),
+            Duration::from_secs(30),
+            &never,
+        );
+        assert!(
+            matches!(out, ProbeOutcome::NotReady(ref s) if s.contains("take0000/video.mp4: файла нет")),
+            "{out:?}"
+        );
+        assert!(host.runs().is_empty());
+    }
+
+    #[test]
+    fn host_errors_map_to_invalid_and_cancel_stays_cancel() {
+        let sc = Scenario::happy(1).program("ffprobe", &[], Err(HostError::Timeout));
+        let (out, _) = probe_with("timeout", sc, &never);
+        assert!(
+            matches!(out, ProbeOutcome::Invalid(ref s) if s.contains("не уложился в 30 с")),
+            "{out:?}"
+        );
+
+        let sc =
+            Scenario::happy(1).program("ffprobe", &[], Err(HostError::Spawn("нет файла".into())));
+        let (out, _) = probe_with("spawn", sc, &never);
+        assert!(
+            matches!(out, ProbeOutcome::Invalid(ref s) if s.contains("не запустился")),
+            "{out:?}"
+        );
+
+        let sc = Scenario::happy(1).program("ffprobe", &[], Err(HostError::Cancelled));
+        let (out, _) = probe_with("cancelled", sc, &never);
+        assert_eq!(out, ProbeOutcome::Cancelled);
+
+        let (out, host) = probe_with("raised", Scenario::happy(1), &|| true);
+        assert_eq!(out, ProbeOutcome::Cancelled);
+        assert!(
+            host.runs().is_empty(),
+            "поднятая отмена не запускает ffprobe"
+        );
+    }
+
+    #[test]
+    fn oversized_stdout_is_cut_and_reported_without_panic() {
+        let big = "x".repeat(1000);
+        let lines: Vec<&str> = (0..100).map(|_| big.as_str()).collect();
+        let sc = Scenario::happy(1).program("ffprobe", &lines, exit(0, &[]));
+        let (out, _) = probe_with("big", sc, &never);
+        assert!(
+            matches!(out, ProbeOutcome::Invalid(ref s) if s.contains("слишком длинный")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn fake_ffprobe_responder_flags_truncated_and_silent_takes() {
+        let (out, _) = probe_with("auto-ok", Scenario::happy(1), &never);
+        assert!(matches!(out, ProbeOutcome::Valid(_)), "{out:?}");
+        let (out, _) = probe_with("auto-cut", Scenario::happy(1).truncated_take(0), &never);
+        assert!(
+            matches!(out, ProbeOutcome::Invalid(ref s) if s.contains("длительность")),
+            "{out:?}"
+        );
+        let (out, _) = probe_with(
+            "auto-mute",
+            Scenario::happy(1).take_without_audio(0),
+            &never,
+        );
+        assert!(
+            matches!(out, ProbeOutcome::Invalid(ref s) if s.contains("нет аудиопотока")),
+            "{out:?}"
+        );
+        let (out, _) = probe_with(
+            "auto-size",
+            Scenario::happy(1).video_size(1920, 1080),
+            &never,
+        );
+        assert!(
+            matches!(out, ProbeOutcome::Invalid(ref s) if s.contains("1920x1080")),
+            "{out:?}"
+        );
     }
 }

@@ -9,6 +9,7 @@ use std::time::Duration;
 use host::{HostError, Liveness, WindowInfo};
 
 use super::machine::RecordState;
+use super::verify::TakeFacts;
 
 /// Код сбоя записи (набор D-08).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +29,10 @@ pub enum FailCode {
     ForeignGameRunning,
     /// Своя игра прошлой задачи не закрылась.
     PrevGameStuck,
+    /// Дубль записан, но не прошёл проверку ffprobe: нет звука, обрезан, другое разрешение.
+    TakeInvalid,
+    /// Повтору нечего взять из папки задачи: нет или испорчен `record.json`, изменились скрипты.
+    RetryNoData,
 }
 
 impl FailCode {
@@ -46,6 +51,8 @@ impl FailCode {
             FailCode::PrecheckFailed => "PRECHECK_FAILED",
             FailCode::ForeignGameRunning => "FOREIGN_GAME_RUNNING",
             FailCode::PrevGameStuck => "PREV_GAME_STUCK",
+            FailCode::TakeInvalid => "TAKE_INVALID",
+            FailCode::RetryNoData => "RETRY_NO_DATA",
         }
     }
 
@@ -78,13 +85,19 @@ impl FailCode {
             }
             FailCode::Cancelled => "",
             FailCode::PrecheckFailed => {
-                "Исправьте пункты предпроверки, отмеченные ✖, и нажмите «Повторить»; проверить окружение можно в настройках."
+                "Исправьте пункты предпроверки, отмеченные ✖, и нажмите «Повторить» (или «Заново», если задача не дошла до записи); проверить окружение можно в настройках."
             }
             FailCode::ForeignGameRunning => {
-                "Закройте CS2, запущенный не приложением, и нажмите «Повторить». Приложение чужие процессы не закрывает."
+                "Закройте CS2, запущенный не приложением, и нажмите «Повторить» (или «Заново», если задача не дошла до записи). Приложение чужие процессы не закрывает."
             }
             FailCode::PrevGameStuck => {
-                "Игра прошлой задачи не закрылась за 30 с. Завершите cs2.exe в диспетчере задач и нажмите «Повторить»."
+                "Игра прошлой задачи не закрылась за 30 с. Завершите cs2.exe в диспетчере задач и нажмите «Повторить» (или «Заново», если задача не дошла до записи)."
+            }
+            FailCode::TakeInvalid => {
+                "Посмотрите дубль, названный в сообщении, в папке clips: он сохранится как улика. «Повторить» запишет дубли заново; если сбой повторяется — проверьте ffmpeg HLAE и свободное место."
+            }
+            FailCode::RetryNoData => {
+                "Данных для повтора нет — нажмите «Заново»: задача начнётся со скачивания и плана."
             }
         }
     }
@@ -246,6 +259,36 @@ pub fn msg_take_timeout(n: u32, m: u32, kind: &str, limit: Duration) -> String {
         "Дубль {n} из {m}: метка {kind} не пришла за {} с",
         secs(limit)
     )
+}
+
+/// Дубль записан, но не прошёл проверку (D-04): номер с единицы, папка и причина от `judge`.
+pub fn msg_take_invalid(n: u32, m: u32, dir: &str, reason: &str) -> String {
+    format!("дубль {n} из {m} ({dir}) не прошёл проверку: {reason}")
+}
+
+/// Подсказка с номером и папкой негодного дубля — драйвер ставит её вместо общей (D-04).
+pub fn hint_take_invalid(n: u32, dir: &str) -> String {
+    format!(
+        "Посмотрите дубль {n} в папке clips/{dir}: он сохранится как улика. «Повторить» запишет дубли заново; если сбой повторяется — проверьте ffmpeg HLAE и свободное место."
+    )
+}
+
+/// Повтору нечего взять из папки задачи (D-08).
+pub fn msg_retry_no_data(reason: &str) -> String {
+    format!("нет данных для повтора: {reason} — запустите задачу заново")
+}
+
+/// Дубль проверен: длина, размер кадра и длина звука.
+pub fn msg_take_validated(n: u32, m: u32, f: &TakeFacts) -> String {
+    format!(
+        "дубль {n}/{m} проверен: {:.1} с, {}x{}, звук {:.1} с",
+        f.video_secs, f.width, f.height, f.audio_secs
+    )
+}
+
+/// Файл дубля не дописан за отведённое время.
+pub fn msg_take_not_final(dir: &str, limit: Duration, reason: &str) -> String {
+    format!("{dir}: файл не дописан за {} с — {reason}", secs(limit))
 }
 
 /// Пришла метка, но не та, что ждали.
@@ -468,6 +511,51 @@ mod tests {
         assert!(FailCode::PrecheckFailed.hint().contains("Повторить"));
         assert!(FailCode::ForeignGameRunning.hint().contains("не закрывает"));
         assert!(FailCode::PrevGameStuck.hint().contains("30 с"));
+    }
+
+    #[test]
+    fn take_invalid_names_the_take_in_message_and_hint() {
+        assert_eq!(FailCode::TakeInvalid.as_str(), "TAKE_INVALID");
+        let msg = msg_take_invalid(2, 3, "take0001", "audio.wav: нет аудиопотока");
+        assert!(
+            msg.contains("дубль 2 из 3") && msg.contains("take0001"),
+            "{msg}"
+        );
+        assert!(msg.contains("нет аудиопотока"), "{msg}");
+        let hint = hint_take_invalid(2, "take0001");
+        assert!(
+            hint.contains("дубль 2") && hint.contains("take0001"),
+            "{hint}"
+        );
+        assert!(FailCode::TakeInvalid.hint().contains("улика"));
+        let f = TakeFacts {
+            video_secs: 5.0,
+            audio_secs: 5.0,
+            width: 1280,
+            height: 720,
+            video_bytes: 1,
+            audio_bytes: 1,
+        };
+        assert_eq!(
+            msg_take_validated(1, 3, &f),
+            "дубль 1/3 проверен: 5.0 с, 1280x720, звук 5.0 с"
+        );
+        let nf = msg_take_not_final("take0000", Duration::from_secs(20), "moov atom not found");
+        assert_eq!(
+            nf,
+            "take0000: файл не дописан за 20 с — moov atom not found"
+        );
+    }
+
+    #[test]
+    fn retry_no_data_has_its_own_code_and_hint() {
+        assert_eq!(FailCode::RetryNoData.as_str(), "RETRY_NO_DATA");
+        let msg = msg_retry_no_data("record.json нет");
+        assert_eq!(
+            msg,
+            "нет данных для повтора: record.json нет — запустите задачу заново"
+        );
+        assert!(FailCode::RetryNoData.hint().contains("Заново"));
     }
 
     #[test]

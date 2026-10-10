@@ -15,8 +15,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
-    WaitForSingleObject,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
 
 use super::job::Job;
@@ -52,8 +52,42 @@ impl OwnedProc {
         Ok(OwnedProc { pid, handle })
     }
 
+    /// Открывает процесс ещё и с правом завершения: для режима «игра принята без job», когда
+    /// завершить её можно только своим handle (D-02, запасной путь).
+    pub fn open_owned(pid: u32) -> Result<Self, HostError> {
+        // SAFETY: аргументы — права доступа, флаг наследования и PID; результат проверяем на null.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            return Err(HostError::Io(format!(
+                "OpenProcess({pid}, с правом завершения): {}",
+                last_error()
+            )));
+        }
+        Ok(OwnedProc { pid, handle })
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Завершает процесс своим handle (нужен `open_owned`; у `open` права нет и вернётся ошибка ОС).
+    pub fn kill(&self, code: u32) -> Result<(), HostError> {
+        // SAFETY: handle открыт нами и жив до конца `self`.
+        let ok = unsafe { TerminateProcess(self.handle, code) };
+        if ok == 0 {
+            return Err(HostError::Io(format!(
+                "TerminateProcess({}): {}",
+                self.pid,
+                last_error()
+            )));
+        }
+        Ok(())
     }
 
     /// Жив ли процесс: ожидание на handle без задержки.

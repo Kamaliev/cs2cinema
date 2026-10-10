@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 02
 current_phase_name: Предпроверка, отмена и только свои процессы
 status: executing
-stopped_at: Completed 02-04-PLAN.md
-last_updated: "2026-10-10T16:14:47.016Z"
+stopped_at: Completed 02-05-PLAN.md
+last_updated: "2026-10-10T16:21:18.719Z"
 last_activity: 2026-10-10
 last_activity_desc: Phase 02 execution started
-state_head: 1b79ba64d5a8c9324d7980b773d0a613df4cf0f0
+state_head: d6138077198569231f323285d91710e9758297b3
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 16
-  completed_plans: 12
+  completed_plans: 13
   percent: 0
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 02 (Предпроверка, отмена и только свои процессы) — EXECUTING
-Plan: 5 of 8
+Plan: 6 of 8
 Status: Ready to execute
 Last activity: 2026-10-10 — Phase 02 execution started
 
@@ -68,6 +68,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 02 P02 | 8min | 2 tasks | 2 files |
 | Phase 02 P03 | 25 min | 2 tasks | 9 files |
 | Phase 02 P04 | 35 min | 3 tasks | 8 files |
+| Phase 02 P05 | 25 min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -100,6 +101,8 @@ Recent decisions affecting current work:
 - [Phase 02]: StateFlags Steam: идущее обновление и битые файлы - fail, ожидающее обновление и нераспознанное - warn; сборка CS2 сравнивается по buildid
 - [Phase 02]: Режим закрытия игры по коду сбоя: успех/GAME_EXITED без ожидания, HLAE_ERROR с дочиткой строк 1 с, остальное с quit
 - [Phase 02]: Окна опрашиваются в состояниях Launcher..Take; мгновенно роняет только диалог #32770 с afxhook/hlae/afxerror
+- [Phase 02]: Сначала wait_previous_game (D-14), потом снимок процессов: своя зависшая игра не должна выглядеть чужим CS2
+- [Phase 02]: hlae_ffmpeg: Path= из ffmpeg.ini берётся как есть, без ini - ffmpeg/bin/ffmpeg.exe, иначе None
 
 ### Pending Todos
 
@@ -122,6 +125,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-10T16:14:46.910Z
-Stopped at: Completed 02-04-PLAN.md
+Last session: 2026-10-10T16:21:18.605Z
+Stopped at: Completed 02-05-PLAN.md
 Resume file: None

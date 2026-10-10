@@ -160,6 +160,20 @@ pub struct Plan {
     pub ffmpeg_args: Vec<String>,
     /// Длина готового ролика, с.
     pub video_secs: f32,
+    /// Ожидаемые дубли в порядке записи — выводятся из плана до начала записи.
+    pub takes: Vec<renderer::TakePlan>,
+    /// Метка задачи в маркерах консоли (тот же nonce записан в cfg).
+    pub nonce: String,
+}
+
+/// Случайная метка плана для маркеров консоли (8 строчных hex-символов), не секрет.
+pub fn new_nonce() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    h.write_u128(nanos);
+    h.write_u32(std::process::id());
+    format!("{:08x}", h.finish() as u32)
 }
 
 /// Игрок демки по FACEIT: сначала по SteamID, затем по нику (точно, потом подстрокой без учёта регистра).
@@ -223,7 +237,10 @@ pub fn plan_player(a: &mut Analysis, hero: PlayerId, o: &PlanOptions, out_dir: &
     if o.take_nvenc {
         rcfg.dialect.record_ffmpeg = Some(renderer::TAKE_NVENC.into());
     }
+    let nonce = new_nonce();
+    rcfg.nonce = nonce.clone();
     let out = renderer::render(&a.m, &timeline, &rcfg);
+    let takes = renderer::takes(&timeline, &rcfg);
     let (ffmpeg_args, video_secs) = renderer::ffmpeg_args(&timeline, &rcfg).unwrap_or_default();
     // скрипты и пути камер прошлого плана (их могло быть больше) — убираем, чтобы не путали
     for e in std::fs::read_dir(out_dir).into_iter().flatten().flatten() {
@@ -232,7 +249,7 @@ pub fn plan_player(a: &mut Analysis, hero: PlayerId, o: &PlanOptions, out_dir: &
         }
     }
     out.write_to(out_dir).map_err(|e| format!("запись в {}: {e}", out_dir.display()))?;
-    Ok(Plan { timeline, out_dir: out_dir.to_path_buf(), ffmpeg_args, video_secs })
+    Ok(Plan { timeline, out_dir: out_dir.to_path_buf(), ffmpeg_args, video_secs, takes, nonce })
 }
 
 /// Позиции игроков (для пролётов) и геометрия карты (чтобы камера не смотрела сквозь стены).
@@ -303,6 +320,18 @@ mod tests {
         assert_eq!(console_name(""), "match");
     }
 
+    #[test]
+    fn new_nonce_is_eight_lowercase_hex_and_console_safe() {
+        let a = new_nonce();
+        let b = new_nonce();
+        for n in [&a, &b] {
+            assert_eq!(n.len(), 8, "{n}");
+            assert!(n.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')), "{n}");
+            assert!(renderer::console_safe(n));
+        }
+        assert_ne!(a, b, "каждый план получает новую метку");
+    }
+
     /// Реальная демка (CS2_TEST_DEMO или демка из репозитория, если она скачана из LFS, а не указатель):
     /// разбор → игрок → план ролика про него и файлы.
     #[test]
@@ -324,6 +353,9 @@ mod tests {
         let p = plan_player(&mut a, hero, &o, &out, &Quiet).unwrap();
         assert!(!p.timeline.shots.is_empty() && !p.ffmpeg_args.is_empty());
         assert!(out.join("highlights.cfg").is_file() && out.join("plan.json").is_file());
+        assert_eq!(p.takes.len(), p.timeline.shots.len());
+        let cfg = std::fs::read_to_string(out.join("highlights.cfg")).unwrap();
+        assert!(cfg.contains(&format!("echo CS2C {} SCRIPT", p.nonce)), "{cfg}");
         let _ = std::fs::remove_dir_all(out);
     }
 }

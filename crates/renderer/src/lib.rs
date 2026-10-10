@@ -94,6 +94,9 @@ pub struct Config {
     pub out_dir: String,
     pub dialect: Dialect,
     pub encoder: Encoder,
+    /// Метка задачи в консольных маркерах `CS2C <nonce> …`: только `[0-9a-z]`, чтобы проходила `console_safe`
+    /// и не ломалась в `mirv_cmd`.
+    pub nonce: String,
 }
 
 impl Default for Config {
@@ -109,8 +112,17 @@ impl Default for Config {
             out_dir: ".".into(),
             dialect: Dialect::default(),
             encoder: Encoder::default(),
+            nonce: "cli".into(),
         }
     }
+}
+
+/// Первое слово маркера консоли: `CS2C <nonce> <ВИД> [n]`.
+pub const MARKER_TAG: &str = "CS2C";
+
+/// Строка маркера консоли `CS2C <nonce> <what>`. Формат общий для генератора cfg и парсера в `pipeline::record`.
+pub fn marker(nonce: &str, what: &str) -> String {
+    format!("{MARKER_TAG} {nonce} {what}")
 }
 
 #[derive(Debug, Default)]
@@ -162,6 +174,8 @@ pub fn render(m: &Match, t: &Timeline, cfg: &Config) -> Output {
     let _ = writeln!(s, "// Рядом должны лежать cs2c_NN.cfg — по скрипту на шот.");
     let _ = writeln!(s, "// Дубли пишутся в {}/clips (takeNNNN по порядку записи). Перед повторной записью", cfg.out_dir);
     let _ = writeln!(s, "// удалите старую папку clips, иначе assemble склеит старые дубли.");
+    // первая команда скрипта: по этой метке приложение понимает, что highlights.cfg запущен
+    let _ = writeln!(s, "echo {}", marker(&cfg.nonce, "SCRIPT"));
     let _ = writeln!(s, "mirv_streams record name \"{}/clips\"", cfg.out_dir);
     let _ = writeln!(s, "mirv_streams record screen enabled 1");
     match &d.record_ffmpeg {
@@ -199,7 +213,8 @@ pub fn render(m: &Match, t: &Timeline, cfg: &Config) -> Output {
         let at = |s: &mut String, tick: i32, cmds: &str| {
             let _ = writeln!(s, "mirv_cmd addAtTick {tick} \"{cmds}\"");
         };
-        at(&mut s, shot.start_tick, "mirv_streams record start");
+        let start_marker = marker(&cfg.nonce, &format!("TAKE_START {i}"));
+        at(&mut s, shot.start_tick, &format!("mirv_streams record start; echo {start_marker}"));
         for (si, seg) in shot.segments.iter().enumerate() {
             if let Some(style) = &seg.style {
                 let _ = writeln!(s, "// камера {style} (красочность {:.2})", seg.colorfulness.unwrap_or_default());
@@ -223,10 +238,11 @@ pub fn render(m: &Match, t: &Timeline, cfg: &Config) -> Output {
             Some(next) if (shot.end_tick + 2..=shot.end_tick + t.tick_rate as i32).contains(&next.start_tick) => format!("exec {}", shot_cfg(i + 1)),
             // запас после перемотки: игра догружает сцену и первые кадры иначе выходят тёмными
             Some(next) => format!("exec {}; demo_gototick {}", shot_cfg(i + 1), (next.start_tick - SEEK_MARGIN_SECS * t.tick_rate as i32).max(0)),
-            None => "mirv_cmd clear; engine_no_focus_sleep 20; demo_pause".to_owned(),
+            None => format!("echo {}; mirv_cmd clear; engine_no_focus_sleep 20; demo_pause", marker(&cfg.nonce, "ALL_DONE")),
         };
-        // маркер для приложения: дубль дописан (читается через netcon)
-        at(&mut s, shot.end_tick, &format!("mirv_streams record end; mirv_campath enabled 0; mirv_fov default; echo {TAKE_DONE}{i}; {tail}"));
+        // маркеры для приложения: начало и конец дубля с nonce задачи (читаются через netcon)
+        let end_marker = marker(&cfg.nonce, &format!("TAKE_END {i}"));
+        at(&mut s, shot.end_tick, &format!("mirv_streams record end; mirv_campath enabled 0; mirv_fov default; echo {end_marker}; {tail}"));
         out.files.push((format!("{}.cfg", shot_cfg(i)), s));
     }
 
@@ -238,8 +254,6 @@ pub fn render(m: &Match, t: &Timeline, cfg: &Config) -> Output {
     out
 }
 
-/// Строка в консоли игры после каждого дубля: `CS2C_TAKE_DONE <номер записи>`.
-pub const TAKE_DONE: &str = "CS2C_TAKE_DONE ";
 /// За сколько секунд до шота перематывать демку: после `demo_gototick` игра догружает сцену.
 const SEEK_MARGIN_SECS: i32 = 2;
 
@@ -248,6 +262,46 @@ pub fn record_order(t: &Timeline) -> Vec<usize> {
     let mut order: Vec<usize> = (0..t.shots.len()).collect();
     order.sort_by_key(|&k| (t.shots[k].start_tick, k));
     order
+}
+
+/// Ожидаемый дубль записи: выводится из плана до начала записи.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TakePlan {
+    /// Номер дубля = позиция шота в порядке записи (`takeNNNN`).
+    pub index: u32,
+    /// Индекс шота в `Timeline::shots`.
+    pub shot: usize,
+    /// Длительность шота в игровом времени, секунды (`(end_tick - start_tick) / tick_rate`).
+    pub game_secs: f32,
+    /// fps записи этого шота (`mirv_streams record fps`).
+    pub capture_fps: u32,
+}
+
+impl TakePlan {
+    /// Файлы, которые HLAE кладёт в папку готового дубля.
+    pub const FILES: [&'static str; 2] = ["video.mp4", "audio.wav"];
+
+    /// Имя папки дубля внутри `clips/`: `take0000`.
+    pub fn dir_name(&self) -> String {
+        format!("take{:04}", self.index)
+    }
+}
+
+/// Ожидаемые дубли в порядке записи: по одному на шот.
+pub fn takes(t: &Timeline, cfg: &Config) -> Vec<TakePlan> {
+    record_order(t)
+        .into_iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let shot = &t.shots[k];
+            TakePlan {
+                index: i as u32,
+                shot: k,
+                game_secs: (shot.end_tick - shot.start_tick).max(0) as f32 / t.tick_rate,
+                capture_fps: capture_fps(shot, cfg),
+            }
+        })
+        .collect()
 }
 
 /// Номер дубля каждого шота: `take_of[шот] = позиция в порядке записи`.
@@ -648,10 +702,10 @@ mod tests {
         assert!(first.starts_with("// Шот 2 -> take0000") && first.contains("mirv_cmd clear"), "{first}");
         assert!(first.contains("spec_player 4; spec_mode 3"), "chase, слот 3 -> 4: {first}");
         // после шота 1000..1400 — вперёд к 5000..5400 (запас 2 с), с маркером дубля для приложения
-        assert!(first.contains("echo CS2C_TAKE_DONE 0; exec cs2c_02; demo_gototick 4872"), "{first}");
+        assert!(first.contains("echo CS2C cli TAKE_END 0; exec cs2c_02; demo_gototick 4872"), "{first}");
         assert!(s.contains("hideconsole"), "{s}");
         assert!(second.contains("spec_player 4; spec_mode 2"), "POV");
-        assert!(second.contains("echo CS2C_TAKE_DONE 1; mirv_cmd clear") && second.contains("demo_pause"), "последний шот останавливает демку");
+        assert!(second.contains("echo CS2C cli TAKE_END 1; echo CS2C cli ALL_DONE; mirv_cmd clear") && second.contains("demo_pause"), "последний шот останавливает демку");
         for f in [s, first, second] {
             assert!(!f.contains("timescale"), "замедление — при склейке, не в игре");
             // в mirv_cmd кавычки теряются, а консоль режет по ':' — абсолютных путей внутри быть не должно
@@ -673,6 +727,43 @@ mod tests {
     }
 
     #[test]
+    fn markers_carry_the_nonce_and_cover_every_take() {
+        let (m, t) = setup();
+        let cfg = Config { nonce: "ab12cd34".into(), ..Config::default() };
+        let out = render(&m, &t, &cfg);
+        let s = out.file("highlights.cfg").unwrap();
+        let first_cmd = s.lines().find(|l| !l.starts_with("//") && !l.is_empty()).unwrap();
+        assert_eq!(first_cmd, "echo CS2C ab12cd34 SCRIPT", "{s}");
+        let first = out.file("cs2c_01.cfg").unwrap();
+        let second = out.file("cs2c_02.cfg").unwrap();
+        assert!(first.contains("mirv_cmd addAtTick 1000 \"mirv_streams record start; echo CS2C ab12cd34 TAKE_START 0\""), "{first}");
+        assert!(first.contains("echo CS2C ab12cd34 TAKE_END 0"), "{first}");
+        assert!(second.contains("mirv_cmd addAtTick 5000 \"mirv_streams record start; echo CS2C ab12cd34 TAKE_START 1\""), "{second}");
+        assert!(second.contains("echo CS2C ab12cd34 TAKE_END 1"), "{second}");
+        assert!(!s.contains("ALL_DONE") && !first.contains("ALL_DONE"), "ALL_DONE только у последнего дубля");
+        assert!(second.contains("echo CS2C ab12cd34 ALL_DONE"), "{second}");
+        for (name, body) in &out.files {
+            assert!(!body.contains(concat!("TAKE", "_DONE")), "старый маркер остался в {name}");
+        }
+    }
+
+    #[test]
+    fn takes_follow_record_order_with_game_length() {
+        let (_, t) = setup();
+        let takes = takes(&t, &Config::default());
+        assert_eq!(takes.len(), 2);
+        // первым пишется ранний по демке шот (второй в показе)
+        assert_eq!(takes[0].shot, 1);
+        assert_eq!(takes[1].shot, 0);
+        assert_eq!((takes[0].index, takes[1].index), (0, 1));
+        assert_eq!((takes[0].dir_name().as_str(), takes[1].dir_name().as_str()), ("take0000", "take0001"));
+        assert!((takes[0].game_secs - 400.0 / 64.0).abs() < 1e-4, "{}", takes[0].game_secs);
+        assert!((takes[1].game_secs - 400.0 / 64.0).abs() < 1e-4);
+        assert_eq!((takes[0].capture_fps, takes[1].capture_fps), (240, 60));
+        assert_eq!(TakePlan::FILES, ["video.mp4", "audio.wav"]);
+    }
+
+    #[test]
     fn close_shots_play_through_and_nvenc_is_used() {
         let (m, mut t) = setup();
         // второй по демке шот начинается через 0.5 с после первого — без перемотки
@@ -683,7 +774,7 @@ mod tests {
         cfg.dialect.record_ffmpeg = Some(TAKE_NVENC.into());
         let out = render(&m, &t, &cfg);
         let first = out.file("cs2c_01.cfg").unwrap();
-        assert!(first.contains("echo CS2C_TAKE_DONE 0; exec cs2c_02\""), "{first}");
+        assert!(first.contains("echo CS2C cli TAKE_END 0; exec cs2c_02\""), "{first}");
         let s = out.file("highlights.cfg").unwrap();
         assert!(s.contains("mirv_streams settings add ffmpeg cs2c \"-vcodec h264_nvenc") && s.contains("record screen settings cs2c"), "{s}");
         assert!(!s.contains("-c:v"), "консоль режет по ':'");

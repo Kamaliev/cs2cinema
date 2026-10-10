@@ -159,7 +159,7 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
         launch::install_files(&s.cs2_dir, &out_dir, &demo_name, |path| a.write_demo(path))?;
         let started = std::time::Instant::now();
         // отмена во время записи — закрываем игру, иначе она так и будет писать дубли
-        let r = record(s, &out_dir, &demo_name, last, p);
+        let r = record(s, &out_dir, &demo_name, last, &plan.nonce, p);
         if r.as_ref().is_err_and(|e| e == pipeline::CANCELLED) {
             launch::kill_game();
         }
@@ -186,7 +186,7 @@ const EXEC_RETRIES: u32 = 4;
 const RECONNECT_EVERY: Duration = Duration::from_secs(10);
 
 /// Запись: CS2 через HLAE, скрипт `highlights` как только демка пошла, ждём последний дубль и закрываем игру.
-fn record(s: &Settings, out_dir: &Path, demo_name: &str, last: usize, p: &JobReporter) -> Result<(), String> {
+fn record(s: &Settings, out_dir: &Path, demo_name: &str, last: usize, nonce: &str, p: &JobReporter) -> Result<(), String> {
     let since = SystemTime::now();
     p.log("запускаю CS2 через HLAE…");
     // свой порт на каждый запуск: фиксированный может держать «мёртвый» сокет прошлой игры
@@ -197,6 +197,8 @@ fn record(s: &Settings, out_dir: &Path, demo_name: &str, last: usize, p: &JobRep
     let load_wait = Duration::from_secs(s.load_wait_secs as u64);
     // свои строки консоли (не эхо отправленной команды)
     let marker = |l: &str, m: &str| l.contains(m) && !l.contains("echo") && !l.contains("addAtTick");
+    // метка конца дубля с nonce этого плана: чужие запуски и старые строки консоли не совпадут
+    let take_end = renderer::marker(nonce, "TAKE_END ");
     // большая демка может грузиться дольше настройки — маркер ждём до жёсткого потолка,
     // а настройка лишь говорит, когда перестать молчать
     let load_cap = load_wait.max(LOAD_CAP);
@@ -255,8 +257,8 @@ fn record(s: &Settings, out_dir: &Path, demo_name: &str, last: usize, p: &JobRep
         }
         if let Some(c) = console_ref.borrow().as_ref() {
             for l in c.drain() {
-                let take = l.split(renderer::TAKE_DONE).nth(1).and_then(|r| r.split_whitespace().next()?.parse::<usize>().ok());
-                if let Some(n) = take.filter(|_| marker(&l, renderer::TAKE_DONE.trim())) {
+                let take = l.split(&take_end).nth(1).and_then(|r| r.split_whitespace().next()?.parse::<usize>().ok());
+                if let Some(n) = take.filter(|_| marker(&l, take_end.trim())) {
                     any_take.set(true);
                     p.log(&format!("записан дубль {}/{}", n + 1, last + 1));
                     done.set(done.get() || n >= last);

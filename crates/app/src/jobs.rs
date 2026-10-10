@@ -15,7 +15,7 @@ use std::{
 use pipeline::{
     Deadlines, FailCode, PlanOptions, Progress, RecordFailure, RecordReport, RecordRequest, RecordState, Source, Stage,
     host::{CmdSpec, Host, HostError, LaunchSpec},
-    manifest::{Manifest, RecordJson, TakeStatus},
+    manifest::{EnvSnapshot, Manifest, RecordJson, TakeStatus},
     precheck::{self, Demo, Inputs, Level, Report, ids, space},
     record::{Verify, failure},
 };
@@ -194,19 +194,20 @@ pub fn finish(store: &Store, id: i64, result: &Result<JobOutcome, RunError>) -> 
     }
 }
 
-/// Запрос записи из настроек и плана. Ограничения путей и имя демки проверяет вызывающий.
-pub fn record_request(s: &Settings, out_dir: &Path, demo_name: &str, plan: &pipeline::Plan, job_id: i64, verify: Option<Verify>) -> RecordRequest {
+/// Запрос записи из настроек и `record.json`: кадр, метка, имя демки и дубли берутся из `record.json`, а не из
+/// текущих настроек — старые скрипты и граф склейки нельзя смешивать с новым разрешением (Pattern 5).
+pub fn record_request(s: &Settings, out_dir: &Path, rj: &RecordJson, job_id: i64, verify: Option<Verify>) -> RecordRequest {
     RecordRequest {
         out_dir: out_dir.to_path_buf(),
         launch: LaunchSpec {
             hlae_dir: s.hlae_dir.clone().into(),
             cs2_exe: launch::cs2_exe(&s.cs2_dir),
-            demo_name: demo_name.to_owned(),
-            size: s.frame_size(),
-            nonce: plan.nonce.clone(),
+            demo_name: rj.demo_name.clone(),
+            size: rj.frame,
+            nonce: rj.nonce.clone(),
             console_log: Some(Path::new(&s.cs2_dir).join("game/csgo/console.log")),
         },
-        takes: plan.takes.clone(),
+        takes: rj.take_plans(),
         deadlines: deadlines(s),
         header: format!("задача #{job_id} · {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")),
         afxerror_ignore: s.afxerror_ignore.clone(),
@@ -401,53 +402,114 @@ fn run(host: &dyn Host, job: &Job, s: &Settings, store: &Store, p: &JobReporter)
         return Err("в пути результатов есть пробелы — HLAE не загрузит campath; выберите папку без пробелов".into());
     }
 
-    p.stage(Stage::Record);
-    let clips = out_dir.join("clips");
-    // дубли этого же плана уже есть (например, упала склейка) — не пишем заново;
-    // ожидаемый набор дублей берём из плана, а не считаем номера сами
-    let hash = plan_hash(&out_dir, &plan.nonce);
-    let recorded = std::fs::read_to_string(clips.join("plan.hash")).is_ok_and(|h| h == hash)
-        && plan.takes.iter().all(|t| renderer::TakePlan::FILES.iter().all(|f| clips.join(t.dir_name()).join(f).is_file()));
-    if recorded {
-        p.log("дубли этого плана уже записаны — сразу склеиваю");
-    } else {
-        // второй проход места по плану (D-03): сумма игровых секунд дублей, размер кадра и демки; до запуска игры
-        if let Some(report) = report.as_mut() {
-            space_pass(host, &inputs, space::estimate(&plan.takes, s.frame_size(), a.demo_len()), report, store, job.id, p)?;
-        }
-        // старые дубли сбили бы нумерацию takeNNNN — откладываем в сторону (запись дорогая, не удаляем)
-        if clips.is_dir() {
-            let stamp = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-            std::fs::rename(&clips, out_dir.join(format!("clips_old_{stamp}"))).map_err(|e| format!("не удалось отложить прошлые дубли: {e}"))?;
-        }
-        let demo_name = format!("cs2cinema_{}", pipeline::console_name(&a.label));
-        let installed = launch::install_files(&s.cs2_dir, &out_dir, &demo_name, |path| a.write_demo(path));
-        // игру закрывает сама запись при любом выходе, в том числе при отмене
-        let recorded_run = installed.map_err(RunError::from).and_then(|()| {
-            let verify = Verify { ffprobe: "ffprobe".into(), plan_hash: hash.clone(), attempt: p.attempt, env: None };
-            let req = record_request(s, &out_dir, &demo_name, &plan, job.id, Some(verify));
-            p.log(&format!("запас по времени ×{:.2}", s.time_margin));
-            record_stage(host, &req, p)
-        });
-        // папка игры чистая при любом исходе — успех, сбой, отмена (D-05, D-06, TMO-06): запись вернулась
-        // только после подтверждённого закрытия игры, поэтому копия демки уже никем не занята
-        for note in launch::cleanup_installed(&s.cs2_dir, &out_dir) {
-            p.log(&note);
-        }
-        let rep = recorded_run?;
-        let _ = std::fs::write(clips.join("plan.hash"), &hash);
-        p.log(&format!("запись заняла {:.0} с", rep.elapsed.as_secs_f32()));
+    // скрипты плана готовы: всё, что нужно записи и склейке, — в `RecordJson` (повтор берёт его же, D-08)
+    let demo_name = format!("cs2cinema_{}", pipeline::console_name(&a.label));
+    let rj = record_json_for(&plan, &a.demo_path, a.demo_len(), &demo_name, s, take_nvenc)?;
+    // второй проход места по плану (D-03): сумма игровых секунд дублей, размер кадра и демки; до запуска игры
+    if let Some(report) = report.as_mut() {
+        space_pass(host, &inputs, space::estimate(&plan.takes, s.frame_size(), a.demo_len()), report, store, job.id, p)?;
     }
+    // первый запуск и «Заново» всегда пишут дубли с проверкой, прежние не переиспользуют (решение 2)
+    record_takes(host, s, job, &out_dir, &rj, report.as_ref(), p)?;
 
     p.stage(Stage::Assemble);
     let out = assemble_stage(host, &out_dir, &plan.takes, &plan.ffmpeg_args, plan.video_secs, deadlines(s).ffmpeg_for(plan.video_secs), p)?;
     // пара «сборка CS2 / версия HLAE» после удачной задачи, в которой шла запись (D-04, DIF-01)
-    if let (false, Some(r)) = (recorded, report.as_ref()) {
+    remember_last_good(store, report.as_ref());
+    Ok(JobOutcome { out_dir, result: out, shots, secs })
+}
+
+/// Пара «сборка CS2 / версия HLAE» удачной записи — в базу (для предупреждения об обновлении, DIF-01).
+fn remember_last_good(store: &Store, report: Option<&Report>) {
+    if let Some(r) = report {
         if let (Some(build), Some(hlae)) = (&r.cs2_build, &r.hlae_version) {
             let _ = store.set_last_good(build, hlae);
         }
     }
-    Ok(JobOutcome { out_dir, result: out, shots, secs })
+}
+
+/// Всё, что нужно записи и склейке, из плана и настроек: кадр, fps, дубли, аргументы ffmpeg, отпечаток скриптов.
+/// `secs` — длина ролика по плану (то, что показывает карточка задачи).
+fn record_json_for(plan: &pipeline::Plan, demo_path: &Path, demo_len: u64, demo_name: &str, s: &Settings, take_nvenc: bool) -> Result<RecordJson, String> {
+    let created_unix = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_secs() as i64).unwrap_or(0);
+    Ok(RecordJson {
+        version: 1,
+        nonce: plan.nonce.clone(),
+        demo_path: PathBuf::from(pipeline::absolute_slash(demo_path)),
+        demo_name: demo_name.to_owned(),
+        demo_len,
+        frame: s.frame_size(),
+        fps: s.fps,
+        take_nvenc,
+        takes: plan.takes.iter().map(pipeline::manifest::TakeSpec::from).collect(),
+        ffmpeg_args: plan.ffmpeg_args.clone(),
+        video_secs: plan.video_secs,
+        shots: plan.timeline.shots.len(),
+        secs: plan.timeline.total_secs(),
+        plan_hash: plan_hash(&plan.out_dir, &plan.nonce),
+        created_unix,
+    })
+}
+
+/// Прежние дубли целиком — в `clips_old_<секунды>` (при совпадении имени — суффикс `-2`, `-3`, …): HLAE нумерует
+/// новые дубли «наибольший + 1», старые сбили бы нумерацию `takeNNNN`, а запись дорогая — не удаляем (D-07, D-12, RET-06).
+fn set_aside_clips(out_dir: &Path) -> Result<Option<PathBuf>, String> {
+    let clips = out_dir.join("clips");
+    if !clips.is_dir() {
+        return Ok(None);
+    }
+    let stamp = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    let mut to = out_dir.join(format!("clips_old_{stamp}"));
+    let mut n = 2;
+    while to.exists() {
+        to = out_dir.join(format!("clips_old_{stamp}-{n}"));
+        n += 1;
+    }
+    std::fs::rename(&clips, &to).map_err(|e| format!("не удалось отложить прошлые дубли: {e}"))?;
+    Ok(Some(to))
+}
+
+/// Одна дорога записи для первого запуска, «Заново» и «Повторить»: прежние дубли в сторону, снимок окружения,
+/// установка файлов в игру, запись с проверкой дублей, уборка папки игры при любом исходе (OBS-03, D-05, D-07).
+fn record_takes(
+    host: &dyn Host,
+    s: &Settings,
+    job: &Job,
+    out_dir: &Path,
+    rj: &RecordJson,
+    report: Option<&Report>,
+    p: &JobReporter,
+) -> Result<RecordReport, RunError> {
+    p.stage(Stage::Record);
+    if let Some(to) = set_aside_clips(out_dir)? {
+        p.log(&format!("прошлые дубли отложены в {}", to.file_name().unwrap_or_default().to_string_lossy()));
+    }
+    // снимок окружения — в env.json, в манифест попытки и строкой в журнал
+    let nvenc_assemble = rj.ffmpeg_args.iter().any(|a| a == "h264_nvenc");
+    let env = match report {
+        Some(r) => EnvSnapshot::from_report(r, rj.frame, rj.fps, nvenc_assemble, rj.take_nvenc),
+        None => EnvSnapshot { frame: rj.frame, fps: rj.fps, nvenc_assemble, nvenc_takes: rj.take_nvenc, ..EnvSnapshot::default() },
+    };
+    if let Err(e) = env.save(out_dir) {
+        p.log(&format!("env.json не записан: {e}"));
+    }
+    p.log(&env.one_line());
+    let installed = launch::install_files(&s.cs2_dir, out_dir, &rj.demo_name, |path| pipeline::write_demo_copy(&rj.demo_path, path));
+    // игру закрывает сама запись при любом выходе, в том числе при отмене
+    let recorded_run = installed.map_err(RunError::from).and_then(|()| {
+        let verify = Verify { ffprobe: "ffprobe".into(), plan_hash: rj.plan_hash.clone(), attempt: p.attempt, env: Some(env) };
+        let req = record_request(s, out_dir, rj, job.id, Some(verify));
+        p.log(&format!("запас по времени ×{:.2}", s.time_margin));
+        record_stage(host, &req, p)
+    });
+    // папка игры чистая при любом исходе — успех, сбой, отмена (D-05, D-06, TMO-06): запись вернулась
+    // только после подтверждённого закрытия игры, поэтому копия демки уже никем не занята
+    for note in launch::cleanup_installed(&s.cs2_dir, out_dir) {
+        p.log(&note);
+    }
+    let rep = recorded_run?;
+    p.log(&format!("запись заняла {:.0} с", rep.elapsed.as_secs_f32()));
+    Ok(rep)
 }
 
 /// Повтору нечего взять из папки задачи: типизированный сбой `RETRY_NO_DATA` (D-08).
@@ -486,7 +548,27 @@ fn resume_job(host: &dyn Host, job: &Job, s: &Settings, store: &Store, p: &JobRe
         let out = assemble_stage(host, &out_dir, &takes, &rj.ffmpeg_args, rj.video_secs, deadlines(s).ffmpeg_for(rj.video_secs), p)?;
         return Ok(outcome(out));
     }
-    Err(retry_no_data("запись дублей заново появится в следующем шаге"))
+    // не все дубли проверены: HLAE нумерует новые дубли «наибольший + 1» и не заполняет пропуски, поэтому
+    // дописать только недостающие нельзя — записываем все заново, прежние уходят в `clips_old_<ts>` (D-07, RET-06)
+    let not_validated = match &manifest {
+        None => "манифест дублей не найден".to_owned(),
+        Some(m) => takes
+            .iter()
+            .filter(|t| m.entry(t.index).is_none_or(|e| e.status != TakeStatus::Validated))
+            .map(|t| (t.index + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    p.log(&format!("дубли не все проверены: {not_validated} — записываю все заново (новые дубли HLAE нумерует подряд)"));
+    // демка — из record.json, не из скачивания: предпроверка скажет, если её нет (PRECHECK_FAILED)
+    let inputs = precheck_inputs(s, Demo::File(rj.demo_path.clone()), store.last_good().ok().flatten());
+    let mut report = precheck_stage(host, &inputs, store, job.id, p)?;
+    space_pass(host, &inputs, space::estimate(&takes, rj.frame, rj.demo_len), &mut report, store, job.id, p)?;
+    record_takes(host, s, job, &out_dir, &rj, Some(&report), p)?;
+    p.stage(Stage::Assemble);
+    let out = assemble_stage(host, &out_dir, &takes, &rj.ffmpeg_args, rj.video_secs, deadlines(s).ffmpeg_for(rj.video_secs), p)?;
+    remember_last_good(store, Some(&report));
+    Ok(outcome(out))
 }
 
 /// Последний аргумент склейки — `highlights.mp4`; ролик пишется во временный `highlights.part.mp4` (D-06).
@@ -948,20 +1030,54 @@ mod tests {
         assert!(!launch::has_nvenc(&host, Path::new("ffmpeg"), Duration::from_secs(20), &|| false));
     }
 
+    /// `record.json` на `n` дублей по 5 игровых секунд в кадре 1280x720, как у дублей фейка.
+    fn sample_record_json(n: usize, demo: PathBuf, plan_hash: String) -> RecordJson {
+        let takes: Vec<TakePlan> = (0..n as u32).map(|index| TakePlan { index, shot: index as usize, game_secs: 5.0, capture_fps: 60 }).collect();
+        let mut args: Vec<String> = vec!["-y".into()];
+        for t in &takes {
+            for f in TakePlan::FILES {
+                args.extend(["-i".to_owned(), format!("clips/{}/{f}", t.dir_name())]);
+            }
+        }
+        args.extend(["-map", "[v]", "highlights.mp4"].map(String::from));
+        RecordJson {
+            version: 1,
+            nonce: "ab12cd34".into(),
+            demo_path: demo,
+            demo_name: "cs2cinema_match_hero".into(),
+            demo_len: 12,
+            frame: (1280, 720),
+            fps: 60,
+            take_nvenc: false,
+            takes: takes.iter().map(pipeline::manifest::TakeSpec::from).collect(),
+            ffmpeg_args: args,
+            video_secs: 10.0,
+            shots: takes.len(),
+            secs: 5.0 * takes.len() as f32,
+            plan_hash,
+            created_unix: 1,
+        }
+    }
+
     #[test]
     fn afxerror_ignore_from_settings_reaches_the_record_request() {
         let mut s = Settings::default();
-        let plan = pipeline::Plan {
-            timeline: director::Timeline { map: "de_nuke".into(), tick_rate: 64.0, server_start_tick: 0, shots: vec![] },
-            out_dir: std::path::PathBuf::new(),
-            ffmpeg_args: vec![],
-            video_secs: 0.0,
-            takes: two_takes(),
-            nonce: "ab12cd34".into(),
-        };
-        assert!(record_request(&s, Path::new("out"), "cs2cinema_m", &plan, 7, None).afxerror_ignore.is_empty(), "по умолчанию список пуст");
+        let rj = sample_record_json(2, PathBuf::from("match.dem"), "h".into());
+        assert!(record_request(&s, Path::new("out"), &rj, 7, None).afxerror_ignore.is_empty(), "по умолчанию список пуст");
         s.afxerror_ignore = vec!["shader cache".into()];
-        assert_eq!(record_request(&s, Path::new("out"), "cs2cinema_m", &plan, 7, None).afxerror_ignore, vec!["shader cache".to_owned()]);
+        assert_eq!(record_request(&s, Path::new("out"), &rj, 7, None).afxerror_ignore, vec!["shader cache".to_owned()]);
+    }
+
+    #[test]
+    fn resume_launches_at_the_recorded_frame_not_the_current_setting() {
+        let mut s = Settings::default();
+        s.resolution = 1080;
+        assert_eq!(s.frame_size(), (1920, 1080));
+        let rj = sample_record_json(2, PathBuf::from("match.dem"), "h".into());
+        let req = record_request(&s, Path::new("out"), &rj, 7, None);
+        assert_eq!(req.launch.size, (1280, 720), "кадр — из record.json");
+        assert_eq!((req.launch.nonce.as_str(), req.launch.demo_name.as_str()), ("ab12cd34", "cs2cinema_match_hero"));
+        assert_eq!(req.takes, rj.take_plans());
     }
 
     use pipeline::record::verify::TakeFacts;
@@ -981,32 +1097,9 @@ mod tests {
         std::fs::write(dir.join("cs2c_01.cfg"), format!("echo CS2C {nonce} TAKE_END 0\n")).unwrap();
         let hash = plan_hash(&dir, nonce);
         let takes: Vec<TakePlan> = (0..statuses.len() as u32).map(|index| TakePlan { index, shot: index as usize, game_secs: 5.0, capture_fps: 60 }).collect();
-        let mut args: Vec<String> = vec!["-y".into()];
-        for t in &takes {
-            for f in TakePlan::FILES {
-                args.extend(["-i".to_owned(), format!("clips/{}/{f}", t.dir_name())]);
-            }
-        }
-        args.extend(["-map", "[v]", "highlights.mp4"].map(String::from));
         let demo = dir.join("match.dem");
         std::fs::write(&demo, b"PBDEMS2\0demo").unwrap();
-        let rj = RecordJson {
-            version: 1,
-            nonce: nonce.into(),
-            demo_path: demo,
-            demo_name: "cs2cinema_match_hero".into(),
-            demo_len: 12,
-            frame: (1280, 720),
-            fps: 60,
-            take_nvenc: false,
-            takes: takes.iter().map(pipeline::manifest::TakeSpec::from).collect(),
-            ffmpeg_args: args,
-            video_secs: 10.0,
-            shots: takes.len(),
-            secs: 5.0 * takes.len() as f32,
-            plan_hash: hash.clone(),
-            created_unix: 1,
-        };
+        let rj = sample_record_json(statuses.len(), demo, hash.clone());
         rj.save(&dir).unwrap();
         let clips = dir.join("clips");
         let mut m = Manifest::new(hash, nonce, (1280, 720), &takes);
@@ -1127,5 +1220,96 @@ mod tests {
         assert!(e.message.contains("скрипты записи в папке задачи изменились"), "{}", e.message);
         assert!(host.runs().is_empty());
         cleanup(&s);
+    }
+
+    /// Steam-раскладка вокруг CS2 в папке настроек: `<lib>/steamapps/common/<игра>` и манифест рядом,
+    /// чтобы предпроверка нашла сборку CS2 (она попадает в снимок окружения).
+    fn with_steam_layout(s: &mut Settings) {
+        let lib = Path::new(&s.cs2_dir).parent().unwrap().join("lib");
+        let game = lib.join("steamapps/common/Counter-Strike Global Offensive");
+        let exe = game.join("game/bin/win64/cs2.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(exe, b"x").unwrap();
+        std::fs::write(
+            lib.join("steamapps/appmanifest_730.acf"),
+            "\"AppState\"\n{\n\t\"StateFlags\"\t\t\"4\"\n\t\"buildid\"\t\t\"25815307\"\n\t\"TargetBuildID\"\t\t\"0\"\n}\n",
+        )
+        .unwrap();
+        s.cs2_dir = game.to_string_lossy().replace('\\', "/");
+    }
+
+    #[test]
+    fn retry_with_an_invalid_take_sets_clips_aside_and_records_again() {
+        let (store, job, dir, mut s) = retry_job("retry-rec", &[TakeStatus::Validated, TakeStatus::Invalid]);
+        with_steam_layout(&mut s);
+        // текущая настройка — другой кадр: запись обязана идти в кадре из record.json (1280x720)
+        s.resolution = 1080;
+        // поддельный ffmpeg склейки файлов не пишет
+        std::fs::write(dir.join("highlights.part.mp4"), b"new").unwrap();
+        let ok = pipeline::host::CmdOutput { code: Some(0), stderr_tail: vec![], elapsed: Duration::ZERO };
+        let host = FakeHost::new(
+            Scenario::happy(2)
+                .clips_dir(dir.join("clips"))
+                .program_for("ffmpeg", "-version", &["ffmpeg version 7.1.1 Copyright (c) the FFmpeg developers"], Ok(ok.clone()))
+                .program_for("ffprobe", "-version", &["ffprobe version 7.1.1 Copyright (c) the FFmpeg developers"], Ok(ok)),
+        );
+        let out = run(&host, &job, &s, &store, &reporter(&store, &job)).expect("повтор записывает дубли заново и склеивает");
+
+        assert_eq!(host.launches(), 1, "игра запущена один раз");
+        assert_eq!(out.result, dir.join("highlights.mp4"));
+        assert_eq!(std::fs::read(dir.join("highlights.mp4")).unwrap(), b"new");
+        assert!(!dir.join("installed.json").exists(), "папка игры убрана после записи");
+
+        // прежние дубли и манифест — в clips_old_<ts> как улики
+        let old: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("clips_old_"))
+            .collect();
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert!(old[0].join("take0000/video.mp4").is_file() && old[0].join("take0001/video.mp4").is_file());
+        let old_manifest = Manifest::load(&old[0]).expect("прежний манифест");
+        assert_eq!(old_manifest.entry(1).map(|e| e.status), Some(TakeStatus::Invalid));
+
+        // оба дубля записаны заново и проверены с номером попытки задачи
+        let m = Manifest::load(&dir.join("clips")).expect("новый манифест");
+        assert_eq!(m.takes.len(), 2);
+        for t in &m.takes {
+            assert_eq!((t.status, t.attempt), (TakeStatus::Validated, job.attempt), "{t:?}");
+        }
+
+        // снимок окружения: env.json, манифест попытки и журнал
+        let env: EnvSnapshot = serde_json::from_str(&std::fs::read_to_string(dir.join("env.json")).expect("env.json в папке задачи")).unwrap();
+        assert_eq!(env.cs2_build.as_deref(), Some("25815307"));
+        assert!(env.hlae_version.as_deref().is_some_and(|v| v.starts_with("2.192")), "{env:?}");
+        assert!(env.ffmpeg.as_deref().is_some_and(|v| v.contains("7.1.1")), "{env:?}");
+        assert_eq!(env.frame, (1280, 720));
+        assert_eq!(m.attempts.last().and_then(|a| a.env.as_ref()), Some(&env), "тот же снимок у попытки в манифесте");
+        let log = store.job(job.id).unwrap().unwrap().log;
+        assert!(log.contains("окружение: CS2 25815307"), "{log}");
+        assert!(log.contains("прошлые дубли отложены в clips_old_"), "{log}");
+        assert!(log.contains("дубли не все проверены: 2"), "{log}");
+        // успешная запись запоминает пару «сборка CS2 / версия HLAE»
+        assert_eq!(store.last_good().unwrap().map(|g| g.cs2_build), Some("25815307".to_owned()));
+        cleanup(&s);
+    }
+
+    #[test]
+    fn set_aside_clips_never_overwrites_an_earlier_set_aside_folder() {
+        let dir = std::env::temp_dir().join(format!("cs2cinema-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(set_aside_clips(&dir).unwrap(), None, "нет clips — нечего откладывать");
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..3 {
+            std::fs::create_dir_all(dir.join("clips")).unwrap();
+            std::fs::write(dir.join("clips/marker.txt"), i.to_string()).unwrap();
+            let to = set_aside_clips(&dir).unwrap().expect("clips отложены");
+            assert!(to.file_name().unwrap().to_string_lossy().starts_with("clips_old_"));
+            assert!(seen.insert(to.clone()), "имя {to:?} уже занято");
+            assert_eq!(std::fs::read_to_string(to.join("marker.txt")).unwrap(), i.to_string());
+            assert!(!dir.join("clips").exists());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

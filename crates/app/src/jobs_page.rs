@@ -1,7 +1,10 @@
 //! Страница «Задачи»: очередь и история задач на монтаж — карточками с превью и прогрессом.
 
 use eframe::egui::{self, RichText, Ui};
-use pipeline::{RecordState, Stage};
+use pipeline::{
+    RecordState, Stage,
+    precheck::{Level, Report},
+};
 use store::{Job, JobKind, JobStatus};
 
 use crate::{
@@ -126,6 +129,12 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                         ui::pill(ui, "отменена", MUTED);
                     }
                 });
+                // отчёт предпроверки: у упавшей на ней задачи раскрыт
+                if j.kind == JobKind::Record {
+                    if let Some(r) = j.precheck.as_deref().and_then(Report::from_json) {
+                        precheck_view(ui, ("precheck", j.id), &r, j.fail_state.as_deref() == Some("precheck"));
+                    }
+                }
                 match j.status {
                     JobStatus::Running | JobStatus::Cancelling if !j.phase.is_empty() => ladder(ui, j, if running { app.status.take_now } else { None }),
                     JobStatus::Failed if j.fail_state.is_some() => ladder(ui, j, None),
@@ -198,6 +207,50 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                     ui.label(RichText::new(text).monospace().small());
                 });
             });
+        }
+    });
+}
+
+/// Число с существительным в нужной форме: 1 ошибка, 2 ошибки, 5 ошибок.
+fn plural(n: usize, one: &str, few: &str, many: &str) -> String {
+    let word = match (n % 100, n % 10) {
+        (11..=14, _) => many,
+        (_, 1) => one,
+        (_, 2..=4) => few,
+        _ => many,
+    };
+    format!("{n} {word}")
+}
+
+/// Отчёт предпроверки: свёрнутый заголовок с итогом и строки ✔ / ⚠ / ✖ с сообщением; у `warn` и `fail` под строкой подсказка (PRE-01).
+/// `open` — раскрыт ли отчёт сразу (у задачи, упавшей на предпроверке).
+pub fn precheck_view(ui: &mut Ui, salt: impl std::hash::Hash, r: &Report, open: bool) {
+    let count = |level: Level| r.items.iter().filter(|i| i.level == level).count();
+    let (fails, warns) = (count(Level::Fail), count(Level::Warn));
+    let title = if fails > 0 {
+        format!("Предпроверка: {}", plural(fails, "ошибка", "ошибки", "ошибок"))
+    } else if warns > 0 {
+        format!("Предпроверка: {}", plural(warns, "предупреждение", "предупреждения", "предупреждений"))
+    } else {
+        "Предпроверка: всё в порядке".to_owned()
+    };
+    egui::CollapsingHeader::new(title).id_salt(salt).default_open(open).show(ui, |ui| {
+        for item in &r.items {
+            let (glyph, color) = match item.level {
+                Level::Ok => ("✔", OK),
+                Level::Warn => ("⚠", ACCENT),
+                Level::Fail => ("✖", BAD),
+            };
+            ui.horizontal_top(|ui| {
+                ui.label(RichText::new(glyph).color(color));
+                ui.add(egui::Label::new(RichText::new(&item.message).color(color)).wrap());
+            });
+            if item.level != Level::Ok && !item.hint.is_empty() {
+                ui.horizontal_top(|ui| {
+                    ui.add_space(18.0);
+                    ui.add(egui::Label::new(RichText::new(&item.hint).color(MUTED).size(12.5)).wrap());
+                });
+            }
         }
     });
 }

@@ -311,6 +311,11 @@ pub fn absolute_slash(p: &Path) -> String {
 }
 
 impl Analysis {
+    /// Размер распакованной демки в байтах — столько занимает её копия в `game/csgo` (диск CS2, D-03).
+    pub fn demo_len(&self) -> u64 {
+        self.data.len() as u64
+    }
+
     /// Кладёт распакованную демку в `path` (CS2 читает `.dem` из `game/csgo`, архивы `.zst` не понимает).
     pub fn write_demo(&self, path: &Path) -> Result<()> {
         std::fs::write(path, &self.data).map_err(|e| format!("{}: {e}", path.display()))

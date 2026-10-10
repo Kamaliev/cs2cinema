@@ -13,8 +13,9 @@ use std::{
 };
 
 use pipeline::{
-    Deadlines, FailCode, PlanOptions, Progress, RecordFailure, RecordReport, RecordRequest, Source, Stage,
+    Deadlines, FailCode, PlanOptions, Progress, RecordFailure, RecordReport, RecordRequest, RecordState, Source, Stage,
     host::{CmdSpec, Host, HostError, LaunchSpec},
+    precheck::{self, Demo, Inputs, Level, Report, ids, space},
 };
 use store::{Job, JobFailure, JobKind, JobOutcome, JobSource, Store};
 
@@ -136,6 +137,70 @@ pub fn record_stage(host: &dyn Host, req: &RecordRequest, p: &dyn Progress) -> R
         .map_err(|f| if f.code == FailCode::Cancelled { RunError::from(pipeline::CANCELLED) } else { RunError { message: f.message.clone(), fail: Some(f) } })
 }
 
+/// Нужна ли задаче предпроверка окружения: «только план» ничего не пишет, поэтому её пропускает (D-01).
+pub fn needs_precheck(kind: JobKind) -> bool {
+    kind != JobKind::Plan
+}
+
+/// Что проверять: пути из настроек, дедлайны с «Запасом по времени», пара последней удачной записи.
+/// Один построитель для задачи и для кнопки в настройках (D-01).
+pub fn precheck_inputs(s: &Settings, demo: Demo, last_good: Option<store::LastGood>) -> Inputs {
+    Inputs {
+        hlae_dir: s.hlae_dir.clone().into(),
+        cs2_dir: s.cs2_dir.clone().into(),
+        out_root: s.out_root.clone().into(),
+        demo,
+        last_good: last_good.map(|g| (g.cs2_build, g.hlae_version)),
+        deadlines: deadlines(s),
+        ffmpeg: "ffmpeg".into(),
+        ffprobe: "ffprobe".into(),
+    }
+}
+
+/// Демка задачи для предпроверки: файл, готовая скачанная копия из реестра или «ещё скачать».
+fn job_demo(job: &Job, store: &Store) -> Demo {
+    match &job.source {
+        JobSource::File(p) => Demo::File(p.clone()),
+        JobSource::Faceit(id) => match store.demo_path(id) {
+            Ok(Some(path)) => Demo::File(path),
+            _ => Demo::Download,
+        },
+    }
+}
+
+/// Предпроверка первым шагом записи (PRE-02, D-01, D-02): отчёт уходит в базу, `fail` останавливает задачу
+/// типизированным сбоем на ступени «предпроверка», `warn` остаются в журнале и запись идёт дальше.
+pub fn precheck_stage(host: &dyn Host, inputs: &Inputs, store: &Store, id: i64, p: &dyn Progress) -> Result<Report, RunError> {
+    p.event(&pipeline::Event::State { state: RecordState::Precheck, take: None });
+    let t0 = host.now();
+    let report = precheck::run(host, inputs, p)?;
+    let _ = store.set_precheck(id, &report.to_json());
+    if let Some(f) = report.failure(host.now().saturating_sub(t0)) {
+        return Err(RunError { message: f.message.clone(), fail: Some(f) });
+    }
+    // лестница прячется до начала записи
+    let _ = store.set_phase(id, "");
+    Ok(report)
+}
+
+/// Второй проход оценки места по плану (D-03, PRE-06): пункты места в отчёте заменяются, нехватка места
+/// (`fail`) останавливает задачу до запуска игры, `warn` и `fail` попадают в журнал.
+fn space_pass(host: &dyn Host, inputs: &Inputs, need: space::Need, report: &mut Report, store: &Store, id: i64, p: &dyn Progress) -> Result<(), RunError> {
+    precheck::check_space(host, inputs, need, report);
+    let _ = store.set_precheck(id, &report.to_json());
+    for item in report.items.iter().filter(|i| matches!(i.id.as_str(), ids::SPACE_RESULTS | ids::SPACE_CS2)) {
+        match item.level {
+            Level::Ok => {}
+            Level::Warn => p.log(&format!("предпроверка: ⚠ {}", item.message)),
+            Level::Fail => p.log(&format!("предпроверка: ✖ {}", item.message)),
+        }
+    }
+    match report.failure(Duration::ZERO) {
+        Some(f) => Err(RunError { message: f.message.clone(), fail: Some(f) }),
+        None => Ok(()),
+    }
+}
+
 /// Запускает следующую задачу из очереди, если сейчас ничего не выполняется.
 pub fn run_next(app: &mut App) {
     if app.jobs.running.is_some() || app.status.busy {
@@ -163,6 +228,10 @@ pub fn run_next(app: &mut App) {
 
 /// Весь путь задачи: демка -> план -> (запись -> склейка); исполняется в фоновом потоке.
 fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOutcome, RunError> {
+    let host = pipeline::host::default_host();
+    // предпроверка окружения — до скачивания, разбора и плана (PRE-02): неисправное окружение видно за секунды
+    let inputs = precheck_inputs(s, job_demo(job, store), store.last_good().ok().flatten());
+    let mut report = if needs_precheck(job.kind) { Some(precheck_stage(&*host, &inputs, store, job.id, p)?) } else { None };
     let src = match &job.source {
         // скачанную демку берём из реестра, иначе качаем
         JobSource::Faceit(id) => match store.demo_path(id)? {
@@ -208,13 +277,12 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
         return Ok(JobOutcome { out_dir: out_dir.clone(), result: out_dir, shots, secs });
     }
     pipeline::check(p)?;
-    launch::check_paths(&s.hlae_dir, &s.cs2_dir)?;
+    // пути HLAE и CS2 проверила предпроверка; путь результатов должен годиться для консоли HLAE
     if !renderer::console_safe(&pipeline::absolute_slash(&out_dir)) {
         return Err("в пути результатов есть пробелы — HLAE не загрузит campath; выберите папку без пробелов".into());
     }
 
     p.stage(Stage::Record);
-    let host = pipeline::host::default_host();
     let clips = out_dir.join("clips");
     // дубли этого же плана уже есть (например, упала склейка) — не пишем заново;
     // ожидаемый набор дублей берём из плана, а не считаем номера сами
@@ -224,6 +292,10 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
     if recorded {
         p.log("дубли этого плана уже записаны — сразу склеиваю");
     } else {
+        // второй проход места по плану (D-03): сумма игровых секунд дублей, размер кадра и демки; до запуска игры
+        if let Some(report) = report.as_mut() {
+            space_pass(&*host, &inputs, space::estimate(&plan.takes, s.frame_size(), a.demo_len()), report, store, job.id, p)?;
+        }
         // старые дубли сбили бы нумерацию takeNNNN — откладываем в сторону (запись дорогая, не удаляем)
         if clips.is_dir() {
             let stamp = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_secs()).unwrap_or(0);
@@ -244,6 +316,12 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
     let out = out_dir.join("highlights.mp4");
     run_ffmpeg(&*host, &out_dir, &plan.ffmpeg_args, plan.video_secs, deadlines(s).ffmpeg_for(plan.video_secs), p)?;
     p.log(&format!("ролик готов: {}", out.display()));
+    // пара «сборка CS2 / версия HLAE» после удачной задачи, в которой шла запись (D-04, DIF-01)
+    if let (false, Some(r)) = (recorded, report.as_ref()) {
+        if let (Some(build), Some(hlae)) = (&r.cs2_build, &r.hlae_version) {
+            let _ = store.set_last_good(build, hlae);
+        }
+    }
     ui::open_path(&out);
     Ok(JobOutcome { out_dir, result: out, shots, secs })
 }
@@ -464,5 +542,71 @@ mod tests {
         finish(&store, id, &Err(RunError::from("игрок не найден"))).unwrap();
         let j = store.job(id).unwrap().unwrap();
         assert_eq!((j.status, j.error.as_deref(), j.fail_code), (JobStatus::Failed, Some("игрок не найден"), None));
+    }
+
+    use pipeline::host::ProcInfo;
+
+    fn proc(pid: u32, exe: &str) -> ProcInfo {
+        ProcInfo { pid, exe_name: exe.to_owned() }
+    }
+
+    /// Настройки с временным деревом HLAE и CS2, где есть всё нужное предпроверке.
+    fn healthy_settings(tag: &str) -> Settings {
+        let root = std::env::temp_dir().join(format!("cs2cinema-precheck-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for f in ["hlae/HLAE.exe", "hlae/x64/AfxHookSource2.dll", "hlae/ffmpeg/bin/ffmpeg.exe", "cs2/game/bin/win64/cs2.exe"] {
+            let path = root.join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+        let slash = |p: std::path::PathBuf| p.to_string_lossy().replace('\\', "/");
+        Settings { hlae_dir: slash(root.join("hlae")), cs2_dir: slash(root.join("cs2")), out_root: slash(root.join("out")), ..Settings::default() }
+    }
+
+    #[test]
+    fn plan_job_skips_the_precheck() {
+        assert!(!needs_precheck(JobKind::Plan));
+        assert!(needs_precheck(JobKind::Record));
+    }
+
+    #[test]
+    fn precheck_failure_reaches_the_job_row_with_its_report() {
+        let (store, id, _dir) = running_job("precheck");
+        let s = healthy_settings("fail");
+        let host = FakeHost::new(Scenario::happy(1).processes(vec![proc(100, "steam.exe"), proc(777, "cs2.exe")]));
+        let host_ref: &dyn Host = &host;
+        let inputs = precheck_inputs(&s, Demo::NotApplicable, None);
+        let e = precheck_stage(host_ref, &inputs, &store, id, &pipeline::Quiet).expect_err("чужой CS2 останавливает запись");
+        let f = e.fail.as_ref().expect("сбой типизирован");
+        assert_eq!(f.code, FailCode::ForeignGameRunning);
+        assert_eq!(f.state, RecordState::Precheck);
+        finish(&store, id, &Err(e)).unwrap();
+
+        let j = store.job(id).unwrap().unwrap();
+        assert_eq!(j.status, JobStatus::Failed);
+        assert_eq!(j.fail_code.as_deref(), Some("FOREIGN_GAME_RUNNING"));
+        assert_eq!(j.fail_state.as_deref(), Some("precheck"));
+        let report = Report::from_json(j.precheck.as_deref().expect("отчёт сохранён")).expect("отчёт разбирается");
+        let item = report.items.iter().find(|i| i.id == ids::FOREIGN_GAME).expect("пункт чужого CS2");
+        assert_eq!(item.level, Level::Fail);
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&s.cs2_dir).parent().unwrap());
+    }
+
+    #[test]
+    fn passing_precheck_clears_the_phase_and_keeps_the_report() {
+        let (store, id, _dir) = running_job("precheck-ok");
+        store.set_phase(id, "precheck").unwrap();
+        let s = healthy_settings("ok");
+        let ok = pipeline::host::CmdOutput { code: Some(0), stderr_tail: vec![], elapsed: Duration::ZERO };
+        let host = FakeHost::new(Scenario::happy(1).program("ffmpeg", &["ffmpeg version 7.1.1 Copyright (c) the FFmpeg developers"], Ok(ok)));
+        let host_ref: &dyn Host = &host;
+        let inputs = precheck_inputs(&s, Demo::NotApplicable, None);
+        let report = precheck_stage(host_ref, &inputs, &store, id, &pipeline::Quiet).expect("окружение исправно");
+        assert!(!report.blocks(), "{report:?}");
+
+        let j = store.job(id).unwrap().unwrap();
+        assert_eq!(j.phase, "", "лестница спрятана до начала записи");
+        assert_eq!(Report::from_json(j.precheck.as_deref().unwrap()), Some(report));
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&s.cs2_dir).parent().unwrap());
     }
 }

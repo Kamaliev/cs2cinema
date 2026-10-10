@@ -2,10 +2,11 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use pipeline::host::LaunchSpec;
 use pipeline::host::fake::{FakeHost, FakeMarker, Scenario};
+use pipeline::host::{LaunchSpec, Source};
 use pipeline::record::{Deadlines, Event, FailCode, RecordRequest, RecordState, record};
 use pipeline::{Progress, Stage};
 use renderer::TakePlan;
@@ -42,13 +43,23 @@ fn request(name: &str, n: u32) -> RecordRequest {
     }
 }
 
-/// Собирает события записи в том порядке, в котором они пришли.
+/// Собирает события записи в том порядке, в котором они пришли; умеет «отменить» задачу.
 #[derive(Default)]
 struct Capture {
     events: Mutex<Vec<Event>>,
+    /// Отмена начинается после входа в это состояние.
+    cancel_after: Option<RecordState>,
+    cancel: AtomicBool,
 }
 
 impl Capture {
+    fn cancelling_after(state: RecordState) -> Self {
+        Capture {
+            cancel_after: Some(state),
+            ..Capture::default()
+        }
+    }
+
     fn events(&self) -> Vec<Event> {
         self.events.lock().unwrap().clone()
     }
@@ -78,7 +89,15 @@ impl Progress for Capture {
             .push(Event::Fact(msg.to_owned()));
     }
     fn event(&self, e: &Event) {
+        if let (Event::State { state, .. }, Some(at)) = (e, self.cancel_after)
+            && *state == at
+        {
+            self.cancel.store(true, Ordering::SeqCst);
+        }
         self.events.lock().unwrap().push(e.clone());
+    }
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
     }
 }
 
@@ -148,4 +167,262 @@ fn missing_ready_marker_fails_with_demo_not_loaded_after_the_deadline() {
     );
     assert!(f.message.contains("демка не загрузилась"), "{}", f.message);
     assert!(!f.hint.is_empty());
+}
+
+type Outcome = Result<pipeline::RecordReport, pipeline::RecordFailure>;
+
+fn secs(n: u64) -> Duration {
+    Duration::from_secs(n)
+}
+
+/// Запись на фейке со сценарием: результат, события, фейк и запрос.
+fn run(name: &str, sc: Scenario, n: u32) -> (Outcome, Capture, FakeHost, RecordRequest) {
+    let fake = FakeHost::new(sc);
+    let cap = Capture::default();
+    let req = request(name, n);
+    let r = record(&fake, &req, &cap);
+    (r, cap, fake, req)
+}
+
+fn fail_of(r: Outcome) -> pipeline::RecordFailure {
+    r.expect_err("запись обязана упасть")
+}
+
+#[test]
+fn launcher_exit_code_is_reported_as_launcher_failed() {
+    let sc = Scenario::happy(3).launcher_exit(Some(1), secs(2));
+    let (r, ..) = run("launcher-code", sc, 3);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::LauncherFailed);
+    assert_eq!(f.state, RecordState::Launcher);
+    assert!(
+        f.message.contains("HLAE.exe завершился с кодом 1"),
+        "{}",
+        f.message
+    );
+    assert!(!f.hint.is_empty());
+}
+
+#[test]
+fn launcher_that_never_exits_fails_after_the_launcher_deadline() {
+    let (r, _, _, req) = run(
+        "launcher-hang",
+        Scenario::happy(3).launcher_never_exits(),
+        3,
+    );
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::LauncherFailed);
+    assert_eq!(f.state, RecordState::Launcher);
+    assert!(f.message.contains("не завершился за 30 с"), "{}", f.message);
+    assert!(f.elapsed >= req.deadlines.launcher && f.elapsed < req.deadlines.launcher + secs(1));
+}
+
+#[test]
+fn game_that_never_appears_fails_with_game_not_started() {
+    let (r, ..) = run("no-game", Scenario::happy(3).game_never_appears(), 3);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::GameNotStarted);
+    assert_eq!(f.state, RecordState::Game);
+    assert!(
+        f.message
+            .contains("CS2 не запустилась за 20 с после выхода HLAE"),
+        "{}",
+        f.message
+    );
+}
+
+#[test]
+fn console_that_never_opens_fails_with_console_not_open() {
+    let (r, ..) = run("no-console", Scenario::happy(3).console_never_up(), 3);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::ConsoleNotOpen);
+    assert_eq!(f.state, RecordState::Console);
+    assert!(
+        f.elapsed >= secs(90) && f.elapsed < secs(91),
+        "{:?}",
+        f.elapsed
+    );
+    assert!(
+        f.message.contains("консольный порт не открылся за 90 с"),
+        "{}",
+        f.message
+    );
+}
+
+#[test]
+fn missing_script_marker_fails_with_script_not_run_and_exec_is_sent_once() {
+    let sc = Scenario::happy(3).drop_marker(FakeMarker::Script);
+    let (r, _, fake, _) = run("no-script", sc, 3);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::ScriptNotRun);
+    assert_eq!(f.state, RecordState::Script);
+    assert!(
+        f.message.contains("метка SCRIPT не пришла за 30 с"),
+        "{}",
+        f.message
+    );
+    let execs = fake
+        .sent()
+        .iter()
+        .filter(|l| *l == "exec highlights")
+        .count();
+    assert_eq!(
+        execs,
+        1,
+        "повторной отправки по таймеру нет (D-10): {:?}",
+        fake.sent()
+    );
+}
+
+#[test]
+fn missing_first_take_start_fails_with_take_timeout() {
+    let sc = Scenario::happy(3).drop_marker(FakeMarker::TakeStart(0));
+    let (r, ..) = run("no-take-start", sc, 3);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::TakeTimeout);
+    assert_eq!(f.state, RecordState::Take);
+    assert!(
+        f.message
+            .contains("Дубль 1 из 3: метка TAKE_START не пришла за 90 с"),
+        "{}",
+        f.message
+    );
+}
+
+#[test]
+fn missing_take_end_fails_with_take_timeout_naming_the_take() {
+    let sc = Scenario::happy(3).drop_marker(FakeMarker::TakeEnd(1));
+    let (r, ..) = run("no-take-end", sc, 3);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::TakeTimeout);
+    assert!(
+        f.message.contains("Дубль 2 из 3: метка TAKE_END не пришла"),
+        "{}",
+        f.message
+    );
+}
+
+#[test]
+fn all_done_does_not_stand_in_for_a_lost_last_take_end() {
+    let sc = Scenario::happy(3).drop_marker(FakeMarker::TakeEnd(2));
+    let (r, cap, fake, req) = run("all-done-vs-end", sc, 3);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::TakeTimeout);
+    assert_eq!(f.state, RecordState::Take);
+    assert!(
+        f.message.contains("Дубль 3 из 3: метка TAKE_END не пришла"),
+        "{}",
+        f.message
+    );
+    assert!(
+        f.message
+            .contains("пришла метка ALL_DONE вместо TAKE_END 2"),
+        "{}",
+        f.message
+    );
+    let limit = req.deadlines.take_run(&req.takes[2]);
+    assert!(
+        f.elapsed >= limit && f.elapsed < limit + secs(1),
+        "дедлайн дубля не остановлен ALL_DONE: {:?} против {:?}",
+        f.elapsed,
+        limit
+    );
+    assert!(
+        !fake.sent().iter().any(|l| l == "quit"),
+        "quit не отправлялся: {:?}",
+        fake.sent()
+    );
+    assert!(
+        !cap.states().iter().any(|(s, _)| *s == RecordState::Closing),
+        "в Closing не переходили"
+    );
+}
+
+#[test]
+fn game_exit_mid_take_fails_with_game_exited() {
+    // дубль 2 идёт с 18-й по 23-ю секунду виртуального времени
+    let sc = Scenario::happy(3).game_dies_at(secs(20), Some(0xC0000005));
+    let (r, ..) = run("game-dies", sc, 3);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::GameExited);
+    assert_eq!(f.state, RecordState::Take);
+    assert!(
+        f.message.contains("Игра закрылась на этапе «дубль»"),
+        "{}",
+        f.message
+    );
+    assert!(f.message.contains("дубль 2 из 3"), "{}", f.message);
+}
+
+#[test]
+fn stale_nonce_echoes_and_duplicate_markers_are_ignored() {
+    let sc = Scenario::happy(3)
+        .line_at(secs(6), Source::Netcon, "CS2C ffff0000 SCRIPT")
+        .line_at(secs(6), Source::Netcon, "CS2C ffff0000 READY")
+        .duplicate_via_console_log();
+    let (r, cap, fake, _) = run("stale-and-dups", sc, 3);
+    let report = r.expect("чужие метки и повторы не мешают записи");
+    assert_eq!(report.takes.len(), 3);
+    let done = cap
+        .events()
+        .iter()
+        .filter(|e| matches!(e, Event::TakeDone { .. }))
+        .count();
+    assert_eq!(done, 3, "каждый дубль засчитан один раз");
+    let sent = fake.sent();
+    assert_eq!(
+        sent.len(),
+        3,
+        "запрос READY, exec, quit — и ничего лишнего: {sent:?}"
+    );
+    assert_eq!(sent[1], "exec highlights");
+}
+
+#[test]
+fn late_console_gets_ready_through_the_direct_request() {
+    let sc = Scenario::happy(3).ready_only_direct().line_at(
+        secs(10),
+        Source::ConsoleLog,
+        "[HostStateManager] Host activate: Playing Demo (…)",
+    );
+    let (r, cap, fake, _) = run("late-console", sc, 3);
+    r.expect("запись должна дойти до конца через прямой запрос READY");
+    let direct = format!("echo CS2C {NONCE} READY");
+    let sent = fake.sent();
+    assert_eq!(
+        sent.iter().filter(|l| **l == direct).count(),
+        1,
+        "прямой запрос один раз: {sent:?}"
+    );
+    assert_eq!(
+        sent.iter().filter(|l| *l == "exec highlights").count(),
+        1,
+        "exec по-прежнему один раз"
+    );
+    assert!(
+        cap.lines()
+            .iter()
+            .any(|l| l.contains("запрашиваю её напрямую")),
+        "{:?}",
+        cap.lines()
+    );
+}
+
+#[test]
+fn cancel_during_demo_load_returns_cancelled_and_terminates() {
+    let fake = FakeHost::new(Scenario::happy(3).drop_marker(FakeMarker::Ready));
+    let cap = Capture::cancelling_after(RecordState::Demo);
+    let req = request("cancel", 3);
+    let f = record(&fake, &req, &cap).expect_err("отмена");
+    assert_eq!(f.code, FailCode::Cancelled);
+    assert_eq!(f.state, RecordState::Demo);
+    assert!(fake.terminated() >= 1, "сессия завершена");
+}
+
+#[test]
+fn take_done_lines_keep_the_legacy_format() {
+    assert_eq!(
+        Event::TakeDone { n: 2, m: 3 }.to_string(),
+        "записан дубль 2/3"
+    );
 }

@@ -11,6 +11,7 @@
 
 pub mod fake;
 pub mod gate;
+pub mod runner;
 mod unsupported;
 #[cfg(windows)]
 pub mod win;
@@ -234,5 +235,19 @@ mod tests {
         let s: String = HostError::BadCommand.into();
         assert!(s.contains("перевод строки"), "{s}");
         assert_eq!(String::from(HostError::Cancelled), "отменено");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn default_host_is_win_host_on_windows() {
+        // путей нет, поэтому ничего не запускается: настоящий хост отвечает `Spawn`, а не `Unsupported`
+        let Err(e) = default_host().launch(&LaunchSpec::default()) else {
+            panic!("пустой LaunchSpec не должен запускаться")
+        };
+        assert!(matches!(e, HostError::Spawn(_)), "{e:?}");
     }
 }

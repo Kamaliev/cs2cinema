@@ -1,18 +1,18 @@
 ---
 gsd_state_version: "1.0"
-current_phase: 01
-current_phase_name: Новый путь записи с понятными сбоями
-status: verifying
-stopped_at: Phase 2 context gathered
-last_updated: "2026-10-10T12:35:40.474Z"
+current_phase: 02
+current_phase_name: Предпроверка, отмена и только свои процессы
+status: executing
+stopped_at: Completed 02-01-PLAN.md
+last_updated: "2026-10-10T15:49:17.942Z"
 last_activity: 2026-10-10
-last_activity_desc: Phase 01 execution started
-state_head: e0b6540b95a13fa6a053dd6a8a1a788129407382
+last_activity_desc: Phase 02 execution started
+state_head: 52c3649621b75461953dce287238917bbd99411c
 progress:
   total_phases: 4
   completed_phases: 0
-  total_plans: 8
-  completed_plans: 8
+  total_plans: 16
+  completed_plans: 9
   percent: 0
 ---
 
@@ -23,14 +23,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-10)
 
 **Core value:** Задача на монтаж из очереди доходит до готового `highlights.mp4` без ручного вмешательства, а если это невозможно — останавливается быстро и объясняет, что именно пошло не так.
-**Current focus:** Phase 01 — Новый путь записи с понятными сбоями
+**Current focus:** Phase 02 — Предпроверка, отмена и только свои процессы
 
 ## Current Position
 
-Phase: 01 (Новый путь записи с понятными сбоями) — EXECUTING
-Plan: 8 of 8
-Status: Phase complete — ready for verification
-Last activity: 2026-10-10 — Phase 01 execution started
+Phase: 02 (Предпроверка, отмена и только свои процессы) — EXECUTING
+Plan: 2 of 8
+Status: Ready to execute
+Last activity: 2026-10-10 — Phase 02 execution started
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -64,6 +64,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 01 P06 | 11min | 3 tasks | 11 files |
 | Phase 01 P08 | 25min | 3 tasks | 6 files |
 | Phase 01 P07 | 25 min | 3 tasks | 6 files |
+| Phase 02 P01 | 10 min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -90,6 +91,7 @@ Recent decisions affecting current work:
 - [Phase 01]: 01-08: HLAE_ERROR срабатывает на любом истёкшем дедлайне при увиденной AFXERROR; закрепляются первая AFXERROR, самая частая повторяющаяся AFXERROR и последняя метка
 - [Phase 01]: 01-08: record.log и хвост консоли очищают управляющие символы, профиль пользователя и секреты (недоверенный netcon)
 - [Phase 01]: 01-07: Status.take_now (разбор «запись: дубль N из M») даёт лестнице «дубль N/M» с начала дубля; файлы app форматировать только rustfmt с max_width=160,use_small_heuristics=Max, а не cargo fmt -p app
+- [Phase 02]: 02-01: свои игры, пережившие сессию, живут в static OWN_GAMES с открытым handle; у Host нет завершения по PID или имени
 
 ### Pending Todos
 
@@ -112,6 +114,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-10T12:35:40.395Z
-Stopped at: Phase 2 context gathered
-Resume file: .planning/phases/02-predproverka-otmena-i-tolko-svoi-protsessy/02-CONTEXT.md
+Last session: 2026-10-10T15:49:17.828Z
+Stopped at: Completed 02-01-PLAN.md
+Resume file: None

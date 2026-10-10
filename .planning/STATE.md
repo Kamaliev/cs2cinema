@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 01
 current_phase_name: Новый путь записи с понятными сбоями
 status: executing
-stopped_at: Completed 01-05-PLAN.md
-last_updated: "2026-10-10T11:33:19.107Z"
+stopped_at: Completed 01-06-PLAN.md
+last_updated: "2026-10-10T11:48:59.472Z"
 last_activity: 2026-10-10
 last_activity_desc: Phase 01 execution started
-state_head: d60be8922cd5e4949b649552241646219d070adf
+state_head: 1273f169b43a27b1a9bbede9313df0b9d7650de9
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 8
-  completed_plans: 5
+  completed_plans: 6
   percent: 0
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 01 (Новый путь записи с понятными сбоями) — EXECUTING
-Plan: 6 of 8
+Plan: 7 of 8
 Status: Ready to execute
 Last activity: 2026-10-10 — Phase 01 execution started
 
@@ -61,6 +61,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 01 P03 | 12 min | 3 tasks | 1 files |
 | Phase 01 P04 | 35 min | 2 tasks | 9 files |
 | Phase 01 P05 | 25min | 3 tasks | 5 files |
+| Phase 01 P06 | 11min | 3 tasks | 11 files |
 
 ## Accumulated Context
 
@@ -80,6 +81,10 @@ Recent decisions affecting current work:
 - [Phase 01]: Тайминги дублей отдаёт Machine::timings(); Event::TakeDone остаётся {n, m}, чтобы строка «записан дубль N/M» для status.rs не менялась
 - [Phase 01]: exec highlights уходит один раз; прямой READY запрашивается один раз через ready_grace, если демка уже идёт
 - [Phase 01]: 01-05: cs2.exe попадает в job через HLAE, netcon слушает 0.0.0.0, READY принимать только после Host activate: Playing Demo, abs_playdemo=fails для кириллицы
+- [Phase 01]: READY и любая метка задачи до подтверждения демки отбрасываются (Note), а не удерживаются; потерянный READY возвращает машина через ready_direct
+- [Phase 01]: abs_playdemo=fails: WinHost::launch отвергает не-ASCII/пробельные имена демки типизированной ошибкой Spawn до запуска; копия в game/csgo остаётся за приложением (01-07)
+- [Phase 01]: закрытие всегда заканчивается Job::terminate(); поток наблюдения живёт 3 с после terminate; netcon не переподключается после смерти игры
+- [Phase 01]: netcon на 0.0.0.0 без пароля: хост подключается к 127.0.0.1 на случайный порт, строки недоверенные и не исполняются, остаточный риск записан в SUMMARY 01-06
 
 ### Pending Todos
 
@@ -102,6 +107,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-10T11:33:19.073Z
-Stopped at: Completed 01-05-PLAN.md
+Last session: 2026-10-10T11:48:59.441Z
+Stopped at: Completed 01-06-PLAN.md
 Resume file: None

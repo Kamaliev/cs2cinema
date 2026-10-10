@@ -326,6 +326,63 @@ pub fn msg_take_timing(n: u32, m: u32, wall: Duration, game_secs: f32) -> String
     format!("дубль {n}/{m}: {wall_secs:.0} с записи на {game_secs:.1} с игры (×{ratio})")
 }
 
+/// `quit` не ушёл в консоль: дальше ждать выхода игры нечего.
+pub fn msg_quit_not_sent(error: &str) -> String {
+    format!("quit не отправлен: {error}")
+}
+
+/// Игра вышла сама после `quit`.
+pub fn msg_quit_exited(elapsed: Duration) -> String {
+    format!("игра вышла после quit за {:.1} с", elapsed.as_secs_f64())
+}
+
+/// Игра не вышла после `quit` за отведённое время.
+pub fn msg_quit_ignored(limit: Duration) -> String {
+    format!(
+        "игра не вышла за {} с после quit — завершаю свой job",
+        secs(limit)
+    )
+}
+
+/// Принудительная отмена: `quit` и ожидание пропущены (D-12).
+pub fn msg_force_cancel() -> String {
+    "принудительная отмена — quit и ожидание пропущены".to_owned()
+}
+
+/// Свой job завершён.
+pub fn msg_job_ended() -> String {
+    "свой job завершён".to_owned()
+}
+
+/// Выход игры подтверждён по handle.
+pub fn msg_exit_confirmed() -> String {
+    "игра закрыта (подтверждено по handle)".to_owned()
+}
+
+/// Игра жива после завершения job: следующая задача подождёт её (D-14).
+pub fn msg_exit_pending(confirm: Duration, next_wait: Duration) -> String {
+    format!(
+        "игра не закрылась за {} с после завершения job — следующая задача подождёт её до {} с",
+        secs(confirm),
+        secs(next_wait)
+    )
+}
+
+/// Выход игры подтвердить не удалось (ошибка опроса).
+pub fn msg_exit_unknown(error: &str) -> String {
+    format!("закрытие игры не удалось подтвердить: {error}")
+}
+
+/// Недописанный дубль помечен.
+pub fn msg_partial_marked(name: &str, target: &str) -> String {
+    format!("дубль {name} не дописан — помечен как {target}")
+}
+
+/// Недописанный дубль пометить не удалось: файл держит чужой процесс, уборка отложена.
+pub fn msg_partial_failed(name: &str, error: &str) -> String {
+    format!("не удалось пометить {name}: {error} (уборка отложена)")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,7 +394,10 @@ mod tests {
         assert!(FailCode::LauncherFailed.hint().contains("HLAE.exe"));
         assert_eq!(FailCode::Cancelled.hint(), "");
         assert_eq!(FailCode::PrecheckFailed.as_str(), "PRECHECK_FAILED");
-        assert_eq!(FailCode::ForeignGameRunning.as_str(), "FOREIGN_GAME_RUNNING");
+        assert_eq!(
+            FailCode::ForeignGameRunning.as_str(),
+            "FOREIGN_GAME_RUNNING"
+        );
         assert_eq!(FailCode::PrevGameStuck.as_str(), "PREV_GAME_STUCK");
         assert!(FailCode::PrecheckFailed.hint().contains("Повторить"));
         assert!(FailCode::ForeignGameRunning.hint().contains("не закрывает"));

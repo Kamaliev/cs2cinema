@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use pipeline::host::fake::{FakeHost, FakeMarker, Scenario};
-use pipeline::host::{LaunchSpec, Liveness, Source};
-use pipeline::record::{Deadlines, Event, FailCode, RecordRequest, RecordState, record};
+use pipeline::host::{Host, LaunchSpec, Liveness, Source};
+use pipeline::record::{
+    Deadlines, Event, FailCode, RecordRequest, RecordState, mark_partial, record,
+};
 use pipeline::{Progress, Stage};
 use renderer::TakePlan;
 
@@ -40,6 +42,7 @@ fn request(name: &str, n: u32) -> RecordRequest {
         takes: takes(n),
         deadlines: Deadlines::default(),
         header: String::new(),
+        afxerror_ignore: vec![],
     }
 }
 
@@ -50,6 +53,11 @@ struct Capture {
     /// Отмена начинается после входа в это состояние.
     cancel_after: Option<RecordState>,
     cancel: AtomicBool,
+    /// Вместе с отменой приходит принудительная (второе нажатие «Отмена»).
+    force: bool,
+    /// Фейк, по часам которого запоминается момент отмены.
+    fake: Option<FakeHost>,
+    cancelled_at: Mutex<Option<Duration>>,
 }
 
 impl Capture {
@@ -58,6 +66,26 @@ impl Capture {
             cancel_after: Some(state),
             ..Capture::default()
         }
+    }
+
+    /// Запоминать виртуальный момент отмены по часам этого фейка.
+    fn watching(mut self, fake: &FakeHost) -> Self {
+        self.fake = Some(fake.clone());
+        self
+    }
+
+    /// Отмена сразу принудительная.
+    fn forced(mut self) -> Self {
+        self.force = true;
+        self
+    }
+
+    /// Виртуальный момент, когда пришла отмена.
+    fn cancelled_at(&self) -> Duration {
+        self.cancelled_at
+            .lock()
+            .unwrap()
+            .expect("отмена не приходила")
     }
 
     fn events(&self) -> Vec<Event> {
@@ -92,12 +120,18 @@ impl Progress for Capture {
         if let (Event::State { state, .. }, Some(at)) = (e, self.cancel_after)
             && *state == at
         {
+            if let Some(fake) = &self.fake {
+                self.cancelled_at.lock().unwrap().get_or_insert(fake.now());
+            }
             self.cancel.store(true, Ordering::SeqCst);
         }
         self.events.lock().unwrap().push(e.clone());
     }
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
+    }
+    fn force_cancelled(&self) -> bool {
+        self.force && self.cancel.load(Ordering::SeqCst)
     }
 }
 
@@ -327,9 +361,12 @@ fn all_done_does_not_stand_in_for_a_lost_last_take_end() {
         f.elapsed,
         limit
     );
-    assert!(
-        !fake.sent().iter().any(|l| l == "quit"),
-        "quit не отправлялся: {:?}",
+    // `quit` уходит из поэтапного закрытия после сбоя (TMO-04), а не из машины,
+    // поэтому он один, а в Closing машина не входила
+    assert_eq!(
+        fake.sent().iter().filter(|l| *l == "quit").count(),
+        1,
+        "{:?}",
         fake.sent()
     );
     assert!(
@@ -657,4 +694,111 @@ fn journal_reports_launcher_code_and_game_liveness_separately() {
             .any(|l| l == "HLAE.exe: код 0 · cs2.exe: не жива (код 0)"),
         "итоговая строка фактов: {lines:#?}"
     );
+}
+
+#[test]
+fn cancel_during_a_take_quits_waits_terminates_and_confirms_exit_within_ten_seconds() {
+    let fake = FakeHost::new(Scenario::happy(3).ignore_quit());
+    let cap = Capture::cancelling_after(RecordState::Take).watching(&fake);
+    let req = fresh("cancel-take", 3);
+    let f = record(&fake, &req, &cap).expect_err("отмена");
+    assert_eq!(f.code, FailCode::Cancelled);
+    assert_eq!(f.state, RecordState::Take);
+    let spent = fake.now() - cap.cancelled_at();
+    assert!(spent <= secs(10), "от отмены до возврата прошло {spent:?}");
+    assert!(fake.sent().iter().any(|l| l == "quit"), "{:?}", fake.sent());
+    assert_eq!(fake.terminated(), 1);
+    let log = read_log(&req);
+    for need in ["→ quit", "свой job завершён", "подтверждено по handle"]
+    {
+        assert!(log.contains(need), "в record.log нет «{need}»: {log}");
+    }
+    assert!(log.contains("не вышла за 5 с после quit"), "{log}");
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn force_cancel_skips_quit_and_terminates_at_once() {
+    let fake = FakeHost::new(Scenario::happy(3).ignore_quit());
+    let cap = Capture::cancelling_after(RecordState::Take)
+        .watching(&fake)
+        .forced();
+    let req = fresh("force-cancel", 3);
+    let f = record(&fake, &req, &cap).expect_err("принудительная отмена");
+    assert_eq!(f.code, FailCode::Cancelled);
+    assert!(
+        !fake.sent().iter().any(|l| l == "quit"),
+        "quit при принудительной отмене не уходит: {:?}",
+        fake.sent()
+    );
+    let spent = fake.now() - cap.cancelled_at();
+    assert!(spent <= secs(4), "прошло {spent:?}");
+    assert_eq!(fake.terminated(), 1);
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn unfinished_take_is_renamed_partial_and_finished_ones_stay() {
+    let req = fresh("partial", 3);
+    let clips = req.out_dir.join("clips");
+    // дубль 2 идёт с 18-й по 23-ю секунду виртуального времени, игра умирает на 20-й
+    let sc = Scenario::happy(3)
+        .clips_dir(clips.clone())
+        .take_dirs_on_start()
+        .game_dies_at(secs(20), Some(0));
+    let f = record(&FakeHost::new(sc), &req, &Capture::default()).expect_err("игра умерла");
+    assert_eq!(f.code, FailCode::GameExited);
+    assert!(clips.join("take0000").join("video.mp4").is_file());
+    assert!(clips.join("take0000").join("audio.wav").is_file());
+    assert!(
+        !clips.join("take0001").exists(),
+        "оборванный дубль переименован"
+    );
+    assert!(clips.join("take0001.partial").join("video.mp4").is_file());
+    assert!(
+        read_log(&req).contains("дубль take0001 не дописан — помечен как take0001.partial"),
+        "{}",
+        read_log(&req)
+    );
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn game_that_survives_terminate_is_reported_and_not_awaited_in_record() {
+    let fake = FakeHost::new(Scenario::happy(3).ignore_quit().exit_after_terminate(None));
+    let cap = Capture::cancelling_after(RecordState::Take).watching(&fake);
+    let req = fresh("survivor", 3);
+    let f = record(&fake, &req, &cap).expect_err("отмена");
+    assert_eq!(f.code, FailCode::Cancelled);
+    let d = &req.deadlines;
+    let spent = fake.now() - cap.cancelled_at();
+    assert!(
+        spent <= d.quit_wait + d.kill_confirm + secs(1),
+        "возврат позже бюджета: {spent:?}"
+    );
+    assert!(
+        read_log(&req).contains("подождёт её до 30 с"),
+        "{}",
+        read_log(&req)
+    );
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn mark_partial_touches_only_take_dirs() {
+    let clips = std::env::temp_dir().join(format!("cs2cinema-partial-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&clips);
+    for d in ["take0000", "take0001", "takeX"] {
+        std::fs::create_dir_all(clips.join(d)).unwrap();
+    }
+    std::fs::write(clips.join("plan.hash"), b"h").unwrap();
+    let notes = mark_partial(&clips, &[0]);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(clips.join("take0000").is_dir(), "готовый дубль на месте");
+    assert!(!clips.join("take0001").exists());
+    assert!(clips.join("take0001.partial").is_dir());
+    assert!(clips.join("takeX").is_dir(), "чужое имя не трогаем");
+    assert!(clips.join("plan.hash").is_file());
+    assert!(mark_partial(&clips.join("нет-такой"), &[]).is_empty());
+    let _ = std::fs::remove_dir_all(&clips);
 }

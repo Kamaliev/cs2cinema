@@ -125,6 +125,7 @@ pub fn record_request(s: &Settings, out_dir: &Path, demo_name: &str, plan: &pipe
         takes: plan.takes.clone(),
         deadlines: deadlines(s),
         header: format!("задача #{job_id} · {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")),
+        afxerror_ignore: Vec::new(),
     }
 }
 
@@ -374,6 +375,7 @@ mod tests {
             takes: two_takes(),
             deadlines: Deadlines::default(),
             header: "задача #1 · тест".into(),
+            afxerror_ignore: Vec::new(),
         }
     }
 

@@ -198,6 +198,11 @@ impl Machine {
         self.launcher
     }
 
+    /// Консольный порт игры сейчас открыт: только тогда `quit` дойдёт до игры.
+    pub fn console_up(&self) -> bool {
+        self.console_up
+    }
+
     /// Сколько заняла запись каждого принятого дубля.
     pub fn timings(&self) -> &[TakeTiming] {
         &self.timings
@@ -231,7 +236,7 @@ impl Machine {
         }
         match input {
             Input::Cancel => {
-                acts.push(Action::Terminate);
+                // игру закрывает драйвер: поэтапно, с подтверждением выхода (TMO-04)
                 let f = self.fail(
                     now,
                     FailCode::Cancelled,

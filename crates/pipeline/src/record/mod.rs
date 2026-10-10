@@ -12,7 +12,7 @@ pub mod machine;
 pub mod markers;
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use host::{Host, LaunchSpec, Liveness, Session, SessionEvent, Source};
@@ -38,6 +38,8 @@ pub struct RecordRequest {
     pub deadlines: Deadlines,
     /// Заголовок журнала записи (кто, что, с какими настройками).
     pub header: String,
+    /// Подстроки строк `AFXERROR`, которые не останавливают запись (D-09, из `settings.json`).
+    pub afxerror_ignore: Vec<String>,
 }
 
 /// Сколько заняла запись одного дубля — для будущей настройки дедлайнов.
@@ -239,6 +241,176 @@ impl Journal {
     }
 }
 
+/// Как закрывать игру после конца записи (TMO-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// Сначала `quit` (если консоль открыта) и ожидание выхода, потом завершение своего job.
+    Graceful,
+    /// Без `quit`: свой job завершается сразу, строки консоли дочитываются не дольше `drain`.
+    Immediate { drain: Duration },
+}
+
+/// Режим закрытия по итогу записи. Сломанная игра `quit` не выполнит, но шторм строк `AFXERROR`
+/// дочитывается секунду (хвост консоли в сбое должен его содержать).
+fn stop_for(result: &Result<(), RecordFailure>) -> Stop {
+    match result {
+        Ok(()) => Stop::Immediate {
+            drain: Duration::ZERO,
+        },
+        Err(f) => match f.code {
+            FailCode::HlaeError => Stop::Immediate {
+                drain: Duration::from_secs(1),
+            },
+            FailCode::GameExited => Stop::Immediate {
+                drain: Duration::ZERO,
+            },
+            _ => Stop::Graceful,
+        },
+    }
+}
+
+/// Поэтапное закрытие игры (TMO-04, D-12): `quit` -> ожидание выхода не дольше `quit_wait` ->
+/// завершение своего job -> подтверждение выхода по handle не дольше `kill_confirm`. Принудительная
+/// отмена пропускает `quit` и ожидание. Возвращает то, что известно о живости игры после закрытия.
+fn shutdown(
+    host: &dyn Host,
+    session: &mut Guard,
+    machine: &Machine,
+    j: &mut Journal,
+    p: &dyn Progress,
+    d: &Deadlines,
+    stop: Stop,
+) -> Liveness {
+    let forced = p.force_cancelled();
+    let stop = if forced {
+        j.line(host.now(), "app", &failure::msg_force_cancel());
+        Stop::Immediate {
+            drain: Duration::ZERO,
+        }
+    } else {
+        stop
+    };
+    match stop {
+        Stop::Graceful if machine.console_up() => {
+            j.line(host.now(), "app", "→ quit");
+            match session.0.send("quit") {
+                Err(e) => j.line(
+                    host.now(),
+                    "app",
+                    &failure::msg_quit_not_sent(&e.to_string()),
+                ),
+                Ok(()) => {
+                    let start = host.now();
+                    let mut exited = false;
+                    while !exited
+                        && host.now().saturating_sub(start) < d.quit_wait
+                        && !p.force_cancelled()
+                    {
+                        if let Some(ev) = session.0.poll(TICK) {
+                            j.session_event(host.now(), &ev);
+                            exited = matches!(
+                                ev,
+                                SessionEvent::GameExited { .. } | SessionEvent::JobEmpty
+                            );
+                        }
+                    }
+                    let waited = host.now().saturating_sub(start);
+                    let text = if exited {
+                        failure::msg_quit_exited(waited)
+                    } else {
+                        failure::msg_quit_ignored(d.quit_wait)
+                    };
+                    j.line(host.now(), "app", &text);
+                }
+            }
+        }
+        Stop::Graceful => {}
+        Stop::Immediate { drain } => {
+            let start = host.now();
+            while host.now().saturating_sub(start) < drain {
+                if let Some(ev) = session.0.poll(TICK) {
+                    j.session_event(host.now(), &ev);
+                }
+            }
+        }
+    }
+    session.0.terminate();
+    j.line(host.now(), "app", &failure::msg_job_ended());
+    let l = session.0.wait_exit(d.kill_confirm);
+    let text = match &l {
+        Liveness::Exited(_) => Some(failure::msg_exit_confirmed()),
+        Liveness::Alive => Some(failure::msg_exit_pending(d.kill_confirm, d.prev_game_exit)),
+        Liveness::Unknown(e) => Some(failure::msg_exit_unknown(e)),
+        Liveness::NotStarted => None,
+    };
+    if let Some(t) = text {
+        j.line(host.now(), "app", &t);
+    }
+    l
+}
+
+/// Номер дубля из имени папки: ровно `take` и четыре цифры.
+fn take_number(name: &str) -> Option<u32> {
+    let digits = name.strip_prefix("take")?;
+    if digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_digit()) {
+        digits.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Пометить недописанные дубли (D-07): папка `takeNNNN`, которой нет среди готовых, становится
+/// `takeNNNN.partial`. Готовые дубли и всё, что не похоже на `take` + 4 цифры, не трогаются; ничего
+/// не удаляется. Вызывать только после подтверждённого выхода игры: файл дубля может держать
+/// ffmpeg HLAE. Возвращает строки для журнала.
+pub fn mark_partial(clips: &Path, done: &[u32]) -> Vec<String> {
+    let Ok(dir) = std::fs::read_dir(clips) else {
+        return vec![];
+    };
+    let mut found: Vec<(u32, String)> = dir
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            take_number(&name).map(|n| (n, name))
+        })
+        .filter(|(n, _)| !done.contains(n))
+        .collect();
+    found.sort();
+    let mut notes = vec![];
+    for (_, name) in found {
+        let mut target_name = format!("{name}.partial");
+        if clips.join(&target_name).exists() {
+            let stamp = std::time::UNIX_EPOCH
+                .elapsed()
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            target_name = format!("{name}.partial-{stamp}");
+        }
+        let from = clips.join(&name);
+        let mut last_error = String::new();
+        let mut renamed = false;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            match std::fs::rename(&from, clips.join(&target_name)) {
+                Ok(()) => {
+                    renamed = true;
+                    break;
+                }
+                Err(e) => last_error = e.to_string(),
+            }
+        }
+        notes.push(if renamed {
+            failure::msg_partial_marked(&name, &target_name)
+        } else {
+            failure::msg_partial_failed(&name, &last_error)
+        });
+    }
+    notes
+}
+
 /// Записать все дубли плана. Успех — все метки пришли в срок и игра закрыта; иначе `RecordFailure`
 /// с кодом, состоянием и прошедшим временем. Игра в любом случае завершается до возврата.
 pub fn record(
@@ -277,7 +449,7 @@ pub fn record(
         if let Some(e) = &ev {
             j.session_event(now, e);
         }
-        let input = if p.cancelled() {
+        let input = if p.cancelled() || p.force_cancelled() {
             Input::Cancel
         } else {
             ev.map_or(Input::Tick, Input::Event)
@@ -305,8 +477,18 @@ pub fn record(
                 }
                 Action::Finish(Ok(())) => {
                     let game = liveness.unwrap_or_else(|| session.0.game_liveness());
-                    let now = host.now();
                     let launcher = machine.launcher();
+                    let stop = stop_for(&Ok(()));
+                    shutdown(
+                        host,
+                        &mut session,
+                        &machine,
+                        &mut j,
+                        p,
+                        &req.deadlines,
+                        stop,
+                    );
+                    let now = host.now();
                     j.success(now, p, req.takes.len(), &launcher, &game);
                     return Ok(RecordReport {
                         takes: machine.timings().to_vec(),
@@ -318,7 +500,21 @@ pub fn record(
                 Action::Finish(Err(mut f)) => {
                     f.game = liveness.unwrap_or_else(|| session.0.game_liveness());
                     f.launcher = machine.launcher();
-                    session.0.terminate();
+                    let stop = stop_for(&Err(f.clone()));
+                    shutdown(
+                        host,
+                        &mut session,
+                        &machine,
+                        &mut j,
+                        p,
+                        &req.deadlines,
+                        stop,
+                    );
+                    // дубль могла держать запись до самого выхода игры: помечаем после него
+                    let done: Vec<u32> = machine.timings().iter().map(|t| t.index).collect();
+                    for note in mark_partial(&req.out_dir.join("clips"), &done) {
+                        j.line(host.now(), "app", &note);
+                    }
                     j.failure(host.now(), p, &mut f);
                     return Err(f);
                 }

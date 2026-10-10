@@ -52,6 +52,10 @@ pub trait Progress: Sync {
     fn cancelled(&self) -> bool {
         false
     }
+    /// Второе нажатие «Отмена» (D-12): закрыть свой job сразу, без `quit` и ожидания.
+    fn force_cancelled(&self) -> bool {
+        false
+    }
     /// Типизированное событие записи; по умолчанию — строка журнала.
     fn event(&self, e: &record::Event) {
         self.log(&e.to_string())

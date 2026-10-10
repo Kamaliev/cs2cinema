@@ -255,7 +255,12 @@ fn game_state(w: &Watch, told: &mut Told) -> bool {
         _ => {}
     }
     if w.shared.adopted_without_job.load(Ordering::SeqCst) {
-        // игра не в нашем job: пустота job ничего не говорит, конец наблюдения — смерть игры
+        // игра не в нашем job: пустота job ничего не говорит, конец наблюдения — смерть игры;
+        // в нашем job ждать больше нечего, поэтому закрытие не должно ждать пустого job
+        if told.game_exit && !told.job_empty {
+            told.job_empty = true;
+            w.sink.send(SessionEvent::JobEmpty);
+        }
         return told.game_exit;
     }
     match w.job.active_count() {

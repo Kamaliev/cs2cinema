@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use host::win::{SessionParams, WinHost};
-use host::{HostError, Liveness, Session, SessionEvent, Source};
+use host::{Host, HostError, Liveness, PrevGame, Session, SessionEvent, Source};
 
 /// Лаунчер-заглушка: `cmd` выходит с кодом 0, а `PING.EXE` остаётся в job и изображает игру.
 fn stand_in_launcher() -> Command {
@@ -354,5 +354,46 @@ fn a_game_outside_the_job_is_adopted_by_pid_and_terminated_with_the_session() {
     assert!(
         matches!(after, Liveness::Exited(_)),
         "принятая игра пережила terminate: {after:?}"
+    );
+}
+
+#[test]
+fn terminated_stand_in_game_is_confirmed_gone_by_wait_exit() {
+    let mut session = WinHost::new()
+        .launch_with(stand_in_launcher(), "ping.exe", 1, None)
+        .expect("сессия должна запуститься");
+    let mut events = Vec::new();
+    let appeared = poll_until(
+        session.as_mut(),
+        Duration::from_secs(10),
+        &mut events,
+        |e| {
+            e.iter()
+                .any(|x| matches!(x, SessionEvent::GameAppeared { .. }))
+        },
+    );
+    assert!(appeared, "игра-заглушка не появилась: {events:?}");
+
+    session.terminate();
+    let started = Instant::now();
+    assert_eq!(
+        session.wait_exit(Duration::from_secs(3)),
+        Liveness::Exited(Some(1))
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "выход виден по handle, без ожидания лимита"
+    );
+
+    // сессия закрыта: оставшихся своих игр нет, ожидание заканчивается сразу
+    drop(session);
+    let started = Instant::now();
+    let prev =
+        WinHost::new().wait_previous_game(Duration::from_secs(30), Duration::ZERO, &|| false);
+    assert!(matches!(prev, PrevGame::Clear { .. }), "{prev:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
     );
 }

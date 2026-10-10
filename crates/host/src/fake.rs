@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::{
-    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, Session, SessionEvent, Source,
-    WindowInfo, console_line_ok,
+    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, PrevGame, Session, SessionEvent,
+    Source, WindowInfo, console_line_ok,
 };
 
 /// PID «игры» в событии `GameAppeared`.
@@ -81,6 +81,16 @@ pub struct Scenario {
     pub duplicate_log: bool,
     /// Окна процессов job по времени от запуска: последний список с `at <= now - t0` текущий.
     pub windows: Vec<(Duration, Vec<WindowInfo>)>,
+    /// Через сколько после `terminate` игра выходит: `Some(ZERO)` — сразу (по умолчанию),
+    /// `None` — не выходит никогда.
+    pub exit_after_terminate: Option<Duration>,
+    /// Игра прошлой сессии, оставленная в момент 0: `Some(Some(d))` выйдет через `d`,
+    /// `Some(None)` — никогда.
+    pub previous_game: Option<Option<Duration>>,
+    /// На `TAKE_START i` при заданном `clips` создаётся `take{i:04}` с недописанным `video.mp4`.
+    pub take_dirs: bool,
+    /// На `quit`: `JobEmpty` приходит через столько после `GameExited`; `None` — не приходит.
+    pub job_empty_after_exit: Option<Duration>,
 }
 
 impl Scenario {
@@ -111,6 +121,10 @@ impl Scenario {
             ready_only_direct: false,
             duplicate_log: false,
             windows: vec![],
+            exit_after_terminate: Some(Duration::ZERO),
+            previous_game: None,
+            take_dirs: false,
+            job_empty_after_exit: Some(Duration::ZERO),
         }
     }
 
@@ -215,6 +229,30 @@ impl Scenario {
         self
     }
 
+    /// Через сколько после `terminate` игра выходит; `None` — не выходит никогда (зависшая игра).
+    pub fn exit_after_terminate(mut self, after: Option<Duration>) -> Self {
+        self.exit_after_terminate = after;
+        self
+    }
+
+    /// Игра прошлой сессии, оставленная в момент 0: выйдет через `exits_after`, `None` — никогда.
+    pub fn previous_game(mut self, exits_after: Option<Duration>) -> Self {
+        self.previous_game = Some(exits_after);
+        self
+    }
+
+    /// На начало дубля HLAE уже создал папку `take{i:04}` с недописанным `video.mp4`.
+    pub fn take_dirs_on_start(mut self) -> Self {
+        self.take_dirs = true;
+        self
+    }
+
+    /// `JobEmpty` после `quit` приходит через `after` после `GameExited`; `None` — не приходит.
+    pub fn job_empty_after_exit(mut self, after: Option<Duration>) -> Self {
+        self.job_empty_after_exit = after;
+        self
+    }
+
     /// С момента `at` от запуска текущий список окон — этот; пустой список = окна закрыты.
     pub fn windows_at(mut self, at: Duration, list: Vec<WindowInfo>) -> Self {
         self.windows.push((at, list));
@@ -237,6 +275,17 @@ struct HostState {
     sent: Vec<String>,
     terminated: u32,
     launches: u32,
+    /// Своя игра, пережившая сессию: (момент завершения job, момент выхода или `None` — никогда).
+    leftover: Option<(Duration, Option<Duration>)>,
+    /// Момент последнего подтверждённого выхода своей игры.
+    last_exit: Option<Duration>,
+}
+
+/// Страховка от зациклившегося сценария: виртуальные часы не должны уходить за `MAX_VIRTUAL`.
+fn check_virtual(now: Duration) {
+    if now > MAX_VIRTUAL {
+        panic!("фейк: виртуальное время перевалило за 10 ч — сценарий завис");
+    }
 }
 
 fn lock(h: &Arc<Mutex<HostState>>) -> MutexGuard<'_, HostState> {
@@ -252,6 +301,7 @@ pub struct FakeHost {
 
 impl FakeHost {
     pub fn new(scenario: Scenario) -> Self {
+        let leftover = scenario.previous_game.map(|exit| (Duration::ZERO, exit));
         FakeHost {
             state: Arc::new(Mutex::new(HostState {
                 scenario,
@@ -259,6 +309,8 @@ impl FakeHost {
                 sent: vec![],
                 terminated: 0,
                 launches: 0,
+                leftover,
+                last_exit: None,
             })),
         }
     }
@@ -298,6 +350,8 @@ impl Host for FakeHost {
             launcher_exit: None,
             terminated: false,
             t0,
+            terminated_at: None,
+            exit_moment: None,
         };
         let sc = &st.scenario;
         if let Some((after, code)) = sc.launcher {
@@ -349,6 +403,58 @@ impl Host for FakeHost {
         }
         lock(&self.state).scenario.run.clone()
     }
+
+    fn wait_previous_game(
+        &self,
+        limit: Duration,
+        settle: Duration,
+        cancel: &dyn Fn() -> bool,
+    ) -> PrevGame {
+        if cancel() {
+            return PrevGame::Cancelled;
+        }
+        let mut st = lock(&self.state);
+        let start = st.now;
+        let Some((ended, exit)) = st.leftover else {
+            if let Some(t) = st.last_exit {
+                st.now = st.now.max(t + settle);
+            }
+            return PrevGame::Clear {
+                waited: st.now - start,
+            };
+        };
+        let result = match exit {
+            Some(at) if at <= ended + limit => {
+                st.now = st.now.max(at + settle);
+                st.leftover = None;
+                st.last_exit = Some(at);
+                PrevGame::Clear {
+                    waited: st.now - start,
+                }
+            }
+            _ => {
+                st.now = st.now.max(ended + limit);
+                PrevGame::Stuck {
+                    pid: FAKE_PID,
+                    since_end: st.now - ended,
+                    liveness: Liveness::Alive,
+                }
+            }
+        };
+        let over = st.now;
+        drop(st);
+        check_virtual(over);
+        result
+    }
+}
+
+/// Что появляется на диске после метки дубля.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TakeFx {
+    /// Начало дубля: папка с недописанным `video.mp4` (если сценарий просит `take_dirs_on_start`).
+    Start(u32),
+    /// Конец дубля: готовые `video.mp4` и `audio.wav`.
+    End(u32),
 }
 
 /// Запланированное событие. `ev == None` — метка «убрана»: на линии её нет, а побочный эффект
@@ -358,7 +464,7 @@ struct Item {
     seq: u64,
     ev: Option<SessionEvent>,
     /// После этого события на диске появляются файлы дубля с таким номером.
-    take_files: Option<u32>,
+    take_files: Option<TakeFx>,
 }
 
 /// Сессия фейковой игры.
@@ -374,10 +480,14 @@ pub struct FakeSession {
     terminated: bool,
     /// Виртуальный момент запуска: от него отсчитываются окна сценария.
     t0: Duration,
+    /// Момент первого `terminate`.
+    terminated_at: Option<Duration>,
+    /// Момент, когда выход игры стал известен вызывающему (событие или подтверждённое ожидание).
+    exit_moment: Option<Duration>,
 }
 
 impl FakeSession {
-    fn push(&mut self, at: Duration, ev: Option<SessionEvent>, take_files: Option<u32>) {
+    fn push(&mut self, at: Duration, ev: Option<SessionEvent>, take_files: Option<TakeFx>) {
         self.seq += 1;
         self.queue.push(Item {
             at,
@@ -394,7 +504,7 @@ impl FakeSession {
         m: FakeMarker,
         at: Duration,
         text: &str,
-        take_files: Option<u32>,
+        take_files: Option<TakeFx>,
     ) {
         if sc.dropped.contains(&m) {
             self.push(at, None, take_files);
@@ -437,7 +547,7 @@ impl FakeSession {
                 FakeMarker::TakeStart(i),
                 t,
                 &format!("TAKE_START {i}"),
-                None,
+                Some(TakeFx::Start(i)),
             );
             t += *dur + sc.delay_of(FakeMarker::TakeEnd(i));
             self.marker(
@@ -445,7 +555,7 @@ impl FakeSession {
                 FakeMarker::TakeEnd(i),
                 t,
                 &format!("TAKE_END {i}"),
-                Some(i),
+                Some(TakeFx::End(i)),
             );
         }
         self.marker(
@@ -458,13 +568,14 @@ impl FakeSession {
     }
 
     /// Состояние сессии после доставки события вызывающему.
-    fn delivered(&mut self, ev: &SessionEvent) {
+    fn delivered(&mut self, ev: &SessionEvent, now: Duration) {
         match ev {
             SessionEvent::LauncherExited { code } => self.launcher_exit = Some(*code),
             SessionEvent::GameAppeared { .. } => self.appeared = true,
             SessionEvent::ConsoleUp => self.console_up = true,
             SessionEvent::GameExited { code } => {
                 self.exited = Some(*code);
+                self.exit_moment.get_or_insert(now);
                 self.console_up = false;
                 // мёртвая игра больше ничего не печатает
                 self.queue.retain(|i| {
@@ -481,6 +592,13 @@ impl FakeSession {
             _ => {}
         }
     }
+}
+
+/// Начало дубля: HLAE уже создал папку и пишет `video.mp4`, но дубль не закончен.
+fn write_take_start(dir: &std::path::Path, i: u32) {
+    let d = dir.join(format!("take{i:04}"));
+    let _ = std::fs::create_dir_all(&d);
+    let _ = std::fs::write(d.join("video.mp4"), b"partial");
 }
 
 fn write_take_files(dir: &std::path::Path, i: u32) {
@@ -514,11 +632,15 @@ impl Session for FakeSession {
             };
             let item = self.queue.remove(idx);
             st.now = st.now.max(item.at);
-            if let (Some(i), Some(dir)) = (item.take_files, st.scenario.clips.as_ref()) {
-                write_take_files(dir, i);
+            if let (Some(fx), Some(dir)) = (item.take_files, st.scenario.clips.as_ref()) {
+                match fx {
+                    TakeFx::End(i) => write_take_files(dir, i),
+                    TakeFx::Start(i) if st.scenario.take_dirs => write_take_start(dir, i),
+                    TakeFx::Start(_) => {}
+                }
             }
             if let Some(ev) = item.ev {
-                self.delivered(&ev);
+                self.delivered(&ev, st.now);
                 return Some(ev);
             }
         }
@@ -561,14 +683,27 @@ impl Session for FakeSession {
                 Some(SessionEvent::GameExited { code: Some(0) }),
                 None,
             );
-            self.push(now + after, Some(SessionEvent::JobEmpty), None);
+            if let Some(late) = sc.job_empty_after_exit {
+                self.push(now + after + late, Some(SessionEvent::JobEmpty), None);
+            }
         }
         Ok(())
     }
 
     fn game_liveness(&mut self) -> Liveness {
-        if let Some(l) = lock(&self.host).scenario.liveness.clone() {
-            return l;
+        {
+            let st = lock(&self.host);
+            if let Some(l) = st.scenario.liveness.clone() {
+                return l;
+            }
+            // отложенный выход после terminate наступил по виртуальным часам
+            if self.exited.is_none()
+                && let (Some(t), Some(d)) = (self.terminated_at, st.scenario.exit_after_terminate)
+                && t + d <= st.now
+            {
+                self.exited = Some(Some(1));
+                self.exit_moment.get_or_insert(t + d);
+            }
         }
         match self.exited {
             Some(code) => Liveness::Exited(code),
@@ -594,14 +729,67 @@ impl Session for FakeSession {
     }
 
     fn terminate(&mut self) {
+        let mut st = lock(&self.host);
         if !self.terminated {
             self.terminated = true;
-            lock(&self.host).terminated += 1;
+            st.terminated += 1;
+            self.terminated_at = Some(st.now);
         }
         self.queue.clear();
         self.console_up = false;
-        if self.exited.is_none() {
+        // `Some(ZERO)` — игра выходит сразу; иначе её выход подтверждает только `wait_exit`
+        if self.exited.is_none() && st.scenario.exit_after_terminate == Some(Duration::ZERO) {
             self.exited = Some(Some(1));
+            self.exit_moment.get_or_insert(st.now);
+        }
+    }
+
+    fn wait_exit(&mut self, limit: Duration) -> Liveness {
+        if let Some(l) = lock(&self.host).scenario.liveness.clone() {
+            return l;
+        }
+        // выход мог уже наступить: `game_liveness` учтёт и отложенный выход после terminate
+        if let Liveness::Exited(code) = self.game_liveness() {
+            return Liveness::Exited(code);
+        }
+        let mut st = lock(&self.host);
+        let now = st.now;
+        let exit_at = self
+            .terminated_at
+            .zip(st.scenario.exit_after_terminate)
+            .map(|(t, d)| t + d);
+        if let Some(at) = exit_at
+            && at <= now + limit
+        {
+            st.now = now.max(at);
+            self.exited = Some(Some(1));
+            self.exit_moment.get_or_insert(at);
+            return Liveness::Exited(Some(1));
+        }
+        st.now = now + limit;
+        let over = st.now;
+        drop(st);
+        check_virtual(over);
+        if self.appeared {
+            Liveness::Alive
+        } else {
+            Liveness::NotStarted
+        }
+    }
+}
+
+impl Drop for FakeSession {
+    /// Как `WinSession`: сессия завершается, а игра, не подтвердившая выход, остаётся в «реестре»
+    /// хоста для `wait_previous_game`.
+    fn drop(&mut self) {
+        self.terminate();
+        let mut st = lock(&self.host);
+        if let Some(at) = self.exit_moment {
+            st.last_exit = Some(st.last_exit.map_or(at, |t| t.max(at)));
+        } else if self.appeared {
+            let ended = self.terminated_at.unwrap_or(st.now);
+            let exit = st.scenario.exit_after_terminate.map(|d| ended + d);
+            st.leftover = Some((ended, exit));
         }
     }
 }
@@ -925,6 +1113,170 @@ mod tests {
             s.poll(Duration::from_millis(500));
         }
         assert!(s.windows().is_empty(), "на 6 с окна закрыты");
+    }
+
+    #[test]
+    fn wait_exit_follows_exit_after_terminate() {
+        // по умолчанию игра выходит сразу
+        let host = FakeHost::new(Scenario::happy(1));
+        let mut s = host.launch(&spec()).unwrap();
+        until_console(s.as_mut());
+        s.terminate();
+        assert_eq!(s.wait_exit(secs(5)), Liveness::Exited(Some(1)));
+
+        // выход через 4 с: за 2 с игра ещё жива, за ещё 3 с — вышла
+        let host = FakeHost::new(Scenario::happy(1).exit_after_terminate(Some(secs(4))));
+        let mut s = host.launch(&spec()).unwrap();
+        until_console(s.as_mut());
+        s.terminate();
+        let t = host.now();
+        assert_eq!(s.game_liveness(), Liveness::Alive, "выход ещё не наступил");
+        assert_eq!(s.wait_exit(secs(2)), Liveness::Alive);
+        assert_eq!(host.now() - t, secs(2));
+        assert_eq!(s.wait_exit(secs(3)), Liveness::Exited(Some(1)));
+        assert_eq!(
+            host.now() - t,
+            secs(4),
+            "часы остановились на моменте выхода"
+        );
+        assert_eq!(s.game_liveness(), Liveness::Exited(Some(1)));
+
+        // игра не появлялась
+        let host = FakeHost::new(Scenario::happy(1).game_never_appears());
+        let mut s = host.launch(&spec()).unwrap();
+        assert_eq!(s.wait_exit(secs(1)), Liveness::NotStarted);
+    }
+
+    #[test]
+    fn a_game_that_never_exits_is_reported_stuck_after_the_limit() {
+        let real = Instant::now();
+        let host = FakeHost::new(Scenario::happy(1).exit_after_terminate(None));
+        let mut s = host.launch(&spec()).unwrap();
+        until_console(s.as_mut());
+        s.terminate();
+        assert_eq!(s.wait_exit(secs(30)), Liveness::Alive);
+        let ended = host.now() - secs(30);
+        drop(s);
+
+        let prev = host.wait_previous_game(secs(30), Duration::ZERO, &|| false);
+        let PrevGame::Stuck {
+            pid,
+            since_end,
+            liveness,
+        } = prev
+        else {
+            panic!("ожидалась Stuck, получено {prev:?}")
+        };
+        assert_eq!(pid, FAKE_PID);
+        assert!(since_end >= secs(30), "{since_end:?}");
+        assert_eq!(liveness, Liveness::Alive);
+        assert!(host.now() >= ended + secs(30));
+        // запись остаётся: следующая проверка снова её видит
+        assert!(matches!(
+            host.wait_previous_game(secs(30), Duration::ZERO, &|| false),
+            PrevGame::Stuck { .. }
+        ));
+        assert!(real.elapsed() < secs(1), "без настоящих пауз");
+    }
+
+    #[test]
+    fn previous_game_that_exits_gives_clear_after_the_settle_pause() {
+        let host = FakeHost::new(Scenario::happy(1).previous_game(Some(secs(10))));
+        let prev = host.wait_previous_game(secs(30), secs(3), &|| false);
+        assert!(matches!(prev, PrevGame::Clear { .. }), "{prev:?}");
+        assert!(host.now() >= secs(10) + secs(3), "{:?}", host.now());
+
+        // игра прошлой сессии, которая не выходит
+        let stuck = FakeHost::new(Scenario::happy(1).previous_game(None));
+        assert!(matches!(
+            stuck.wait_previous_game(secs(30), secs(3), &|| false),
+            PrevGame::Stuck { .. }
+        ));
+        // отмена до начала ожидания
+        let cancelled = FakeHost::new(Scenario::happy(1).previous_game(Some(secs(10))));
+        assert_eq!(
+            cancelled.wait_previous_game(secs(30), secs(3), &|| true),
+            PrevGame::Cancelled
+        );
+        // нет оставшихся игр — сразу Clear
+        let clean = FakeHost::new(Scenario::happy(1));
+        assert_eq!(
+            clean.wait_previous_game(secs(30), secs(3), &|| false),
+            PrevGame::Clear {
+                waited: Duration::ZERO
+            }
+        );
+    }
+
+    #[test]
+    fn take_dirs_appear_at_take_start_when_asked() {
+        let dir = std::env::temp_dir().join(format!("cs2cinema-host-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake = FakeHost::new(
+            Scenario::happy(1)
+                .echo_commands(false)
+                .clips_dir(dir.clone())
+                .take_dirs_on_start(),
+        );
+        let mut s = fake.launch(&spec()).unwrap();
+        until_console(s.as_mut());
+        s.send("exec highlights").unwrap();
+        assert_eq!(next(s.as_mut()), marker("SCRIPT"));
+        assert_eq!(next(s.as_mut()), marker("TAKE_START 0"));
+        let video = dir.join("take0000").join("video.mp4");
+        assert_eq!(std::fs::read(&video).unwrap(), b"partial");
+        assert!(!dir.join("take0000").join("audio.wav").exists());
+        assert_eq!(next(s.as_mut()), marker("TAKE_END 0"));
+        assert_eq!(std::fs::read(&video).unwrap(), b"fake-video");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // без просьбы папка на старте не создаётся
+        let plain =
+            std::env::temp_dir().join(format!("cs2cinema-host-nostart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&plain);
+        let fake = FakeHost::new(
+            Scenario::happy(1)
+                .echo_commands(false)
+                .clips_dir(plain.clone()),
+        );
+        let mut s = fake.launch(&spec()).unwrap();
+        until_console(s.as_mut());
+        s.send("exec highlights").unwrap();
+        assert_eq!(next(s.as_mut()), marker("SCRIPT"));
+        assert_eq!(next(s.as_mut()), marker("TAKE_START 0"));
+        assert!(!plain.join("take0000").exists());
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    #[test]
+    fn job_empty_comes_late_or_never_after_quit_when_asked() {
+        // поздний JobEmpty: через 7 с после выхода игры
+        let fake = FakeHost::new(
+            Scenario::happy(1)
+                .echo_commands(false)
+                .job_empty_after_exit(Some(secs(7))),
+        );
+        let mut s = fake.launch(&spec()).unwrap();
+        until_console(s.as_mut());
+        s.send("quit").unwrap();
+        assert_eq!(next(s.as_mut()), SessionEvent::GameExited { code: Some(0) });
+        let exited_at = fake.now();
+        assert_eq!(next(s.as_mut()), SessionEvent::JobEmpty);
+        assert_eq!(fake.now() - exited_at, secs(7));
+
+        // JobEmpty не приходит вовсе
+        let fake = FakeHost::new(
+            Scenario::happy(1)
+                .echo_commands(false)
+                .job_empty_after_exit(None),
+        );
+        let mut s = fake.launch(&spec()).unwrap();
+        until_console(s.as_mut());
+        s.send("quit").unwrap();
+        assert_eq!(next(s.as_mut()), SessionEvent::GameExited { code: Some(0) });
+        for _ in 0..60 {
+            assert_eq!(s.poll(secs(1)), None, "JobEmpty убран — его не будет");
+        }
     }
 
     #[test]

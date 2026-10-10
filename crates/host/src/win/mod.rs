@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use crate::gate::{DemoGate, Verdict};
 use crate::{
-    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, Session, SessionEvent, Source,
-    WindowInfo, console_line_ok,
+    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, PrevGame, Session, SessionEvent,
+    Source, WindowInfo, console_line_ok,
 };
 use job::Job;
 use process::OwnedProc;
@@ -235,6 +235,7 @@ impl WinHost {
             job,
             sink,
             terminated: false,
+            terminated_at: None,
         }))
     }
 }
@@ -347,7 +348,78 @@ impl Host for WinHost {
     ) -> Result<CmdOutput, HostError> {
         crate::runner::run_bounded(cmd, cancel, on_line)
     }
+
+    fn wait_previous_game(
+        &self,
+        limit: Duration,
+        settle: Duration,
+        cancel: &dyn Fn() -> bool,
+    ) -> PrevGame {
+        let start = Instant::now();
+        loop {
+            if cancel() {
+                return PrevGame::Cancelled;
+            }
+            {
+                let mut reg = lock(&OWN_GAMES);
+                let mut any_exited = false;
+                reg.leftovers.retain(|l| {
+                    let gone = matches!(l.game.wait(Duration::ZERO), Liveness::Exited(_));
+                    any_exited |= gone;
+                    !gone
+                });
+                if any_exited {
+                    reg.last_exit = Some(Instant::now());
+                }
+                if reg.leftovers.is_empty() {
+                    if reg.last_exit.is_none_or(|t| t.elapsed() >= settle) {
+                        return PrevGame::Clear {
+                            waited: start.elapsed(),
+                        };
+                    }
+                } else if let Some(l) = reg.leftovers.iter().find(|l| l.ended.elapsed() >= limit) {
+                    // свой handle, свой процесс: одна попытка завершить, потом честный ответ
+                    let _ = l.game.kill(1);
+                    let liveness = l.game.wait(WAIT_SLICE);
+                    if !matches!(liveness, Liveness::Exited(_)) {
+                        return PrevGame::Stuck {
+                            pid: l.game.pid(),
+                            since_end: l.ended.elapsed(),
+                            liveness,
+                        };
+                    }
+                }
+            }
+            std::thread::sleep(WAIT_SLICE);
+        }
+    }
 }
+
+/// Срез ожидания на handle игры: дольше `Shared.game` не держим (его каждые 250 мс берёт наблюдатель).
+const WAIT_SLICE: Duration = Duration::from_millis(100);
+/// Шаг опроса пустоты job, когда игра уже вышла, а в job ещё есть процессы.
+const JOB_POLL: Duration = Duration::from_millis(50);
+
+/// Своя игра, пережившая свою сессию: handle открыт, PID повторно не открывается (T-02-02).
+struct Leftover {
+    game: OwnedProc,
+    /// Когда завершён job игры.
+    ended: Instant,
+}
+
+/// Реестр своих игр, общий на процесс: задача за задачей создаёт хост заново, а игра прошлой
+/// задачи могла не выйти (D-14, TMO-07). Держит только `OwnedProc` своих сессий — чужие
+/// процессы сюда не попадают и завершать по нему нечего (T-02-01).
+struct OwnGames {
+    leftovers: Vec<Leftover>,
+    /// Последний подтверждённый выход своей игры.
+    last_exit: Option<Instant>,
+}
+
+static OWN_GAMES: Mutex<OwnGames> = Mutex::new(OwnGames {
+    leftovers: Vec::new(),
+    last_exit: None,
+});
 
 /// Сессия игры: события из канала, команды в netcon, факты по handle.
 pub struct WinSession {
@@ -356,6 +428,8 @@ pub struct WinSession {
     job: Arc<Job>,
     sink: Arc<Sink>,
     terminated: bool,
+    /// Когда сессию завершили впервые: от этого момента считается «игра не выходит».
+    terminated_at: Option<Instant>,
 }
 
 impl Session for WinSession {
@@ -421,6 +495,7 @@ impl Session for WinSession {
             return;
         }
         self.terminated = true;
+        self.terminated_at = Some(Instant::now());
         self.shared.stop.store(true, Ordering::SeqCst);
         if let Err(e) = self.job.terminate(1) {
             self.sink.note(format!("завершение job: {e}"));
@@ -435,11 +510,53 @@ impl Session for WinSession {
             let _ = s.shutdown(Shutdown::Both);
         }
     }
+
+    fn wait_exit(&mut self, limit: Duration) -> Liveness {
+        let deadline = Instant::now() + limit;
+        let adopted = self.shared.adopted_without_job.load(Ordering::SeqCst);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            // mutex игры держим ровно один срез: между срезами его берёт наблюдатель
+            let waited = match lock(&self.shared.game).as_ref() {
+                Some(game) => game.wait(left.min(WAIT_SLICE)),
+                None => return Liveness::NotStarted,
+            };
+            match waited {
+                Liveness::Exited(code) => {
+                    // игра вышла; подтверждение — ещё и пустой job (ffmpeg от HLAE дописывает файлы)
+                    if adopted {
+                        return Liveness::Exited(code);
+                    }
+                    match self.job.active_count() {
+                        Ok(0) => return Liveness::Exited(code),
+                        Ok(_) if left.is_zero() => return Liveness::Alive,
+                        Ok(_) => std::thread::sleep(left.min(JOB_POLL)),
+                        Err(e) => return Liveness::Unknown(e.to_string()),
+                    }
+                }
+                Liveness::Alive if left.is_zero() => return Liveness::Alive,
+                Liveness::Alive => {}
+                other => return other,
+            }
+        }
+    }
 }
 
 impl Drop for WinSession {
     fn drop(&mut self) {
         self.terminate();
+        // игра переживает сессию только с открытым handle: она переезжает в общий реестр
+        let Some(game) = lock(&self.shared.game).take() else {
+            return;
+        };
+        let mut reg = lock(&OWN_GAMES);
+        match game.wait(Duration::ZERO) {
+            Liveness::Exited(_) => reg.last_exit = Some(Instant::now()),
+            _ => reg.leftovers.push(Leftover {
+                game,
+                ended: self.terminated_at.unwrap_or_else(Instant::now),
+            }),
+        }
     }
 }
 

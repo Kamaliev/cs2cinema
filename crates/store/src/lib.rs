@@ -4,6 +4,8 @@
 //! статус и этап, журнал, результат. Задачи переживают перезапуск приложения и выполняются
 //! по очереди (CS2 пишет только одну).
 
+pub mod journal;
+
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -149,6 +151,10 @@ pub struct Job {
     pub phase: String,
     /// Отчёт предпроверки в JSON (`pipeline::precheck::Report`); store его не разбирает.
     pub precheck: Option<String>,
+    /// Номер последней начатой попытки; 0 — задача ещё не запускалась.
+    pub attempt: u32,
+    /// Следующий запуск — «Повторить»: с записи по `record.json`, без скачивания и плана.
+    pub resume: bool,
 }
 
 /// Сборка CS2 и версия HLAE последней удачной записи (D-04, DIF-01): с ней предпроверка сравнивает текущую сборку CS2.
@@ -249,7 +255,8 @@ CREATE TABLE IF NOT EXISTS demos (
 
 // Версии схемы: 1 — сбой записи (fail_*, D-05);
 // 2 — прошедшее время сбоя и состояние записи для карточки (D-06);
-// 3 — отчёт предпроверки (`jobs.precheck`, JSON) и пара «сборка CS2 / версия HLAE» последней удачной записи (`last_good`, D-04).
+// 3 — отчёт предпроверки (`jobs.precheck`, JSON) и пара «сборка CS2 / версия HLAE» последней удачной записи (`last_good`, D-04);
+// 4 — номер попытки (`attempt`, D-10) и флаг «повтор с записи» (`resume`, RET-02).
 // Новая версия — только новым шагом в конце списка и только добавлением колонок или таблиц.
 // Элемент k поднимает схему до версии k+1; шаг идёт в одной транзакции со своим `user_version`.
 const MIGRATIONS: &[&str] = &[
@@ -266,6 +273,8 @@ const MIGRATIONS: &[&str] = &[
          recorded_at  INTEGER NOT NULL
      );
      ALTER TABLE jobs ADD COLUMN precheck TEXT;",
+    "ALTER TABLE jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE jobs ADD COLUMN resume INTEGER NOT NULL DEFAULT 0;",
 ];
 
 impl Store {
@@ -347,6 +356,8 @@ impl Store {
             fail_elapsed_ms: r.get("fail_elapsed_ms")?,
             phase: r.get("phase")?,
             precheck: r.get("precheck")?,
+            attempt: r.get::<_, i64>("attempt")?.max(0) as u32,
+            resume: r.get::<_, i64>("resume")? != 0,
         })
     }
 
@@ -372,13 +383,16 @@ impl Store {
         self.with(|c| c.query_row("SELECT * FROM jobs WHERE status = 'running' ORDER BY id LIMIT 1", [], Self::row).optional())
     }
 
-    pub fn start_job(&self, id: i64) -> Result<()> {
+    /// Начинает новую попытку и возвращает её номер. Журнал не стирается: попытки копятся в нём (D-10);
+    /// `resume` не трогается — его читает исполнитель из строки, полученной `next_queued`.
+    pub fn start_job(&self, id: i64) -> Result<u32> {
         self.with(|c| {
             c.execute(
-                "UPDATE jobs SET status = 'running', stage = '', error = NULL, result = NULL, log = '', fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', precheck = NULL, updated_at = ?2 WHERE id = ?1",
+                "UPDATE jobs SET status = 'running', stage = '', error = NULL, result = NULL, attempt = attempt + 1, fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', precheck = NULL, updated_at = ?2 WHERE id = ?1",
                 params![id, now()],
             )?;
-            Ok(())
+            let n: i64 = c.query_row("SELECT attempt FROM jobs WHERE id = ?1", [id], |r| r.get(0)).optional()?.unwrap_or(0);
+            Ok(n.max(0) as u32)
         })
     }
 
@@ -490,12 +504,21 @@ impl Store {
         })
     }
 
-    /// Поставить задачу в очередь заново (после ошибки или чтобы перезаписать).
+    /// Поставить задачу в очередь заново (после ошибки или чтобы перезаписать): с самого начала, `resume` сбрасывается.
     pub fn requeue(&self, id: i64) -> Result<()> {
+        self.requeue_with(id, false)
+    }
+
+    /// «Повторить» (D-09): поставить в очередь так же, как `requeue`, но с флагом `resume` — исполнитель продолжит с записи.
+    pub fn requeue_resume(&self, id: i64) -> Result<()> {
+        self.requeue_with(id, true)
+    }
+
+    fn requeue_with(&self, id: i64, resume: bool) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "UPDATE jobs SET status = 'queued', stage = '', error = NULL, fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', precheck = NULL, updated_at = ?2 WHERE id = ?1",
-                params![id, now()],
+                "UPDATE jobs SET status = 'queued', stage = '', error = NULL, fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', precheck = NULL, resume = ?3, updated_at = ?2 WHERE id = ?1",
+                params![id, now(), resume as i64],
             )?;
             Ok(())
         })
@@ -743,10 +766,10 @@ mod tests {
         let j = s.jobs().unwrap().pop().unwrap();
         assert_eq!(j.error.as_deref(), Some("старая ошибка"));
         assert_eq!((j.fail_code, j.fail_state, j.fail_hint, j.fail_tail), (None, None, None, None));
-        assert_eq!(user_version(&s), 3);
+        assert_eq!(user_version(&s), 4);
         drop(s);
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 3, "повторное открытие ничего не меняет");
+        assert_eq!(user_version(&s), 4, "повторное открытие ничего не меняет");
         assert_eq!(s.jobs().unwrap().len(), 1);
     }
 
@@ -761,13 +784,13 @@ mod tests {
             insert_old_job(&c);
         }
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 3);
+        assert_eq!(user_version(&s), 4);
         let j = s.jobs().unwrap().pop().unwrap();
         assert_eq!(j.error.as_deref(), Some("старая ошибка"));
         assert_eq!((j.phase.as_str(), j.fail_elapsed_ms), ("", None));
         drop(s);
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 3, "повторное открытие ничего не меняет");
+        assert_eq!(user_version(&s), 4, "повторное открытие ничего не меняет");
         assert_eq!(s.jobs().unwrap().len(), 1);
     }
 
@@ -785,7 +808,7 @@ mod tests {
         }
         let report = r#"{"ok":false,"items":["нет ffmpeg"]}"#;
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 3);
+        assert_eq!(user_version(&s), 4);
         let j = s.jobs().unwrap().pop().unwrap();
         assert_eq!(j.error.as_deref(), Some("старая ошибка"));
         assert_eq!(j.precheck, None);
@@ -804,10 +827,77 @@ mod tests {
         drop(s);
 
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 3, "повторное открытие ничего не меняет");
+        assert_eq!(user_version(&s), 4, "повторное открытие ничего не меняет");
         assert_eq!(s.jobs().unwrap().len(), 1);
         assert_eq!(s.jobs().unwrap()[0].precheck.as_deref(), Some(report));
         assert_eq!(s.last_good().unwrap().unwrap().cs2_build, "25900000");
+    }
+
+    #[test]
+    fn version_three_database_gains_attempt_and_resume() {
+        let db = TempDb::new("v3");
+        {
+            let c = Connection::open(&db.0).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            for sql in &MIGRATIONS[..3] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.execute_batch("PRAGMA user_version = 3").unwrap();
+            insert_old_job(&c);
+        }
+        let s = Store::open(&db.0).unwrap();
+        assert_eq!(user_version(&s), 4);
+        let j = s.jobs().unwrap().pop().unwrap();
+        assert_eq!(j.error.as_deref(), Some("старая ошибка"));
+        assert_eq!((j.attempt, j.resume), (0, false));
+        assert_eq!(s.start_job(j.id).unwrap(), 1);
+        drop(s);
+        let s = Store::open(&db.0).unwrap();
+        assert_eq!(user_version(&s), 4, "повторное открытие ничего не меняет");
+        assert_eq!(s.jobs().unwrap()[0].attempt, 1);
+    }
+
+    #[test]
+    fn log_survives_restart_and_attempts_count_up() {
+        let s = Store::in_memory().unwrap();
+        let a = s.add_job(&new_job(JobKind::Record)).unwrap();
+        assert_eq!(s.job(a).unwrap().unwrap().attempt, 0);
+        assert_eq!(s.start_job(a).unwrap(), 1);
+        s.append_log(a, "строка первой попытки").unwrap();
+        s.finish_job(a, Err("упала")).unwrap();
+        s.requeue(a).unwrap();
+        assert_eq!(s.start_job(a).unwrap(), 2);
+        s.append_log(a, "строка второй").unwrap();
+        s.finish_job(a, Err("упала")).unwrap();
+        s.requeue(a).unwrap();
+        assert_eq!(s.start_job(a).unwrap(), 3);
+        let j = s.job(a).unwrap().unwrap();
+        assert_eq!(j.attempt, 3);
+        assert_eq!(
+            j.log,
+            "строка первой попытки
+строка второй
+",
+            "журнал не стирается"
+        );
+    }
+
+    #[test]
+    fn requeue_resume_marks_the_job_for_resume() {
+        let s = Store::in_memory().unwrap();
+        let a = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.start_job(a).unwrap();
+        s.fail_job(a, &JobFailure { message: "сбой".into(), code: "CONSOLE_NOT_OPEN".into(), state: "console".into(), ..Default::default() }).unwrap();
+        s.requeue_resume(a).unwrap();
+        let j = s.job(a).unwrap().unwrap();
+        assert_eq!((j.status, j.resume, j.error, j.fail_code, j.fail_state), (JobStatus::Queued, true, None, None, None));
+        assert_eq!(s.next_queued().unwrap().unwrap().id, a);
+        assert!(s.next_queued().unwrap().unwrap().resume, "исполнитель читает флаг из строки очереди");
+        s.start_job(a).unwrap();
+        assert!(s.job(a).unwrap().unwrap().resume, "старт флаг не трогает");
+        s.finish_job(a, Err("упала")).unwrap();
+        s.requeue(a).unwrap();
+        assert!(!s.job(a).unwrap().unwrap().resume, "«Заново» сбрасывает флаг");
     }
 
     #[test]

@@ -17,7 +17,10 @@ use pipeline::{
     host::{CmdSpec, Host, HostError, LaunchSpec},
     precheck::{self, Demo, Inputs, Level, Report, ids, space},
 };
-use store::{Job, JobFailure, JobKind, JobOutcome, JobSource, Store};
+use store::{
+    Job, JobFailure, JobKind, JobOutcome, JobSource, Store,
+    journal::{self, StartKind},
+};
 
 use crate::{
     app::{App, Msg, Reporter},
@@ -79,6 +82,8 @@ struct JobReporter {
     cancel: CancelToken,
     /// Папка задачи: известна после разбора демки; сюда `TakeDone` дописывает номера записанных дублей (D-08).
     out_dir: OnceLock<PathBuf>,
+    /// Номер попытки — в метке каждой строки журнала.
+    attempt: u32,
 }
 
 impl Progress for JobReporter {
@@ -122,8 +127,23 @@ pub fn job_failure(f: &RecordFailure) -> JobFailure {
     }
 }
 
+/// Итог попытки одной строкой для журнала: «готово», «отменена», «сбой КОД · состояние · этап X — сообщение».
+fn outcome_text(result: &Result<JobOutcome, RunError>, stage: &str) -> String {
+    let stage = if stage.is_empty() { "Старт" } else { stage };
+    let short = |m: &str| m.chars().take(200).collect::<String>();
+    match result {
+        Ok(_) => "готово".to_owned(),
+        Err(e) if e.message == pipeline::CANCELLED => "отменена".to_owned(),
+        Err(RunError { fail: Some(f), .. }) => format!("сбой {} · {} · этап {stage} — {}", f.code.as_str(), f.state.title(), short(&f.message)),
+        Err(e) => format!("ошибка · этап {stage} — {}", short(&e.message)),
+    }
+}
+
 /// Итог задачи в строку базы: отмена остаётся отменой, типизированный сбой — со всеми полями.
+/// Итог попытки пишется в журнал раньше, чем статус (RET-01, D-10).
 pub fn finish(store: &Store, id: i64, result: &Result<JobOutcome, RunError>) -> store::Result<()> {
+    let (attempt, stage) = store.job(id).ok().flatten().map(|j| (j.attempt, j.stage)).unwrap_or_default();
+    let _ = store.append_log(id, &journal::outcome_line(attempt, &outcome_text(result, &stage)));
     match result {
         Ok(o) => store.finish_job(id, Ok(o)),
         Err(e) if e.message == pipeline::CANCELLED => store.cancel_job(id),
@@ -235,16 +255,28 @@ pub fn run_next(app: &mut App) {
     let Ok(Some(job)) = app.store.next_queued() else {
         return;
     };
-    if let Err(e) = app.store.start_job(job.id) {
-        app.status.finish(Err(e));
-        return;
-    }
+    let attempt = match app.store.start_job(job.id) {
+        Ok(n) => n,
+        Err(e) => {
+            app.status.finish(Err(e));
+            return;
+        }
+    };
+    // журнал не стирается: каждая попытка открывается разделителем с номером, датой и способом запуска (D-10)
+    let kind = if job.resume {
+        StartKind::Retry
+    } else if attempt <= 1 {
+        StartKind::First
+    } else {
+        StartKind::Redo
+    };
+    let _ = app.store.append_log(job.id, &journal::separator(attempt, &chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(), kind));
     let cancel = CancelToken::default();
     app.jobs.running = Some((job.id, cancel.clone()));
     app.status.start(&format!("Задача #{}: {} · {}", job.id, job.label, job.kind.title()));
     let (store, s, ui) = (app.store.clone(), app.s.clone(), app.reporter());
     std::thread::spawn(move || {
-        let rep = JobReporter { store: store.clone(), id: job.id, ui, cancel, out_dir: OnceLock::new() };
+        let rep = JobReporter { store: store.clone(), id: job.id, ui, cancel, out_dir: OnceLock::new(), attempt };
         let result = run(&job, &s, &store, &rep);
         let _ = finish(&store, job.id, &result);
         rep.ui.send(Msg::JobDone { id: job.id, result: result.map(|o| o.result).map_err(|e| e.message) });
@@ -467,7 +499,8 @@ mod tests {
         token.cancel();
         assert!(token.is_cancelled() && !token.is_forced(), "обычная отмена не закрывает сразу");
         let token = CancelToken::default();
-        let rep = JobReporter { store: Store::in_memory().unwrap(), id: 1, ui: Reporter::detached(), cancel: token.clone(), out_dir: OnceLock::new() };
+        let rep =
+            JobReporter { store: Store::in_memory().unwrap(), id: 1, ui: Reporter::detached(), cancel: token.clone(), out_dir: OnceLock::new(), attempt: 1 };
         assert!(!rep.force_cancelled());
         token.force();
         assert!(token.is_cancelled(), "force включает и отмену");
@@ -599,6 +632,28 @@ mod tests {
         assert_eq!(deadlines(&s).ffmpeg_for(100.0), base * 2);
         s.time_margin = f32::NAN;
         assert_eq!(deadlines(&s).ffmpeg_for(100.0), base, "мусор в настройках не ломает дедлайны");
+    }
+
+    #[test]
+    fn finished_attempt_leaves_an_outcome_line_and_the_next_one_a_separator() {
+        let (store, id, dir) = running_job("outcome");
+        store.append_log(id, "строка первой попытки").unwrap();
+        store.set_stage(id, "Запись").unwrap();
+        let host = FakeHost::new(Scenario::happy(2).console_never_up());
+        let e = record_stage(&host, &request(&dir), &pipeline::Quiet).expect_err("консоль не открывается — запись падает");
+        finish(&store, id, &Err(e)).unwrap();
+
+        store.requeue(id).unwrap();
+        let attempt = store.start_job(id).unwrap();
+        assert_eq!(attempt, 2);
+        store.append_log(id, &journal::separator(attempt, "2026-10-11 10:30", StartKind::Redo)).unwrap();
+        let log = store.job(id).unwrap().unwrap().log;
+        assert!(log.contains("строка первой попытки"), "{log}");
+        assert!(log.contains("итог попытки 1: сбой CONSOLE_NOT_OPEN"), "{log}");
+        assert!(log.contains("этап Запись"), "{log}");
+        assert!(log.contains("──── попытка 2"), "{log}");
+        assert!(log.find("итог попытки 1").unwrap() < log.find("──── попытка 2").unwrap());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

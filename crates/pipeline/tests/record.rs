@@ -426,3 +426,86 @@ fn take_done_lines_keep_the_legacy_format() {
         "записан дубль 2/3"
     );
 }
+
+/// Запрос записи в чистую папку: следы прошлых прогонов тест не читает.
+fn fresh(name: &str, n: u32) -> RecordRequest {
+    let req = request(name, n);
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+    req
+}
+
+fn read_log(req: &RecordRequest) -> String {
+    std::fs::read_to_string(req.out_dir.join("record.log"))
+        .expect("record.log должен лежать в папке задачи")
+}
+
+#[test]
+fn record_log_is_written_on_success_and_on_failure_with_source_tags() {
+    let req = fresh("log-both", 2);
+    let ok = record(
+        &FakeHost::new(Scenario::happy(2)),
+        &req,
+        &Capture::default(),
+    );
+    ok.expect("первая запись проходит");
+    let after_first = read_log(&req);
+    assert_eq!(
+        after_first.matches("==== запись").count(),
+        1,
+        "{after_first}"
+    );
+    assert!(
+        after_first.contains(NONCE),
+        "nonce в разделителе: {after_first}"
+    );
+    assert!(after_first.contains("[netcon]"), "{after_first}");
+    assert!(after_first.contains("[app]"), "{after_first}");
+    assert!(after_first.contains("→ exec highlights"), "{after_first}");
+    assert!(
+        after_first.contains("HLAE.exe: stdout — 0 строк, stderr — 0 строк"),
+        "ноль строк HLAE — тоже явный факт: {after_first}"
+    );
+    assert!(
+        after_first.contains("запись завершена: дублей 2"),
+        "{after_first}"
+    );
+
+    // повторная попытка в ту же папку: журнал дописывается, а не перезаписывается
+    let f = record(
+        &FakeHost::new(Scenario::happy(2).console_never_up()),
+        &req,
+        &Capture::default(),
+    )
+    .expect_err("консоль не откроется");
+    assert_eq!(f.code, FailCode::ConsoleNotOpen);
+    let log = read_log(&req);
+    assert!(log.starts_with(&after_first), "прошлая попытка на месте");
+    assert_eq!(log.matches("==== запись").count(), 2, "{log}");
+    assert_eq!(log.matches(NONCE).count() >= 2, true);
+    assert_eq!(log.matches("stdout — 0 строк").count(), 2, "{log}");
+    let tail = &log[after_first.len()..];
+    for need in [
+        "CONSOLE_NOT_OPEN",
+        "консольный порт не открылся за 90 с",
+        "Закройте CS2",
+        "прошло 90 с",
+    ] {
+        assert!(tail.contains(need), "в итоге нет «{need}»: {tail}");
+    }
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn cancelled_recording_still_leaves_a_complete_record_log() {
+    let req = fresh("log-cancel", 3);
+    let fake = FakeHost::new(Scenario::happy(3).drop_marker(FakeMarker::Ready));
+    let cap = Capture::cancelling_after(RecordState::Demo);
+    let f = record(&fake, &req, &cap).expect_err("отмена");
+    assert_eq!(f.code, FailCode::Cancelled);
+    let log = read_log(&req);
+    let at = log.rfind("итог").expect("итог записан");
+    assert!(log[at..].contains("CANCELLED"), "{log}");
+    assert!(log[at..].contains("прошло"), "{log}");
+    assert!(log.contains("stdout — 0 строк"), "{log}");
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}

@@ -135,7 +135,10 @@ pub fn run(host: &dyn Host, i: &Inputs, p: &dyn Progress) -> crate::Result<Repor
 /// Второй проход оценки места (D-03): после плана известна потребность по дублям, и пункты места
 /// в отчёте заменяются. В журнал ничего не пишет — новые пункты логирует вызывающий.
 pub fn check_space(host: &dyn Host, i: &Inputs, need: space::Need, report: &mut Report) {
-    report.replace(space_items(&space_facts(host, i, need, true)));
+    let facts = space_facts(host, i, need, true);
+    report.free_results = facts.results.as_ref().ok().copied();
+    report.free_cs2 = facts.cs2.as_ref().ok().copied();
+    report.replace(space_items(&facts));
 }
 
 /// Свободное место на обоих дисках и потребность `need`.

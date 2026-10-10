@@ -323,6 +323,13 @@ impl Analysis {
     }
 }
 
+/// Кладёт распакованную копию демки `src` в `dest` без разбора (повтор не скачивает и не планирует,
+/// ему нужен только файл для `playdemo`, D-08). Ошибки называют путь.
+pub fn write_demo_copy(src: &Path, dest: &Path) -> Result<()> {
+    let data = demo::read_demo(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    std::fs::write(dest, data).map_err(|e| format!("{}: {e}", dest.display()))
+}
+
 /// Имя, безопасное для консоли CS2 (без пробелов и кавычек).
 pub fn console_name(s: &str) -> String {
     let n: String = s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
@@ -332,6 +339,22 @@ pub fn console_name(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_copy_is_written_unpacked() {
+        let dir = std::env::temp_dir().join(format!("cs2cinema-demo-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("a.dem"), dir.join("copy.dem"));
+        let body = b"PBDEMS2\0 demo body".to_vec();
+        std::fs::write(&src, &body).unwrap();
+        write_demo_copy(&src, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let gone = dir.join("нет.dem");
+        let e = write_demo_copy(&gone, &dest).unwrap_err();
+        assert!(e.contains("нет.dem"), "ошибка называет путь: {e}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn console_name_is_safe() {

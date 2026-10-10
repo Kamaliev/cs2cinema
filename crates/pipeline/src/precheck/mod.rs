@@ -73,6 +73,21 @@ pub struct Report {
     pub items: Vec<Item>,
     pub cs2_build: Option<String>,
     pub hlae_version: Option<String>,
+    /// Первая строка ответа `ffmpeg -version` (OBS-03).
+    #[serde(default)]
+    pub ffmpeg_version: Option<String>,
+    /// Первая строка ответа `ffprobe -version`.
+    #[serde(default)]
+    pub ffprobe_version: Option<String>,
+    /// Первая строка ответа `-version` у ffmpeg, которым пишет HLAE.
+    #[serde(default)]
+    pub hlae_ffmpeg_version: Option<String>,
+    /// Свободно на диске результатов, байт.
+    #[serde(default)]
+    pub free_results: Option<u64>,
+    /// Свободно на диске CS2, байт.
+    #[serde(default)]
+    pub free_cs2: Option<u64>,
 }
 
 impl Report {
@@ -389,10 +404,22 @@ pub fn evaluate(f: &Facts) -> Report {
         items.extend(space_items(s));
     }
 
+    let version = |t: &ToolFact| match t {
+        ToolFact::Answered { first_line } => Some(first_line.clone()),
+        _ => None,
+    };
     Report {
         items,
         cs2_build,
         hlae_version: f.hlae_version.clone(),
+        ffmpeg_version: version(&f.ffmpeg),
+        ffprobe_version: version(&f.ffprobe),
+        hlae_ffmpeg_version: f.hlae_ffmpeg.as_ref().and_then(|(_, t)| version(t)),
+        free_results: f
+            .space
+            .as_ref()
+            .and_then(|s| s.results.as_ref().ok().copied()),
+        free_cs2: f.space.as_ref().and_then(|s| s.cs2.as_ref().ok().copied()),
     }
 }
 
@@ -572,12 +599,12 @@ fn steam_items(f: &Facts) -> (Vec<Item>, Option<String>) {
         steam::SteamState::Updating(fl) => Item::fail(
             ids::STEAM_UPDATE,
             format!("Steam обновляет CS2 (StateFlags {fl})"),
-            "Дождитесь окончания обновления в Steam и нажмите «Повторить».",
+            "Дождитесь окончания обновления в Steam и нажмите «Повторить» (или «Заново», если задача не дошла до записи).",
         ),
         steam::SteamState::NotInstalled(fl) => Item::fail(
             ids::STEAM_UPDATE,
             format!("CS2 установлен не полностью (StateFlags {fl})"),
-            "Проверьте целостность файлов CS2 в Steam (свойства игры → Установленные файлы) и нажмите «Повторить».",
+            "Проверьте целостность файлов CS2 в Steam (свойства игры → Установленные файлы) и нажмите «Повторить» (или «Заново», если задача не дошла до записи).",
         ),
         steam::SteamState::UpdatePending(fl) => Item::warn(
             ids::STEAM_UPDATE,
@@ -786,6 +813,44 @@ mod tests {
             FailCode::PrecheckFailed.hint(),
             "пустая подсказка пункта -> подсказка кода"
         );
+    }
+
+    #[test]
+    fn report_without_env_facts_still_parses() {
+        // отчёт фазы 2 из базы: полей версий утилит и свободного места ещё нет
+        let old = r#"{"items":[{"id":"steam","level":"Ok","message":"Steam запущен","hint":""}],"cs2_build":"25815307","hlae_version":"2.192.7"}"#;
+        let r = Report::from_json(old).expect("старый отчёт читается");
+        assert_eq!(r.cs2_build.as_deref(), Some("25815307"));
+        assert_eq!(r.ffmpeg_version, None);
+        assert_eq!(r.free_results, None);
+    }
+
+    #[test]
+    fn evaluate_carries_tool_versions_and_free_space_into_the_report() {
+        let r = evaluate(&Facts {
+            ffmpeg: ToolFact::Answered {
+                first_line: "ffmpeg version 9.0.2".to_owned(),
+            },
+            ffprobe: ToolFact::Failed("нет".to_owned()),
+            hlae_ffmpeg: Some((
+                None,
+                ToolFact::Answered {
+                    first_line: "ffmpeg version 4.4".to_owned(),
+                },
+            )),
+            space: Some(SpaceFacts {
+                results: Ok(7),
+                cs2: Err("нет диска".to_owned()),
+                same_volume: false,
+                need: space::floors(),
+                by_plan: false,
+            }),
+            ..Facts::default()
+        });
+        assert_eq!(r.ffmpeg_version.as_deref(), Some("ffmpeg version 9.0.2"));
+        assert_eq!(r.ffprobe_version, None);
+        assert_eq!(r.hlae_ffmpeg_version.as_deref(), Some("ffmpeg version 4.4"));
+        assert_eq!((r.free_results, r.free_cs2), (Some(7), None));
     }
 
     #[test]

@@ -119,58 +119,58 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| PRE-01 | — | Pending |
-| PRE-02 | — | Pending |
-| PRE-03 | — | Pending |
-| PRE-04 | — | Pending |
-| PRE-05 | — | Pending |
-| PRE-06 | — | Pending |
-| PRE-07 | — | Pending |
-| LCH-01 | — | Pending |
-| LCH-02 | — | Pending |
-| LCH-03 | — | Pending |
-| LCH-04 | — | Pending |
-| LCH-05 | — | Pending |
-| LCH-06 | — | Pending |
-| TMO-01 | — | Pending |
-| TMO-02 | — | Pending |
-| TMO-03 | — | Pending |
-| TMO-04 | — | Pending |
-| TMO-05 | — | Pending |
-| TMO-06 | — | Pending |
-| TMO-07 | — | Pending |
-| TAK-01 | — | Pending |
-| TAK-02 | — | Pending |
-| TAK-03 | — | Pending |
-| TAK-04 | — | Pending |
-| TAK-05 | — | Pending |
-| TAK-06 | — | Pending |
-| RET-01 | — | Pending |
-| RET-02 | — | Pending |
-| RET-03 | — | Pending |
-| RET-04 | — | Pending |
-| RET-05 | — | Pending |
-| RET-06 | — | Pending |
-| OBS-01 | — | Pending |
-| OBS-02 | — | Pending |
-| OBS-03 | — | Pending |
-| OBS-04 | — | Pending |
-| TST-01 | — | Pending |
-| TST-02 | — | Pending |
-| TST-03 | — | Pending |
-| ACC-01 | — | Pending |
-| ACC-02 | — | Pending |
-| ACC-03 | — | Pending |
-| DIF-01 | — | Pending |
-| DIF-02 | — | Pending |
-| DIF-03 | — | Pending |
-| DIF-04 | — | Pending |
+| PRE-01 | Phase 2 | Pending |
+| PRE-02 | Phase 2 | Pending |
+| PRE-03 | Phase 2 | Pending |
+| PRE-04 | Phase 2 | Pending |
+| PRE-05 | Phase 2 | Pending |
+| PRE-06 | Phase 2 | Pending |
+| PRE-07 | Phase 2 | Pending |
+| LCH-01 | Phase 1 | Pending |
+| LCH-02 | Phase 1 | Pending |
+| LCH-03 | Phase 1 | Pending |
+| LCH-04 | Phase 1 | Pending |
+| LCH-05 | Phase 2 | Pending |
+| LCH-06 | Phase 1 | Pending |
+| TMO-01 | Phase 1 | Pending |
+| TMO-02 | Phase 1 | Pending |
+| TMO-03 | Phase 2 | Pending |
+| TMO-04 | Phase 2 | Pending |
+| TMO-05 | Phase 2 | Pending |
+| TMO-06 | Phase 2 | Pending |
+| TMO-07 | Phase 2 | Pending |
+| TAK-01 | Phase 1 | Pending |
+| TAK-02 | Phase 3 | Pending |
+| TAK-03 | Phase 3 | Pending |
+| TAK-04 | Phase 3 | Pending |
+| TAK-05 | Phase 3 | Pending |
+| TAK-06 | Phase 3 | Pending |
+| RET-01 | Phase 3 | Pending |
+| RET-02 | Phase 3 | Pending |
+| RET-03 | Phase 3 | Pending |
+| RET-04 | Phase 3 | Pending |
+| RET-05 | Phase 4 | Pending |
+| RET-06 | Phase 3 | Pending |
+| OBS-01 | Phase 3 | Pending |
+| OBS-02 | Phase 3 | Pending |
+| OBS-03 | Phase 3 | Pending |
+| OBS-04 | Phase 4 | Pending |
+| TST-01 | Phase 1 | Pending |
+| TST-02 | Phase 3 | Pending |
+| TST-03 | Phase 4 | Pending |
+| ACC-01 | Phase 4 | Pending |
+| ACC-02 | Phase 4 | Pending |
+| ACC-03 | Phase 4 | Pending |
+| DIF-01 | Phase 2 | Pending |
+| DIF-02 | Phase 2 | Pending |
+| DIF-03 | Phase 4 | Pending |
+| DIF-04 | Phase 4 | Pending |
 
 **Coverage:**
 - v1 requirements: 46 total
-- Mapped to phases: 0
-- Unmapped: 46 ⚠️
+- Mapped to phases: 46
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-10-10*
-*Last updated: 2026-10-10 after initial definition*
+*Last updated: 2026-10-10 after roadmap creation (traceability filled)*

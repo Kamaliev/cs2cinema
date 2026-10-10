@@ -207,9 +207,14 @@ fn space_pass(host: &dyn Host, inputs: &Inputs, need: space::Need, report: &mut 
     }
 }
 
-/// Запускает следующую задачу из очереди, если сейчас ничего не выполняется.
+/// Останавливает ли итог задачи очередь: только осознанная отмена (D-13); сбой и успех — очередь идёт дальше.
+pub fn pauses_queue(result: &Result<PathBuf, String>) -> bool {
+    matches!(result, Err(e) if e == pipeline::CANCELLED)
+}
+
+/// Запускает следующую задачу из очереди, если сейчас ничего не выполняется и очередь не на паузе.
 pub fn run_next(app: &mut App) {
-    if app.jobs.running.is_some() || app.status.busy {
+    if app.jobs.running.is_some() || app.status.busy || app.jobs.paused {
         return;
     }
     let Ok(Some(job)) = app.store.next_queued() else {
@@ -438,6 +443,13 @@ mod tests {
         for d in [a, b, c] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn only_a_cancelled_job_pauses_the_queue() {
+        assert!(pauses_queue(&Err(pipeline::CANCELLED.to_owned())));
+        assert!(!pauses_queue(&Err("сбой записи".to_owned())));
+        assert!(!pauses_queue(&Ok(PathBuf::from("highlights.mp4"))));
     }
 
     use pipeline::host::fake::{FakeHost, Scenario};

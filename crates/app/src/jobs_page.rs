@@ -18,6 +18,7 @@ enum Act {
     Retry(i64),
     Delete(i64),
     Log(i64),
+    Resume,
 }
 
 pub fn ui(app: &mut App, ui: &mut Ui) {
@@ -44,6 +45,25 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
     }
 
     let mut act: Option<Act> = None;
+    // очередь стоит после отмены, пока пользователь не нажмёт «Продолжить» (D-13)
+    let waiting = app.jobs.list.iter().filter(|j| j.status == JobStatus::Queued).count();
+    if app.jobs.paused && waiting > 0 {
+        egui::Frame::new().stroke(egui::Stroke::new(1.0_f32, ACCENT)).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(
+            ui,
+            |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Очередь на паузе после отмены: {} ждут", plural(waiting, "задача", "задачи", "задач"))).color(ACCENT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui::primary(ui, true, "Продолжить") {
+                            act = Some(Act::Resume);
+                        }
+                    });
+                });
+            },
+        );
+        ui.add_space(8.0);
+    }
     let jobs = app.jobs.list.clone();
     egui::ScrollArea::vertical().id_salt("jobs").auto_shrink([false, false]).show(ui, |ui| {
         for j in &jobs {
@@ -53,7 +73,10 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
     });
     match act {
         Some(Act::Cancel(id)) => app.cancel_job(id),
+        Some(Act::Resume) => app.resume_queue(),
         Some(Act::Retry(id)) => {
+            // «Повторить» — осознанное действие, пауза после отмены снимается (D-13)
+            app.jobs.paused = false;
             if let Err(e) = app.store.requeue(id) {
                 app.status.finish(Err(e));
             }

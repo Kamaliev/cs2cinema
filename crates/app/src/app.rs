@@ -7,8 +7,8 @@ use std::{
     time::Duration,
 };
 
-use eframe::egui::{self, RichText};
 use cs2::{PlayerId, report::Report};
+use eframe::egui::{self, RichText};
 use faceit::stats::{MatchStats, MatchSummary, Player};
 use highlights::{Highlight, Utility};
 use pipeline::{Analysis, Stage};
@@ -34,13 +34,20 @@ pub enum Msg {
     Stage(Stage),
     Analyzed(Result<Analysis, String>),
     /// Задача на монтаж завершилась (успех — путь к ролику или папке плана; `CANCELLED` — отмена).
-    JobDone { id: i64, result: Result<PathBuf, String> },
+    JobDone {
+        id: i64,
+        result: Result<PathBuf, String>,
+    },
     Player(Result<(Player, Vec<MatchSummary>), String>),
     Stats(String, Result<MatchStats, String>),
     UpdateFound(Result<Option<update::Release>, String>),
     Updated(Result<PathBuf, String>),
     /// Кадр готового ролика для карточки задачи (RGBA).
-    Thumb { id: i64, size: [usize; 2], rgba: Vec<u8> },
+    Thumb {
+        id: i64,
+        size: [usize; 2],
+        rgba: Vec<u8>,
+    },
 }
 
 /// Отчёт конвейера из фонового потока в окно.
@@ -103,6 +110,9 @@ pub struct JobsState {
     pub thumbs: HashMap<i64, egui::TextureHandle>,
     pub thumb_requested: std::collections::HashSet<i64>,
     pub sizes: HashMap<i64, u64>,
+    /// Очередь стоит после отмены выполняемой задачи до «Продолжить» (D-13). Только в памяти: после
+    /// перезапуска приложения задачи из очереди продолжаются.
+    pub paused: bool,
 }
 
 /// Размер превью ролика в карточке задачи.
@@ -327,7 +337,9 @@ impl App {
 
     /// Поставить задачу на открытый матч и выбранного игрока; возвращает её id.
     pub fn enqueue(&mut self, kind: JobKind) -> Result<i64, String> {
-        let (Some(a), Some(hero)) = (&self.game.analysis, self.game.hero) else { return Err("сначала разберите демку и выберите игрока".into()) };
+        let (Some(a), Some(hero)) = (&self.game.analysis, self.game.hero) else {
+            return Err("сначала разберите демку и выберите игрока".into());
+        };
         let source = match &self.game.match_id {
             Some(id) => {
                 let _ = self.store.remember_demo(id, &a.demo_path);
@@ -342,26 +354,25 @@ impl App {
             .and_then(|id| self.matches.list.iter().find(|m| &m.match_id == id))
             .map(|m| ui::date(m.started_at))
             .unwrap_or_else(|| a.label.clone());
-        let job = NewJob {
-            kind,
-            source,
-            label,
-            hero_name: a.m.name(hero),
-            hero_steam: a.m.player(hero).map_or(0, |p| p.xuid),
-            map: a.m.map.clone(),
-        };
+        let job = NewJob { kind, source, label, hero_name: a.m.name(hero), hero_steam: a.m.player(hero).map_or(0, |p| p.xuid), map: a.m.map.clone() };
         let id = self.store.add_job(&job)?;
+        // постановка новой задачи — осознанное действие, пауза после отмены снимается (D-13)
+        self.jobs.paused = false;
         self.refresh_jobs();
         jobs::run_next(self);
         Ok(id)
     }
 
     /// Отменить задачу: из очереди — сразу, выполняемую — через токен (поток сам остановится).
+    /// У выполняемой статус «отменяется» ставится в этом же кадре (D-11), не дожидаясь потока задачи.
     pub fn cancel_job(&mut self, id: i64) {
         match &self.jobs.running {
             Some((rid, token)) if *rid == id => {
                 token.cancel();
-                self.status.push("отменяю задачу…");
+                if let Err(e) = self.store.set_cancelling(id) {
+                    self.status.push(&e);
+                }
+                self.status.push(&format!("отменяю задачу #{id}: закрываю игру…"));
             }
             _ => {
                 if let Err(e) = self.store.cancel_job(id) {
@@ -370,6 +381,12 @@ impl App {
             }
         }
         self.refresh_jobs();
+    }
+
+    /// «Продолжить» после отмены: пауза снимается, очередь идёт дальше (D-13).
+    pub fn resume_queue(&mut self) {
+        self.jobs.paused = false;
+        jobs::run_next(self);
     }
 
     /// Разобрать демку; для файла страница матча открывается без FACEIT-шапки.
@@ -431,13 +448,21 @@ impl App {
                     Err(e) => self.status.finish(Err(e)),
                 },
                 Msg::JobDone { id, result } => {
+                    // осознанная отмена останавливает очередь, сбой и успех — нет (D-13)
+                    if jobs::pauses_queue(&result) {
+                        self.jobs.paused = true;
+                        self.status.push("очередь на паузе после отмены — нажмите «Продолжить»");
+                    }
                     if self.jobs.running.as_ref().is_some_and(|(rid, _)| *rid == id) {
                         self.jobs.running = None;
                     }
                     match result {
                         Ok(p) => {
                             let what = if p.extension().is_some_and(|e| e == "mp4") { "ролик" } else { "план и скрипты" };
-                            self.status.finish(Ok(format!("Задача #{id} готова: {what} — {}", p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default())));
+                            self.status.finish(Ok(format!(
+                                "Задача #{id} готова: {what} — {}",
+                                p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
+                            )));
                             self.status.result = Some(p);
                         }
                         Err(e) if e == pipeline::CANCELLED => {
@@ -500,7 +525,8 @@ impl App {
         });
         ui.add_space(18.0);
         let active = self.jobs.list.iter().filter(|j| j.is_active()).count();
-        let items = [(Page::Player, "👤", "Игрок", 0), (Page::Match, "🎯", "Матч", 0), (Page::Jobs, "🎬", "Задачи", active), (Page::Settings, "⚙", "Настройки", 0)];
+        let items =
+            [(Page::Player, "👤", "Игрок", 0), (Page::Match, "🎯", "Матч", 0), (Page::Jobs, "🎬", "Задачи", active), (Page::Settings, "⚙", "Настройки", 0)];
         for (page, glyph, title, badge) in items {
             if nav_item(ui, self.page == page, glyph, title, badge) {
                 self.page = page;
@@ -554,7 +580,13 @@ fn nav_item(ui: &mut egui::Ui, selected: bool, glyph: &str, title: &str, badge: 
     let color = if selected { ui::TEXT } else { ui::MUTED };
     let p = ui.painter();
     p.text(rect.left_center() + egui::vec2(18.0, 0.0), egui::Align2::LEFT_CENTER, glyph, egui::FontId::proportional(16.0), color);
-    p.text(rect.left_center() + egui::vec2(46.0, 0.0), egui::Align2::LEFT_CENTER, title, egui::FontId::new(15.0, if selected { ui::bold() } else { egui::FontFamily::Proportional }), color);
+    p.text(
+        rect.left_center() + egui::vec2(46.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::new(15.0, if selected { ui::bold() } else { egui::FontFamily::Proportional }),
+        color,
+    );
     if badge > 0 {
         let c = rect.right_center() - egui::vec2(20.0, 0.0);
         p.circle_filled(c, 10.0, ui::ACCENT);
@@ -603,7 +635,9 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
-        egui::TopBottomPanel::bottom("status").frame(egui::Frame::new().fill(ui::PANEL).inner_margin(egui::Margin::symmetric(12, 6))).show(ctx, |ui| self.status.ui(ui));
+        egui::TopBottomPanel::bottom("status")
+            .frame(egui::Frame::new().fill(ui::PANEL).inner_margin(egui::Margin::symmetric(12, 6)))
+            .show(ctx, |ui| self.status.ui(ui));
         egui::SidePanel::left("nav")
             .exact_width(196.0)
             .resizable(false)

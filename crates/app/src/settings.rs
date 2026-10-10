@@ -20,8 +20,8 @@ pub struct Settings {
     pub walls: bool,
     pub minimize_to_tray: bool,
     pub auto_update: bool,
-    /// Сколько секунд ждать загрузки демки перед `exec highlights`.
-    pub load_wait_secs: u32,
+    /// Запас по времени: множитель всех дедлайнов записи и склейки (1.0 — как задумано, больше — для медленной машины).
+    pub time_margin: f32,
     /// Высота кадра (720 / 1080 / 1440): окно игры и ролик, 16:9.
     pub resolution: u32,
     /// Кодировать на видеокарте NVIDIA (NVENC), если она есть.
@@ -51,7 +51,7 @@ impl Default for Settings {
             walls: true,
             minimize_to_tray: true,
             auto_update: true,
-            load_wait_secs: 25,
+            time_margin: 1.0,
             resolution: 720,
             gpu_encode: true,
             detailed: false,
@@ -85,5 +85,17 @@ impl Settings {
         if let Ok(s) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(Self::file(), s);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_file_with_load_wait_still_loads() {
+        let s: Settings = serde_json::from_str(r#"{"hlae_dir":"C:/hlae","load_wait_secs":40,"fps":90}"#).unwrap();
+        assert_eq!((s.hlae_dir.as_str(), s.fps), ("C:/hlae", 90));
+        assert_eq!(s.time_margin, 1.0, "прежнее поле игнорируется, запас по умолчанию ×1.0");
     }
 }

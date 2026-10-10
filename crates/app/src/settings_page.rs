@@ -94,8 +94,9 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
                     }
                 });
                 ui.end_row();
-                ui.label("Ожидание загрузки демки, с");
-                ui.add(egui::DragValue::new(&mut d.load_wait_secs).range(5..=180));
+                ui.label("Запас по времени");
+                ui.add(egui::DragValue::new(&mut d.time_margin).range(0.5..=5.0).speed(0.05).fixed_decimals(2).prefix("×"))
+                    .on_hover_text("Умножает все ожидания записи и склейки: игра, консоль, демка, дубли, ffmpeg");
                 ui.end_row();
             });
             ui.add_space(4.0);

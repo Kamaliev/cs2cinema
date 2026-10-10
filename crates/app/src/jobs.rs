@@ -14,7 +14,7 @@ use std::{
 
 use pipeline::{
     Deadlines, FailCode, PlanOptions, Progress, RecordFailure, RecordReport, RecordRequest, Source, Stage,
-    host::{Host, LaunchSpec},
+    host::{CmdSpec, Host, HostError, LaunchSpec},
 };
 use store::{Job, JobFailure, JobKind, JobOutcome, JobSource, Store};
 
@@ -123,7 +123,7 @@ pub fn record_request(s: &Settings, out_dir: &Path, demo_name: &str, plan: &pipe
             console_log: Some(Path::new(&s.cs2_dir).join("game/csgo/console.log")),
         },
         takes: plan.takes.clone(),
-        deadlines: Deadlines::default(),
+        deadlines: deadlines(s),
         header: format!("задача #{job_id} · {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")),
     }
 }
@@ -213,6 +213,7 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
     }
 
     p.stage(Stage::Record);
+    let host = pipeline::host::default_host();
     let clips = out_dir.join("clips");
     // дубли этого же плана уже есть (например, упала склейка) — не пишем заново;
     // ожидаемый набор дублей берём из плана, а не считаем номера сами
@@ -231,7 +232,8 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
         launch::install_files(&s.cs2_dir, &out_dir, &demo_name, |path| a.write_demo(path))?;
         // игру закрывает сама запись при любом выходе, в том числе при отмене
         let req = record_request(s, &out_dir, &demo_name, &plan, job.id);
-        let rep = record_stage(&*pipeline::host::default_host(), &req, p)?;
+        p.log(&format!("запас по времени ×{:.2}", s.time_margin));
+        let rep = record_stage(&*host, &req, p)?;
         let _ = std::fs::write(clips.join("plan.hash"), &hash);
         p.log(&format!("запись заняла {:.0} с", rep.elapsed.as_secs_f32()));
     }
@@ -239,7 +241,7 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
     p.stage(Stage::Assemble);
     p.log("склеиваю ролик через ffmpeg…");
     let out = out_dir.join("highlights.mp4");
-    run_ffmpeg(&out_dir, &plan.ffmpeg_args, plan.video_secs, p)?;
+    run_ffmpeg(&*host, &out_dir, &plan.ffmpeg_args, plan.video_secs, deadlines(s).ffmpeg_for(plan.video_secs), p)?;
     p.log(&format!("ролик готов: {}", out.display()));
     ui::open_path(&out);
     Ok(JobOutcome { out_dir, result: out, shots, secs })
@@ -270,66 +272,41 @@ fn plan_hash(out_dir: &Path, nonce: &str) -> String {
     format!("{h:016x}")
 }
 
-/// Склейка: ffmpeg в `dir` с прогрессом в лог. stdout (прогресс) и stderr (ошибки) читаются
-/// в своих потоках — непрочитанный pipe заполняется, и ffmpeg встаёт намертво.
-fn run_ffmpeg(dir: &Path, args: &[String], secs: f32, p: &JobReporter) -> Result<(), String> {
-    use std::io::{BufRead, BufReader, Read};
-    use std::process::{Command, Stdio};
-    let mut cmd = Command::new("ffmpeg");
-    cmd.current_dir(dir)
-        .args(["-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1"])
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    launch::no_window(&mut cmd);
-    let mut child = cmd.spawn().map_err(|e| format!("не удалось запустить ffmpeg (он должен быть в PATH): {e}"))?;
-    // прогресс: `out_time_us=…` в микросекундах готового ролика
-    let done_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let stdout = child.stdout.take().map(|o| {
-        let done_us = done_us.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(o).lines().map_while(Result::ok) {
-                if let Some(v) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<u64>().ok()) {
-                    done_us.store(v, Ordering::Relaxed);
-                }
-            }
-        })
-    });
-    let stderr = child.stderr.take().map(|mut e| {
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = e.read_to_string(&mut s);
-            s
-        })
-    });
+/// Дедлайны записи и склейки с учётом «Запаса по времени» из настроек.
+fn deadlines(s: &Settings) -> Deadlines {
+    Deadlines::default().scaled(s.time_margin)
+}
+
+/// Текст ошибки запуска утилиты склейки по-русски.
+fn ffmpeg_error(e: &HostError, deadline: Duration) -> String {
+    match e {
+        HostError::Timeout => format!("ffmpeg не уложился в {} с — склейка прервана; увеличьте «Запас по времени» в настройках", deadline.as_secs()),
+        HostError::Cancelled => pipeline::CANCELLED.to_owned(),
+        HostError::Spawn(e) => format!("не удалось запустить ffmpeg (он должен быть в PATH): {e}"),
+        e => format!("ffmpeg: {e}"),
+    }
+}
+
+/// Склейка: ffmpeg в `dir` через `Host::run` — с дедлайном и отменой; прогресс берётся из `-progress pipe:1`
+/// (`out_time_us` в микросекундах готового ролика) и раз в 10 с пишется в журнал.
+fn run_ffmpeg(host: &dyn Host, dir: &Path, args: &[String], secs: f32, deadline: Duration, p: &dyn Progress) -> Result<(), String> {
+    let mut all: Vec<String> = ["-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1"].map(String::from).into();
+    all.extend_from_slice(args);
+    let cmd = CmdSpec { program: "ffmpeg".into(), args: all, cwd: Some(dir.to_path_buf()), deadline };
     let started = std::time::Instant::now();
-    let mut logged = 0u32;
-    let status = loop {
-        if p.cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(pipeline::CANCELLED.to_owned());
-        }
-        match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) => std::thread::sleep(Duration::from_millis(300)),
-            Err(e) => return Err(format!("ffmpeg: {e}")),
-        }
-        // раз в 10 с — сколько склеено
-        if started.elapsed().as_secs() as u32 / 10 > logged && secs > 0.0 {
-            logged = started.elapsed().as_secs() as u32 / 10;
-            let pct = (done_us.load(Ordering::Relaxed) as f32 / 1e6 / secs * 100.0).min(100.0);
+    let mut logged = 0u64;
+    let mut on_line = |line: &str| {
+        let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<u64>().ok()) else { return };
+        let tick = started.elapsed().as_secs() / 10;
+        if tick > logged && secs > 0.0 {
+            logged = tick;
+            let pct = (us as f32 / 1e6 / secs * 100.0).min(100.0);
             p.log(&format!("склейка: {pct:.0}%"));
         }
     };
-    if let Some(t) = stdout {
-        let _ = t.join();
-    }
-    let err = stderr.and_then(|t| t.join().ok()).unwrap_or_default();
-    if !status.success() {
-        let tail: Vec<&str> = err.lines().rev().take(6).collect();
+    let out = host.run(&cmd, &|| p.cancelled(), &mut on_line).map_err(|e| ffmpeg_error(&e, deadline))?;
+    if out.code != Some(0) {
+        let tail: Vec<&str> = out.stderr_tail.iter().rev().take(6).map(String::as_str).collect();
         return Err(format!("ffmpeg завершился с ошибкой: {}", tail.into_iter().rev().collect::<Vec<_>>().join(" | ")));
     }
     p.log(&format!("склейка заняла {:.0} с", started.elapsed().as_secs_f32()));
@@ -447,6 +424,36 @@ mod tests {
         assert_eq!(j.fail_code, None);
         assert!(host.terminated() > 0, "игра закрыта и при отмене");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn assemble_with(r: Result<pipeline::host::CmdOutput, HostError>) -> Result<(), String> {
+        let host = FakeHost::new(Scenario::happy(1).run_result(r));
+        run_ffmpeg(&host, Path::new("."), &[], 10.0, Duration::from_secs(600), &pipeline::Quiet)
+    }
+
+    #[test]
+    fn ffmpeg_failures_are_explained_in_russian() {
+        let timeout = assemble_with(Err(HostError::Timeout)).unwrap_err();
+        assert!(timeout.starts_with("ffmpeg не уложился в 600 с"), "{timeout}");
+        assert!(timeout.contains("Запас по времени"), "{timeout}");
+        assert_eq!(assemble_with(Err(HostError::Cancelled)).unwrap_err(), pipeline::CANCELLED);
+        let spawn = assemble_with(Err(HostError::Spawn("нет файла".into()))).unwrap_err();
+        assert!(spawn.contains("должен быть в PATH"), "{spawn}");
+        let failed = pipeline::host::CmdOutput { code: Some(1), stderr_tail: (1..=8).map(|i| format!("строка {i}")).collect(), elapsed: Duration::ZERO };
+        let msg = assemble_with(Ok(failed)).unwrap_err();
+        assert_eq!(msg, "ffmpeg завершился с ошибкой: строка 3 | строка 4 | строка 5 | строка 6 | строка 7 | строка 8");
+        let ok = pipeline::host::CmdOutput { code: Some(0), stderr_tail: vec![], elapsed: Duration::ZERO };
+        assert!(assemble_with(Ok(ok)).is_ok());
+    }
+
+    #[test]
+    fn time_margin_scales_the_assemble_deadline() {
+        let mut s = Settings::default();
+        let base = deadlines(&s).ffmpeg_for(100.0);
+        s.time_margin = 2.0;
+        assert_eq!(deadlines(&s).ffmpeg_for(100.0), base * 2);
+        s.time_margin = f32::NAN;
+        assert_eq!(deadlines(&s).ffmpeg_for(100.0), base, "мусор в настройках не ломает дедлайны");
     }
 
     #[test]

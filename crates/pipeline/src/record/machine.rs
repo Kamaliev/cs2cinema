@@ -14,6 +14,7 @@ use renderer::TakePlan;
 
 use super::deadlines::Deadlines;
 use super::failure::{self, FailCode, LauncherFact, RecordFailure};
+use super::log;
 use super::markers::{self, EXEC, Marker};
 use super::{Event, TakeTiming};
 
@@ -146,6 +147,8 @@ pub struct Machine {
     evidence_at: Option<Duration>,
     /// Прямой запрос READY уже отправлен (не больше одного).
     direct_sent: bool,
+    /// Первая строка `AFXERROR` записи: при истёкшем дедлайне это причина сбоя (HLAE_ERROR).
+    afx: Option<String>,
     /// Последняя метка не по порядку — для сообщения о сбое.
     misordered: Option<String>,
     /// Уже показанные в журнале замечания, чтобы не повторять.
@@ -174,6 +177,7 @@ impl Machine {
             game_exited_at: None,
             evidence_at: None,
             direct_sent: false,
+            afx: None,
             misordered: None,
             facts_seen: vec![],
             finished: false,
@@ -279,9 +283,13 @@ impl Machine {
             SessionEvent::LauncherExited { code } => {
                 self.launcher = LauncherFact::Exited(code);
                 self.launcher_exit_at = Some(now);
+                acts.push(Action::Emit(Event::Fact(failure::msg_launcher_exit(code))));
             }
-            SessionEvent::GameAppeared { .. } => {
-                self.appeared_at.get_or_insert(now);
+            SessionEvent::GameAppeared { pid } => {
+                if self.appeared_at.is_none() {
+                    self.appeared_at = Some(now);
+                    acts.push(Action::Emit(Event::Fact(failure::msg_game_appeared(pid))));
+                }
             }
             SessionEvent::ConsoleUp => {
                 self.console_up = true;
@@ -292,6 +300,9 @@ impl Machine {
             }
             SessionEvent::ConsoleDown => self.console_up = false,
             SessionEvent::Line { text, .. } => {
+                if self.afx.is_none() && markers::is_afxerror(&text) {
+                    self.afx = Some(log::clean(&text));
+                }
                 if markers::is_demo_running_evidence(&text) {
                     self.evidence_at.get_or_insert(now);
                 }
@@ -299,7 +310,8 @@ impl Machine {
                     self.on_marker(now, mk, acts);
                 }
             }
-            SessionEvent::GameExited { .. } => {
+            SessionEvent::GameExited { code } => {
+                acts.push(Action::Emit(Event::Fact(failure::msg_game_ended(code))));
                 if self.state == RecordState::Closing {
                     self.game_exited_at.get_or_insert(now);
                 } else {
@@ -406,6 +418,12 @@ impl Machine {
                 let n = self.take as u32 + 1;
                 let m = self.takes.len() as u32;
                 acts.push(Action::Emit(Event::TakeDone { n, m }));
+                acts.push(Action::Emit(Event::Fact(failure::msg_take_timing(
+                    n,
+                    m,
+                    now.saturating_sub(self.take_started),
+                    self.takes[self.take].game_secs,
+                ))));
                 if (self.take + 1) < self.takes.len() {
                     self.begin_take_wait(self.take + 1, now, acts);
                 } else {
@@ -517,7 +535,14 @@ impl Machine {
         if now.saturating_sub(self.since) < limit {
             return;
         }
-        let msg = self.timeout_message(code, limit);
+        // HLAE уже сказал, что не так: дедлайн лишь подтверждает, что дальше ждать нечего
+        let (code, msg) = match &self.afx {
+            Some(afx) => (
+                FailCode::HlaeError,
+                failure::msg_hlae_error(afx, self.state, limit),
+            ),
+            None => (code, self.timeout_message(code, limit)),
+        };
         let f = self.fail(now, code, self.since, msg);
         acts.push(f);
     }

@@ -2,7 +2,7 @@
 //! здесь: машина и драйвер передают сюда факты (секунды, коды выхода), а не строят фразы сами.
 //!
 //! Что в каждом сбое: код, состояние лестницы, сообщение, подсказка и прошедшее время. Хвост
-//! консоли, строку фактов HLAE.exe/cs2.exe и код `HLAE_ERROR` добавляет план 01-08.
+//! консоли и строку фактов HLAE.exe/cs2.exe заполняет драйвер `record()` (`facts_line`).
 
 use std::time::Duration;
 
@@ -245,6 +245,69 @@ pub fn msg_send_failed(line: &str, error: &str) -> String {
     format!("не удалось отправить в консоль «{line}»: {error}")
 }
 
+/// Код завершения Windows в сообщении: большие (`0xC0000005`) — шестнадцатеричным строчными
+/// (так их ищут в справочниках), остальные — десятичным.
+pub fn code_text(code: u32) -> String {
+    if code >= 0x8000_0000 {
+        format!("{code:#x}")
+    } else {
+        code.to_string()
+    }
+}
+
+/// Строка фактов о двух процессах: код выхода `HLAE.exe` и живость `cs2.exe` — раздельно,
+/// потому что лаунчер выходит сразу после старта игры (LCH-06). Проверка живости, которая не
+/// удалась, всегда «неизвестно» и никогда «жива» (TMO-02).
+pub fn facts_line(launcher: &LauncherFact, game: &Liveness) -> String {
+    let hlae = match launcher {
+        LauncherFact::NotLaunched => "не запускался".to_owned(),
+        LauncherFact::Running => "ещё работает".to_owned(),
+        LauncherFact::Exited(Some(c)) => format!("код {}", code_text(*c as u32)),
+        LauncherFact::Exited(None) => "код неизвестен".to_owned(),
+    };
+    let cs2 = match game {
+        Liveness::NotStarted => "не запускалась".to_owned(),
+        Liveness::Alive => "жива".to_owned(),
+        Liveness::Exited(Some(c)) => format!("не жива (код {})", code_text(*c)),
+        Liveness::Exited(None) => "не жива".to_owned(),
+        Liveness::Unknown(e) => format!("неизвестно ({e})"),
+    };
+    format!("HLAE.exe: {hlae} · cs2.exe: {cs2}")
+}
+
+/// Дедлайн истёк, а в консоли уже была строка `AFXERROR`: HLAE сам сказал, что не так.
+pub fn msg_hlae_error(afx: &str, state: RecordState, limit: Duration) -> String {
+    format!(
+        "HLAE сообщил об ошибке: {afx} (сработал дедлайн этапа «{}» — {} с)",
+        state.title(),
+        secs(limit)
+    )
+}
+
+/// Игра появилась в нашем job.
+pub fn msg_game_appeared(pid: u32) -> String {
+    format!("cs2.exe запущена (PID {pid})")
+}
+
+/// Процесс игры завершился (отдельно от кода лаунчера).
+pub fn msg_game_ended(code: Option<u32>) -> String {
+    match code {
+        Some(c) => format!("cs2.exe завершилась (код {})", code_text(c)),
+        None => "cs2.exe завершилась (код неизвестен)".to_owned(),
+    }
+}
+
+/// Сколько реального времени заняла запись дубля `n` из `m` — данные для подстройки дедлайна дубля.
+pub fn msg_take_timing(n: u32, m: u32, wall: Duration, game_secs: f32) -> String {
+    let wall_secs = wall.as_secs_f32();
+    let ratio = if game_secs > 0.0 {
+        format!("{:.1}", wall_secs / game_secs)
+    } else {
+        "—".to_owned()
+    };
+    format!("дубль {n}/{m}: {wall_secs:.0} с записи на {game_secs:.1} с игры (×{ratio})")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +324,43 @@ mod tests {
     fn negative_exit_codes_are_printed_as_hex() {
         assert_eq!(exit_code_text(1), "1");
         assert_eq!(exit_code_text(-1073741819), "0xC0000005");
+    }
+
+    #[test]
+    fn facts_line_prints_windows_codes_in_hex_and_unknown_as_unknown() {
+        let line = |l, g| facts_line(&l, &g);
+        assert_eq!(
+            line(LauncherFact::Exited(Some(0)), Liveness::Alive),
+            "HLAE.exe: код 0 · cs2.exe: жива"
+        );
+        assert_eq!(
+            line(
+                LauncherFact::Exited(Some(0)),
+                Liveness::Exited(Some(0xC0000005))
+            ),
+            "HLAE.exe: код 0 · cs2.exe: не жива (код 0xc0000005)"
+        );
+        assert_eq!(
+            line(
+                LauncherFact::Running,
+                Liveness::Unknown("отказано в доступе".to_owned())
+            ),
+            "HLAE.exe: ещё работает · cs2.exe: неизвестно (отказано в доступе)"
+        );
+        assert_eq!(
+            line(LauncherFact::NotLaunched, Liveness::NotStarted),
+            "HLAE.exe: не запускался · cs2.exe: не запускалась"
+        );
+        assert_eq!(
+            line(
+                LauncherFact::Exited(Some(-1073741819)),
+                Liveness::Exited(None)
+            ),
+            "HLAE.exe: код 0xc0000005 · cs2.exe: не жива"
+        );
+        assert_eq!(
+            line(LauncherFact::Exited(None), Liveness::Alive),
+            "HLAE.exe: код неизвестен · cs2.exe: жива"
+        );
     }
 }

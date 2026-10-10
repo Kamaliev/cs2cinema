@@ -20,7 +20,7 @@ use renderer::TakePlan;
 
 use crate::Progress;
 pub use deadlines::Deadlines;
-pub use failure::{FailCode, LauncherFact, RecordFailure};
+pub use failure::{FailCode, LauncherFact, RecordFailure, facts_line};
 pub use machine::{Action, Input, Machine, RecordState};
 
 /// Верхняя граница одного ожидания события: так часто проверяются дедлайны и отмена.
@@ -205,7 +205,15 @@ impl Journal {
         self.line(now, "app", &text);
     }
 
-    fn success(&mut self, now: Duration, takes: usize) {
+    fn success(
+        &mut self,
+        now: Duration,
+        p: &dyn Progress,
+        takes: usize,
+        launcher: &LauncherFact,
+        game: &Liveness,
+    ) {
+        self.emit(now, p, &Event::Fact(facts_line(launcher, game)));
         self.hlae_counts(now);
         let secs = now.saturating_sub(self.t0).as_secs_f64().round() as u64;
         self.line(
@@ -215,8 +223,14 @@ impl Journal {
         );
     }
 
-    fn failure(&mut self, now: Duration, f: &mut RecordFailure) {
+    /// Дописать к сбою то, что знает журнал: хвост консоли и строку фактов о двух процессах.
+    fn failure(&mut self, now: Duration, p: &dyn Progress, f: &mut RecordFailure) {
         f.console_tail = self.tail.render(30);
+        let facts = facts_line(&f.launcher, &f.game);
+        if f.code != FailCode::Cancelled {
+            f.message = format!("{} ({facts})", f.message);
+        }
+        self.emit(now, p, &Event::Fact(facts));
         self.hlae_counts(now);
         let at = now.saturating_sub(self.t0);
         if let Some(l) = &mut self.log {
@@ -249,7 +263,7 @@ pub fn record(
         Ok(s) => s,
         Err(e) => {
             let mut f = machine.launch_failed(host.now(), &e);
-            j.failure(host.now(), &mut f);
+            j.failure(host.now(), p, &mut f);
             return Err(f);
         }
     };
@@ -292,11 +306,12 @@ pub fn record(
                 Action::Finish(Ok(())) => {
                     let game = liveness.unwrap_or_else(|| session.0.game_liveness());
                     let now = host.now();
-                    j.success(now, req.takes.len());
+                    let launcher = machine.launcher();
+                    j.success(now, p, req.takes.len(), &launcher, &game);
                     return Ok(RecordReport {
                         takes: machine.timings().to_vec(),
                         elapsed: now.saturating_sub(t0),
-                        launcher: machine.launcher(),
+                        launcher,
                         game,
                     });
                 }
@@ -304,7 +319,7 @@ pub fn record(
                     f.game = liveness.unwrap_or_else(|| session.0.game_liveness());
                     f.launcher = machine.launcher();
                     session.0.terminate();
-                    j.failure(host.now(), &mut f);
+                    j.failure(host.now(), p, &mut f);
                     return Err(f);
                 }
             }

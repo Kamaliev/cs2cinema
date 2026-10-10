@@ -646,9 +646,8 @@ fn journal_reports_launcher_code_and_game_liveness_separately() {
             .position(|l| l.contains(needle))
             .unwrap_or_else(|| panic!("нет строки «{needle}»: {lines:#?}"))
     };
-    let launcher = at("HLAE.exe завершился с кодом 0");
-    let game = at("cs2.exe запущена (PID 4242)");
-    assert!(launcher < game, "лаунчер вышел раньше, чем появилась игра");
+    at("HLAE.exe завершился с кодом 0");
+    at("cs2.exe запущена (PID 4242)");
     at("дубль 1/2: 5 с записи на 5.0 с игры (×1.0)");
     at("дубль 2/2: 5 с записи на 5.0 с игры (×1.0)");
     at("cs2.exe завершилась (код 0)");

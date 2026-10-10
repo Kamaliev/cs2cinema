@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 01
 current_phase_name: Новый путь записи с понятными сбоями
 status: executing
-stopped_at: Completed 01-01-PLAN.md
-last_updated: "2026-10-10T10:54:28.724Z"
+stopped_at: Completed 01-02-PLAN.md
+last_updated: "2026-10-10T10:58:59.127Z"
 last_activity: 2026-10-10
 last_activity_desc: Phase 01 execution started
-state_head: e689023364f58f4b1974c6b1811c8e245dacdb17
+state_head: 23d73bf2f2242a406f4a9edf8bf3408d3b1f0ae6
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 8
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 01 (Новый путь записи с понятными сбоями) — EXECUTING
-Plan: 2 of 8
+Plan: 3 of 8
 Status: Ready to execute
 Last activity: 2026-10-10 — Phase 01 execution started
 
@@ -57,6 +57,7 @@ Progress: [░░░░░░░░░░] 0%
 | Plan | Duration | Tasks | Files |
 |------|----------|-------|-------|
 | Phase 01 P01 | 11 min | 3 tasks | 10 files |
+| Phase 01 P02 | 10 min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -70,6 +71,7 @@ Recent decisions affecting current work:
 - Phase 2: свои процессы держатся в Job Object, запасной вариант — (PID, время создания); выбор подтверждается спайком в Phase 1
 - [Phase 01]: Фейк host: задержка метки сдвигает всю цепочку, убранная метка не приходит, но файлы дубля остаются; отклонённые команды не попадают в sent()
 - [Phase 01]: Стенд спайков: при запущенном cs2.exe отказ (код 2); без --fix запуски netcon чередуются off/on (5+5 = два запуска)
+- [Phase 01]: 01-02: старый путь записи ищет TAKE_END с nonce плана; plan_hash нормализует nonce в NONCE
 
 ### Pending Todos
 
@@ -92,6 +94,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-10T10:54:27.991Z
-Stopped at: Completed 01-01-PLAN.md
+Last session: 2026-10-10T10:58:59.093Z
+Stopped at: Completed 01-02-PLAN.md
 Resume file: None

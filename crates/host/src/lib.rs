@@ -11,6 +11,8 @@
 
 pub mod fake;
 mod unsupported;
+#[cfg(windows)]
+pub mod win;
 
 use std::path::PathBuf;
 use std::time::Duration;

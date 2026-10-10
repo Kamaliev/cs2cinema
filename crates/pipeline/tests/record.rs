@@ -1462,3 +1462,58 @@ fn launcher_spawn_error_fails_with_launcher_failed_and_still_writes_record_log()
     assert!(log[at..].contains("HLAE.exe не найден"), "{log}");
     let _ = std::fs::remove_dir_all(&req.out_dir);
 }
+
+#[test]
+fn cancel_in_every_state_returns_cancelled_closes_the_session_within_ten_seconds() {
+    // Отмена во время проверки дубля покрыта `cancel_during_ffprobe_cancels_the_recording`.
+    let table: [(RecordState, Scenario); 7] = [
+        // лаунчер не выходит, поэтому машина остаётся в Launcher
+        (
+            RecordState::Launcher,
+            Scenario::happy(3).launcher_never_exits(),
+        ),
+        // игра появляется позже выхода лаунчера, иначе машина проскакивает Game за один шаг
+        (RecordState::Game, Scenario::happy(3).game_appears(secs(10))),
+        (RecordState::Console, Scenario::happy(3).console_never_up()),
+        (
+            RecordState::Demo,
+            Scenario::happy(3).drop_marker(FakeMarker::Ready),
+        ),
+        (
+            RecordState::Script,
+            Scenario::happy(3).drop_marker(FakeMarker::Script),
+        ),
+        (RecordState::Take, Scenario::happy(3)),
+        // игра не выходит по quit: поэтапное закрытие доходит до принудительного
+        (RecordState::Closing, Scenario::happy(3).ignore_quit()),
+    ];
+    for (state, scenario) in table {
+        let fake = FakeHost::new(scenario);
+        let cap = Capture::cancelling_after(state).watching(&fake);
+        let req = fresh(&format!("cancel-ladder-{}", state.code()), 3);
+        let f = record(&fake, &req, &cap).expect_err(&format!(
+            "отмена в состоянии «{}» обязана вернуть сбой",
+            state.title()
+        ));
+        assert_eq!(f.code, FailCode::Cancelled, "состояние {}", state.code());
+        assert_eq!(f.state, state, "отмена названа в том состоянии, где пришла");
+        assert!(
+            fake.terminated() >= 1,
+            "{}: сессия не закрыта",
+            state.code()
+        );
+        let spent = fake.now() - cap.cancelled_at();
+        assert!(
+            spent <= secs(10),
+            "{}: от отмены до возврата прошло {spent:?}",
+            state.code()
+        );
+        let log = read_log(&req);
+        assert!(
+            log.contains("код: CANCELLED"),
+            "{}: в record.log нет итога отмены: {log}",
+            state.code()
+        );
+        let _ = std::fs::remove_dir_all(&req.out_dir);
+    }
+}

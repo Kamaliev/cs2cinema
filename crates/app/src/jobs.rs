@@ -6,10 +6,10 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use pipeline::{
@@ -84,15 +84,51 @@ struct JobReporter {
     out_dir: OnceLock<PathBuf>,
     /// Номер попытки — в метке каждой строки журнала.
     attempt: u32,
+    /// Текущий этап для метки строк журнала и время входа в него — по нему считается длительность (OBS-01, D-11).
+    cur: Mutex<Option<(String, Instant)>>,
+}
+
+impl JobReporter {
+    fn new(store: Store, id: i64, ui: Reporter, cancel: CancelToken, attempt: u32) -> Self {
+        JobReporter { store, id, ui, cancel, out_dir: OnceLock::new(), attempt, cur: Mutex::new(None) }
+    }
+
+    /// Строка в журнал задачи в базе: время, метка `[этап #попытка]` и текст.
+    fn write(&self, label: &str, text: &str) {
+        let line = format!("{}  {} {text}", chrono::Local::now().format("%H:%M:%S"), journal::prefix(label, self.attempt));
+        let _ = self.store.append_log(self.id, &line);
+    }
+
+    /// Перейти на этап `label`: длительность предыдущего этапа пишется в журнал. Тот же этап — ничего не меняет.
+    fn switch(&self, label: &str) {
+        let Ok(mut cur) = self.cur.lock() else { return };
+        match cur.as_ref() {
+            Some((prev, _)) if prev == label => return,
+            Some((prev, since)) => self.write(prev, &journal::stage_line(prev, since.elapsed())),
+            None => {}
+        }
+        *cur = Some((label.to_owned(), Instant::now()));
+    }
+
+    /// Закрыть текущий этап: записать его длительность. Повторный вызов ничего не пишет.
+    pub fn close_stage(&self) {
+        let Ok(mut cur) = self.cur.lock() else { return };
+        if let Some((prev, since)) = cur.take() {
+            self.write(&prev, &journal::stage_line(&prev, since.elapsed()));
+        }
+    }
 }
 
 impl Progress for JobReporter {
     fn stage(&self, s: Stage) {
+        self.switch(s.title());
         let _ = self.store.set_stage(self.id, s.title());
         self.ui.send(Msg::Stage(s));
     }
     fn log(&self, m: &str) {
-        let _ = self.store.append_log(self.id, &format!("{}  {m}", chrono::Local::now().format("%H:%M:%S")));
+        let label = self.cur.lock().ok().and_then(|c| c.as_ref().map(|(l, _)| l.clone())).unwrap_or_else(|| "Старт".to_owned());
+        self.write(&label, m);
+        // в окно уходит сырой текст: status.rs разбирает его префиксы
         self.ui.send(Msg::Log(m.to_owned()));
     }
     fn cancelled(&self) -> bool {
@@ -106,6 +142,9 @@ impl Progress for JobReporter {
     fn event(&self, e: &pipeline::Event) {
         if let pipeline::Event::State { state, .. } = e {
             let _ = self.store.set_phase(self.id, state.code());
+            if *state == RecordState::Precheck {
+                self.switch("Предпроверка");
+            }
         }
         if let (pipeline::Event::TakeDone { n, .. }, Some(dir)) = (e, self.out_dir.get()) {
             // номер дубля в событии с единицы, в `installed.json` и в имени `takeNNNN` — с нуля
@@ -276,8 +315,10 @@ pub fn run_next(app: &mut App) {
     app.status.start(&format!("Задача #{}: {} · {}", job.id, job.label, job.kind.title()));
     let (store, s, ui) = (app.store.clone(), app.s.clone(), app.reporter());
     std::thread::spawn(move || {
-        let rep = JobReporter { store: store.clone(), id: job.id, ui, cancel, out_dir: OnceLock::new(), attempt };
+        let rep = JobReporter::new(store.clone(), job.id, ui, cancel, attempt);
         let result = run(&job, &s, &store, &rep);
+        // длительность последнего этапа — до итога попытки (успех, сбой и отмена)
+        rep.close_stage();
         let _ = finish(&store, job.id, &result);
         rep.ui.send(Msg::JobDone { id: job.id, result: result.map(|o| o.result).map_err(|e| e.message) });
     });
@@ -499,8 +540,7 @@ mod tests {
         token.cancel();
         assert!(token.is_cancelled() && !token.is_forced(), "обычная отмена не закрывает сразу");
         let token = CancelToken::default();
-        let rep =
-            JobReporter { store: Store::in_memory().unwrap(), id: 1, ui: Reporter::detached(), cancel: token.clone(), out_dir: OnceLock::new(), attempt: 1 };
+        let rep = JobReporter::new(Store::in_memory().unwrap(), 1, Reporter::detached(), token.clone(), 1);
         assert!(!rep.force_cancelled());
         token.force();
         assert!(token.is_cancelled(), "force включает и отмену");
@@ -654,6 +694,29 @@ mod tests {
         assert!(log.contains("──── попытка 2"), "{log}");
         assert!(log.find("итог попытки 1").unwrap() < log.find("──── попытка 2").unwrap());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn journal_lines_carry_stage_and_attempt_and_stage_durations() {
+        let (store, id, _dir) = running_job("journal");
+        let rep = JobReporter::new(store.clone(), id, Reporter::detached(), CancelToken::default(), 2);
+        rep.log("а");
+        rep.event(&pipeline::Event::State { state: RecordState::Precheck, take: None });
+        rep.log("б");
+        rep.stage(Stage::Download);
+        rep.log("в");
+        rep.stage(Stage::Parse);
+        rep.close_stage();
+        rep.close_stage();
+
+        let log = store.job(id).unwrap().unwrap().log;
+        assert!(log.contains("[Старт #2] а"), "{log}");
+        assert!(log.contains("[Предпроверка #2] б"), "{log}");
+        assert!(log.contains("[Скачивание #2] в"), "{log}");
+        assert_eq!(log.matches("⏱ этап Разбор").count(), 1, "{log}");
+        assert_eq!(log.matches("⏱ этап Скачивание").count(), 1, "{log}");
+        let names: Vec<String> = journal::stage_summary(&log).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["Предпроверка", "Скачивание", "Разбор"]);
     }
 
     #[test]

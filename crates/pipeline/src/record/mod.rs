@@ -10,6 +10,7 @@ pub mod failure;
 pub mod log;
 pub mod machine;
 pub mod markers;
+pub mod processes;
 pub mod verify;
 
 use std::collections::VecDeque;
@@ -616,6 +617,47 @@ impl<'a> Verifier<'a> {
         Verdict::Rejected(failure::msg_take_invalid(n, m, &dir, &reason))
     }
 
+    /// После закрытия игры (job пуст — ffmpeg HLAE закончил) каждый оставшийся дубль проверяется
+    /// один раз. Негодный — сбой `TAKE_INVALID` (первый из негодных), отмена — сбой `Cancelled`.
+    fn verify_rest(
+        &mut self,
+        host: &dyn Host,
+        req: &RecordRequest,
+        p: &dyn Progress,
+        j: &mut Journal,
+    ) -> Option<RecordFailure> {
+        let waited = self
+            .pending
+            .first()
+            .map(|x| host.now().saturating_sub(x.first_at))
+            .unwrap_or_default();
+        let mut first: Option<String> = None;
+        while !self.pending.is_empty() {
+            match self.probe(0, host, req, p, j, true) {
+                Verdict::Settled => {}
+                Verdict::Cancelled => {
+                    return Some(RecordFailure::new(
+                        FailCode::Cancelled,
+                        RecordState::Closing,
+                        failure::msg_cancelled(),
+                        waited,
+                    ));
+                }
+                Verdict::Rejected(message) => {
+                    first.get_or_insert(message);
+                }
+            }
+        }
+        first.map(|message| {
+            let mut f =
+                RecordFailure::new(FailCode::TakeInvalid, RecordState::Take, message, waited);
+            if let Some(hint) = self.hint() {
+                f.hint = hint;
+            }
+            f
+        })
+    }
+
     /// Подсказка сбоя `TAKE_INVALID` с номером и папкой дубля (D-04).
     fn hint(&self) -> Option<String> {
         self.invalid
@@ -627,6 +669,31 @@ impl<'a> Verifier<'a> {
     fn end(&mut self, outcome: &str, now: Duration, j: &mut Journal) {
         self.manifest.end_attempt(outcome);
         self.save(now, j);
+    }
+}
+
+/// Записать свои процессы сессии в `processes.json` (D-15); пустой список не пишется, ошибка записи —
+/// строка журнала.
+fn save_processes(out_dir: &Path, session: &Guard, j: &mut Journal, now: Duration) {
+    let list = session.0.processes();
+    if list.is_empty() {
+        return;
+    }
+    if let Err(e) = processes::save(out_dir, &list) {
+        j.line(now, "app", &format!("processes.json не записан: {e}"));
+    }
+}
+
+/// После закрытия игры: подтверждённый выход (или игры не было) — `processes.json` больше не нужен;
+/// иначе он остаётся для следующего запуска приложения.
+fn settle_processes(out_dir: &Path, live: &Liveness, j: &mut Journal, now: Duration) {
+    match live {
+        Liveness::Exited(_) | Liveness::NotStarted => processes::remove(out_dir),
+        Liveness::Alive | Liveness::Unknown(_) => j.line(
+            now,
+            "app",
+            "processes.json оставлен: игра может быть жива — её завершит следующий запуск приложения",
+        ),
     }
 }
 
@@ -679,6 +746,7 @@ pub fn record(
         }
     };
     let mut session = Guard(session);
+    save_processes(&req.out_dir, &session, &mut j, host.now());
     // опрос окон своего job (D-10): когда смотрели в последний раз и какой набор окон был тогда
     let mut windows_at: Option<Duration> = None;
     let mut windows_seen: Vec<(String, String)> = vec![];
@@ -688,6 +756,9 @@ pub fn record(
         let now = host.now();
         if let Some(e) = &ev {
             j.session_event(now, e);
+            if matches!(e, SessionEvent::GameAppeared { .. }) {
+                save_processes(&req.out_dir, &session, &mut j, now);
+            }
         }
         let windows = if (RecordState::Launcher..=RecordState::Take).contains(&machine.state())
             && windows_at.is_none_or(|t| now.saturating_sub(t) >= req.deadlines.window_poll)
@@ -744,7 +815,7 @@ pub fn record(
                         let game = session.0.game_liveness();
                         let launcher = machine.launcher();
                         let stop = stop_for(&Ok(()));
-                        shutdown(
+                        let live = shutdown(
                             host,
                             &mut session,
                             &machine,
@@ -753,6 +824,18 @@ pub fn record(
                             &req.deadlines,
                             stop,
                         );
+                        settle_processes(&req.out_dir, &live, &mut j, host.now());
+                        // job пуст: ffmpeg HLAE закончил, последний дубль проверяется один раз
+                        if let Some(vf) = &mut verifier
+                            && let Some(mut f) = vf.verify_rest(host, req, p, &mut j)
+                        {
+                            f.game = game;
+                            f.launcher = launcher;
+                            j.failure(host.now(), p, &mut f);
+                            let outcome = format!("{}: {}", f.code.as_str(), f.message);
+                            vf.end(&outcome, host.now(), &mut j);
+                            return Err(f);
+                        }
                         let now = host.now();
                         j.success(now, p, req.takes.len(), &launcher, &game);
                         if let Some(vf) = &mut verifier {
@@ -785,7 +868,7 @@ pub fn record(
                             f.hint = hint;
                         }
                         let stop = stop_for(&Err(f.clone()));
-                        shutdown(
+                        let live = shutdown(
                             host,
                             &mut session,
                             &machine,
@@ -794,6 +877,7 @@ pub fn record(
                             &req.deadlines,
                             stop,
                         );
+                        settle_processes(&req.out_dir, &live, &mut j, host.now());
                         // дубль могла держать запись до самого выхода игры: помечаем после него
                         let done: Vec<u32> = machine.timings().iter().map(|t| t.index).collect();
                         for note in mark_partial(&req.out_dir.join("clips"), &done) {

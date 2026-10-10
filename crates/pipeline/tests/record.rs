@@ -5,12 +5,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use pipeline::host::fake::{FAKE_LAUNCHER_PID, FAKE_PID};
 use pipeline::host::fake::{FakeHost, FakeMarker, Scenario};
-use pipeline::host::{Host, LaunchSpec, Liveness, Source};
+use pipeline::host::{Host, HostError, LaunchSpec, Liveness, Source};
+use pipeline::manifest::{Manifest, TakeStatus};
+use pipeline::record::processes;
 use pipeline::record::{
     Deadlines, Event, FailCode, RecordRequest, RecordState, Verify, mark_partial, record,
 };
-use pipeline::manifest::{Manifest, TakeStatus};
 use pipeline::{Progress, Stage};
 use renderer::TakePlan;
 
@@ -989,8 +991,15 @@ fn ffprobe_never_reads_a_take_before_its_take_end() {
             .split(['/', '\\'])
             .find_map(|c| c.strip_prefix("take").and_then(|d| d.parse().ok()))
             .expect("в пути есть takeNNNN");
-        let end = ends.iter().find(|(i, _)| *i == idx).expect("TAKE_END был").1;
-        assert!(*at >= end, "дубль {idx} читали в {at:?}, а TAKE_END был в {end:?}");
+        let end = ends
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .expect("TAKE_END был")
+            .1;
+        assert!(
+            *at >= end,
+            "дубль {idx} читали в {at:?}, а TAKE_END был в {end:?}"
+        );
     }
     let _ = std::fs::remove_dir_all(&req.out_dir);
 }
@@ -1006,19 +1015,40 @@ fn truncated_take_fails_with_take_invalid_within_seconds_naming_the_take() {
     assert!(f.message.contains("дубль 2 из 3"), "{}", f.message);
     assert!(f.message.contains("take0001"), "{}", f.message);
     assert!(f.hint.contains("take0001"), "{}", f.hint);
-    let end_1 = fake.take_ends().iter().find(|(i, _)| *i == 1).expect("TAKE_END 1").1;
+    let end_1 = fake
+        .take_ends()
+        .iter()
+        .find(|(i, _)| *i == 1)
+        .expect("TAKE_END 1")
+        .1;
     let spent = fake.now() - end_1;
-    assert!(spent <= secs(10), "сбой пришёл через {spent:?} после TAKE_END 1");
+    assert!(
+        spent <= secs(10),
+        "сбой пришёл через {spent:?} после TAKE_END 1"
+    );
     assert_eq!(fake.take_ends().len(), 2, "третий дубль не дописывали");
 
     let m = manifest_of(&req);
     assert_eq!(m.entry(0).unwrap().status, TakeStatus::Validated);
     let bad = m.entry(1).unwrap();
     assert_eq!(bad.status, TakeStatus::Invalid);
-    assert!(bad.error.as_deref().is_some_and(|e| e.contains("длительность")), "{bad:?}");
-    assert!(m.attempts[0].outcome.as_deref().is_some_and(|o| o.contains("TAKE_INVALID")));
+    assert!(
+        bad.error
+            .as_deref()
+            .is_some_and(|e| e.contains("длительность")),
+        "{bad:?}"
+    );
+    assert!(
+        m.attempts[0]
+            .outcome
+            .as_deref()
+            .is_some_and(|o| o.contains("TAKE_INVALID"))
+    );
     assert!(read_log(&req).contains("TAKE_INVALID"));
-    assert!(req.out_dir.join("clips").join("take0001").is_dir(), "негодный дубль остаётся уликой");
+    assert!(
+        req.out_dir.join("clips").join("take0001").is_dir(),
+        "негодный дубль остаётся уликой"
+    );
     let _ = std::fs::remove_dir_all(&req.out_dir);
 }
 
@@ -1029,7 +1059,11 @@ fn take_without_audio_is_invalid() {
     let f = record(&fake, &req, &Capture::default()).expect_err("беззвучный дубль");
     assert_eq!(f.code, FailCode::TakeInvalid);
     assert!(f.message.contains("дубль 1 из 2"), "{}", f.message);
-    assert!(f.message.contains("audio.wav: нет аудиопотока"), "{}", f.message);
+    assert!(
+        f.message.contains("audio.wav: нет аудиопотока"),
+        "{}",
+        f.message
+    );
     let _ = std::fs::remove_dir_all(&req.out_dir);
 }
 
@@ -1041,5 +1075,160 @@ fn wrong_resolution_is_invalid_and_names_both_sizes() {
     assert_eq!(f.code, FailCode::TakeInvalid);
     assert!(f.message.contains("1920x1080"), "{}", f.message);
     assert!(f.message.contains("1280x720"), "{}", f.message);
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn finalizing_take_is_retried_until_ffmpeg_finishes_it() {
+    // ffmpeg HLAE дописывает файл 5 с; job пустеет, когда он закончил
+    let (req, clips) = verified("verify-lag", 3);
+    let sc = Scenario::happy(3)
+        .clips_dir(clips)
+        .finalize_lag(secs(5))
+        .job_empty_after_exit(Some(secs(6)));
+    let fake = FakeHost::new(sc);
+    record(&fake, &req, &Capture::default()).expect("дописываемый файл — не негодный");
+
+    let m = manifest_of(&req);
+    assert!(m.all_validated(), "{m:?}");
+    let first = fake
+        .runs()
+        .iter()
+        .filter(|(_, _, args)| {
+            args.last()
+                .is_some_and(|a| a.contains("take0000") && a.contains("video.mp4"))
+        })
+        .count();
+    assert!(
+        first > 1,
+        "проверка должна повторяться, пока файл дописывается: {first}"
+    );
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn take_that_never_finalizes_fails_after_take_finalize() {
+    let (req, clips) = verified("verify-never", 6);
+    let fake = FakeHost::new(Scenario::happy(6).clips_dir(clips).finalize_lag(secs(60)));
+    let f = record(&fake, &req, &Capture::default()).expect_err("файл так и не дописан");
+
+    assert_eq!(f.code, FailCode::TakeInvalid);
+    assert_eq!(f.state, RecordState::Take);
+    assert!(f.message.contains("дубль 1 из 6"), "{}", f.message);
+    assert!(f.message.contains("take0000"), "{}", f.message);
+    assert!(f.message.contains("не дописан за 20 с"), "{}", f.message);
+    let end_0 = fake.take_ends()[0].1;
+    let spent = fake.now() - end_0;
+    assert!(
+        spent >= req.deadlines.take_finalize && spent <= req.deadlines.take_finalize + secs(10),
+        "решение не позже take_finalize: {spent:?}"
+    );
+    assert!(
+        fake.take_ends().len() < 6,
+        "игра писала дальше, но запись остановлена"
+    );
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn last_take_is_verified_after_the_game_closes() {
+    // каждый дубль занимает 7 с, дописывается 6 с: последний не успевает до выхода игры
+    let (req, clips) = verified("verify-last", 3);
+    let fake = FakeHost::new(Scenario::happy(3).clips_dir(clips).finalize_lag(secs(6)));
+    let f = record(&fake, &req, &Capture::default()).expect_err("последний дубль не дописан");
+
+    assert_eq!(f.code, FailCode::TakeInvalid);
+    assert_eq!(f.state, RecordState::Take);
+    assert!(f.message.contains("дубль 3 из 3"), "{}", f.message);
+    assert!(f.hint.contains("take0002"), "{}", f.hint);
+    let m = manifest_of(&req);
+    assert_eq!(m.entry(0).unwrap().status, TakeStatus::Validated);
+    assert_eq!(m.entry(1).unwrap().status, TakeStatus::Validated);
+    assert_eq!(m.entry(2).unwrap().status, TakeStatus::Invalid);
+    let log = read_log(&req);
+    let at = log.rfind("итог").expect("итог сбоя записан в record.log");
+    assert!(log[at..].contains("TAKE_INVALID"), "{log}");
+    assert!(
+        m.attempts[0]
+            .outcome
+            .as_deref()
+            .is_some_and(|o| o.contains("TAKE_INVALID"))
+    );
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn cancel_during_ffprobe_cancels_the_recording() {
+    let (req, clips) = verified("verify-cancel", 3);
+    let sc = Scenario::happy(3).clips_dir(clips).program_for(
+        "ffprobe",
+        "take0000",
+        &[],
+        Err(HostError::Cancelled),
+    );
+    let fake = FakeHost::new(sc);
+    let f = record(&fake, &req, &Capture::default()).expect_err("отмена во время ffprobe");
+    assert_eq!(f.code, FailCode::Cancelled);
+    assert!(fake.terminated() >= 1, "игра закрыта");
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn missing_ffprobe_fails_the_take_with_the_host_error() {
+    let (req, clips) = verified("verify-no-ffprobe", 2);
+    let sc = Scenario::happy(2).clips_dir(clips).program(
+        "ffprobe",
+        &[],
+        Err(HostError::Spawn("файл не найден".to_owned())),
+    );
+    let fake = FakeHost::new(sc);
+    let f = record(&fake, &req, &Capture::default()).expect_err("ffprobe не запускается");
+    assert_eq!(f.code, FailCode::TakeInvalid);
+    assert!(f.message.contains("ffprobe не запустился"), "{}", f.message);
+    assert!(f.message.contains("файл не найден"), "{}", f.message);
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn own_processes_file_lives_only_while_the_game_may_be_alive() {
+    // удачная запись: игра закрыта и подтверждена, файла нет
+    let req = fresh("procs-ok", 2);
+    record(
+        &FakeHost::new(Scenario::happy(2)),
+        &req,
+        &Capture::default(),
+    )
+    .expect("запись удаётся");
+    assert!(
+        !req.out_dir.join(processes::PROCESSES_FILE).exists(),
+        "файл удаляется после выхода игры"
+    );
+    assert_eq!(processes::load(&req.out_dir), Ok(None));
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+
+    // игра пережила terminate: файл остаётся для следующего запуска приложения
+    let req = fresh("procs-survivor", 3);
+    let fake = FakeHost::new(Scenario::happy(3).ignore_quit().exit_after_terminate(None));
+    let cap = Capture::cancelling_after(RecordState::Take);
+    let f = record(&fake, &req, &cap).expect_err("отмена");
+    assert_eq!(f.code, FailCode::Cancelled);
+    let list = processes::load(&req.out_dir)
+        .expect("файл читается")
+        .expect("файл остался");
+    assert!(
+        list.iter()
+            .any(|p| p.image == "cs2.exe" && p.pid == FAKE_PID),
+        "{list:?}"
+    );
+    assert!(
+        list.iter()
+            .any(|p| p.image == "HLAE.exe" && p.pid == FAKE_LAUNCHER_PID),
+        "{list:?}"
+    );
+    assert!(
+        read_log(&req).contains("processes.json оставлен"),
+        "{}",
+        read_log(&req)
+    );
     let _ = std::fs::remove_dir_all(&req.out_dir);
 }

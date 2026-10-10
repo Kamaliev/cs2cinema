@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 
 use crate::gate::{DemoGate, Verdict};
 use crate::{
-    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, PrevGame, ProcInfo, Session,
-    SessionEvent, Source, WindowInfo, console_line_ok,
+    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, ORPHAN_IMAGES, OrphanOutcome,
+    PrevGame, ProcIdentity, ProcInfo, Session, SessionEvent, Source, WindowInfo, console_line_ok,
 };
 use job::Job;
 use process::OwnedProc;
@@ -202,9 +202,12 @@ impl WinHost {
         }
 
         // время создания лаунчера — нижняя граница для принятия игры по PID
-        let launcher_created = OwnedProc::open(child.id())
-            .ok()
-            .and_then(|p| p.creation_time());
+        let launcher_proc = OwnedProc::open(child.id()).ok();
+        let launcher_created = launcher_proc.as_ref().and_then(|p| p.creation_time());
+        let launcher = launcher_proc
+            .as_ref()
+            .and_then(|p| identity_of(p, launcher_created?));
+        drop(launcher_proc);
 
         let (tx, rx) = mpsc::channel::<SessionEvent>();
         let sink = Arc::new(Sink::new(tx, &params.nonce));
@@ -235,6 +238,7 @@ impl WinHost {
             shared,
             job,
             sink,
+            launcher,
             terminated: false,
             terminated_at: None,
         }))
@@ -310,7 +314,25 @@ fn check_demo_name(name: &str) -> Result<(), HostError> {
     Ok(())
 }
 
+/// Идентичность открытого процесса: PID, переданное время создания и имя файла образа.
+fn identity_of(proc: &OwnedProc, created: u64) -> Option<ProcIdentity> {
+    let image = proc
+        .image_path()?
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
+    Some(ProcIdentity {
+        pid: proc.pid(),
+        created,
+        image,
+    })
+}
+
 impl Host for WinHost {
+    fn kill_orphan(&self, id: &ProcIdentity) -> OrphanOutcome {
+        process::kill_if_same(id, &ORPHAN_IMAGES)
+    }
+
     fn launch(&self, spec: &LaunchSpec) -> Result<Box<dyn Session>, HostError> {
         let hlae = spec.hlae_dir.join("HLAE.exe");
         let hook = spec.hlae_dir.join("x64").join("AfxHookSource2.dll");
@@ -446,6 +468,8 @@ pub struct WinSession {
     shared: Arc<Shared>,
     job: Arc<Job>,
     sink: Arc<Sink>,
+    /// Лаунчер (HLAE) с момента запуска: PID, время создания, образ.
+    launcher: Option<ProcIdentity>,
     terminated: bool,
     /// Когда сессию завершили впервые: от этого момента считается «игра не выходит».
     terminated_at: Option<Instant>,
@@ -496,6 +520,18 @@ impl Session for WinSession {
 
     fn launcher_exit(&self) -> Option<Option<i32>> {
         *lock(&self.shared.launcher_exit)
+    }
+
+    fn processes(&self) -> Vec<ProcIdentity> {
+        let mut out: Vec<ProcIdentity> = self.launcher.iter().cloned().collect();
+        // игра без времени создания в список не попадает: по одному PID её завершать нельзя
+        if let Some(game) = lock(&self.shared.game).as_ref()
+            && let Some(created) = game.creation_time()
+            && let Some(id) = identity_of(game, created)
+        {
+            out.push(id);
+        }
+        out
     }
 
     fn windows(&mut self) -> Vec<WindowInfo> {

@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Threading::{
 
 use super::job::Job;
 use super::last_error;
-use crate::{HostError, Liveness};
+use crate::{HostError, Liveness, OrphanOutcome, ProcIdentity};
 
 /// Процесс, открытый по PID: владеет handle и закрывает его в `Drop`.
 pub struct OwnedProc {
@@ -178,6 +178,74 @@ pub fn liveness_of_pid(pid: u32) -> Liveness {
     }
 }
 
+/// Код ошибки ОС «неверный параметр»: так `OpenProcess` отвечает на PID, которого нет.
+const ERROR_INVALID_PARAMETER: i32 = 87;
+
+/// Завершает процесс `id`, только если его образ в `allowed`, а время создания и имя образа
+/// совпали с идентичностью. Открытие, сравнение, завершение и ожидание идут на одном handle,
+/// поэтому PID не может смениться под рукой (T-03-04, T-03-05). Без совпадения — `Mismatch`,
+/// процесс не тронут.
+pub fn kill_if_same(id: &ProcIdentity, allowed: &[&str]) -> OrphanOutcome {
+    if !allowed.iter().any(|a| a.eq_ignore_ascii_case(&id.image)) {
+        return OrphanOutcome::Mismatch(format!("образ {} не из списка своих", id.image));
+    }
+    // SAFETY: аргументы — права доступа, флаг наследования и PID; результат проверяем на null.
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            0,
+            id.pid,
+        )
+    };
+    if handle.is_null() {
+        let e = std::io::Error::last_os_error();
+        return if e.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+            OrphanOutcome::Gone
+        } else {
+            OrphanOutcome::Failed(format!("OpenProcess({}): {}", id.pid, last_error()))
+        };
+    }
+    let proc = OwnedProc {
+        pid: id.pid,
+        handle,
+    };
+    if proc.creation_time() != Some(id.created) {
+        return OrphanOutcome::Mismatch(format!(
+            "PID {} занят другим процессом (другое время создания)",
+            id.pid
+        ));
+    }
+    // время создания читается и у вышедшего процесса, а образ — уже нет: выход проверяем до образа
+    if matches!(proc.liveness(), Liveness::Exited(_)) {
+        return OrphanOutcome::Gone;
+    }
+    let actual = proc
+        .image_path()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+    match actual {
+        Some(name) if name.eq_ignore_ascii_case(&id.image) => {}
+        Some(name) => {
+            return OrphanOutcome::Mismatch(format!(
+                "PID {} — другой образ: {name}, а не {}",
+                id.pid, id.image
+            ));
+        }
+        None => {
+            return OrphanOutcome::Mismatch(format!(
+                "PID {}: имя образа прочитать не удалось",
+                id.pid
+            ));
+        }
+    }
+    if let Err(e) = proc.kill(1) {
+        return OrphanOutcome::Failed(e.to_string());
+    }
+    match proc.wait(Duration::from_secs(3)) {
+        Liveness::Exited(_) => OrphanOutcome::Killed,
+        _ => OrphanOutcome::Failed("процесс не завершился за 3 с".into()),
+    }
+}
+
 /// Запись из снимка процессов.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcEntry {
@@ -238,6 +306,66 @@ mod tests {
             }
             other => panic!("ожидалось Unknown, получено {other:?}"),
         }
+    }
+
+    #[test]
+    fn orphan_is_killed_only_when_pid_creation_time_and_image_match() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("ping запускается");
+        let probe = OwnedProc::open(child.id()).expect("свой процесс открывается");
+        let created = probe.creation_time().expect("время создания читается");
+        let image = probe
+            .image_path()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .expect("образ читается");
+        drop(probe);
+        let id = ProcIdentity {
+            pid: child.id(),
+            created,
+            image: image.clone(),
+        };
+
+        // другое время создания: PID занят другим процессом
+        let other_time = ProcIdentity {
+            created: created + 1,
+            ..id.clone()
+        };
+        assert!(matches!(
+            kill_if_same(&other_time, &["ping.exe"]),
+            OrphanOutcome::Mismatch(_)
+        ));
+        assert!(child.try_wait().unwrap().is_none(), "процесс должен жить");
+
+        // образ не из списка своих
+        assert!(matches!(
+            kill_if_same(&id, &crate::ORPHAN_IMAGES),
+            OrphanOutcome::Mismatch(_)
+        ));
+        assert!(child.try_wait().unwrap().is_none(), "процесс должен жить");
+
+        // образ в списке, но у процесса другой
+        let other_image = ProcIdentity {
+            image: "cs2.exe".into(),
+            ..id.clone()
+        };
+        assert!(matches!(
+            kill_if_same(&other_image, &["cs2.exe", "ping.exe"]),
+            OrphanOutcome::Mismatch(_)
+        ));
+        assert!(child.try_wait().unwrap().is_none(), "процесс должен жить");
+
+        // полное совпадение
+        assert_eq!(kill_if_same(&id, &["ping.exe"]), OrphanOutcome::Killed);
+        child.wait().expect("процесс завершён");
+
+        // повтор: процесса уже нет
+        assert_eq!(kill_if_same(&id, &["ping.exe"]), OrphanOutcome::Gone);
     }
 
     #[test]

@@ -397,3 +397,52 @@ fn terminated_stand_in_game_is_confirmed_gone_by_wait_exit() {
         started.elapsed()
     );
 }
+
+#[test]
+fn session_names_its_own_processes_and_refuses_to_kill_a_foreign_image() {
+    let port = host::win::netcon::free_port();
+    let mut session = WinHost::new()
+        .launch_with(stand_in_launcher(), "ping.exe", port, None)
+        .expect("сессия должна запуститься");
+
+    let mut events = Vec::new();
+    let appeared = poll_until(
+        session.as_mut(),
+        Duration::from_secs(10),
+        &mut events,
+        |e| {
+            e.iter()
+                .any(|x| matches!(x, SessionEvent::GameAppeared { .. }))
+        },
+    );
+    assert!(appeared, "игра не появилась: {events:?}");
+    let game_pid = events
+        .iter()
+        .find_map(|x| match x {
+            SessionEvent::GameAppeared { pid } => Some(*pid),
+            _ => None,
+        })
+        .unwrap();
+
+    let ours = session.processes();
+    let game = ours
+        .iter()
+        .find(|p| p.pid == game_pid)
+        .unwrap_or_else(|| panic!("игры нет среди процессов сессии: {ours:?}"));
+    assert_ne!(game.created, 0, "время создания игры должно быть известно");
+    assert!(
+        game.image.eq_ignore_ascii_case("ping.exe"),
+        "образ стенда: {}",
+        game.image
+    );
+
+    // образ PING.EXE не из ORPHAN_IMAGES: хост отказывает, игра жива
+    let outcome = WinHost::new().kill_orphan(game);
+    assert!(
+        matches!(outcome, host::OrphanOutcome::Mismatch(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(session.game_liveness(), Liveness::Alive);
+
+    session.terminate();
+}

@@ -58,17 +58,29 @@ fn no_process_is_ever_stopped_by_image_name() {
 }
 
 #[test]
-fn host_trait_has_no_way_to_stop_a_process_by_pid_or_name() {
+fn host_trait_stops_a_process_only_by_its_full_identity() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../host/src/lib.rs");
     let text = std::fs::read_to_string(&path).expect("crates/host/src/lib.rs читается");
     assert!(text.contains("pub trait Host"), "трейт Host не найден");
-    let bad: Vec<&str> = text
+    assert!(
+        text.contains("pub created: u64"),
+        "в идентичности процесса нет времени создания"
+    );
+    let killers: Vec<&str> = text
         .lines()
         .filter(|l| l.contains("fn ") && l.contains("&self"))
         .filter(|l| l.to_lowercase().contains("kill"))
         .collect();
     assert!(
+        killers.len() <= 1,
+        "в трейтах хоста больше одного метода завершения: {killers:?}"
+    );
+    let bad: Vec<&&str> = killers
+        .iter()
+        .filter(|l| !l.contains("&ProcIdentity") || l.contains("pid:") || l.contains("name"))
+        .collect();
+    assert!(
         bad.is_empty(),
-        "в трейтах хоста появился метод завершения по PID или имени: {bad:?}"
+        "метод завершения должен принимать только &ProcIdentity, а не PID или имя: {bad:?}"
     );
 }

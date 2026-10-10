@@ -185,6 +185,48 @@ pub struct ProcInfo {
     pub exe_name: String,
 }
 
+/// Процесс, запущенный приложением: PID, время создания (FILETIME, 100 нс от 1601 г.) и имя образа.
+///
+/// PID переиспользуется системой, поэтому один PID ничего не доказывает — только пара с временем
+/// создания. Имя образа — как его отдаёт ОС (например `cs2.exe`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcIdentity {
+    pub pid: u32,
+    pub created: u64,
+    pub image: String,
+}
+
+/// Образы, которые приложение вправе завершить как свои осиротевшие процессы (сравнение без
+/// учёта регистра). Дочерний ffmpeg HLAE завершается вместе с job и сюда не входит.
+pub const ORPHAN_IMAGES: [&str; 2] = ["cs2.exe", "hlae.exe"];
+
+/// Итог попытки завершить осиротевший процесс прошлого экземпляра приложения (D-15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrphanOutcome {
+    /// Процесс совпал по всем признакам и завершён.
+    Killed,
+    /// Процесса уже нет (или он успел выйти).
+    Gone,
+    /// PID занят другим процессом или образ не из списка своих: ничего не тронуто.
+    Mismatch(String),
+    /// Процесс свой, но завершить его не удалось.
+    Failed(String),
+    /// Платформа не умеет завершать процессы по идентичности.
+    Unsupported,
+}
+
+impl std::fmt::Display for OrphanOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OrphanOutcome::Killed => f.write_str("завершён"),
+            OrphanOutcome::Gone => f.write_str("уже не работает"),
+            OrphanOutcome::Mismatch(why) => write!(f, "не тот процесс: {why}"),
+            OrphanOutcome::Failed(why) => write!(f, "не удалось завершить: {why}"),
+            OrphanOutcome::Unsupported => f.write_str("недоступно на этой платформе"),
+        }
+    }
+}
+
 /// Итог ожидания своей игры от прошлой сессии, пережившей завершение job (D-14, TMO-07).
 #[derive(Debug, Clone, PartialEq)]
 pub enum PrevGame {
@@ -222,6 +264,11 @@ pub trait Session: Send {
     /// Видимые верхние окна процессов своего job. Не блокирует и ничего не отправляет окнам
     /// (читается только кэшированный заголовок). Ошибка перечисления — пустой список (D-10).
     fn windows(&mut self) -> Vec<WindowInfo> {
+        Vec::new()
+    }
+
+    /// Свои процессы сессии для записи `processes.json`: лаунчер с запуска, игра с `GameAppeared`.
+    fn processes(&self) -> Vec<ProcIdentity> {
         Vec::new()
     }
 
@@ -268,9 +315,18 @@ pub trait Host: Send + Sync {
     }
 
     /// Снимок процессов системы — только для проверок «Steam запущен» и «запущен чужой CS2».
-    /// Завершать по нему нечем: у хоста нет метода «завершить по PID или имени» (PRE-04, PRE-05).
+    /// Завершать по снимку нечем: единственный способ остановить процесс по PID —
+    /// [`Host::kill_orphan`] по полной идентичности (PRE-04, PRE-05, TMO-05).
     fn processes(&self) -> Result<Vec<ProcInfo>, HostError> {
         Err(HostError::Unsupported)
+    }
+
+    /// Завершает процесс прошлого экземпляра приложения, только если PID, время создания и имя
+    /// образа совпали, а образ входит в [`ORPHAN_IMAGES`]; проверка и завершение идут на одном
+    /// handle. По имени или по одному PID хост не завершает ничего (D-15, TMO-05).
+    fn kill_orphan(&self, id: &ProcIdentity) -> OrphanOutcome {
+        let _ = id;
+        OrphanOutcome::Unsupported
     }
 
     /// Байты, доступные вызывающему (с учётом квот), на томе пути; у несуществующего пути —

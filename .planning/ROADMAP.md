@@ -32,7 +32,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. Журнал и текст ошибки отдельно сообщают код выхода `HLAE.exe` и живость `cs2.exe`. Живость определяется по дескриптору процесса, а ошибка проверки показывается как «неизвестно», а не как «жива».
   5. `cargo test --workspace` без CS2 прогоняет машину состояний записи на фейковом `Host` (успешная запись и пропавший маркер), а workspace собирается на не-Windows с заглушкой хоста.
 
-**Plans**: 3/8 plans executed
+**Plans**: 4/8 plans executed
 
 Plans:
 **Wave 1**
@@ -41,7 +41,7 @@ Plans:
 - [x] 01-03-PLAN.md — хранение типизированного сбоя в задаче: миграция с четырьмя колонками `fail_*` D-05, `fail_job`, `set_out_dir`; `fail_elapsed_ms`/`phase`/`set_phase` — по решению пользователя (волна 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
-- [ ] 01-04-PLAN.md — `pipeline::record`: машина состояний, маркеры, дедлайны, коды и сообщения сбоев, `ALL_DONE` не подменяет `TAKE_END`, тесты на фейке (волна 2)
+- [x] 01-04-PLAN.md — `pipeline::record`: машина состояний, маркеры, дедлайны, коды и сообщения сбоев, `ALL_DONE` не подменяет `TAKE_END`, тесты на фейке (волна 2)
 - [ ] 01-05-PLAN.md — спайки S1–S4 на машине автора и `01-SPIKES.md` (волна 2, нужен пользователь)
 
 **Wave 3** *(blocked on Wave 2 completion)*
@@ -111,7 +111,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Новый путь записи с понятными сбоями | 3/8 | In Progress | - |
+| 1. Новый путь записи с понятными сбоями | 4/8 | In Progress | - |
 | 2. Предпроверка, отмена и только свои процессы | 0/TBD | Not started | - |
 | 3. Проверенные дубли, повтор и восстановление | 0/TBD | Not started | - |
 | 4. Очередь без присмотра и приёмка | 0/TBD | Not started | - |

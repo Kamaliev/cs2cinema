@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 01
 current_phase_name: Новый путь записи с понятными сбоями
 status: executing
-stopped_at: Completed 01-03-PLAN.md
-last_updated: "2026-10-10T11:10:22.686Z"
+stopped_at: Completed 01-04-PLAN.md
+last_updated: "2026-10-10T11:22:31.833Z"
 last_activity: 2026-10-10
 last_activity_desc: Phase 01 execution started
-state_head: 63a30453ac174e06f103799bad735547ebddb7be
+state_head: efec539b00cd236825b792cb14dfe14c9bb695fe
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 8
-  completed_plans: 3
+  completed_plans: 4
   percent: 0
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 01 (Новый путь записи с понятными сбоями) — EXECUTING
-Plan: 4 of 8
+Plan: 5 of 8
 Status: Ready to execute
 Last activity: 2026-10-10 — Phase 01 execution started
 
@@ -59,6 +59,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 01 P01 | 11 min | 3 tasks | 10 files |
 | Phase 01 P02 | 10 min | 2 tasks | 3 files |
 | Phase 01 P03 | 12 min | 3 tasks | 1 files |
+| Phase 01 P04 | 35 min | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -74,6 +75,9 @@ Recent decisions affecting current work:
 - [Phase 01]: Стенд спайков: при запущенном cs2.exe отказ (код 2); без --fix запуски netcon чередуются off/on (5+5 = два запуска)
 - [Phase 01]: 01-02: старый путь записи ищет TAKE_END с nonce плана; plan_hash нормализует nonce в NONCE
 - [Phase 01]: 01-03: колонки jobs — six-columns: к четырём fail_* D-05 добавлены fail_elapsed_ms и phase вторым шагом миграции (user_version = 2)
+- [Phase 01]: Метка не по порядку (включая ALL_DONE вместо TAKE_END) не меняет состояние и дедлайн машины записи, а только попадает в текст сбоя; повтор принятой метки молча игнорируется
+- [Phase 01]: Тайминги дублей отдаёт Machine::timings(); Event::TakeDone остаётся {n, m}, чтобы строка «записан дубль N/M» для status.rs не менялась
+- [Phase 01]: exec highlights уходит один раз; прямой READY запрашивается один раз через ready_grace, если демка уже идёт
 
 ### Pending Todos
 
@@ -96,6 +100,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-10T11:10:22.651Z
-Stopped at: Completed 01-03-PLAN.md
+Last session: 2026-10-10T11:22:23.613Z
+Stopped at: Completed 01-04-PLAN.md
 Resume file: None

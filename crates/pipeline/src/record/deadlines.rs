@@ -44,6 +44,22 @@ pub struct Deadlines {
     pub ffmpeg_min: Duration,
     /// Дедлайн склейки: длина ролика в секундах, умноженная на это число.
     pub ffmpeg_factor: f32,
+    /// Ответ `-version` у ffmpeg, ffprobe и ffmpeg HLAE в предпроверке.
+    pub tool_probe: Duration,
+    /// Пробное кодирование NVENC в предпроверке.
+    pub nvenc_probe: Duration,
+    /// Один кадр превью.
+    pub thumbnail: Duration,
+    /// Сколько ждать выхода игры после `quit` при отмене или сбое.
+    pub quit_wait: Duration,
+    /// Подтверждение выхода по handle после завершения своего job.
+    pub kill_confirm: Duration,
+    /// Как часто смотреть окна своего job.
+    pub window_poll: Duration,
+    /// D-14: сколько следующая задача ждёт свою прошлую игру.
+    pub prev_game_exit: Duration,
+    /// D-14: пауза после выхода прошлой игры, прежде чем начать.
+    pub next_job_settle: Duration,
 }
 
 impl Deadlines {
@@ -65,6 +81,14 @@ impl Deadlines {
             ffprobe: unit(30),
             ffmpeg_min: unit(600),
             ffmpeg_factor: 15.0,
+            tool_probe: unit(10),
+            nvenc_probe: unit(20),
+            thumbnail: unit(15),
+            quit_wait: unit(5),
+            kill_confirm: unit(3),
+            window_poll: unit(1),
+            prev_game_exit: unit(30),
+            next_job_settle: unit(3),
         }
     }
 
@@ -97,6 +121,15 @@ impl Deadlines {
             ffprobe: d(self.ffprobe),
             ffmpeg_min: d(self.ffmpeg_min),
             ffmpeg_factor: self.ffmpeg_factor * k,
+            tool_probe: d(self.tool_probe),
+            nvenc_probe: d(self.nvenc_probe),
+            thumbnail: d(self.thumbnail),
+            // цели отмены (3 с / ~10 с) и ожидание прошлой игры D-14 не зависят от «Запаса по времени»
+            quit_wait: self.quit_wait,
+            kill_confirm: self.kill_confirm,
+            window_poll: self.window_poll,
+            prev_game_exit: self.prev_game_exit,
+            next_job_settle: self.next_job_settle,
         }
     }
 
@@ -173,6 +206,23 @@ mod tests {
         assert_eq!(d.scaled(100.0), d.scaled(5.0), "верхняя граница 5.0");
         assert_eq!(d.scaled(0.0), d.scaled(0.5), "нижняя граница 0.5");
         assert_eq!(d.scaled(f32::NAN), d, "NaN не портит таблицу");
+    }
+
+    #[test]
+    fn cancel_and_exit_budgets_do_not_grow_with_the_time_margin() {
+        let d = Deadlines::default().scaled(5.0);
+        assert_eq!(d.quit_wait, Duration::from_secs(5));
+        assert_eq!(d.kill_confirm, Duration::from_secs(3));
+        assert_eq!(d.window_poll, Duration::from_secs(1));
+        assert_eq!(d.prev_game_exit, Duration::from_secs(30));
+        assert_eq!(d.next_job_settle, Duration::from_secs(3));
+        assert_eq!(
+            d.tool_probe,
+            Duration::from_secs(50),
+            "пробы утилит растут с запасом"
+        );
+        assert_eq!(d.nvenc_probe, Duration::from_secs(100));
+        assert_eq!(d.thumbnail, Duration::from_secs(75));
     }
 
     #[test]

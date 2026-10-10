@@ -13,8 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::record::failure::{FailCode, RecordFailure};
 use crate::record::machine::RecordState;
 
+mod gather;
 pub mod space;
 pub mod steam;
+
+pub use gather::{Demo, Inputs, run};
 
 /// Уровень пункта предпроверки.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

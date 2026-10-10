@@ -3,7 +3,7 @@
 //! `Machine::step(now, input)` получает время аргументом и возвращает действия; ввод-вывод и
 //! часы — забота драйвера (`record()`), поэтому тест проходит дедлайн в один вызов.
 //!
-//! Лестница: лаунчер → игра → консоль → демка → скрипт → дубль N/M → закрытие → готово. У каждого
+//! Лестница: предпроверка (её сообщает приложение) → лаунчер → игра → консоль → демка → скрипт → дубль N/M → закрытие → готово. У каждого
 //! ожидания свой дедлайн из `Deadlines` и свой код сбоя. Пропавшая метка — всегда сбой, а не
 //! предупреждение; `ALL_DONE` никогда не засчитывается вместо `TAKE_END` (LCH-03).
 
@@ -21,6 +21,8 @@ use super::{Event, TakeTiming};
 /// Состояние записи — ступень лестницы, которую видит пользователь.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RecordState {
+    /// Предпроверка окружения: её сообщает приложение, машина записи в это состояние не входит.
+    Precheck,
     Launcher,
     Game,
     Console,
@@ -33,7 +35,8 @@ pub enum RecordState {
 
 impl RecordState {
     /// Ступени лестницы до «готово», по порядку.
-    pub const LADDER: [RecordState; 7] = [
+    pub const LADDER: [RecordState; 8] = [
+        RecordState::Precheck,
         RecordState::Launcher,
         RecordState::Game,
         RecordState::Console,
@@ -46,6 +49,7 @@ impl RecordState {
     /// Код состояния в базе (`jobs.phase`, `fail_state`).
     pub fn code(self) -> &'static str {
         match self {
+            RecordState::Precheck => "precheck",
             RecordState::Launcher => "launcher",
             RecordState::Game => "game",
             RecordState::Console => "console",
@@ -67,6 +71,7 @@ impl RecordState {
     /// Название ступени лестницы.
     pub fn title(self) -> &'static str {
         match self {
+            RecordState::Precheck => "предпроверка",
             RecordState::Launcher => "лаунчер",
             RecordState::Game => "игра",
             RecordState::Console => "консоль",
@@ -81,6 +86,7 @@ impl RecordState {
     /// Строка журнала задачи при входе в состояние.
     pub fn journal(self) -> &'static str {
         match self {
+            RecordState::Precheck => "предпроверка окружения",
             RecordState::Launcher => "запуск лаунчера (HLAE)",
             RecordState::Game => "ожидание игры (cs2.exe)",
             RecordState::Console => "игра запущена, жду консоль",
@@ -507,7 +513,7 @@ impl Machine {
             }
             RecordState::Take if self.take == 0 => (d.first_take, FailCode::TakeTimeout),
             RecordState::Take => (d.take_seek, FailCode::TakeTimeout),
-            RecordState::Closing | RecordState::Done => return None,
+            RecordState::Precheck | RecordState::Closing | RecordState::Done => return None,
         })
     }
 

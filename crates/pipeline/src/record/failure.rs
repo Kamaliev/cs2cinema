@@ -22,6 +22,12 @@ pub enum FailCode {
     GameExited,
     HlaeError,
     Cancelled,
+    /// Предпроверка окружения не пройдена.
+    PrecheckFailed,
+    /// Запущен CS2, который приложение не запускало.
+    ForeignGameRunning,
+    /// Своя игра прошлой задачи не закрылась.
+    PrevGameStuck,
 }
 
 impl FailCode {
@@ -37,6 +43,9 @@ impl FailCode {
             FailCode::GameExited => "GAME_EXITED",
             FailCode::HlaeError => "HLAE_ERROR",
             FailCode::Cancelled => "CANCELLED",
+            FailCode::PrecheckFailed => "PRECHECK_FAILED",
+            FailCode::ForeignGameRunning => "FOREIGN_GAME_RUNNING",
+            FailCode::PrevGameStuck => "PREV_GAME_STUCK",
         }
     }
 
@@ -68,6 +77,15 @@ impl FailCode {
                 "Проверьте ffmpeg HLAE: Path в ffmpeg\\ffmpeg.ini должен указывать на рабочий ffmpeg.exe."
             }
             FailCode::Cancelled => "",
+            FailCode::PrecheckFailed => {
+                "Исправьте пункты предпроверки, отмеченные ✖, и нажмите «Повторить»; проверить окружение можно в настройках."
+            }
+            FailCode::ForeignGameRunning => {
+                "Закройте CS2, запущенный не приложением, и нажмите «Повторить». Приложение чужие процессы не закрывает."
+            }
+            FailCode::PrevGameStuck => {
+                "Игра прошлой задачи не закрылась за 30 с. Завершите cs2.exe в диспетчере задач и нажмите «Повторить»."
+            }
         }
     }
 }
@@ -318,6 +336,12 @@ mod tests {
         assert_eq!(FailCode::Cancelled.as_str(), "CANCELLED");
         assert!(FailCode::LauncherFailed.hint().contains("HLAE.exe"));
         assert_eq!(FailCode::Cancelled.hint(), "");
+        assert_eq!(FailCode::PrecheckFailed.as_str(), "PRECHECK_FAILED");
+        assert_eq!(FailCode::ForeignGameRunning.as_str(), "FOREIGN_GAME_RUNNING");
+        assert_eq!(FailCode::PrevGameStuck.as_str(), "PREV_GAME_STUCK");
+        assert!(FailCode::PrecheckFailed.hint().contains("Повторить"));
+        assert!(FailCode::ForeignGameRunning.hint().contains("не закрывает"));
+        assert!(FailCode::PrevGameStuck.hint().contains("30 с"));
     }
 
     #[test]

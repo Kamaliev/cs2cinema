@@ -139,6 +139,17 @@ pub struct Job {
     pub fail_elapsed_ms: Option<i64>,
     /// Код текущего состояния записи для лестницы в карточке; не путать со `stage`.
     pub phase: String,
+    /// Отчёт предпроверки в JSON (`pipeline::precheck::Report`); store его не разбирает.
+    pub precheck: Option<String>,
+}
+
+/// Сборка CS2 и версия HLAE последней удачной записи (D-04, DIF-01): с ней предпроверка сравнивает текущую сборку CS2.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LastGood {
+    pub cs2_build: String,
+    pub hlae_version: String,
+    /// Когда запись удалась, секунды Unix.
+    pub recorded_at: i64,
 }
 
 impl Job {
@@ -218,8 +229,9 @@ CREATE TABLE IF NOT EXISTS demos (
 ";
 
 // Версии схемы: 1 — сбой записи (fail_*, D-05);
-// 2 — прошедшее время сбоя и состояние записи для карточки (D-06).
-// Новая версия — только новым шагом в конце списка и только добавлением колонок.
+// 2 — прошедшее время сбоя и состояние записи для карточки (D-06);
+// 3 — отчёт предпроверки (`jobs.precheck`, JSON) и пара «сборка CS2 / версия HLAE» последней удачной записи (`last_good`, D-04).
+// Новая версия — только новым шагом в конце списка и только добавлением колонок или таблиц.
 // Элемент k поднимает схему до версии k+1; шаг идёт в одной транзакции со своим `user_version`.
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE jobs ADD COLUMN fail_code TEXT;
@@ -228,6 +240,13 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE jobs ADD COLUMN fail_tail TEXT;",
     "ALTER TABLE jobs ADD COLUMN fail_elapsed_ms INTEGER;
      ALTER TABLE jobs ADD COLUMN phase TEXT NOT NULL DEFAULT '';",
+    "CREATE TABLE IF NOT EXISTS last_good (
+         id           INTEGER PRIMARY KEY CHECK (id = 1),
+         cs2_build    TEXT NOT NULL,
+         hlae_version TEXT NOT NULL,
+         recorded_at  INTEGER NOT NULL
+     );
+     ALTER TABLE jobs ADD COLUMN precheck TEXT;",
 ];
 
 impl Store {
@@ -308,6 +327,7 @@ impl Store {
             fail_tail: r.get("fail_tail")?,
             fail_elapsed_ms: r.get("fail_elapsed_ms")?,
             phase: r.get("phase")?,
+            precheck: r.get("precheck")?,
         })
     }
 
@@ -336,7 +356,7 @@ impl Store {
     pub fn start_job(&self, id: i64) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "UPDATE jobs SET status = 'running', stage = '', error = NULL, result = NULL, log = '', fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', updated_at = ?2 WHERE id = ?1",
+                "UPDATE jobs SET status = 'running', stage = '', error = NULL, result = NULL, log = '', fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', precheck = NULL, updated_at = ?2 WHERE id = ?1",
                 params![id, now()],
             )?;
             Ok(())
@@ -354,6 +374,32 @@ impl Store {
     pub fn set_phase(&self, id: i64, phase: &str) -> Result<()> {
         self.with(|c| {
             c.execute("UPDATE jobs SET phase = ?2, updated_at = ?3 WHERE id = ?1", params![id, phase, now()])?;
+            Ok(())
+        })
+    }
+
+    /// Отчёт предпроверки (JSON) кладётся на задачу — карточка показывает его и после падения приложения.
+    pub fn set_precheck(&self, id: i64, json: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE jobs SET precheck = ?2, updated_at = ?3 WHERE id = ?1", params![id, json, now()])?;
+            Ok(())
+        })
+    }
+
+    /// Пара «сборка CS2 / версия HLAE» последней удачной записи; `None` — удачных записей ещё не было.
+    pub fn last_good(&self) -> Result<Option<LastGood>> {
+        self.with(|c| {
+            c.query_row("SELECT cs2_build, hlae_version, recorded_at FROM last_good WHERE id = 1", [], |r| {
+                Ok(LastGood { cs2_build: r.get(0)?, hlae_version: r.get(1)?, recorded_at: r.get(2)? })
+            })
+            .optional()
+        })
+    }
+
+    /// Запомнить пару последней удачной записи; прежняя заменяется.
+    pub fn set_last_good(&self, cs2_build: &str, hlae_version: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("INSERT OR REPLACE INTO last_good (id, cs2_build, hlae_version, recorded_at) VALUES (1, ?1, ?2, ?3)", params![cs2_build, hlae_version, now()])?;
             Ok(())
         })
     }
@@ -409,7 +455,7 @@ impl Store {
     pub fn requeue(&self, id: i64) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "UPDATE jobs SET status = 'queued', stage = '', error = NULL, fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', updated_at = ?2 WHERE id = ?1",
+                "UPDATE jobs SET status = 'queued', stage = '', error = NULL, fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', precheck = NULL, updated_at = ?2 WHERE id = ?1",
                 params![id, now()],
             )?;
             Ok(())
@@ -580,10 +626,10 @@ mod tests {
         let j = s.jobs().unwrap().pop().unwrap();
         assert_eq!(j.error.as_deref(), Some("старая ошибка"));
         assert_eq!((j.fail_code, j.fail_state, j.fail_hint, j.fail_tail), (None, None, None, None));
-        assert_eq!(user_version(&s), 2);
+        assert_eq!(user_version(&s), 3);
         drop(s);
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 2, "повторное открытие ничего не меняет");
+        assert_eq!(user_version(&s), 3, "повторное открытие ничего не меняет");
         assert_eq!(s.jobs().unwrap().len(), 1);
     }
 
@@ -598,14 +644,67 @@ mod tests {
             insert_old_job(&c);
         }
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 2);
+        assert_eq!(user_version(&s), 3);
         let j = s.jobs().unwrap().pop().unwrap();
         assert_eq!(j.error.as_deref(), Some("старая ошибка"));
         assert_eq!((j.phase.as_str(), j.fail_elapsed_ms), ("", None));
         drop(s);
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 2, "повторное открытие ничего не меняет");
+        assert_eq!(user_version(&s), 3, "повторное открытие ничего не меняет");
         assert_eq!(s.jobs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn version_two_database_gains_precheck_and_last_good() {
+        let db = TempDb::new("v2");
+        {
+            let c = Connection::open(&db.0).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            for sql in &MIGRATIONS[..2] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.execute_batch("PRAGMA user_version = 2").unwrap();
+            insert_old_job(&c);
+        }
+        let report = r#"{"ok":false,"items":["нет ffmpeg"]}"#;
+        let s = Store::open(&db.0).unwrap();
+        assert_eq!(user_version(&s), 3);
+        let j = s.jobs().unwrap().pop().unwrap();
+        assert_eq!(j.error.as_deref(), Some("старая ошибка"));
+        assert_eq!(j.precheck, None);
+        s.set_precheck(j.id, report).unwrap();
+        assert_eq!(s.job(j.id).unwrap().unwrap().precheck.as_deref(), Some(report));
+
+        assert_eq!(s.last_good().unwrap(), None);
+        s.set_last_good("25815307", "2.192.7.0").unwrap();
+        let g = s.last_good().unwrap().unwrap();
+        assert_eq!((g.cs2_build.as_str(), g.hlae_version.as_str()), ("25815307", "2.192.7.0"));
+        s.set_last_good("25900000", "2.193.0.0").unwrap();
+        let g = s.last_good().unwrap().unwrap();
+        assert_eq!((g.cs2_build.as_str(), g.hlae_version.as_str()), ("25900000", "2.193.0.0"));
+        let rows: i64 = s.with(|c| c.query_row("SELECT COUNT(*) FROM last_good", [], |r| r.get(0))).unwrap();
+        assert_eq!(rows, 1, "пара одна: повтор заменяет строку");
+        drop(s);
+
+        let s = Store::open(&db.0).unwrap();
+        assert_eq!(user_version(&s), 3, "повторное открытие ничего не меняет");
+        assert_eq!(s.jobs().unwrap().len(), 1);
+        assert_eq!(s.jobs().unwrap()[0].precheck.as_deref(), Some(report));
+        assert_eq!(s.last_good().unwrap().unwrap().cs2_build, "25900000");
+    }
+
+    #[test]
+    fn precheck_report_is_cleared_on_start_and_requeue() {
+        let s = Store::in_memory().unwrap();
+        let a = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.set_precheck(a, "{}").unwrap();
+        s.start_job(a).unwrap();
+        assert_eq!(s.job(a).unwrap().unwrap().precheck, None, "старт сбрасывает отчёт прошлого запуска");
+        s.set_precheck(a, "{}").unwrap();
+        s.finish_job(a, Err("нет ffmpeg")).unwrap();
+        assert!(s.job(a).unwrap().unwrap().precheck.is_some(), "после ошибки отчёт остаётся виден");
+        s.requeue(a).unwrap();
+        assert_eq!(s.job(a).unwrap().unwrap().precheck, None, "повтор сбрасывает отчёт");
     }
 
     #[test]

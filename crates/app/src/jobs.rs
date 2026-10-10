@@ -9,11 +9,14 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
-use pipeline::{PlanOptions, Progress, Source, Stage};
-use store::{Job, JobKind, JobOutcome, JobSource, Store};
+use pipeline::{
+    Deadlines, FailCode, PlanOptions, Progress, RecordFailure, RecordReport, RecordRequest, Source, Stage,
+    host::{Host, LaunchSpec},
+};
+use store::{Job, JobFailure, JobKind, JobOutcome, JobSource, Store};
 
 use crate::{
     app::{App, Msg, Reporter},
@@ -33,6 +36,25 @@ impl CancelToken {
     }
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Ошибка задачи: текст для строки задачи и, если это сбой записи, его типизированное описание.
+#[derive(Debug)]
+pub struct RunError {
+    pub message: String,
+    pub fail: Option<RecordFailure>,
+}
+
+impl From<String> for RunError {
+    fn from(message: String) -> Self {
+        RunError { message, fail: None }
+    }
+}
+
+impl From<&str> for RunError {
+    fn from(message: &str) -> Self {
+        RunError::from(message.to_owned())
     }
 }
 
@@ -56,6 +78,61 @@ impl Progress for JobReporter {
     fn cancelled(&self) -> bool {
         self.cancel.is_cancelled()
     }
+    /// Состояние записи — в строку задачи (для лестницы в карточке), любое событие — в журнал.
+    /// Подсостояние не пишем в `stage`: полоска прогресса сопоставляет `stage` с `Stage::ALL`.
+    fn event(&self, e: &pipeline::Event) {
+        if let pipeline::Event::State { state, .. } = e {
+            let _ = self.store.set_phase(self.id, state.code());
+        }
+        self.log(&e.to_string());
+    }
+}
+
+/// Сбой записи строками для базы: store не знает типов pipeline.
+pub fn job_failure(f: &RecordFailure) -> JobFailure {
+    JobFailure {
+        message: f.message.clone(),
+        code: f.code.as_str().to_owned(),
+        state: f.state.code().to_owned(),
+        hint: f.hint.clone(),
+        tail: f.console_tail.join("\n"),
+        elapsed_ms: Some(f.elapsed.as_millis() as i64),
+    }
+}
+
+/// Итог задачи в строку базы: отмена остаётся отменой, типизированный сбой — со всеми полями.
+pub fn finish(store: &Store, id: i64, result: &Result<JobOutcome, RunError>) -> store::Result<()> {
+    match result {
+        Ok(o) => store.finish_job(id, Ok(o)),
+        Err(e) if e.message == pipeline::CANCELLED => store.cancel_job(id),
+        Err(RunError { fail: Some(f), .. }) => store.fail_job(id, &job_failure(f)),
+        Err(e) => store.finish_job(id, Err(&e.message)),
+    }
+}
+
+/// Запрос записи из настроек и плана. Ограничения путей и имя демки проверяет вызывающий.
+pub fn record_request(s: &Settings, out_dir: &Path, demo_name: &str, plan: &pipeline::Plan, job_id: i64) -> RecordRequest {
+    RecordRequest {
+        out_dir: out_dir.to_path_buf(),
+        launch: LaunchSpec {
+            hlae_dir: s.hlae_dir.clone().into(),
+            cs2_exe: launch::cs2_exe(&s.cs2_dir),
+            demo_name: demo_name.to_owned(),
+            size: s.frame_size(),
+            nonce: plan.nonce.clone(),
+            console_log: Some(Path::new(&s.cs2_dir).join("game/csgo/console.log")),
+        },
+        takes: plan.takes.clone(),
+        deadlines: Deadlines::default(),
+        header: format!("задача #{job_id} · {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")),
+    }
+}
+
+/// Запись дублей через `pipeline::record`. Отмена становится сентинелом `CANCELLED`, остальные
+/// сбои несут типизированное описание до строки задачи.
+pub fn record_stage(host: &dyn Host, req: &RecordRequest, p: &dyn Progress) -> Result<RecordReport, RunError> {
+    pipeline::record(host, req, p)
+        .map_err(|f| if f.code == FailCode::Cancelled { RunError::from(pipeline::CANCELLED) } else { RunError { message: f.message.clone(), fail: Some(f) } })
 }
 
 /// Запускает следующую задачу из очереди, если сейчас ничего не выполняется.
@@ -63,7 +140,9 @@ pub fn run_next(app: &mut App) {
     if app.jobs.running.is_some() || app.status.busy {
         return;
     }
-    let Ok(Some(job)) = app.store.next_queued() else { return };
+    let Ok(Some(job)) = app.store.next_queued() else {
+        return;
+    };
     if let Err(e) = app.store.start_job(job.id) {
         app.status.finish(Err(e));
         return;
@@ -75,18 +154,14 @@ pub fn run_next(app: &mut App) {
     std::thread::spawn(move || {
         let rep = JobReporter { store: store.clone(), id: job.id, ui, cancel };
         let result = run(&job, &s, &store, &rep);
-        let _ = match &result {
-            Ok(o) => store.finish_job(job.id, Ok(o)),
-            Err(e) if e == pipeline::CANCELLED => store.cancel_job(job.id),
-            Err(e) => store.finish_job(job.id, Err(e)),
-        };
-        rep.ui.send(Msg::JobDone { id: job.id, result: result.map(|o| o.result) });
+        let _ = finish(&store, job.id, &result);
+        rep.ui.send(Msg::JobDone { id: job.id, result: result.map(|o| o.result).map_err(|e| e.message) });
     });
     app.refresh_jobs();
 }
 
 /// Весь путь задачи: демка -> план -> (запись -> склейка); исполняется в фоновом потоке.
-fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOutcome, String> {
+fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOutcome, RunError> {
     let src = match &job.source {
         // скачанную демку берём из реестра, иначе качаем
         JobSource::Faceit(id) => match store.demo_path(id)? {
@@ -101,17 +176,15 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
     }
     let hero = pipeline::find_player(&a.m, Some(job.hero_steam), &job.hero_name).ok_or_else(|| format!("игрок {} в демке не найден", job.hero_name))?;
     let out_dir = Path::new(&s.out_root).join(pipeline::console_name(&format!("{}_{}", a.label, a.m.name(hero))));
+    // папка задачи известна карточке до записи: путь к record.log виден и при сбое
+    let _ = store.set_out_dir(job.id, &out_dir);
     // NVENC: для склейки — у ffmpeg из PATH, для дублей — у ffmpeg, которым пишет HLAE
     let (mut nvenc, mut take_nvenc) = (false, false);
     if s.gpu_encode && job.kind != JobKind::Plan {
         let check = launch::nvenc_check(Path::new("ffmpeg"));
         nvenc = check.is_ok();
         take_nvenc = launch::hlae_ffmpeg(&s.hlae_dir).is_some_and(|f| launch::has_nvenc(&f));
-        p.log(&format!(
-            "кодирование: дубли — {}, склейка — {}",
-            if take_nvenc { "NVENC" } else { "процессор" },
-            if nvenc { "NVENC" } else { "процессор" }
-        ));
+        p.log(&format!("кодирование: дубли — {}, склейка — {}", if take_nvenc { "NVENC" } else { "процессор" }, if nvenc { "NVENC" } else { "процессор" }));
         if let Err(e) = check {
             p.log(&format!("NVENC недоступен: {e}"));
         }
@@ -140,8 +213,6 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
     }
 
     p.stage(Stage::Record);
-    // дубли HLAE нумерует по порядку записи: последний записанный — take{shots-1}
-    let last = plan.takes.len().saturating_sub(1);
     let clips = out_dir.join("clips");
     // дубли этого же плана уже есть (например, упала склейка) — не пишем заново;
     // ожидаемый набор дублей берём из плана, а не считаем номера сами
@@ -158,15 +229,11 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
         }
         let demo_name = format!("cs2cinema_{}", pipeline::console_name(&a.label));
         launch::install_files(&s.cs2_dir, &out_dir, &demo_name, |path| a.write_demo(path))?;
-        let started = std::time::Instant::now();
-        // отмена во время записи — закрываем игру, иначе она так и будет писать дубли
-        let r = record(s, &out_dir, &demo_name, last, &plan.nonce, p);
-        if r.as_ref().is_err_and(|e| e == pipeline::CANCELLED) {
-            launch::kill_game();
-        }
-        r?;
+        // игру закрывает сама запись при любом выходе, в том числе при отмене
+        let req = record_request(s, &out_dir, &demo_name, &plan, job.id);
+        let rep = record_stage(&*pipeline::host::default_host(), &req, p)?;
         let _ = std::fs::write(clips.join("plan.hash"), &hash);
-        p.log(&format!("запись заняла {:.0} с", started.elapsed().as_secs_f32()));
+        p.log(&format!("запись заняла {:.0} с", rep.elapsed.as_secs_f32()));
     }
 
     p.stage(Stage::Assemble);
@@ -176,117 +243,6 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
     p.log(&format!("ролик готов: {}", out.display()));
     ui::open_path(&out);
     Ok(JobOutcome { out_dir, result: out, shots, secs })
-}
-
-/// Потолок ожидания загрузки демки (большие демки грузятся дольше минуты).
-const LOAD_CAP: Duration = Duration::from_secs(150);
-/// Если за это время после `exec highlights` не появился первый дубль — повторяем команду.
-const EXEC_RETRY: Duration = Duration::from_secs(30);
-const EXEC_RETRIES: u32 = 4;
-/// Как часто пробовать подключиться к консоли, если с первого раза не вышло.
-const RECONNECT_EVERY: Duration = Duration::from_secs(10);
-
-/// Запись: CS2 через HLAE, скрипт `highlights` как только демка пошла, ждём последний дубль и закрываем игру.
-fn record(s: &Settings, out_dir: &Path, demo_name: &str, last: usize, nonce: &str, p: &JobReporter) -> Result<(), String> {
-    let since = SystemTime::now();
-    p.log("запускаю CS2 через HLAE…");
-    // свой порт на каждый запуск: фиксированный может держать «мёртвый» сокет прошлой игры
-    let port = launch::free_port();
-    let _launcher = launch::launch(&s.hlae_dir, &s.cs2_dir, demo_name, s.frame_size(), port)?;
-    let cancelled = || p.cancelled();
-    let started = std::time::Instant::now();
-    let load_wait = Duration::from_secs(s.load_wait_secs as u64);
-    // свои строки консоли (не эхо отправленной команды)
-    let marker = |l: &str, m: &str| l.contains(m) && !l.contains("echo") && !l.contains("addAtTick");
-    // метка конца дубля с nonce этого плана: чужие запуски и старые строки консоли не совпадут
-    let take_end = renderer::marker(nonce, "TAKE_END ");
-    // большая демка может грузиться дольше настройки — маркер ждём до жёсткого потолка,
-    // а настройка лишь говорит, когда перестать молчать
-    let load_cap = load_wait.max(LOAD_CAP);
-    let console = match launch::Console::connect(port, load_cap, &cancelled) {
-        Ok(mut c) => {
-            // mirv_cmd срабатывает только на тиках идущей демки — маркер значит «демка загрузилась»
-            let _ = c.send("mirv_cmd clear; mirv_cmd addAtTick 64 \"echo CS2C_READY\"");
-            let mut ready = false;
-            let mut warned = false;
-            while !ready && started.elapsed() < load_cap {
-                if cancelled() {
-                    return Err(pipeline::CANCELLED.to_owned());
-                }
-                ready = c.drain().iter().any(|l| marker(l, "CS2C_READY"));
-                if !ready && !warned && started.elapsed() >= load_wait {
-                    warned = true;
-                    p.log(&format!("демка не загрузилась за {} с — жду ещё…", load_wait.as_secs()));
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            p.log(&format!("демка {} за {:.0} с", if ready { "загрузилась" } else { "должна была загрузиться" }, started.elapsed().as_secs_f32()));
-            match c.send("exec highlights") {
-                Ok(()) => p.log("скрипт запущен, идёт запись…"),
-                Err(e) => p.log(&format!("{e}. Откройте консоль игры (~) и выполните: exec highlights")),
-            }
-            Some(c)
-        }
-        Err(e) if e == pipeline::CANCELLED => return Err(e),
-        Err(e) => {
-            p.log(&format!("{e}. Откройте консоль игры (~) и выполните: exec highlights"));
-            None
-        }
-    };
-    let console = std::cell::RefCell::new(console);
-    let console_ref = &console;
-    // прогресс по маркерам дублей из консоли; если первый дубль так и не начался (скрипт ушёл
-    // до загрузки демки — игра просто играет её с начала), повторяем exec highlights
-    let done = std::cell::Cell::new(false);
-    let any_take = std::cell::Cell::new(false);
-    let mut exec_at = std::time::Instant::now();
-    let mut retries = 0u32;
-    let first_take = out_dir.join("clips").join("take0000");
-    let mut reconnect_at = std::time::Instant::now();
-    let mut finished = move || {
-        // консоль не открылась с первого раза — пробуем ещё, пока игра жива и дубли не пошли
-        if console_ref.borrow().is_none() && !any_take.get() && reconnect_at.elapsed() > RECONNECT_EVERY {
-            reconnect_at = std::time::Instant::now();
-            if let Some(mut c) = launch::Console::try_connect(port) {
-                match c.send("exec highlights") {
-                    Ok(()) => p.log("консоль игры открылась — отправил exec highlights"),
-                    Err(e) => p.log(&format!("консоль игры: {e}")),
-                }
-                exec_at = std::time::Instant::now();
-                *console_ref.borrow_mut() = Some(c);
-            }
-        }
-        if let Some(c) = console_ref.borrow().as_ref() {
-            for l in c.drain() {
-                let take = l.split(&take_end).nth(1).and_then(|r| r.split_whitespace().next()?.parse::<usize>().ok());
-                if let Some(n) = take.filter(|_| marker(&l, take_end.trim())) {
-                    any_take.set(true);
-                    p.log(&format!("записан дубль {}/{}", n + 1, last + 1));
-                    done.set(done.get() || n >= last);
-                }
-            }
-        }
-        if !any_take.get() && first_take.is_dir() {
-            any_take.set(true);
-        }
-        if !any_take.get() && exec_at.elapsed() > EXEC_RETRY && retries < EXEC_RETRIES {
-            if let Some(c) = console_ref.borrow_mut().as_mut() {
-                retries += 1;
-                exec_at = std::time::Instant::now();
-                match c.send("exec highlights") {
-                    Ok(()) => p.log(&format!("запись не началась — повторяю exec highlights ({retries}/{EXEC_RETRIES})")),
-                    Err(e) => p.log(&format!("{e}. Откройте консоль игры (~) и выполните: exec highlights")),
-                }
-            }
-        }
-        done.get()
-    };
-    let r = launch::wait_for_clips(out_dir, last, since, &mut finished, &launch::game_alive, &cancelled);
-    // игра больше не нужна — освобождаем видеокарту для склейки
-    if let Some(mut c) = console.into_inner() {
-        let _ = c.send("quit");
-    }
-    r
 }
 
 /// Отпечаток скриптов записи (`highlights.cfg`, `cs2c_*`): совпал — дубли в `clips/` от этого же плана.
@@ -402,5 +358,102 @@ mod tests {
         for d in [a, b, c] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    use pipeline::host::fake::{FakeHost, Scenario};
+    use renderer::TakePlan;
+    use store::JobStatus;
+
+    fn new_job() -> store::NewJob {
+        store::NewJob {
+            kind: JobKind::Record,
+            source: JobSource::Faceit("1-abc".into()),
+            label: "матч".into(),
+            hero_name: "me".into(),
+            hero_steam: 42,
+            map: "de_nuke".into(),
+        }
+    }
+
+    fn two_takes() -> Vec<TakePlan> {
+        (0..2).map(|index| TakePlan { index, shot: index as usize, game_secs: 5.0, capture_fps: 60 }).collect()
+    }
+
+    /// Задача в базе, запущенная и с папкой результата, как её оставляет `run` перед записью.
+    fn running_job(tag: &str) -> (Store, i64, std::path::PathBuf) {
+        let store = Store::in_memory().unwrap();
+        let id = store.add_job(&new_job()).unwrap();
+        store.start_job(id).unwrap();
+        let dir = std::env::temp_dir().join(format!("cs2cinema-app-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        store.set_out_dir(id, &dir).unwrap();
+        (store, id, dir)
+    }
+
+    fn request(dir: &Path) -> RecordRequest {
+        RecordRequest {
+            out_dir: dir.to_path_buf(),
+            launch: LaunchSpec { nonce: "ab12cd34".into(), ..Default::default() },
+            takes: two_takes(),
+            deadlines: Deadlines::default(),
+            header: "задача #1 · тест".into(),
+        }
+    }
+
+    /// Отчёт, который отменён с самого начала.
+    struct Cancelled;
+    impl Progress for Cancelled {
+        fn stage(&self, _: Stage) {}
+        fn log(&self, _: &str) {}
+        fn cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn typed_failure_reaches_the_job_row() {
+        let (store, id, dir) = running_job("fail");
+        let host = FakeHost::new(Scenario::happy(2).console_never_up());
+        let e = record_stage(&host, &request(&dir), &pipeline::Quiet).expect_err("консоль не открывается — запись падает");
+        finish(&store, id, &Err(e)).unwrap();
+
+        let j = store.job(id).unwrap().unwrap();
+        assert_eq!(j.status, JobStatus::Failed);
+        assert_eq!(j.fail_code.as_deref(), Some("CONSOLE_NOT_OPEN"));
+        assert_eq!(j.fail_state.as_deref(), Some("console"));
+        let error = j.error.unwrap();
+        assert!(error.contains("консольный порт не открылся"), "{error}");
+        assert!(error.contains("cs2.exe:"), "в сообщении строка фактов о двух процессах: {error}");
+        assert!(j.fail_hint.is_some_and(|h| !h.is_empty()));
+        assert!(j.fail_tail.is_some(), "хвост консоли записан (может быть пустым)");
+        assert!(j.fail_elapsed_ms.is_some_and(|ms| ms >= 90_000), "{:?}", j.fail_elapsed_ms);
+        assert_eq!(j.out_dir.as_deref(), Some(dir.as_path()));
+        let log = std::fs::read_to_string(dir.join("record.log")).expect("record.log лежит в папке задачи");
+        assert!(log.contains("CONSOLE_NOT_OPEN"), "{log}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cancelled_recording_becomes_a_cancelled_job() {
+        let (store, id, dir) = running_job("cancel");
+        let host = FakeHost::new(Scenario::happy(2));
+        let e = record_stage(&host, &request(&dir), &Cancelled).expect_err("отмена прерывает запись");
+        assert_eq!(e.message, pipeline::CANCELLED);
+        assert!(e.fail.is_none(), "отмена не несёт типизированного сбоя");
+        finish(&store, id, &Err(e)).unwrap();
+
+        let j = store.job(id).unwrap().unwrap();
+        assert_eq!(j.status, JobStatus::Cancelled);
+        assert_eq!(j.fail_code, None);
+        assert!(host.terminated() > 0, "игра закрыта и при отмене");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn plain_error_keeps_the_old_failed_row() {
+        let (store, id, _dir) = running_job("plain");
+        finish(&store, id, &Err(RunError::from("игрок не найден"))).unwrap();
+        let j = store.job(id).unwrap().unwrap();
+        assert_eq!((j.status, j.error.as_deref(), j.fail_code), (JobStatus::Failed, Some("игрок не найден"), None));
     }
 }

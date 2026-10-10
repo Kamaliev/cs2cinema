@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use host::{HostError, SessionEvent};
+use host::{HostError, SessionEvent, WindowInfo};
 use renderer::TakePlan;
 
 use super::deadlines::Deadlines;
@@ -17,6 +17,9 @@ use super::failure::{self, FailCode, LauncherFact, RecordFailure};
 use super::log;
 use super::markers::{self, EXEC, Marker};
 use super::{Event, TakeTiming};
+
+/// Класс окна-диалога Windows: так выглядят окна ошибок HLAE/AfxHookSource2 (D-10).
+const DIALOG_CLASS: &str = "#32770";
 
 /// Состояние записи — ступень лестницы, которую видит пользователь.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -107,6 +110,8 @@ pub enum Input {
     /// Пользователь отменил задачу.
     Cancel,
     Event(SessionEvent),
+    /// Видимые окна процессов своего job (драйвер опрашивает раз в `window_poll`).
+    Windows(Vec<WindowInfo>),
     /// Команду в консоль отправить не удалось.
     SendFailed {
         line: String,
@@ -153,8 +158,8 @@ pub struct Machine {
     evidence_at: Option<Duration>,
     /// Прямой запрос READY уже отправлен (не больше одного).
     direct_sent: bool,
-    /// Первая строка `AFXERROR` записи: при истёкшем дедлайне это причина сбоя (HLAE_ERROR).
-    afx: Option<String>,
+    /// Подстроки `AFXERROR`, которые не останавливают запись (D-09).
+    afx_ignore: Vec<String>,
     /// Последняя метка не по порядку — для сообщения о сбое.
     misordered: Option<String>,
     /// Уже показанные в журнале замечания, чтобы не повторять.
@@ -183,7 +188,7 @@ impl Machine {
             game_exited_at: None,
             evidence_at: None,
             direct_sent: false,
-            afx: None,
+            afx_ignore: vec![],
             misordered: None,
             facts_seen: vec![],
             finished: false,
@@ -248,6 +253,7 @@ impl Machine {
             }
             Input::Tick => {}
             Input::Event(ev) => self.on_event(now, ev, &mut acts),
+            Input::Windows(list) => self.on_windows(now, &list, &mut acts),
             Input::SendFailed { line, error } => self.on_send_failed(now, &line, &error, &mut acts),
         }
         if !self.finished {
@@ -311,8 +317,17 @@ impl Machine {
             }
             SessionEvent::ConsoleDown => self.console_up = false,
             SessionEvent::Line { text, .. } => {
-                if self.afx.is_none() && markers::is_afxerror(&text) {
-                    self.afx = Some(log::clean(&text));
+                if markers::is_afxerror(&text) {
+                    let clean = log::clean(&text);
+                    if markers::is_ignored(&text, &self.afx_ignore) {
+                        self.note_once(failure::msg_afx_ignored(&clean), acts);
+                    } else {
+                        // D-09: первая же строка AFXERROR, ждать дедлайна незачем
+                        let msg = failure::msg_hlae_error_now(&clean, self.state);
+                        let f = self.fail(now, FailCode::HlaeError, self.entered, msg);
+                        acts.push(f);
+                        return;
+                    }
                 }
                 if markers::is_demo_running_evidence(&text) {
                     self.evidence_at.get_or_insert(now);
@@ -546,16 +561,47 @@ impl Machine {
         if now.saturating_sub(self.since) < limit {
             return;
         }
-        // HLAE уже сказал, что не так: дедлайн лишь подтверждает, что дальше ждать нечего
-        let (code, msg) = match &self.afx {
-            Some(afx) => (
-                FailCode::HlaeError,
-                failure::msg_hlae_error(afx, self.state, limit),
-            ),
-            None => (code, self.timeout_message(code, limit)),
-        };
+        let msg = self.timeout_message(code, limit);
         let f = self.fail(now, code, self.since, msg);
         acts.push(f);
+    }
+
+    /// Факт в журнал один раз за запись (повторы одного текста молча пропускаются).
+    fn note_once(&mut self, text: String, acts: &mut Vec<Action>) {
+        if !self.facts_seen.contains(&text) {
+            self.facts_seen.push(text.clone());
+            acts.push(Action::Emit(Event::Fact(text)));
+        }
+    }
+
+    /// Список подстрок `AFXERROR`, которые не останавливают запись (D-09).
+    pub fn ignore_afxerror(&mut self, list: Vec<String>) {
+        self.afx_ignore = list;
+    }
+
+    /// Окна своего job (D-10): диалог `#32770` HLAE/AfxHookSource2 — сразу `HLAE_ERROR`; другие
+    /// диалоги — факт в журнал; обычные окна ничего не меняют. После Take ввод игнорируется.
+    fn on_windows(&mut self, now: Duration, list: &[WindowInfo], acts: &mut Vec<Action>) {
+        if !(RecordState::Launcher..=RecordState::Take).contains(&self.state) {
+            return;
+        }
+        for w in list.iter().filter(|w| w.class == DIALOG_CLASS) {
+            let title = w.title.to_lowercase();
+            let text = w.text.to_lowercase();
+            let hlae = [&title, &text]
+                .iter()
+                .any(|s| s.contains("afxhook") || s.contains("hlae"))
+                || text.contains("afxerror")
+                || title.contains("afxerror");
+            let (title, text) = (log::clean(&w.title), log::clean(&w.text));
+            if hlae && !markers::is_ignored(&w.text, &self.afx_ignore) {
+                let msg = failure::msg_hlae_dialog(&title, &text, self.state);
+                let f = self.fail(now, FailCode::HlaeError, self.entered, msg);
+                acts.push(f);
+                return;
+            }
+            self.note_once(failure::msg_dialog_seen(&title, &text), acts);
+        }
     }
 
     /// Сообщение о сбое по истёкшему дедлайну; для ожиданий метки добавляет «пришла метка … вместо …».
@@ -759,5 +805,49 @@ mod tests {
             "закрытие по таймеру — не сбой"
         );
         assert_eq!(m.state(), RecordState::Done);
+    }
+
+    fn dialog(class: &str, title: &str, text: &str) -> WindowInfo {
+        WindowInfo {
+            pid: 7,
+            class: class.to_owned(),
+            title: title.to_owned(),
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn foreign_dialog_class_alone_is_only_a_fact() {
+        let mut m = Machine::new(NONCE.into(), takes(1), Deadlines::fast());
+        m.start(ms(0));
+        let acts = m.step(
+            ms(1),
+            Input::Windows(vec![dialog("#32770", "Steam", "Идёт обновление")]),
+        );
+        assert!(finish(&acts).is_none(), "чужой диалог запись не роняет");
+        assert!(
+            acts.iter().any(
+                |a| matches!(a, Action::Emit(Event::Fact(t)) if t.contains("Steam") && t.contains("обновление"))
+            ),
+            "{acts:?}"
+        );
+        // обычное окно с именем HLAE в заголовке диалогом не является
+        let acts = m.step(
+            ms(2),
+            Input::Windows(vec![dialog("SDL_app", "AfxHookSource2", "")]),
+        );
+        assert!(finish(&acts).is_none());
+        // а диалог AfxHookSource2 — ошибка
+        let acts = m.step(
+            ms(3),
+            Input::Windows(vec![dialog("#32770", "AfxHookSource2", "ffmpeg")]),
+        );
+        match finish(&acts) {
+            Some(Err(f)) => {
+                assert_eq!(f.code, FailCode::HlaeError);
+                assert!(f.message.contains("ffmpeg"), "{}", f.message);
+            }
+            other => panic!("ждали HLAE_ERROR, получили {other:?}"),
+        }
     }
 }

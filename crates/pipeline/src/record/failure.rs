@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use host::{HostError, Liveness};
+use host::{HostError, Liveness, WindowInfo};
 
 use super::machine::RecordState;
 
@@ -293,11 +293,77 @@ pub fn facts_line(launcher: &LauncherFact, game: &Liveness) -> String {
     format!("HLAE.exe: {hlae} · cs2.exe: {cs2}")
 }
 
-/// Дедлайн истёк, а в консоли уже была строка `AFXERROR`: HLAE сам сказал, что не так.
-pub fn msg_hlae_error(afx: &str, state: RecordState, limit: Duration) -> String {
+/// Первая строка `AFXERROR` в консоли: HLAE сам сказал, что не так, ждать дедлайна незачем (D-09).
+pub fn msg_hlae_error_now(afx: &str, state: RecordState) -> String {
+    format!("HLAE сообщил об ошибке: {afx} (этап «{}»)", state.title())
+}
+
+/// Окно ошибки HLAE/AfxHookSource2 (D-10): заголовок и текст диалога.
+pub fn msg_hlae_dialog(title: &str, text: &str, state: RecordState) -> String {
+    let body = if text.is_empty() {
+        String::new()
+    } else {
+        format!(": {text}")
+    };
     format!(
-        "HLAE сообщил об ошибке: {afx} (сработал дедлайн этапа «{}» — {} с)",
-        state.title(),
+        "окно ошибки HLAE «{title}»{body} (этап «{}»)",
+        state.title()
+    )
+}
+
+/// Игра показала диалог, не похожий на ошибку HLAE: только факт в журнал.
+pub fn msg_dialog_seen(title: &str, text: &str) -> String {
+    if text.is_empty() {
+        format!("игра показала окно «{title}»")
+    } else {
+        format!("игра показала окно «{title}»: {text}")
+    }
+}
+
+/// Строка `AFXERROR` пропущена по списку исключений из настроек.
+pub fn msg_afx_ignored(text: &str) -> String {
+    format!("строка AFXERROR пропущена по списку исключений: {text}")
+}
+
+/// Заголовки окон игры в конец сообщения о сбое по дедлайну запуска: не больше 5 непустых.
+pub fn msg_windows(list: &[WindowInfo]) -> String {
+    let titles: Vec<String> = list
+        .iter()
+        .map(|w| super::log::clean(&w.title))
+        .filter(|t| !t.is_empty())
+        .take(5)
+        .map(|t| format!("«{t}»"))
+        .collect();
+    if titles.is_empty() {
+        String::new()
+    } else {
+        format!("; окна игры: {}", titles.join(", "))
+    }
+}
+
+/// Строка `record.log` со всеми окнами своего job: по ней видно нормальный набор окон (Pitfall 6).
+pub fn windows_line(list: &[WindowInfo]) -> String {
+    if list.is_empty() {
+        return "окна: нет".to_owned();
+    }
+    let items: Vec<String> = list
+        .iter()
+        .map(|w| {
+            format!(
+                "{} [{}] «{}»",
+                w.pid,
+                super::log::clean(&w.class),
+                super::log::clean(&w.title)
+            )
+        })
+        .collect();
+    format!("окна: {}", items.join(" · "))
+}
+
+/// После выхода игры в job остались процессы (ffmpeg HLAE не дописал файл): закрываем свой job.
+pub fn msg_job_not_empty(limit: Duration) -> String {
+    format!(
+        "после выхода игры в job остались процессы {} с — завершаю свой job",
         secs(limit)
     )
 }

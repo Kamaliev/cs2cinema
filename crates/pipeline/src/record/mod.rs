@@ -426,6 +426,15 @@ pub fn record(
         req.takes.clone(),
         req.deadlines.clone(),
     );
+    machine.ignore_afxerror(req.afxerror_ignore.clone());
+    if !req.afxerror_ignore.is_empty() {
+        // что могло быть пропущено, видно в журнале (T-02-13)
+        j.line(
+            t0,
+            "app",
+            &format!("исключения AFXERROR: {}", req.afxerror_ignore.join(" | ")),
+        );
+    }
     for a in machine.start(t0) {
         if let Action::Emit(e) = a {
             j.emit(t0, p, &e);
@@ -442,6 +451,9 @@ pub fn record(
     let mut session = Guard(session);
     // как была игра в момент решения: после Terminate она уже «не жива» из-за нас
     let mut liveness: Option<Liveness> = None;
+    // опрос окон своего job (D-10): когда смотрели в последний раз и какой набор окон был тогда
+    let mut windows_at: Option<Duration> = None;
+    let mut windows_seen: Vec<(String, String)> = vec![];
 
     loop {
         let ev = session.0.poll(TICK);
@@ -449,12 +461,33 @@ pub fn record(
         if let Some(e) = &ev {
             j.session_event(now, e);
         }
+        let windows = if (RecordState::Launcher..=RecordState::Take).contains(&machine.state())
+            && windows_at.is_none_or(|t| now.saturating_sub(t) >= req.deadlines.window_poll)
+        {
+            windows_at = Some(now);
+            let w = session.0.windows();
+            let seen: Vec<(String, String)> = w
+                .iter()
+                .map(|x| (x.class.clone(), x.title.clone()))
+                .collect();
+            if seen != windows_seen {
+                j.line(now, "host", &failure::windows_line(&w));
+                windows_seen = seen;
+            }
+            Some(w)
+        } else {
+            None
+        };
         let input = if p.cancelled() || p.force_cancelled() {
             Input::Cancel
         } else {
             ev.map_or(Input::Tick, Input::Event)
         };
         let mut queue: VecDeque<Action> = machine.step(now, input).into();
+        if let Some(w) = windows {
+            // у завершённой машины `step` ничего не возвращает
+            queue.extend(machine.step(now, Input::Windows(w)));
+        }
         while let Some(action) = queue.pop_front() {
             match action {
                 Action::Send(line) => {
@@ -500,6 +533,17 @@ pub fn record(
                 Action::Finish(Err(mut f)) => {
                     f.game = liveness.unwrap_or_else(|| session.0.game_liveness());
                     f.launcher = machine.launcher();
+                    if matches!(
+                        f.code,
+                        FailCode::LauncherFailed
+                            | FailCode::GameNotStarted
+                            | FailCode::ConsoleNotOpen
+                            | FailCode::DemoNotLoaded
+                    ) {
+                        // дедлайн запуска: заголовки окон игры объясняют, чего она ждёт (D-10)
+                        let w = session.0.windows();
+                        f.message.push_str(&failure::msg_windows(&w));
+                    }
                     let stop = stop_for(&Err(f.clone()));
                     shutdown(
                         host,

@@ -648,16 +648,21 @@ fn unknown_liveness_is_reported_as_unknown_never_alive() {
     let _ = std::fs::remove_dir_all(&req.out_dir);
 }
 
+const AFX: &str = "AFXERROR: COutFFMPEGVideoStream::COutFFMPEGVideoStream: CreateProcessW.";
+
 #[test]
-fn deadline_with_afxerror_in_tail_is_reported_as_hlae_error() {
-    let afx = "AFXERROR: COutFFMPEGVideoStream::COutFFMPEGVideoStream: CreateProcessW.";
-    let sc = Scenario::happy(2)
-        .line_at(secs(10), Source::ConsoleLog, afx)
-        .drop_marker(FakeMarker::TakeEnd(0));
-    let (r, ..) = run("facts-afx", sc, 2);
+fn first_afxerror_fails_at_once_with_hlae_error() {
+    // первая AFXERROR приходит на 10-й секунде, пока машина ждёт TAKE_START первого дубля
+    let sc = Scenario::happy(2).line_at(secs(10), Source::ConsoleLog, AFX);
+    let (r, _, fake, _) = run("afx-now", sc, 2);
     let f = fail_of(r);
     assert_eq!(f.code, FailCode::HlaeError);
     assert_eq!(f.state, RecordState::Take);
+    assert!(
+        fake.now() < secs(13),
+        "сбой не ждал дедлайна: {:?}",
+        fake.now()
+    );
     assert!(
         f.message.contains("HLAE сообщил об ошибке"),
         "{}",
@@ -666,10 +671,94 @@ fn deadline_with_afxerror_in_tail_is_reported_as_hlae_error() {
     assert!(f.message.contains("CreateProcessW"), "{}", f.message);
     assert!(f.message.contains("«дубль»"), "{}", f.message);
     assert!(
-        f.console_tail.iter().any(|l| l == afx),
+        f.console_tail.iter().any(|l| l == AFX),
         "строка из console.log при живом netcon попала в хвост: {:?}",
         f.console_tail
     );
+}
+
+#[test]
+fn ignored_afxerror_does_not_fail_the_recording() {
+    let fake = FakeHost::new(Scenario::happy(2).line_at(secs(10), Source::ConsoleLog, AFX));
+    let cap = Capture::default();
+    let mut req = fresh("afx-ignored", 2);
+    req.afxerror_ignore = vec!["createprocessw".to_owned()];
+    let report = record(&fake, &req, &cap).expect("исключённая AFXERROR запись не роняет");
+    assert_eq!(report.takes.len(), 2);
+    assert!(
+        cap.lines().iter().any(|l| l.contains("пропущена")),
+        "{:?}",
+        cap.lines()
+    );
+    let log = read_log(&req);
+    assert!(log.contains("исключения AFXERROR: createprocessw"), "{log}");
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+fn window(class: &str, title: &str, text: &str) -> pipeline::host::WindowInfo {
+    pipeline::host::WindowInfo {
+        pid: 4242,
+        class: class.to_owned(),
+        title: title.to_owned(),
+        text: text.to_owned(),
+    }
+}
+
+#[test]
+fn hlae_error_dialog_fails_at_once_with_its_text() {
+    let dialog = window(
+        "#32770",
+        "AfxHookSource2 - Error",
+        "AFXERROR: ffmpeg path invalid. Тест кириллицы",
+    );
+    let sc = Scenario::happy(3)
+        .console_never_up()
+        .windows_at(secs(3), vec![dialog]);
+    let (r, _, fake, _) = run("afx-dialog", sc, 3);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::HlaeError);
+    assert_eq!(f.state, RecordState::Console);
+    assert!(
+        fake.now() <= secs(5),
+        "не дождались дедлайна: {:?}",
+        fake.now()
+    );
+    assert!(
+        f.message.contains("AfxHookSource2 - Error"),
+        "{}",
+        f.message
+    );
+    assert!(f.message.contains("Тест кириллицы"), "{}", f.message);
+}
+
+#[test]
+fn ordinary_game_window_does_not_fail_but_lands_in_the_timeout_message() {
+    let req = fresh("plain-window", 2);
+    let sc = Scenario::happy(2)
+        .console_never_up()
+        .windows_at(secs(1), vec![window("SDL_app", "Counter-Strike 2", "")]);
+    let fake = FakeHost::new(sc);
+    let f = record(&fake, &req, &Capture::default()).expect_err("консоль не откроется");
+    assert_eq!(f.code, FailCode::ConsoleNotOpen);
+    assert!(
+        f.message.contains("окна игры: «Counter-Strike 2»"),
+        "{}",
+        f.message
+    );
+    let log = read_log(&req);
+    assert!(log.contains("окна:"), "{log}");
+    assert!(log.contains("Counter-Strike 2"), "{log}");
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn afxerror_while_closing_also_fails() {
+    // ALL_DONE и quit — на 16-й секунде, игра выходит на 18-й; ошибка ffmpeg HLAE приходит между
+    let sc = Scenario::happy(1).line_at(secs(17), Source::ConsoleLog, AFX);
+    let (r, ..) = run("afx-closing", sc, 1);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::HlaeError);
+    assert_eq!(f.state, RecordState::Closing);
 }
 
 #[test]

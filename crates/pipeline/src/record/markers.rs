@@ -99,6 +99,16 @@ pub fn is_afxerror(line: &str) -> bool {
     line.contains("AFXERROR")
 }
 
+/// Строка попадает в список исключений `afxerror_ignore` (D-09): содержит любую непустую подстроку
+/// из списка, без учёта регистра. Только подстроки — регулярных выражений из настроек нет (T-02-13).
+pub fn is_ignored(text: &str, ignore: &[String]) -> bool {
+    let text = text.to_lowercase();
+    ignore
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .any(|s| !s.is_empty() && text.contains(&s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +178,24 @@ mod tests {
             "AFXERROR: Failed writing image for screen recording."
         ));
         assert!(!is_afxerror("все хорошо"));
+    }
+
+    #[test]
+    fn ignore_list_matches_substrings_without_case_and_skips_empty_entries() {
+        let list = vec!["createprocessw".to_owned(), "  ".to_owned()];
+        assert!(is_ignored(
+            "AFXERROR: COutFFMPEGVideoStream: CreateProcessW.",
+            &list
+        ));
+        assert!(!is_ignored("AFXERROR: Failed writing image", &list));
+        assert!(
+            !is_ignored("любая строка", &[String::new()]),
+            "пустая подстрока не гасит всё"
+        );
+        assert!(!is_ignored("AFXERROR: x", &[]), "по умолчанию список пуст");
+        assert!(
+            !is_ignored("AFXERROR: x", &["A.*".to_owned()]),
+            "регулярных выражений нет"
+        );
     }
 }

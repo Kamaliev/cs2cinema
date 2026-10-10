@@ -126,8 +126,6 @@ pub enum Action {
     Send(String),
     /// Сообщить о событии.
     Emit(Event),
-    /// Завершить дерево процессов сессии.
-    Terminate,
     /// Запись закончена: успех или сбой.
     Finish(Result<(), RecordFailure>),
 }
@@ -154,6 +152,8 @@ pub struct Machine {
     accepted: Vec<Marker>,
     timings: Vec<TakeTiming>,
     game_exited_at: Option<Duration>,
+    /// `quit` не ушёл в консоль: повторяется при следующем `ConsoleUp` (WR-01).
+    quit_pending: bool,
     /// Первый признак того, что демка уже идёт (строка консоли).
     evidence_at: Option<Duration>,
     /// Прямой запрос READY уже отправлен (не больше одного).
@@ -186,6 +186,7 @@ impl Machine {
             accepted: vec![],
             timings: vec![],
             game_exited_at: None,
+            quit_pending: false,
             evidence_at: None,
             direct_sent: false,
             afx_ignore: vec![],
@@ -254,7 +255,7 @@ impl Machine {
             Input::Tick => {}
             Input::Event(ev) => self.on_event(now, ev, &mut acts),
             Input::Windows(list) => self.on_windows(now, &list, &mut acts),
-            Input::SendFailed { line, error } => self.on_send_failed(now, &line, &error, &mut acts),
+            Input::SendFailed { line, error } => self.on_send_failed(&line, &error, &mut acts),
         }
         if !self.finished {
             self.advance(now, &mut acts);
@@ -310,6 +311,10 @@ impl Machine {
             }
             SessionEvent::ConsoleUp => {
                 self.console_up = true;
+                if self.state == RecordState::Closing && self.quit_pending {
+                    self.quit_pending = false;
+                    acts.push(Action::Send("quit".to_owned()));
+                }
                 // порт переподключился, пока ждём READY: запрос мог потеряться (это не `exec`)
                 if self.state == RecordState::Demo {
                     acts.push(Action::Send(markers::ready_request(&self.nonce)));
@@ -365,12 +370,11 @@ impl Machine {
         acts.push(f);
     }
 
-    fn on_send_failed(&mut self, now: Duration, line: &str, error: &str, acts: &mut Vec<Action>) {
+    fn on_send_failed(&mut self, line: &str, error: &str, acts: &mut Vec<Action>) {
         if line == "quit" {
-            // игра не приняла quit — закрываем свой job и считаем запись законченной
-            acts.push(Action::Terminate);
-            self.finish_ok(now, acts);
-            return;
+            // консоль могла моргнуть: повторяем `quit` при следующем подключении (WR-01); если оно
+            // не придёт, закрытие всё равно кончится по `game_close`, а job завершит драйвер
+            self.quit_pending = true;
         }
         // `exec highlights` повторно не отправляется (D-10): если он потерялся, скажет дедлайн
         // SCRIPT. Запрос READY повторит следующий `ConsoleUp`.
@@ -539,17 +543,19 @@ impl Machine {
 
     fn check_deadline(&mut self, now: Duration, acts: &mut Vec<Action>) {
         if self.state == RecordState::Closing {
-            if self
-                .game_exited_at
-                .is_some_and(|t| now.saturating_sub(t) >= self.d.close_settle)
-            {
-                self.finish_ok(now, acts);
+            // оба исхода — не сбой, все дубли уже записаны; процессы завершает драйвер (TMO-04)
+            if let Some(exited) = self.game_exited_at {
+                // игра вышла, а ffmpeg HLAE ещё дописывает файл: ждём пустой job до `game_close` (WR-05)
+                if now.saturating_sub(exited) >= self.d.game_close {
+                    acts.push(Action::Emit(Event::Fact(failure::msg_job_not_empty(
+                        self.d.game_close,
+                    ))));
+                    self.finish_ok(now, acts);
+                }
             } else if now.saturating_sub(self.since) >= self.d.game_close {
-                // игра не закрылась после quit: это не сбой — все дубли уже записаны
                 acts.push(Action::Emit(Event::Fact(failure::msg_game_not_closed(
                     self.d.game_close,
                 ))));
-                acts.push(Action::Terminate);
                 self.finish_ok(now, acts);
             }
             return;
@@ -783,11 +789,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn closing_waits_for_job_empty_and_a_late_game_is_terminated_not_failed() {
-        let d = Deadlines::fast();
+    /// Последний дубль записан, машина в `Closing` и отправила `quit`.
+    fn closing(d: &Deadlines) -> (Machine, Duration) {
         let mut m = Machine::new(NONCE.into(), takes(1), d.clone());
-        let mut now = up_to_take_wait(&mut m, &d);
+        let mut now = up_to_take_wait(&mut m, d);
         now += ms(1);
         m.step(now, marker("TAKE_START 0"));
         now += ms(1);
@@ -795,16 +800,67 @@ mod tests {
         assert_eq!(sent(&acts), vec!["quit"]);
         assert_eq!(m.state(), RecordState::Closing);
         assert_eq!(m.timings().len(), 1);
+        (m, now)
+    }
+
+    #[test]
+    fn closing_waits_for_job_empty_and_a_late_game_is_a_success_not_a_failure() {
+        let d = Deadlines::fast();
+        let (mut m, now) = closing(&d);
         let acts = m.step(now + d.game_close, Input::Tick);
-        assert!(
-            acts.iter().any(|a| matches!(a, Action::Terminate)),
-            "свой job завершён"
-        );
         assert!(
             matches!(finish(&acts), Some(Ok(()))),
             "закрытие по таймеру — не сбой"
         );
         assert_eq!(m.state(), RecordState::Done);
+    }
+
+    #[test]
+    fn exited_game_with_a_busy_job_is_waited_for_until_game_close() {
+        let d = Deadlines::fast();
+        let (mut m, now) = closing(&d);
+        m.step(
+            now + ms(1),
+            Input::Event(SessionEvent::GameExited { code: Some(0) }),
+        );
+        let early = now + ms(1) + d.game_close - ms(1);
+        assert!(
+            finish(&m.step(early, Input::Tick)).is_none(),
+            "ffmpeg HLAE ещё дописывает файл: job не пуст, ждём"
+        );
+        let acts = m.step(now + ms(1) + d.game_close, Input::Tick);
+        assert!(matches!(finish(&acts), Some(Ok(()))));
+        assert!(
+            acts.iter().any(
+                |a| matches!(a, Action::Emit(Event::Fact(t)) if t.contains("остались процессы"))
+            ),
+            "{acts:?}"
+        );
+    }
+
+    #[test]
+    fn quit_that_fails_to_send_is_resent_on_reconnect() {
+        let d = Deadlines::fast();
+        let (mut m, now) = closing(&d);
+        let acts = m.step(
+            now + ms(1),
+            Input::SendFailed {
+                line: "quit".to_owned(),
+                error: "консоль игры не подключена".to_owned(),
+            },
+        );
+        assert!(finish(&acts).is_none(), "неотправленный quit — не успех");
+        assert_eq!(m.state(), RecordState::Closing);
+        assert!(
+            acts.iter().any(
+                |a| matches!(a, Action::Emit(Event::Fact(t)) if t.contains("не удалось отправить"))
+            ),
+            "{acts:?}"
+        );
+        let acts = m.step(now + ms(2), Input::Event(SessionEvent::ConsoleUp));
+        assert_eq!(sent(&acts), vec!["quit"], "quit повторён при подключении");
+        let acts = m.step(now + ms(3), Input::Event(SessionEvent::ConsoleUp));
+        assert!(sent(&acts).is_empty(), "повтор ровно один раз");
     }
 
     fn dialog(class: &str, title: &str, text: &str) -> WindowInfo {

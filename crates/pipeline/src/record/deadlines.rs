@@ -34,10 +34,9 @@ pub struct Deadlines {
     pub take_factor: f32,
     /// Постоянный запас на дубль сверх `take_factor`.
     pub take_slack: Duration,
-    /// Игра должна закрыться после `quit`; иначе завершаем свой job (это не сбой).
+    /// Игра должна закрыться после `quit`, а после её выхода job должен опустеть (ffmpeg HLAE дописал
+    /// файл); иначе завершаем свой job (это не сбой).
     pub game_close: Duration,
-    /// Пауза после выхода игры, если пустой job так и не сообщили.
-    pub close_settle: Duration,
     /// `ffprobe` на одном файле.
     pub ffprobe: Duration,
     /// Нижняя граница дедлайна склейки ffmpeg.
@@ -77,7 +76,6 @@ impl Deadlines {
             take_factor: 2.0,
             take_slack: unit(30),
             game_close: unit(30),
-            close_settle: unit(3),
             ffprobe: unit(30),
             ffmpeg_min: unit(600),
             ffmpeg_factor: 15.0,
@@ -117,7 +115,6 @@ impl Deadlines {
             take_factor: self.take_factor * k,
             take_slack: d(self.take_slack),
             game_close: d(self.game_close),
-            close_settle: d(self.close_settle),
             ffprobe: d(self.ffprobe),
             ffmpeg_min: d(self.ffmpeg_min),
             ffmpeg_factor: self.ffmpeg_factor * k,

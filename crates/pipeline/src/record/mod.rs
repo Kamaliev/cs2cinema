@@ -449,8 +449,6 @@ pub fn record(
         }
     };
     let mut session = Guard(session);
-    // как была игра в момент решения: после Terminate она уже «не жива» из-за нас
-    let mut liveness: Option<Liveness> = None;
     // опрос окон своего job (D-10): когда смотрели в последний раз и какой набор окон был тогда
     let mut windows_at: Option<Duration> = None;
     let mut windows_seen: Vec<(String, String)> = vec![];
@@ -504,12 +502,9 @@ pub fn record(
                     }
                 }
                 Action::Emit(e) => j.emit(host.now(), p, &e),
-                Action::Terminate => {
-                    liveness.get_or_insert_with(|| session.0.game_liveness());
-                    session.0.terminate();
-                }
                 Action::Finish(Ok(())) => {
-                    let game = liveness.unwrap_or_else(|| session.0.game_liveness());
+                    // как была игра в момент решения, до закрытия: закрываем её мы сами
+                    let game = session.0.game_liveness();
                     let launcher = machine.launcher();
                     let stop = stop_for(&Ok(()));
                     shutdown(
@@ -531,7 +526,7 @@ pub fn record(
                     });
                 }
                 Action::Finish(Err(mut f)) => {
-                    f.game = liveness.unwrap_or_else(|| session.0.game_liveness());
+                    f.game = session.0.game_liveness();
                     f.launcher = machine.launcher();
                     if matches!(
                         f.code,

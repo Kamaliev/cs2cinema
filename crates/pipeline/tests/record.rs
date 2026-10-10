@@ -891,3 +891,42 @@ fn mark_partial_touches_only_take_dirs() {
     assert!(mark_partial(&clips.join("нет-такой"), &[]).is_empty());
     let _ = std::fs::remove_dir_all(&clips);
 }
+
+#[test]
+fn success_waits_for_job_empty_after_the_game_exits() {
+    // TAKE_END последнего дубля — 23-я секунда, quit -> выход игры на 25-й, пустой job на 35-й
+    let sc = Scenario::happy(2).job_empty_after_exit(Some(secs(10)));
+    let req = fresh("job-empty-late", 2);
+    let fake = FakeHost::new(sc);
+    record(&fake, &req, &Capture::default()).expect("запись удачна");
+    assert!(
+        fake.now() >= secs(35),
+        "последний дубль не обрываем до конца job: {:?}",
+        fake.now()
+    );
+    let log = read_log(&req);
+    let empty = log
+        .find("в job не осталось процессов")
+        .expect("job опустел");
+    let ended = log.find("свой job завершён").expect("job завершён");
+    assert!(empty < ended, "сначала пустой job, потом завершение: {log}");
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn job_that_never_empties_after_exit_is_closed_after_game_close() {
+    let sc = Scenario::happy(2).job_empty_after_exit(None);
+    let (r, cap, fake, req) = run("job-never-empty", sc, 2);
+    r.expect("зависший ffmpeg HLAE не делает запись сбоем");
+    // игра вышла на 25-й секунде, ещё `game_close` ждём пустой job
+    assert!(
+        fake.now() >= secs(25) + req.deadlines.game_close,
+        "{:?}",
+        fake.now()
+    );
+    assert!(
+        cap.lines().iter().any(|l| l.contains("остались процессы")),
+        "{:?}",
+        cap.lines()
+    );
+}

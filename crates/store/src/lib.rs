@@ -135,6 +135,10 @@ pub struct Job {
     pub fail_hint: Option<String>,
     /// Хвост консоли игры на момент сбоя, строки через `\n`.
     pub fail_tail: Option<String>,
+    /// Сколько миллисекунд прошло от старта записи до сбоя (для карточки).
+    pub fail_elapsed_ms: Option<i64>,
+    /// Код текущего состояния записи для лестницы в карточке; не путать со `stage`.
+    pub phase: String,
 }
 
 impl Job {
@@ -161,6 +165,8 @@ pub struct JobFailure {
     pub state: String,
     pub hint: String,
     pub tail: String,
+    /// Прошедшее время до сбоя, мс.
+    pub elapsed_ms: Option<i64>,
 }
 
 /// Общее соединение: одно на приложение, безопасно делится между потоками.
@@ -211,7 +217,8 @@ CREATE TABLE IF NOT EXISTS demos (
 );
 ";
 
-// Версии схемы: 1 — сбой записи (fail_*, D-05).
+// Версии схемы: 1 — сбой записи (fail_*, D-05);
+// 2 — прошедшее время сбоя и состояние записи для карточки (D-06).
 // Новая версия — только новым шагом в конце списка и только добавлением колонок.
 // Элемент k поднимает схему до версии k+1; шаг идёт в одной транзакции со своим `user_version`.
 const MIGRATIONS: &[&str] = &[
@@ -219,6 +226,8 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE jobs ADD COLUMN fail_state TEXT;
      ALTER TABLE jobs ADD COLUMN fail_hint TEXT;
      ALTER TABLE jobs ADD COLUMN fail_tail TEXT;",
+    "ALTER TABLE jobs ADD COLUMN fail_elapsed_ms INTEGER;
+     ALTER TABLE jobs ADD COLUMN phase TEXT NOT NULL DEFAULT '';",
 ];
 
 impl Store {
@@ -297,6 +306,8 @@ impl Store {
             fail_state: r.get("fail_state")?,
             fail_hint: r.get("fail_hint")?,
             fail_tail: r.get("fail_tail")?,
+            fail_elapsed_ms: r.get("fail_elapsed_ms")?,
+            phase: r.get("phase")?,
         })
     }
 
@@ -325,7 +336,7 @@ impl Store {
     pub fn start_job(&self, id: i64) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "UPDATE jobs SET status = 'running', stage = '', error = NULL, result = NULL, log = '', fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, updated_at = ?2 WHERE id = ?1",
+                "UPDATE jobs SET status = 'running', stage = '', error = NULL, result = NULL, log = '', fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', updated_at = ?2 WHERE id = ?1",
                 params![id, now()],
             )?;
             Ok(())
@@ -335,6 +346,22 @@ impl Store {
     pub fn set_stage(&self, id: i64, stage: &str) -> Result<()> {
         self.with(|c| {
             c.execute("UPDATE jobs SET stage = ?2, updated_at = ?3 WHERE id = ?1", params![id, stage, now()])?;
+            Ok(())
+        })
+    }
+
+    /// Текущее состояние записи для лестницы в карточке; `stage` (полоска прогресса) не меняется.
+    pub fn set_phase(&self, id: i64, phase: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE jobs SET phase = ?2, updated_at = ?3 WHERE id = ?1", params![id, phase, now()])?;
+            Ok(())
+        })
+    }
+
+    /// Папка известна до записи — чтобы у упавшей задачи карточка могла назвать record.log.
+    pub fn set_out_dir(&self, id: i64, dir: &Path) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE jobs SET out_dir = ?2, updated_at = ?3 WHERE id = ?1", params![id, dir.to_string_lossy(), now()])?;
             Ok(())
         })
     }
@@ -350,10 +377,10 @@ impl Store {
         self.with(|c| {
             match outcome {
                 Ok(o) => c.execute(
-                    "UPDATE jobs SET status = 'done', stage = '', out_dir = ?2, result = ?3, shots = ?4, secs = ?5, error = NULL, updated_at = ?6 WHERE id = ?1",
+                    "UPDATE jobs SET status = 'done', stage = '', out_dir = ?2, result = ?3, shots = ?4, secs = ?5, error = NULL, phase = '', updated_at = ?6 WHERE id = ?1",
                     params![id, o.out_dir.to_string_lossy(), o.result.to_string_lossy(), o.shots as i64, o.secs as f64, now()],
                 )?,
-                Err(e) => c.execute("UPDATE jobs SET status = 'failed', error = ?2, updated_at = ?3 WHERE id = ?1", params![id, e, now()])?,
+                Err(e) => c.execute("UPDATE jobs SET status = 'failed', error = ?2, phase = '', updated_at = ?3 WHERE id = ?1", params![id, e, now()])?,
             };
             Ok(())
         })
@@ -363,8 +390,8 @@ impl Store {
     pub fn fail_job(&self, id: i64, f: &JobFailure) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "UPDATE jobs SET status = 'failed', error = ?2, fail_code = ?3, fail_state = ?4, fail_hint = ?5, fail_tail = ?6, updated_at = ?7 WHERE id = ?1",
-                params![id, f.message, f.code, f.state, f.hint, f.tail, now()],
+                "UPDATE jobs SET status = 'failed', error = ?2, fail_code = ?3, fail_state = ?4, fail_hint = ?5, fail_tail = ?6, fail_elapsed_ms = ?7, phase = '', updated_at = ?8 WHERE id = ?1",
+                params![id, f.message, f.code, f.state, f.hint, f.tail, f.elapsed_ms, now()],
             )?;
             Ok(())
         })
@@ -373,7 +400,7 @@ impl Store {
     /// Задача отменена (из очереди или на ходу — тогда исполнитель сам доводит её до этого статуса).
     pub fn cancel_job(&self, id: i64) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE jobs SET status = 'cancelled', stage = '', updated_at = ?2 WHERE id = ?1", params![id, now()])?;
+            c.execute("UPDATE jobs SET status = 'cancelled', stage = '', phase = '', updated_at = ?2 WHERE id = ?1", params![id, now()])?;
             Ok(())
         })
     }
@@ -382,7 +409,7 @@ impl Store {
     pub fn requeue(&self, id: i64) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "UPDATE jobs SET status = 'queued', stage = '', error = NULL, fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, updated_at = ?2 WHERE id = ?1",
+                "UPDATE jobs SET status = 'queued', stage = '', error = NULL, fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', updated_at = ?2 WHERE id = ?1",
                 params![id, now()],
             )?;
             Ok(())
@@ -400,7 +427,7 @@ impl Store {
     pub fn reset_running(&self) -> Result<usize> {
         self.with(|c| {
             c.execute(
-                "UPDATE jobs SET status = 'failed', error = 'прервано: приложение закрылось во время выполнения', updated_at = ?1 WHERE status = 'running'",
+                "UPDATE jobs SET status = 'failed', error = 'прервано: приложение закрылось во время выполнения', phase = '', updated_at = ?1 WHERE status = 'running'",
                 [now()],
             )
         })
@@ -553,11 +580,68 @@ mod tests {
         let j = s.jobs().unwrap().pop().unwrap();
         assert_eq!(j.error.as_deref(), Some("старая ошибка"));
         assert_eq!((j.fail_code, j.fail_state, j.fail_hint, j.fail_tail), (None, None, None, None));
-        assert_eq!(user_version(&s), 1);
+        assert_eq!(user_version(&s), 2);
         drop(s);
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 1, "повторное открытие ничего не меняет");
+        assert_eq!(user_version(&s), 2, "повторное открытие ничего не меняет");
         assert_eq!(s.jobs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn version_one_database_gains_elapsed_and_phase() {
+        let db = TempDb::new("v1");
+        {
+            let c = Connection::open(&db.0).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            c.execute_batch(MIGRATIONS[0]).unwrap();
+            c.execute_batch("PRAGMA user_version = 1").unwrap();
+            insert_old_job(&c);
+        }
+        let s = Store::open(&db.0).unwrap();
+        assert_eq!(user_version(&s), 2);
+        let j = s.jobs().unwrap().pop().unwrap();
+        assert_eq!(j.error.as_deref(), Some("старая ошибка"));
+        assert_eq!((j.phase.as_str(), j.fail_elapsed_ms), ("", None));
+        drop(s);
+        let s = Store::open(&db.0).unwrap();
+        assert_eq!(user_version(&s), 2, "повторное открытие ничего не меняет");
+        assert_eq!(s.jobs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn out_dir_and_phase_are_kept_while_running() {
+        let s = Store::in_memory().unwrap();
+        let a = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.start_job(a).unwrap();
+        s.set_stage(a, "Запись").unwrap();
+        s.set_out_dir(a, Path::new("C:/out/m1")).unwrap();
+        s.set_phase(a, "demo").unwrap();
+        let j = s.job(a).unwrap().unwrap();
+        assert_eq!(j.out_dir, Some(PathBuf::from("C:/out/m1")));
+        assert_eq!(j.status, JobStatus::Running);
+        assert_eq!((j.phase.as_str(), j.stage.as_str()), ("demo", "Запись"), "phase не трогает stage");
+
+        let out = JobOutcome { out_dir: "C:/out/m1".into(), result: "C:/out/m1/highlights.mp4".into(), shots: 3, secs: 20.0 };
+        s.finish_job(a, Ok(&out)).unwrap();
+        assert_eq!(s.job(a).unwrap().unwrap().phase, "");
+
+        let b = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.start_job(b).unwrap();
+        s.set_phase(b, "console").unwrap();
+        s.finish_job(b, Err("нет ffmpeg")).unwrap();
+        assert_eq!(s.job(b).unwrap().unwrap().phase, "", "ошибка без типа тоже сбрасывает состояние");
+
+        let c = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.start_job(c).unwrap();
+        s.set_phase(c, "demo").unwrap();
+        s.cancel_job(c).unwrap();
+        assert_eq!(s.job(c).unwrap().unwrap().phase, "");
+
+        let d = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.start_job(d).unwrap();
+        s.set_phase(d, "demo").unwrap();
+        s.requeue(d).unwrap();
+        assert_eq!(s.job(d).unwrap().unwrap().phase, "", "повтор не показывает прошлое состояние");
     }
 
     #[test]
@@ -570,9 +654,11 @@ mod tests {
             state: "console".into(),
             hint: "Проверьте -netconport в параметрах запуска".into(),
             tail: "строка 1\nстрока 2 'кавычка'; DROP TABLE jobs;--".into(),
+            elapsed_ms: Some(90_100),
         };
         s.start_job(a).unwrap();
         s.set_stage(a, "Запись").unwrap();
+        s.set_phase(a, "console").unwrap();
         s.fail_job(a, &f).unwrap();
         let j = s.job(a).unwrap().unwrap();
         assert_eq!(j.status, JobStatus::Failed);
@@ -581,16 +667,20 @@ mod tests {
         assert_eq!(j.fail_state.as_deref(), Some("console"));
         assert_eq!(j.fail_hint.as_deref(), Some(f.hint.as_str()));
         assert_eq!(j.fail_tail.as_deref(), Some(f.tail.as_str()));
+        assert_eq!(j.fail_elapsed_ms, Some(90_100));
         assert_eq!(j.stage, "Запись", "этап сбоя остаётся виден");
+        assert_eq!(j.phase, "", "после сбоя выполняемого состояния нет");
 
         s.requeue(a).unwrap();
         let j = s.job(a).unwrap().unwrap();
         assert_eq!((j.error, j.fail_code, j.fail_state, j.fail_hint, j.fail_tail), (None, None, None, None, None));
+        assert_eq!(j.fail_elapsed_ms, None);
 
         s.start_job(a).unwrap();
         s.fail_job(a, &f).unwrap();
         s.start_job(a).unwrap();
         let j = s.job(a).unwrap().unwrap();
         assert_eq!((j.status, j.error, j.fail_code, j.fail_state, j.fail_hint, j.fail_tail), (JobStatus::Running, None, None, None, None, None));
+        assert_eq!((j.fail_elapsed_ms, j.phase.as_str()), (None, ""));
     }
 }

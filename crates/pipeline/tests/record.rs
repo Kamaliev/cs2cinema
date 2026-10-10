@@ -1288,3 +1288,177 @@ fn own_processes_file_lives_only_while_the_game_may_be_alive() {
     );
     let _ = std::fs::remove_dir_all(&req.out_dir);
 }
+
+/// Одна строка таблицы D-17: сценарий сбоя записи и код, которым он обязан кончиться.
+struct D17 {
+    /// Название сценария по-русски: оно попадает в сообщение при расхождении.
+    name: &'static str,
+    /// Сценарий по папке `clips` задачи (нужна только тем, где ffprobe читает файлы дублей).
+    scenario: fn(&std::path::Path) -> Scenario,
+    /// Запрос с проверкой дублей через ffprobe.
+    verify: bool,
+    /// Отмена приходит после входа в это состояние.
+    cancel_after: Option<RecordState>,
+    code: FailCode,
+}
+
+#[test]
+fn every_d17_scenario_ends_with_its_own_code() {
+    let table = [
+        D17 {
+            name: "лаунчер не стартовал",
+            scenario: |_| {
+                Scenario::happy(3).launch_error(HostError::Spawn("HLAE.exe не найден".to_owned()))
+            },
+            verify: false,
+            cancel_after: None,
+            code: FailCode::LauncherFailed,
+        },
+        D17 {
+            name: "игра не появилась",
+            scenario: |_| Scenario::happy(3).game_never_appears(),
+            verify: false,
+            cancel_after: None,
+            code: FailCode::GameNotStarted,
+        },
+        D17 {
+            name: "окно ошибки HLAE",
+            scenario: |_| {
+                let dialog = window(
+                    "#32770",
+                    "AfxHookSource2 - Error",
+                    "AFXERROR: ffmpeg path invalid.",
+                );
+                Scenario::happy(3)
+                    .console_never_up()
+                    .windows_at(secs(3), vec![dialog])
+            },
+            verify: false,
+            cancel_after: None,
+            code: FailCode::HlaeError,
+        },
+        D17 {
+            name: "консоль не открылась",
+            scenario: |_| Scenario::happy(3).console_never_up(),
+            verify: false,
+            cancel_after: None,
+            code: FailCode::ConsoleNotOpen,
+        },
+        D17 {
+            name: "демка не загрузилась",
+            scenario: |_| Scenario::happy(3).drop_marker(FakeMarker::Ready),
+            verify: false,
+            cancel_after: None,
+            code: FailCode::DemoNotLoaded,
+        },
+        D17 {
+            name: "скрипт не запустился",
+            scenario: |_| Scenario::happy(3).drop_marker(FakeMarker::Script),
+            verify: false,
+            cancel_after: None,
+            code: FailCode::ScriptNotRun,
+        },
+        D17 {
+            name: "маркер дубля не пришёл",
+            scenario: |_| Scenario::happy(3).drop_marker(FakeMarker::TakeEnd(0)),
+            verify: false,
+            cancel_after: None,
+            code: FailCode::TakeTimeout,
+        },
+        D17 {
+            name: "дубль обрезан",
+            scenario: |clips| {
+                Scenario::happy(3)
+                    .clips_dir(clips.to_path_buf())
+                    .truncated_take(0)
+            },
+            verify: true,
+            cancel_after: None,
+            code: FailCode::TakeInvalid,
+        },
+        D17 {
+            name: "игра умерла посреди дубля",
+            // дубль 2 идёт с 18-й по 23-ю секунду виртуального времени
+            scenario: |_| Scenario::happy(3).game_dies_at(secs(20), Some(0xC0000005)),
+            verify: false,
+            cancel_after: None,
+            code: FailCode::GameExited,
+        },
+        D17 {
+            name: "отмена",
+            scenario: |_| Scenario::happy(3),
+            verify: false,
+            cancel_after: Some(RecordState::Take),
+            code: FailCode::Cancelled,
+        },
+    ];
+
+    let mut codes = std::collections::HashSet::new();
+    for (i, row) in table.iter().enumerate() {
+        let mut req = fresh(&format!("d17-{i}"), 3);
+        if row.verify {
+            req.verify = Some(Verify {
+                ffprobe: "ffprobe".into(),
+                plan_hash: "h".into(),
+                attempt: 1,
+                env: None,
+            });
+        }
+        let fake = FakeHost::new((row.scenario)(&req.out_dir.join("clips")));
+        let cap = match row.cancel_after {
+            Some(state) => Capture::cancelling_after(state),
+            None => Capture::default(),
+        };
+        let f = record(&fake, &req, &cap)
+            .expect_err(&format!("сценарий «{}»: запись обязана упасть", row.name));
+        assert_eq!(
+            f.code,
+            row.code,
+            "сценарий «{}»: код {} вместо {}: {}",
+            row.name,
+            f.code.as_str(),
+            row.code.as_str(),
+            f.message
+        );
+        let log = std::fs::read_to_string(req.out_dir.join("record.log"))
+            .unwrap_or_else(|e| panic!("сценарий «{}»: нет record.log: {e}", row.name));
+        let line = format!("код: {}", row.code.as_str());
+        assert!(
+            log.contains(&line),
+            "сценарий «{}»: в record.log нет «{line}»: {log}",
+            row.name
+        );
+        assert!(
+            codes.insert(row.code.as_str()),
+            "сценарий «{}»: код {} уже был у другого сценария",
+            row.name,
+            row.code.as_str()
+        );
+        let _ = std::fs::remove_dir_all(&req.out_dir);
+    }
+    assert_eq!(codes.len(), 10, "десять сценариев — десять разных кодов");
+}
+
+#[test]
+fn launcher_spawn_error_fails_with_launcher_failed_and_still_writes_record_log() {
+    let req = fresh("launch-spawn", 3);
+    let fake = FakeHost::new(
+        Scenario::happy(3).launch_error(HostError::Spawn("HLAE.exe не найден".to_owned())),
+    );
+    let cap = Capture::default();
+    let f = record(&fake, &req, &cap).expect_err("лаунчер не запустился");
+    assert_eq!(f.code, FailCode::LauncherFailed);
+    assert_eq!(f.state, RecordState::Launcher);
+    assert!(
+        f.message.contains("HLAE.exe не найден"),
+        "сообщение называет ошибку хоста: {}",
+        f.message
+    );
+    assert!(!f.hint.is_empty());
+    assert_eq!(fake.launches(), 0, "ни одного запуска не состоялось");
+    let log = read_log(&req);
+    let at = log.rfind("итог").expect("итог записан");
+    assert!(log[at..].contains("код: LAUNCHER_FAILED"), "{log}");
+    assert!(log[at..].contains("HLAE.exe не найден"), "{log}");
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}

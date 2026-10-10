@@ -17,7 +17,7 @@ mod gather;
 pub mod space;
 pub mod steam;
 
-pub use gather::{Demo, Inputs, run};
+pub use gather::{Demo, Inputs, check_space, hlae_ffmpeg, run};
 
 /// Уровень пункта предпроверки.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

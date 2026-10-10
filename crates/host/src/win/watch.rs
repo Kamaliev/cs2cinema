@@ -4,6 +4,7 @@
 //! дальше (спайк S1). Живость игры — ожидание на её handle; ошибка опроса — `Note`, а не «жива».
 //! Завершать по имени образа здесь нечего: поток только наблюдает, а убивает `Session::terminate`.
 
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -158,5 +159,82 @@ fn game_state(w: &Watch, told: &mut Told) -> bool {
             }
             false
         }
+    }
+}
+
+/// Процесс-кандидат на принятие по PID (запасной путь D-02).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Candidate {
+    pub pid: u32,
+    /// Полный путь образа.
+    pub image: PathBuf,
+    /// Время создания процесса, FILETIME.
+    pub created: u64,
+    /// Процесс уже состоит в нашем job.
+    pub in_our_job: bool,
+}
+
+/// Кого принять по PID. RED: пока никого.
+pub(crate) fn pick_adoptee(
+    candidates: &[Candidate],
+    expected: &Path,
+    not_before: u64,
+) -> Option<u32> {
+    let _ = (candidates, expected, not_before);
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EXPECTED: &str = r"C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\cs2.exe";
+    const LAUNCHER_AT: u64 = 1_000;
+
+    fn cand(pid: u32, image: &str, created: u64, in_our_job: bool) -> Candidate {
+        Candidate {
+            pid,
+            image: image.into(),
+            created,
+            in_our_job,
+        }
+    }
+
+    fn pick(c: &[Candidate]) -> Option<u32> {
+        pick_adoptee(c, Path::new(EXPECTED), LAUNCHER_AT)
+    }
+
+    #[test]
+    fn adoption_takes_only_a_single_fresh_candidate_with_the_expected_path() {
+        // один подходящий
+        assert_eq!(pick(&[cand(7, EXPECTED, 2_000, false)]), Some(7));
+        // регистр и разделители не важны
+        let slashed = EXPECTED.replace('\\', "/").to_lowercase();
+        assert_eq!(pick(&[cand(8, &slashed, LAUNCHER_AT, false)]), Some(8));
+        // два подходящих — не принимаем никого
+        assert_eq!(
+            pick(&[
+                cand(7, EXPECTED, 2_000, false),
+                cand(9, EXPECTED, 3_000, false)
+            ]),
+            None
+        );
+        // чужой путь
+        assert_eq!(pick(&[cand(7, r"D:\games\cs2.exe", 2_000, false)]), None);
+        // создан раньше лаунчера (чужой, давно запущенный cs2.exe пользователя)
+        assert_eq!(pick(&[cand(7, EXPECTED, LAUNCHER_AT - 1, false)]), None);
+        // уже в нашем job — принимать нечего
+        assert_eq!(pick(&[cand(7, EXPECTED, 2_000, true)]), None);
+        // лишние кандидаты не мешают единственному подходящему
+        assert_eq!(
+            pick(&[
+                cand(7, EXPECTED, 2_000, false),
+                cand(9, EXPECTED, 3_000, true),
+                cand(11, r"D:\games\cs2.exe", 3_000, false),
+                cand(13, EXPECTED, 10, false),
+            ]),
+            Some(7)
+        );
+        assert_eq!(pick(&[]), None);
     }
 }

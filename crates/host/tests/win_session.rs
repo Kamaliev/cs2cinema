@@ -109,3 +109,95 @@ fn stand_in_launcher_game_and_console_flow_through_one_session() {
     );
     session.terminate();
 }
+
+/// Временный файл `console.log`; удаляется в `Drop`.
+struct TempLog(std::path::PathBuf);
+
+impl Drop for TempLog {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn console_log_tail_starts_at_the_launch_offset() {
+    use std::io::Write;
+
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let log = TempLog(std::env::temp_dir().join(format!(
+        "cs2cinema-win-session-{}-{n}.log",
+        std::process::id()
+    )));
+    // прошлый запуск: BOM и старая метка, которую нельзя принять за новую
+    std::fs::write(
+        &log.0,
+        b"\xef\xbb\xbf10/10 16:00:00 CS2C ab12cd34 READY\r\n",
+    )
+    .unwrap();
+
+    // порт, на котором никто не слушает: консоль не подключается, нужен только хвост файла
+    let port = host::win::netcon::free_port();
+    let mut session = WinHost::new()
+        .launch_with(stand_in_launcher(), "ping.exe", port, Some(log.0.clone()))
+        .expect("сессия должна запуститься");
+
+    let mut events = Vec::new();
+    assert!(
+        poll_until(
+            session.as_mut(),
+            Duration::from_secs(10),
+            &mut events,
+            |e| {
+                e.iter()
+                    .any(|x| matches!(x, SessionEvent::GameAppeared { .. }))
+            }
+        ),
+        "игра-заглушка не появилась: {events:?}"
+    );
+
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log.0)
+        .unwrap();
+    f.write_all("строка 1\n".as_bytes()).unwrap();
+    f.write_all("вторая ".as_bytes()).unwrap();
+    f.flush().unwrap();
+    let has = |e: &[SessionEvent], want: &str| {
+        e.iter().any(|x| {
+            matches!(x, SessionEvent::Line { source: Source::ConsoleLog, text } if text == want)
+        })
+    };
+    assert!(
+        poll_until(session.as_mut(), Duration::from_secs(5), &mut events, |e| {
+            has(e, "строка 1")
+        }),
+        "первая строка хвоста не пришла: {events:?}"
+    );
+    assert!(
+        !has(&events, "вторая"),
+        "обрывок строки не должен приходить"
+    );
+
+    f.write_all("целая\n".as_bytes()).unwrap();
+    f.flush().unwrap();
+    assert!(
+        poll_until(session.as_mut(), Duration::from_secs(5), &mut events, |e| {
+            has(e, "вторая целая")
+        }),
+        "склеенная строка не пришла: {events:?}"
+    );
+    for ev in &events {
+        if let SessionEvent::Line {
+            source: Source::ConsoleLog,
+            text,
+        } = ev
+        {
+            assert!(!text.contains("READY"), "старая строка пришла: {text:?}");
+            assert!(!text.contains('\u{feff}'), "BOM в тексте: {text:?}");
+        }
+    }
+    session.terminate();
+}

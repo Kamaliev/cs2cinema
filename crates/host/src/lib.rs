@@ -10,6 +10,7 @@
 //! Файловая система не абстрагируется: пути, `console.log` и папки дублей читает сам вызывающий.
 
 pub mod fake;
+pub mod gate;
 mod unsupported;
 #[cfg(windows)]
 pub mod win;

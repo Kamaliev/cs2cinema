@@ -12,6 +12,11 @@ use renderer::TakePlan;
 const SCALE_MIN: f32 = 0.5;
 const SCALE_MAX: f32 = 5.0;
 
+/// Допуск длительности дубля: ±10%, но не меньше ±0.5 с; подстраивается в фазе 4 по приёмке.
+pub const TAKE_TOLERANCE_REL: f32 = 0.10;
+/// Нижняя граница допуска длительности дубля, секунды (см. [`TAKE_TOLERANCE_REL`]).
+pub const TAKE_TOLERANCE_MIN_SECS: f32 = 0.5;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Deadlines {
     /// Лаунчер HLAE.exe должен завершиться; если он показывает окно с ошибкой, он не завершится.
@@ -39,6 +44,8 @@ pub struct Deadlines {
     pub game_close: Duration,
     /// `ffprobe` на одном файле.
     pub ffprobe: Duration,
+    /// Сколько после TAKE_END ждать, пока ffmpeg HLAE допишет файл дубля (ffprobe читает его).
+    pub take_finalize: Duration,
     /// Нижняя граница дедлайна склейки ffmpeg.
     pub ffmpeg_min: Duration,
     /// Дедлайн склейки: длина ролика в секундах, умноженная на это число.
@@ -77,6 +84,7 @@ impl Deadlines {
             take_slack: unit(30),
             game_close: unit(30),
             ffprobe: unit(30),
+            take_finalize: unit(20),
             ffmpeg_min: unit(600),
             ffmpeg_factor: 15.0,
             tool_probe: unit(10),
@@ -116,6 +124,7 @@ impl Deadlines {
             take_slack: d(self.take_slack),
             game_close: d(self.game_close),
             ffprobe: d(self.ffprobe),
+            take_finalize: d(self.take_finalize),
             ffmpeg_min: d(self.ffmpeg_min),
             ffmpeg_factor: self.ffmpeg_factor * k,
             tool_probe: d(self.tool_probe),
@@ -220,6 +229,14 @@ mod tests {
         );
         assert_eq!(d.nvenc_probe, Duration::from_secs(100));
         assert_eq!(d.thumbnail, Duration::from_secs(75));
+    }
+
+    #[test]
+    fn take_finalize_is_twenty_seconds_and_follows_the_time_margin() {
+        let d = Deadlines::default();
+        assert_eq!(d.take_finalize, Duration::from_secs(20));
+        assert_eq!(d.scaled(2.0).take_finalize, Duration::from_secs(40));
+        assert_eq!(Deadlines::fast().take_finalize, Duration::from_millis(20));
     }
 
     #[test]

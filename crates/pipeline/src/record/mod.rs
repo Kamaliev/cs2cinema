@@ -10,6 +10,7 @@ pub mod failure;
 pub mod log;
 pub mod machine;
 pub mod markers;
+pub mod verify;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -350,7 +351,7 @@ fn shutdown(
 }
 
 /// Номер дубля из имени папки: ровно `take` и четыре цифры.
-fn take_number(name: &str) -> Option<u32> {
+pub(crate) fn take_number(name: &str) -> Option<u32> {
     let digits = name.strip_prefix("take")?;
     if digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_digit()) {
         digits.parse().ok()

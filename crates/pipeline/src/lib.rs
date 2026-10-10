@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 pub use host;
+pub mod manifest;
 pub mod precheck;
 pub mod record;
 pub use record::{Deadlines, Event, FailCode, RecordFailure, RecordReport, RecordRequest, RecordState, record};

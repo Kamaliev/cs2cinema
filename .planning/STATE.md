@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 02
 current_phase_name: Предпроверка, отмена и только свои процессы
 status: executing
-stopped_at: Completed 02-05-PLAN.md
-last_updated: "2026-10-10T16:21:18.719Z"
+stopped_at: Completed 02-06-PLAN.md
+last_updated: "2026-10-10T16:31:36.858Z"
 last_activity: 2026-10-10
 last_activity_desc: Phase 02 execution started
-state_head: d6138077198569231f323285d91710e9758297b3
+state_head: 7716a6558855214f39a936f4df078977a069aa60
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 16
-  completed_plans: 13
+  completed_plans: 14
   percent: 0
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 02 (Предпроверка, отмена и только свои процессы) — EXECUTING
-Plan: 6 of 8
+Plan: 7 of 8
 Status: Ready to execute
 Last activity: 2026-10-10 — Phase 02 execution started
 
@@ -69,6 +69,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 02 P03 | 25 min | 2 tasks | 9 files |
 | Phase 02 P04 | 35 min | 3 tasks | 8 files |
 | Phase 02 P05 | 25 min | 2 tasks | 4 files |
+| Phase 02 P06 | 35 min | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -103,6 +104,9 @@ Recent decisions affecting current work:
 - [Phase 02]: Окна опрашиваются в состояниях Launcher..Take; мгновенно роняет только диалог #32770 с afxhook/hlae/afxerror
 - [Phase 02]: Сначала wait_previous_game (D-14), потом снимок процессов: своя зависшая игра не должна выглядеть чужим CS2
 - [Phase 02]: hlae_ffmpeg: Path= из ffmpeg.ini берётся как есть, без ini - ffmpeg/bin/ffmpeg.exe, иначе None
+- [Phase 02]: Второй проход места делается в ветке «дубли ещё не записаны»: задача с одной склейкой не блокируется нехваткой места под запись
+- [Phase 02]: recover помечает дубли .partial только при существующем installed.json: без него запись убрана после успеха и дубли целые
+- [Phase 02]: Файлы удаляются из папки игры только по installed.json через is_ours (папка CS2 из настроек, канонизация, шаблоны имён)
 
 ### Pending Todos
 
@@ -125,6 +129,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-10T16:21:18.605Z
-Stopped at: Completed 02-05-PLAN.md
+Last session: 2026-10-10T16:31:36.741Z
+Stopped at: Completed 02-06-PLAN.md
 Resume file: None

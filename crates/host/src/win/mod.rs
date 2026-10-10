@@ -16,13 +16,14 @@ pub mod watch;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::gate::{DemoGate, Verdict};
 use crate::{
     CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, Session, SessionEvent, Source,
     console_line_ok,
@@ -65,11 +66,27 @@ impl Shared {
 }
 
 /// Куда потоки сессии пишут события.
+///
+/// Строки консоли проходят ворота [`DemoGate`]: метка нашей задачи, пришедшая раньше подтверждения
+/// демки (ложный `READY` на меню-карте, спайк S3c), в канал не попадает — вместо неё идёт `Note`.
 pub(crate) struct Sink {
     tx: Sender<SessionEvent>,
+    gate: Mutex<DemoGate>,
+    dropped: AtomicU32,
 }
 
+/// Сколько отброшенных меток описывается в журнале; остальные считаются молча.
+const MAX_DROP_NOTES: u32 = 10;
+
 impl Sink {
+    pub fn new(tx: Sender<SessionEvent>, nonce: &str) -> Self {
+        Sink {
+            tx,
+            gate: Mutex::new(DemoGate::new(nonce)),
+            dropped: AtomicU32::new(0),
+        }
+    }
+
     pub fn send(&self, ev: SessionEvent) {
         // получатель закрыт — сессия уже не нужна, потерять событие не страшно
         let _ = self.tx.send(ev);
@@ -80,7 +97,20 @@ impl Sink {
     }
 
     pub fn line(&self, source: Source, text: String) {
-        self.send(SessionEvent::Line { source, text });
+        // замок держим до отправки: подтверждение демки уходит в канал раньше следующих меток
+        let mut gate = lock(&self.gate);
+        match gate.admit(&text) {
+            Verdict::Pass => self.send(SessionEvent::Line { source, text }),
+            Verdict::Drop => {
+                let n = self.dropped.fetch_add(1, Ordering::SeqCst) + 1;
+                if n <= MAX_DROP_NOTES {
+                    self.note(format!(
+                        "метка до подтверждения демки отброшена [{}]: {text}",
+                        source.label()
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -120,15 +150,40 @@ impl WinHost {
     /// Запустить готовую команду лаунчера в новом job и вернуть сессию.
     ///
     /// `game_image` — имя образа игры (`cs2.exe`), по нему игра ищется среди процессов job;
-    /// `port` — порт netcon на `127.0.0.1`; `console_log` — файл `-condebug` (хвост читается с Task 2).
-    /// Этот вход нужен тестам со стенд-процессами; настоящий запуск — [`Host::launch`].
+    /// `port` — порт netcon на `127.0.0.1`; `console_log` — файл `-condebug`, его хвост читается
+    /// от длины на момент запуска. Принятие игры по PID и ворота меток здесь выключены (путь образа
+    /// и код задачи неизвестны): этот вход нужен тестам со стенд-процессами, настоящий запуск —
+    /// [`Host::launch`].
     pub fn launch_with(
         &self,
-        mut cmd: Command,
+        cmd: Command,
         game_image: &str,
         port: u16,
-        _console_log: Option<PathBuf>,
+        console_log: Option<PathBuf>,
     ) -> Result<Box<dyn Session>, HostError> {
+        self.launch_session(
+            cmd,
+            SessionParams {
+                game_image: game_image.to_owned(),
+                expected_exe: None,
+                port,
+                console_log,
+                nonce: String::new(),
+            },
+        )
+    }
+
+    pub fn launch_session(
+        &self,
+        mut cmd: Command,
+        params: SessionParams,
+    ) -> Result<Box<dyn Session>, HostError> {
+        // смещение хвоста — до запуска: всё, что игра писала раньше, к этой сессии не относится
+        let offset = params
+            .console_log
+            .as_deref()
+            .map(console_log::current_offset)
+            .unwrap_or(0);
         // job создаётся до запуска: лаунчер попадает в него сразу после spawn, потомки наследуют
         let job = Arc::new(Job::new()?);
         cmd.stdin(Stdio::null())
@@ -144,8 +199,13 @@ impl WinHost {
             return Err(e);
         }
 
+        // время создания лаунчера — нижняя граница для принятия игры по PID
+        let launcher_created = OwnedProc::open(child.id())
+            .ok()
+            .and_then(|p| p.creation_time());
+
         let (tx, rx) = mpsc::channel::<SessionEvent>();
-        let sink = Arc::new(Sink { tx });
+        let sink = Arc::new(Sink::new(tx, &params.nonce));
         let shared = Arc::new(Shared::default());
 
         if let Some(out) = child.stdout.take() {
@@ -154,13 +214,18 @@ impl WinHost {
         if let Some(err) = child.stderr.take() {
             spawn_pipe_reader(err, Source::HlaeStderr, sink.clone());
         }
-        netcon::spawn(port, shared.clone(), sink.clone());
+        netcon::spawn(params.port, shared.clone(), sink.clone());
+        if let Some(path) = params.console_log {
+            console_log::spawn(path, offset, shared.clone(), sink.clone());
+        }
         watch::spawn(watch::Watch {
             job: job.clone(),
             child,
             shared: shared.clone(),
             sink: sink.clone(),
-            game_image: game_image.to_owned(),
+            game_image: params.game_image,
+            expected_exe: params.expected_exe,
+            launcher_created,
         });
 
         Ok(Box::new(WinSession {
@@ -173,9 +238,100 @@ impl WinHost {
     }
 }
 
+/// Параметры одной сессии: всё, чем настоящий запуск отличается от стенд-процессов в тестах.
+/// Публичны ради тестов с настоящими процессами Windows (`tests/win_session.rs`).
+pub struct SessionParams {
+    pub game_image: String,
+    /// Ожидаемый путь `cs2.exe`; без него принятие по PID выключено.
+    pub expected_exe: Option<PathBuf>,
+    pub port: u16,
+    pub console_log: Option<PathBuf>,
+    /// Код задачи для ворот меток; пустой — ворота выключены.
+    pub nonce: String,
+}
+
+/// Использовать ли `-afxFixNetCon`. Значение `fix_netcon = on` из таблицы «Решения для 01-06» в
+/// `.planning/phases/01-novyy-put-zapisi-s-ponyatnymi-sboyami/01-SPIKES.md` (S2: 5/5 и 5/5
+/// подключений, флаг безвреден).
+const FIX_NETCON: bool = true;
+
+/// Образ игры, который ищется среди процессов job.
+const GAME_IMAGE: &str = "cs2.exe";
+
+/// Строка параметров игры для `-cmdLine` (порядок и набор флагов — по `01-SPIKES.md`).
+fn game_cmdline(spec: &LaunchSpec, port: u16) -> String {
+    let (w, h) = spec.size;
+    let fix = if FIX_NETCON { " -afxFixNetCon" } else { "" };
+    // `-insecure` обязателен для хука HLAE; приложение только проигрывает демки и не подключается к серверам
+    format!(
+        "-insecure -steam -novid -allow_third_party_software -condebug -netconport {port}{fix} \
+         -windowed -w {w} -h {h} +demo_ui_mode 0 +playdemo {}",
+        spec.demo_name
+    )
+}
+
+/// Команда запуска HLAE: единственное место, где собирается строка запуска.
+fn hlae_command(spec: &LaunchSpec, hlae: &Path, hook: &Path, cs2_exe: &Path, port: u16) -> Command {
+    let mut cmd = Command::new(hlae);
+    cmd.current_dir(&spec.hlae_dir)
+        .args(["-customLoader", "-noGui", "-autoStart", "-noConfig"])
+        .arg("-hookDllPath")
+        .arg(hook)
+        .arg("-programPath")
+        .arg(cs2_exe)
+        .arg("-cmdLine")
+        .arg(game_cmdline(spec, port));
+    cmd
+}
+
+/// Имя демки идёт в `+playdemo` без кавычек. Спайк S4: кириллица в пути через `-cmdLine`
+/// искажается (игра «не находит файл»), ASCII работает. Копирование демки в `game/csgo` остаётся
+/// (TMO-06), поэтому достаточно простого ASCII-имени; иначе — понятная ошибка до запуска игры.
+fn check_demo_name(name: &str) -> Result<(), HostError> {
+    if name.is_empty() {
+        return Err(HostError::Spawn("не задано имя демки для +playdemo".into()));
+    }
+    if !name.is_ascii() {
+        return Err(HostError::Spawn(format!(
+            "имя демки «{name}» содержит не-ASCII символы: через HLAE игра получает искажённый путь и не находит файл (нужно имя из латиницы)"
+        )));
+    }
+    if name
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | ';'))
+    {
+        return Err(HostError::Spawn(format!(
+            "имя демки «{name}» содержит пробел, кавычку или «;»: +playdemo разберёт его неверно"
+        )));
+    }
+    Ok(())
+}
+
 impl Host for WinHost {
-    fn launch(&self, _spec: &LaunchSpec) -> Result<Box<dyn Session>, HostError> {
-        Err(HostError::Unsupported)
+    fn launch(&self, spec: &LaunchSpec) -> Result<Box<dyn Session>, HostError> {
+        let hlae = spec.hlae_dir.join("HLAE.exe");
+        let hook = spec.hlae_dir.join("x64").join("AfxHookSource2.dll");
+        // пути проверяются до запуска чего-либо: нет файла — нет и процесса
+        for file in [&hlae, &hook, &spec.cs2_exe] {
+            if !file.is_file() {
+                return Err(HostError::Spawn(format!("нет {}", file.display())));
+            }
+        }
+        check_demo_name(&spec.demo_name)?;
+        let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let (hook, cs2_exe) = (absolute(&hook), absolute(&spec.cs2_exe));
+        let port = netcon::free_port();
+        let cmd = hlae_command(spec, &hlae, &hook, &cs2_exe, port);
+        self.launch_session(
+            cmd,
+            SessionParams {
+                game_image: GAME_IMAGE.to_owned(),
+                expected_exe: Some(cs2_exe),
+                port,
+                console_log: spec.console_log.clone(),
+                nonce: spec.nonce.clone(),
+            },
+        )
     }
 
     fn now(&self) -> Duration {
@@ -272,5 +428,100 @@ impl Session for WinSession {
 impl Drop for WinSession {
     fn drop(&mut self) {
         self.terminate();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> LaunchSpec {
+        LaunchSpec {
+            hlae_dir: r"C:\Program Files (x86)\HLAE".into(),
+            cs2_exe: r"C:\Steam\game\bin\win64\cs2.exe".into(),
+            demo_name: "cs2cinema_1-abc.dem".into(),
+            size: (1280, 720),
+            nonce: "ab12cd34".into(),
+            console_log: None,
+        }
+    }
+
+    #[test]
+    fn game_line_follows_the_spike_decisions() {
+        let line = game_cmdline(&spec(), 55433);
+        for must in [
+            "-insecure",
+            "-condebug",
+            "-netconport 55433",
+            "-afxFixNetCon",
+            "-windowed -w 1280 -h 720",
+            "+demo_ui_mode 0",
+            "+playdemo cs2cinema_1-abc.dem",
+        ] {
+            assert!(line.contains(must), "нет {must:?} в {line:?}");
+        }
+        assert!(line.ends_with("+playdemo cs2cinema_1-abc.dem"), "{line}");
+    }
+
+    #[test]
+    fn hlae_command_has_every_launcher_flag_in_order() {
+        let s = spec();
+        let cmd = hlae_command(
+            &s,
+            &s.hlae_dir.join("HLAE.exe"),
+            &s.hlae_dir.join("x64").join("AfxHookSource2.dll"),
+            &s.cs2_exe,
+            2121,
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            &args[..4],
+            ["-customLoader", "-noGui", "-autoStart", "-noConfig"]
+        );
+        assert_eq!(args[4], "-hookDllPath");
+        assert!(args[5].ends_with("AfxHookSource2.dll"), "{args:?}");
+        assert_eq!(args[6], "-programPath");
+        assert!(args[7].ends_with("cs2.exe"), "{args:?}");
+        assert_eq!(args[8], "-cmdLine");
+        assert!(args[9].contains("-netconport 2121"), "{args:?}");
+        assert_eq!(args.len(), 10);
+        assert_eq!(cmd.get_current_dir(), Some(s.hlae_dir.as_path()));
+    }
+
+    #[test]
+    fn demo_name_must_be_plain_ascii() {
+        assert!(check_demo_name("cs2cinema_1-abc.dem").is_ok());
+        assert!(check_demo_name("sub/dir.dem").is_ok());
+        for bad in [
+            "",
+            "демо.dem",
+            "a b.dem",
+            "a\".dem",
+            "a;quit.dem",
+            "a\nb.dem",
+        ] {
+            assert!(
+                matches!(check_demo_name(bad), Err(HostError::Spawn(_))),
+                "{bad:?} должно отвергаться"
+            );
+        }
+        let Err(HostError::Spawn(msg)) = check_demo_name("демо.dem") else {
+            panic!("ожидалась ошибка")
+        };
+        assert!(msg.contains("не-ASCII"), "{msg}");
+    }
+
+    #[test]
+    fn launch_refuses_missing_files_before_starting_anything() {
+        let Err(e) = WinHost::new().launch(&spec()) else {
+            panic!("несуществующие пути не должны запускаться")
+        };
+        let HostError::Spawn(msg) = e else {
+            panic!("ожидалась Spawn, получено {e:?}")
+        };
+        assert!(msg.starts_with("нет "), "{msg}");
     }
 }

@@ -1,6 +1,26 @@
 //! Хвост `console.log` (`-condebug`): строки консоли игры из файла, от смещения на момент запуска.
 
+//!
+//! Игра пишет файл с BOM и префиксом времени `MM/DD HH:MM:SS` в каждой строке; файл общий для всех
+//! запусков, поэтому читается только то, что появилось после старта сессии (T-01-22), а метки
+//! прошлых запусков дополнительно отсекает код задачи. Строки недоверенные — как и в netcon.
+
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::{Shared, Sink};
+use crate::Source;
+
+/// Период опроса файла.
+const POLL: Duration = Duration::from_millis(250);
+/// За один опрос читается не больше этого (остальное — в следующий раз).
+const MAX_CHUNK: u64 = 4 << 20;
+/// Неполная строка длиннее этого отдаётся как есть.
+const MAX_LINE: usize = 1 << 20;
+const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
 
 /// Хвост файла: помнит смещение и неполную строку между опросами.
 pub(crate) struct Tail {
@@ -18,11 +38,66 @@ impl Tail {
         }
     }
 
-    /// Новые целые строки с прошлого опроса. RED: пока ничего не читает.
+    /// Новые целые строки с прошлого опроса. Отсутствие файла и ошибки чтения — не ошибки:
+    /// игра могла ещё не создать файл или держать его в этот момент.
     pub fn poll(&mut self) -> Vec<String> {
-        let _ = (&self.path, self.offset, &self.pending);
-        Vec::new()
+        let Ok(mut file) = File::open(&self.path) else {
+            return Vec::new();
+        };
+        let Ok(len) = file.metadata().map(|m| m.len()) else {
+            return Vec::new();
+        };
+        if len < self.offset {
+            // файл пересоздан (новый запуск игры): читаем с начала
+            self.offset = 0;
+            self.pending.clear();
+        }
+        if len == self.offset || file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut chunk = Vec::new();
+        // ошибка посреди чтения не страшна: что успели прочитать, то и берём
+        let _ = file
+            .take(len.saturating_sub(self.offset).min(MAX_CHUNK))
+            .read_to_end(&mut chunk);
+        let from_start = self.offset == 0;
+        self.offset += chunk.len() as u64;
+        if from_start && chunk.starts_with(&BOM) {
+            chunk.drain(..BOM.len());
+        }
+        self.pending.extend_from_slice(&chunk);
+
+        let mut lines = Vec::new();
+        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+            let raw: Vec<u8> = self.pending.drain(..=end).collect();
+            lines.extend(decode(&raw));
+        }
+        if self.pending.len() > MAX_LINE {
+            let raw = std::mem::take(&mut self.pending);
+            lines.extend(decode(&raw));
+        }
+        lines
     }
+}
+
+/// Одна строка: lossy UTF-8, без BOM и пробелов по краям; пустая — `None`.
+fn decode(raw: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    let text = text.trim().trim_start_matches('\u{feff}').trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// Запустить поток хвоста: строки уходят в канал событий с меткой `console.log`.
+pub(crate) fn spawn(path: PathBuf, offset: u64, shared: Arc<Shared>, sink: Arc<Sink>) {
+    std::thread::spawn(move || {
+        let mut tail = Tail::new(path, offset);
+        while !shared.stopped() {
+            for line in tail.poll() {
+                sink.line(Source::ConsoleLog, line);
+            }
+            std::thread::sleep(POLL);
+        }
+    });
 }
 
 /// Длина файла сейчас (0, если файла нет): с этого смещения читается хвост.

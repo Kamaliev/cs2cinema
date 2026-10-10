@@ -25,6 +25,8 @@ pub struct Status {
     pub takes: Option<(u32, u32)>,
     /// Склейка: доля готового ролика.
     pub assemble: Option<f32>,
+    /// Запись: номер дубля, который пишется сейчас, из скольких (для лестницы в карточке).
+    pub take_now: Option<(u32, u32)>,
 }
 
 impl Status {
@@ -35,6 +37,7 @@ impl Status {
         self.passed.clear();
         self.result = None;
         self.takes = None;
+        self.take_now = None;
         self.assemble = None;
         self.last = what.to_owned();
         self.push(what);
@@ -48,6 +51,7 @@ impl Status {
         }
         if s != Stage::Record {
             self.takes = None;
+            self.take_now = None;
         }
         if s != Stage::Assemble {
             self.assemble = None;
@@ -61,6 +65,13 @@ impl Status {
             self.log.remove(0);
         }
         // прогресс записи и склейки — из сообщений конвейера
+        if let Some(rest) = m.strip_prefix("запись: дубль ") {
+            if let Some((a, b)) = rest.split_once(" из ") {
+                if let (Ok(a), Ok(b)) = (a.trim().parse(), b.trim().parse()) {
+                    self.take_now = Some((a, b));
+                }
+            }
+        }
         if let Some(rest) = m.strip_prefix("записан дубль ") {
             if let Some((a, b)) = rest.split_once('/') {
                 if let (Ok(a), Ok(b)) = (a.trim().parse(), b.trim().parse()) {
@@ -78,6 +89,7 @@ impl Status {
     pub fn finish(&mut self, r: Result<String, String>) {
         self.busy = false;
         self.takes = None;
+        self.take_now = None;
         self.assemble = None;
         match r {
             Ok(m) => {
@@ -168,5 +180,22 @@ impl Status {
             });
         }
         ui.add_space(2.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_take_comes_from_the_record_line() {
+        let mut s = Status::default();
+        s.push("запись: дубль 2 из 5");
+        assert_eq!(s.take_now, Some((2, 5)));
+        assert_eq!(s.takes, None, "готовые дубли считаются по строке «записан дубль»");
+        s.push("записан дубль 2/5");
+        assert_eq!(s.takes, Some((2, 5)));
+        s.set_stage(Stage::Assemble);
+        assert_eq!(s.take_now, None);
     }
 }

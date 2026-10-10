@@ -1,7 +1,7 @@
 //! Страница «Задачи»: очередь и история задач на монтаж — карточками с превью и прогрессом.
 
 use eframe::egui::{self, RichText, Ui};
-use pipeline::Stage;
+use pipeline::{RecordState, Stage};
 use store::{Job, JobKind, JobStatus};
 
 use crate::{
@@ -112,13 +112,24 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                     }
                     JobStatus::Failed => {
                         ui::pill(ui, "ошибка", BAD);
-                        let e = j.error.clone().unwrap_or_default();
-                        ui.add(egui::Label::new(RichText::new(&e).color(BAD)).truncate()).on_hover_text(e);
+                        // типизированный сбой показывается блоком ниже, прежняя строка — только для остальных
+                        if j.fail_code.is_none() {
+                            let e = j.error.clone().unwrap_or_default();
+                            ui.add(egui::Label::new(RichText::new(&e).color(BAD)).truncate()).on_hover_text(e);
+                        }
                     }
                     JobStatus::Cancelled => {
                         ui::pill(ui, "отменена", MUTED);
                     }
                 });
+                match j.status {
+                    JobStatus::Running if !j.phase.is_empty() => ladder(ui, j, if running { app.status.take_now } else { None }),
+                    JobStatus::Failed if j.fail_state.is_some() => ladder(ui, j, None),
+                    _ => {}
+                }
+                if j.status == JobStatus::Failed && j.fail_code.is_some() {
+                    error_block(ui, j);
+                }
                 // мета: шоты, длина, размер файла
                 let mut meta: Vec<String> = Vec::new();
                 if let Some(n) = j.shots {
@@ -182,6 +193,70 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
             });
         }
     });
+}
+
+/// Лестница состояний записи: пройденные шаги, текущий у выполняемой задачи и упавший у неудачной (D-06).
+/// `takes` — «дубль a из b», известный только выполняемой задаче.
+fn ladder(ui: &mut Ui, j: &Job, takes: Option<(u32, u32)>) {
+    if j.kind != JobKind::Record {
+        return;
+    }
+    let (current, failed) = match j.status {
+        JobStatus::Running => (RecordState::from_code(&j.phase), false),
+        JobStatus::Failed => (j.fail_state.as_deref().and_then(RecordState::from_code), true),
+        _ => return,
+    };
+    let Some(current) = current else { return };
+    ui.horizontal_wrapped(|ui| {
+        for (i, step) in RecordState::LADDER.iter().enumerate() {
+            if i > 0 {
+                ui.label(RichText::new("→").color(MUTED).size(12.5));
+            }
+            let title = match (step, takes) {
+                (RecordState::Take, Some((n, m))) => format!("дубль {n}/{m}"),
+                _ => step.title().to_owned(),
+            };
+            let text = if *step < current {
+                RichText::new(format!("✓ {title}")).color(OK)
+            } else if *step == current && failed {
+                RichText::new(format!("✕ {title}")).color(BAD)
+            } else if *step == current {
+                ui::b(title).color(ACCENT)
+            } else {
+                RichText::new(title).color(MUTED)
+            };
+            ui.label(text.size(12.5));
+        }
+    });
+}
+
+/// Блок типизированной ошибки: код и состояние, сообщение, подсказка, время, путь к `record.log` и хвост консоли (D-07).
+fn error_block(ui: &mut Ui, j: &Job) {
+    let code = j.fail_code.as_deref().unwrap_or_default();
+    let state = j.fail_state.as_deref().and_then(RecordState::from_code).map_or("", RecordState::title);
+    ui.label(RichText::new(format!("{code} · {state}")).color(MUTED).size(12.5));
+    if let Some(e) = j.error.as_deref().filter(|e| !e.is_empty()) {
+        ui.add(egui::Label::new(RichText::new(e).color(BAD)).wrap());
+    }
+    if let Some(h) = j.fail_hint.as_deref().filter(|h| !h.is_empty()) {
+        ui.add(egui::Label::new(RichText::new(h).color(MUTED)).wrap());
+    }
+    if let Some(ms) = j.fail_elapsed_ms {
+        ui.label(RichText::new(format!("прошло {} с", (ms as f64 / 1000.0).round() as i64)).color(MUTED).size(12.5));
+    }
+    if let Some(d) = &j.out_dir {
+        ui.add(egui::Label::new(RichText::new(format!("record.log: {}", d.join("record.log").display())).color(MUTED).size(12.5)).wrap());
+    }
+    if let Some(tail) = j.fail_tail.as_deref().filter(|t| !t.is_empty()) {
+        egui::CollapsingHeader::new("Последние строки консоли").id_salt(("tail", j.id)).show(ui, |ui| {
+            egui::Frame::new().fill(ui::BG).corner_radius(egui::CornerRadius::same(6)).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::ScrollArea::vertical().id_salt(("tail-scroll", j.id)).max_height(200.0).show(ui, |ui| {
+                    ui.label(RichText::new(tail).monospace().small());
+                });
+            });
+        });
+    }
 }
 
 /// Превью ролика (кадр с 3-й секунды) или заглушка с глифом.

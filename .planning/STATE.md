@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 01
 current_phase_name: Новый путь записи с понятными сбоями
 status: executing
-stopped_at: Completed 01-04-PLAN.md
-last_updated: "2026-10-10T11:22:31.833Z"
+stopped_at: Completed 01-05-PLAN.md
+last_updated: "2026-10-10T11:33:19.107Z"
 last_activity: 2026-10-10
 last_activity_desc: Phase 01 execution started
-state_head: efec539b00cd236825b792cb14dfe14c9bb695fe
+state_head: d60be8922cd5e4949b649552241646219d070adf
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 8
-  completed_plans: 4
+  completed_plans: 5
   percent: 0
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 01 (Новый путь записи с понятными сбоями) — EXECUTING
-Plan: 5 of 8
+Plan: 6 of 8
 Status: Ready to execute
 Last activity: 2026-10-10 — Phase 01 execution started
 
@@ -60,6 +60,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 01 P02 | 10 min | 2 tasks | 3 files |
 | Phase 01 P03 | 12 min | 3 tasks | 1 files |
 | Phase 01 P04 | 35 min | 2 tasks | 9 files |
+| Phase 01 P05 | 25min | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -78,6 +79,7 @@ Recent decisions affecting current work:
 - [Phase 01]: Метка не по порядку (включая ALL_DONE вместо TAKE_END) не меняет состояние и дедлайн машины записи, а только попадает в текст сбоя; повтор принятой метки молча игнорируется
 - [Phase 01]: Тайминги дублей отдаёт Machine::timings(); Event::TakeDone остаётся {n, m}, чтобы строка «записан дубль N/M» для status.rs не менялась
 - [Phase 01]: exec highlights уходит один раз; прямой READY запрашивается один раз через ready_grace, если демка уже идёт
+- [Phase 01]: 01-05: cs2.exe попадает в job через HLAE, netcon слушает 0.0.0.0, READY принимать только после Host activate: Playing Demo, abs_playdemo=fails для кириллицы
 
 ### Pending Todos
 
@@ -100,6 +102,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-10T11:22:23.613Z
-Stopped at: Completed 01-04-PLAN.md
+Last session: 2026-10-10T11:33:19.073Z
+Stopped at: Completed 01-05-PLAN.md
 Resume file: None

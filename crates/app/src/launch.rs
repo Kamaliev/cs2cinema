@@ -8,6 +8,7 @@ use std::{
 
 use pipeline::host::{CmdSpec, Host, HostError};
 use serde::{Deserialize, Serialize};
+use store::Store;
 
 #[cfg(windows)]
 pub fn no_window(cmd: &mut Command) -> &mut Command {
@@ -231,15 +232,95 @@ pub fn note_take_done(out_dir: &Path, index: u32) {
     }
 }
 
+/// Завершает осиротевшие `cs2.exe`/`HLAE.exe` прошлого экземпляра приложения по `processes.json` в папке задачи (D-15, RET-04).
+/// Каждому процессу из файла — `Host::kill_orphan` с полной идентичностью (PID, время создания, образ): чужой процесс
+/// с тем же PID не трогается. Файл недоверенный: испорченный не завершает ничего и остаётся для разбора вручную.
+/// Возвращает строки для журнала задачи; файл удаляется, если ни одно завершение не провалилось.
+pub fn kill_orphans(host: &dyn Host, out_dir: &Path) -> Vec<String> {
+    use pipeline::host::OrphanOutcome;
+    let list = match pipeline::record::processes::load(out_dir) {
+        Ok(None) => return Vec::new(),
+        Ok(Some(list)) => list,
+        Err(why) => return vec![format!("processes.json не разобран — процессы не трогаю: {why}")],
+    };
+    let mut notes = Vec::new();
+    let mut failed = false;
+    for id in &list {
+        let (image, pid) = (&id.image, id.pid);
+        notes.push(match host.kill_orphan(id) {
+            OrphanOutcome::Killed => format!("завершён осиротевший {image} (PID {pid}) прошлого запуска"),
+            OrphanOutcome::Gone => format!("{image} (PID {pid}) уже не работает"),
+            OrphanOutcome::Mismatch(why) => format!("PID {pid} занят другим процессом — не трогаю: {why}"),
+            OrphanOutcome::Failed(e) => {
+                failed = true;
+                format!("{image} (PID {pid}) завершить не удалось: {e}")
+            }
+            OrphanOutcome::Unsupported => "завершение процессов на этой платформе недоступно".to_owned(),
+        });
+    }
+    if !failed {
+        pipeline::record::processes::remove(out_dir);
+    }
+    notes
+}
+
+/// Номера дублей, которые не надо помечать оборванными: манифест `clips/manifest.json` знает их как записанные
+/// (`recorded`) или проверенные (`validated`). Нет манифеста — прежний `installed.json.done_takes`.
+fn finished_takes(out_dir: &Path) -> Option<Vec<u32>> {
+    use pipeline::manifest::{Manifest, TakeStatus};
+    if let Some(m) = Manifest::load(&out_dir.join("clips")) {
+        return Some(m.takes.iter().filter(|t| matches!(t.status, TakeStatus::Recorded | TakeStatus::Validated)).map(|t| t.index).collect());
+    }
+    std::fs::read_to_string(out_dir.join(INSTALLED_FILE)).ok().and_then(|t| serde_json::from_str::<Installed>(&t).ok()).map(|r| r.done_takes)
+}
+
 /// Уборка после падения приложения (D-08): удаляет установленные файлы и помечает оборванные дубли `.partial`.
-/// Без `installed.json` (запись уже убрана или не начиналась) дубли не трогаются — они целые.
+/// Дубли, которые манифест знает как записанные или проверенные, остаются как есть (иначе повтор потерял бы годную запись).
+/// Без `installed.json` и без манифеста (запись уже убрана или не начиналась) дубли не трогаются — они целые.
 pub fn recover(cs2_dir: &str, out_dir: &Path) -> Vec<String> {
-    let done = std::fs::read_to_string(out_dir.join(INSTALLED_FILE)).ok().and_then(|t| serde_json::from_str::<Installed>(&t).ok()).map(|r| r.done_takes);
+    let done = finished_takes(out_dir);
     let mut notes = cleanup_installed(cs2_dir, out_dir);
     if let Some(done) = done {
         notes.extend(pipeline::record::mark_partial(&out_dir.join("clips"), &done));
     }
     notes
+}
+
+/// Восстановление при запуске приложения после падения (RET-04, D-15). Для каждой задачи, оставшейся «выполняется» или
+/// «отменяется», сначала завершается осиротевшая игра, затем убирается папка игры, и только потом `reset_running` делает
+/// задачу «прервана» («отменена»). Порядок обязателен: живой `cs2.exe` держит копию демки, и уборка без завершения её не удалит.
+/// Каждый шаг пишется в журнал задачи строкой «уборка после перезапуска: …».
+pub fn recover_after_crash(store: &Store, host: &dyn Host, cs2_dir: &str) -> store::Result<store::Reset> {
+    for (id, _, dir) in store.interrupted_jobs().unwrap_or_default() {
+        let Some(dir) = dir else { continue };
+        let mut notes = kill_orphans(host, &dir);
+        notes.extend(recover(cs2_dir, &dir));
+        for note in notes {
+            let _ = store.append_log(id, &format!("уборка после перезапуска: {note}"));
+        }
+    }
+    store.reset_running()
+}
+
+/// Журналы прошлых попыток в папке задачи: `record.log.<номер>` по возрастанию номера (D-11). Текущий `record.log` и
+/// файлы с другими именами не входят — открываются только имена такого вида внутри папки задачи (T-03-20).
+pub fn old_logs(out_dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<(u64, PathBuf)> = std::fs::read_dir(out_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let digits = name.strip_prefix("record.log.")?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some((digits.parse().ok()?, e.path()))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().map(|(_, p)| p).collect()
 }
 
 /// ffmpeg, которым пишет HLAE: `Path=` из `ffmpeg\ffmpeg.ini` в папке HLAE. Разбор — в одном месте, в предпроверке.
@@ -396,6 +477,130 @@ mod tests {
         std::fs::create_dir_all(job.join("clips/take0000")).unwrap();
         assert!(recover(&cs2, &job).is_empty());
         assert!(job.join("clips/take0000").is_dir(), "без записи дубли целые — запись уже убрана после успеха");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn identity(pid: u32) -> pipeline::host::ProcIdentity {
+        pipeline::host::ProcIdentity { pid, created: 1234, image: "cs2.exe".into() }
+    }
+
+    /// Задача «выполняется» в базе с этой папкой; возвращает id.
+    fn running_job(store: &Store, job: &Path) -> i64 {
+        let id = store
+            .add_job(&store::NewJob {
+                kind: store::JobKind::Record,
+                source: store::JobSource::Faceit("1-abc".into()),
+                label: "матч".into(),
+                hero_name: "me".into(),
+                hero_steam: 42,
+                map: "de_nuke".into(),
+            })
+            .unwrap();
+        store.start_job(id).unwrap();
+        store.set_out_dir(id, job).unwrap();
+        id
+    }
+
+    #[test]
+    fn startup_kills_the_orphan_before_cleanup_and_marks_the_job_interrupted() {
+        use pipeline::host::{
+            OrphanOutcome,
+            fake::{FakeHost, Scenario},
+        };
+        let (root, cs2, job) = tree("orphan");
+        let demo = root.join("cs2/game/csgo/cs2cinema_m.dem");
+        put(&demo);
+        record(&job, &[&demo], &[]);
+        pipeline::record::processes::save(&job, &[identity(777)]).unwrap();
+        let store = Store::in_memory().unwrap();
+        let id = running_job(&store, &job);
+        let fake = FakeHost::new(Scenario::happy(1).orphan(777, OrphanOutcome::Killed));
+
+        let reset = recover_after_crash(&store, &fake, &cs2).unwrap();
+
+        assert_eq!(fake.orphan_kills(), vec![identity(777)]);
+        assert_eq!(reset.interrupted, 1);
+        let j = store.job(id).unwrap().unwrap();
+        assert_eq!(j.status, store::JobStatus::Interrupted);
+        assert!(!job.join(pipeline::record::processes::PROCESSES_FILE).exists(), "processes.json убран");
+        assert!(!demo.exists(), "копия демки убрана");
+        let at = |needle: &str| j.log.lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("нет строки «{needle}» в журнале:\n{}", j.log));
+        assert!(at("завершён осиротевший cs2.exe (PID 777)") < at("убрано из папки игры"), "процесс завершён раньше уборки:\n{}", j.log);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orphan_with_another_creation_time_is_left_alone() {
+        use pipeline::host::{
+            OrphanOutcome,
+            fake::{FakeHost, Scenario},
+        };
+        let (root, cs2, job) = tree("orphan-mismatch");
+        pipeline::record::processes::save(&job, &[identity(777)]).unwrap();
+        let store = Store::in_memory().unwrap();
+        let id = running_job(&store, &job);
+        let fake = FakeHost::new(Scenario::happy(1).orphan(777, OrphanOutcome::Mismatch("время создания другое".into())));
+
+        let reset = recover_after_crash(&store, &fake, &cs2).unwrap();
+
+        let j = store.job(id).unwrap().unwrap();
+        assert_eq!((reset.interrupted, j.status), (1, store::JobStatus::Interrupted));
+        assert!(j.log.contains("не трогаю"), "{}", j.log);
+        assert!(!job.join(pipeline::record::processes::PROCESSES_FILE).exists(), "чужой процесс не держит файл");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_processes_json_kills_nothing() {
+        use pipeline::host::fake::{FakeHost, Scenario};
+        let (root, cs2, job) = tree("orphan-garbage");
+        std::fs::write(job.join(pipeline::record::processes::PROCESSES_FILE), "{не json").unwrap();
+        let store = Store::in_memory().unwrap();
+        let id = running_job(&store, &job);
+        let fake = FakeHost::new(Scenario::happy(1));
+
+        recover_after_crash(&store, &fake, &cs2).unwrap();
+
+        assert!(fake.orphan_kills().is_empty());
+        let j = store.job(id).unwrap().unwrap();
+        assert!(j.log.contains("processes.json не разобран — процессы не трогаю"), "{}", j.log);
+        assert_eq!(j.status, store::JobStatus::Interrupted);
+        assert!(job.join(pipeline::record::processes::PROCESSES_FILE).exists(), "файл остаётся для разбора вручную");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recover_keeps_takes_the_manifest_knows() {
+        use pipeline::manifest::{Manifest, TakeEntry, TakeStatus};
+        let (root, cs2, job) = tree("recover-manifest");
+        let clips = job.join("clips");
+        let take = |index: u32, status| TakeEntry { index, dir: format!("take{index:04}"), status, ..TakeEntry::default() };
+        let manifest = Manifest {
+            version: 1,
+            takes: vec![take(0, TakeStatus::Validated), take(1, TakeStatus::Recorded), take(2, TakeStatus::Pending)],
+            ..Manifest::default()
+        };
+        for t in ["take0000", "take0001", "take0002"] {
+            std::fs::create_dir_all(clips.join(t)).unwrap();
+        }
+        manifest.save(&clips).unwrap();
+
+        let notes = recover(&cs2, &job);
+
+        assert!(clips.join("take0000").is_dir() && clips.join("take0001").is_dir(), "известные манифесту дубли целы: {notes:?}");
+        assert!(clips.join("take0002.partial").is_dir() && !clips.join("take0002").exists(), "недописанный помечен: {notes:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn old_logs_are_listed_in_attempt_order() {
+        let (root, _cs2, job) = tree("old-logs");
+        for n in ["record.log", "record.log.10", "record.log.2", "record.log.1", "record.log.x", "record.log."] {
+            put(&job.join(n));
+        }
+        let names: Vec<String> = old_logs(&job).iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["record.log.1", "record.log.2", "record.log.10"]);
+        assert!(old_logs(&root.join("no-such-job")).is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 

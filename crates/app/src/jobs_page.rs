@@ -16,6 +16,7 @@ use crate::{
 enum Act {
     Cancel(i64),
     Retry(i64),
+    Redo(i64),
     Delete(i64),
     Log(i64),
     Resume,
@@ -74,15 +75,9 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
     match act {
         Some(Act::Cancel(id)) => app.cancel_job(id),
         Some(Act::Resume) => app.resume_queue(),
-        Some(Act::Retry(id)) => {
-            // «Повторить» — осознанное действие, пауза после отмены снимается (D-13)
-            app.jobs.paused = false;
-            if let Err(e) = app.store.requeue(id) {
-                app.status.finish(Err(e));
-            }
-            app.refresh_jobs();
-            jobs::run_next(app);
-        }
+        // «Повторить» (с записи, D-09) и «Заново» (с начала) — осознанные действия, пауза очереди снимается (D-13)
+        Some(Act::Retry(id)) => requeue(app, id, true),
+        Some(Act::Redo(id)) => requeue(app, id, false),
         Some(Act::Delete(id)) => {
             if let Err(e) = app.store.delete_job(id) {
                 app.status.finish(Err(e));
@@ -92,6 +87,38 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
         }
         Some(Act::Log(id)) => app.jobs.open_log = if app.jobs.open_log == Some(id) { None } else { Some(id) },
         None => {}
+    }
+}
+
+/// Ставит задачу в очередь заново: `resume` — с записи по `record.json`, иначе с самого начала.
+fn requeue(app: &mut App, id: i64, resume: bool) {
+    app.jobs.paused = false;
+    let queued = if resume { app.store.requeue_resume(id) } else { app.store.requeue(id) };
+    if let Err(e) = queued {
+        app.status.finish(Err(e));
+    }
+    app.refresh_jobs();
+    jobs::run_next(app);
+}
+
+/// Какие кнопки показывает карточка задачи.
+#[derive(Debug, PartialEq)]
+pub struct CardButtons {
+    /// «Повторить»: `None` — кнопки нет, `Some(активна)`.
+    pub retry: Option<bool>,
+    /// «Заново» показывается.
+    pub redo: bool,
+    /// «Открыть папку» показывается.
+    pub open_dir: bool,
+}
+
+/// Кнопки карточки по статусу (D-09, D-13). «Повторить» активна, только если в папке есть `record.json` (`resumable`)
+/// и окно не занято (`busy`); «Заново» доступна всегда, когда задача закончилась. У выполняемой и ждущей задачи нет ни той, ни другой.
+pub fn card_buttons(status: JobStatus, resumable: bool, has_dir: bool, busy: bool) -> CardButtons {
+    match status {
+        JobStatus::Failed | JobStatus::Cancelled | JobStatus::Interrupted => CardButtons { retry: Some(resumable && !busy), redo: true, open_dir: has_dir },
+        JobStatus::Done => CardButtons { retry: None, redo: false, open_dir: has_dir },
+        JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling => CardButtons { retry: None, redo: false, open_dir: false },
     }
 }
 
@@ -186,6 +213,7 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
             });
         });
         ui.add_space(4.0);
+        let buttons = card_buttons(j.status, app.jobs.resumable.contains(&j.id), j.out_dir.is_some(), app.status.busy);
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 match j.status {
@@ -208,15 +236,35 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                                 ui::open_path(p);
                             }
                         }
-                        if let Some(d) = &j.out_dir {
-                            if ui.button("Папка").clicked() {
+                        if buttons.open_dir && ui.button("Открыть папку").clicked() {
+                            if let Some(d) = &j.out_dir {
                                 ui::open_path(d);
                             }
                         }
                     }
                     JobStatus::Failed | JobStatus::Cancelled | JobStatus::Interrupted => {
-                        if ui.add_enabled(!app.status.busy, egui::Button::new("Повторить")).clicked() {
-                            *act = Some(Act::Retry(j.id));
+                        // справа налево: «Повторить» крайняя, левее «Заново», затем «Открыть папку»
+                        if let Some(enabled) = buttons.retry {
+                            let retry = ui
+                                .add_enabled(enabled, egui::Button::new("Повторить"))
+                                .on_hover_text("С записи, без скачивания и плана; если все дубли проверены — сразу склейка")
+                                .on_disabled_hover_text("Нет данных записи (record.json) — нажмите «Заново»");
+                            if retry.clicked() {
+                                *act = Some(Act::Retry(j.id));
+                            }
+                        }
+                        if buttons.redo
+                            && ui
+                                .add_enabled(!app.status.busy, egui::Button::new("Заново"))
+                                .on_hover_text("С самого начала: скачивание, план и запись всех дублей")
+                                .clicked()
+                        {
+                            *act = Some(Act::Redo(j.id));
+                        }
+                        if buttons.open_dir && ui.button("Открыть папку").clicked() {
+                            if let Some(d) = &j.out_dir {
+                                ui::open_path(d);
+                            }
                         }
                     }
                 }
@@ -401,5 +449,20 @@ mod tests {
         assert_eq!(pause_banner(PauseReason::Cancelled, 2), "Очередь на паузе после отмены: 2 задачи ждут");
         assert_eq!(pause_banner(PauseReason::Interrupted, 1), "Очередь на паузе: задача прервана закрытием приложения — 1 задача ждут");
         assert_eq!(pause_banner(PauseReason::Interrupted, 2), "Очередь на паузе: задача прервана закрытием приложения — 2 задачи ждут");
+    }
+
+    #[test]
+    fn card_offers_retry_only_with_record_json_and_redo_for_finished_jobs() {
+        use JobStatus::*;
+        for status in [Failed, Interrupted, Cancelled] {
+            assert_eq!(card_buttons(status, true, true, false), CardButtons { retry: Some(true), redo: true, open_dir: true }, "{status:?}");
+            assert_eq!(card_buttons(status, false, true, false).retry, Some(false), "без record.json «Повторить» видна, но неактивна: {status:?}");
+            assert_eq!(card_buttons(status, true, true, true).retry, Some(false), "окно занято: {status:?}");
+            assert!(!card_buttons(status, true, false, false).open_dir, "без папки открывать нечего");
+        }
+        for status in [Running, Cancelling, Queued] {
+            assert_eq!(card_buttons(status, true, true, false), CardButtons { retry: None, redo: false, open_dir: false }, "{status:?}");
+        }
+        assert_eq!(card_buttons(Done, false, true, false), CardButtons { retry: None, redo: false, open_dir: true });
     }
 }

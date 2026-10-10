@@ -12,7 +12,7 @@ use eframe::egui::{self, RichText};
 use faceit::stats::{MatchStats, MatchSummary, Player};
 use highlights::{Highlight, Utility};
 use pipeline::{Analysis, Stage};
-use store::{Job, JobKind, JobSource, NewJob, Store};
+use store::{Job, JobKind, JobSource, JobStatus, NewJob, Store};
 
 use crate::{
     jobs::{self, CancelToken},
@@ -123,6 +123,12 @@ pub struct JobsState {
     pub paused: bool,
     /// Почему очередь на паузе — для текста баннера.
     pub paused_reason: PauseReason,
+    /// У каких задач в папке лежит `record.json`: только с ним «Повторить» может продолжить с записи (D-09).
+    pub resumable: std::collections::HashSet<i64>,
+    /// Журналы прошлых попыток `record.log.N` по id задачи (D-11).
+    pub old_logs: HashMap<i64, Vec<PathBuf>>,
+    /// id задачи -> `updated_at`, при котором папку уже смотрели: файловая система проверяется при изменении задачи, а не в каждом кадре.
+    pub fs_seen: HashMap<i64, i64>,
 }
 
 /// Причина паузы очереди (D-16).
@@ -188,16 +194,9 @@ impl App {
             Ok(st) => (st, None),
             Err(e) => (Store::in_memory().expect("sqlite в памяти"), Some(e)),
         };
-        // приложение упало посреди задачи: убираем из папки игры её файлы и помечаем оборванные дубли (D-08) —
-        // до `reset_running`, пока задачи ещё «выполняется» / «отменяется»
-        for (id, _, dir) in store.interrupted_jobs().unwrap_or_default() {
-            if let Some(dir) = dir {
-                for note in crate::launch::recover(&s.cs2_dir, &dir) {
-                    let _ = store.append_log(id, &format!("уборка после перезапуска: {note}"));
-                }
-            }
-        }
-        let reset = store.reset_running().unwrap_or_default();
+        // приложение упало посреди задачи: сначала завершаем осиротевшую игру по processes.json, затем убираем из папки игры
+        // файлы задачи и помечаем оборванные дубли (D-08, D-15), и только потом задача становится «прервана» (`reset_running`)
+        let reset = crate::launch::recover_after_crash(&store, &*pipeline::host::default_host(), &s.cs2_dir).unwrap_or_default();
         let mut app = Self {
             draft: s.clone(),
             matches: MatchesState { nickname: s.nickname.clone(), ..Default::default() },
@@ -344,6 +343,31 @@ impl App {
             Err(e) => self.status.push(&e),
         }
         self.jobs.dirty = false;
+        // что лежит в папке задачи (`record.json`, `record.log.N`) — смотрим, только если задача изменилась с прошлого раза
+        for j in &self.jobs.list {
+            let settled = matches!(j.status, JobStatus::Failed | JobStatus::Cancelled | JobStatus::Interrupted | JobStatus::Done);
+            let Some(dir) = j.out_dir.as_ref().filter(|_| settled) else {
+                self.jobs.resumable.remove(&j.id);
+                self.jobs.old_logs.remove(&j.id);
+                self.jobs.fs_seen.remove(&j.id);
+                continue;
+            };
+            if self.jobs.fs_seen.get(&j.id) == Some(&j.updated_at) {
+                continue;
+            }
+            self.jobs.fs_seen.insert(j.id, j.updated_at);
+            if dir.join(pipeline::manifest::RECORD_FILE).is_file() {
+                self.jobs.resumable.insert(j.id);
+            } else {
+                self.jobs.resumable.remove(&j.id);
+            }
+            let logs = crate::launch::old_logs(dir);
+            if logs.is_empty() {
+                self.jobs.old_logs.remove(&j.id);
+            } else {
+                self.jobs.old_logs.insert(j.id, logs);
+            }
+        }
         for j in &self.jobs.list {
             if let Some(p) = j.result.as_ref().filter(|p| p.extension().is_some_and(|e| e == "mp4")) {
                 if !self.jobs.sizes.contains_key(&j.id) {

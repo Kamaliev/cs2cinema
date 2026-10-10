@@ -2,17 +2,17 @@
 gsd_state_version: "1.0"
 current_phase: 01
 current_phase_name: Новый путь записи с понятными сбоями
-status: executing
-stopped_at: Completed 01-08-PLAN.md
-last_updated: "2026-10-10T11:58:42.581Z"
+status: verifying
+stopped_at: Completed 01-07-PLAN.md
+last_updated: "2026-10-10T12:08:41.928Z"
 last_activity: 2026-10-10
 last_activity_desc: Phase 01 execution started
-state_head: 06e50b608523d6a57997bca230685625fb4924ba
+state_head: ed91733f96dfc372ad44f665c079e52c4dfacaaf
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 8
-  completed_plans: 7
+  completed_plans: 8
   percent: 0
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 
 Phase: 01 (Новый путь записи с понятными сбоями) — EXECUTING
 Plan: 8 of 8
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-10-10 — Phase 01 execution started
 
 Progress: [░░░░░░░░░░] 0%
@@ -63,6 +63,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 01 P05 | 25min | 3 tasks | 5 files |
 | Phase 01 P06 | 11min | 3 tasks | 11 files |
 | Phase 01 P08 | 25min | 3 tasks | 6 files |
+| Phase 01 P07 | 25 min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -88,6 +89,7 @@ Recent decisions affecting current work:
 - [Phase 01]: netcon на 0.0.0.0 без пароля: хост подключается к 127.0.0.1 на случайный порт, строки недоверенные и не исполняются, остаточный риск записан в SUMMARY 01-06
 - [Phase 01]: 01-08: HLAE_ERROR срабатывает на любом истёкшем дедлайне при увиденной AFXERROR; закрепляются первая AFXERROR, самая частая повторяющаяся AFXERROR и последняя метка
 - [Phase 01]: 01-08: record.log и хвост консоли очищают управляющие символы, профиль пользователя и секреты (недоверенный netcon)
+- [Phase 01]: 01-07: Status.take_now (разбор «запись: дубль N из M») даёт лестнице «дубль N/M» с начала дубля; файлы app форматировать только rustfmt с max_width=160,use_small_heuristics=Max, а не cargo fmt -p app
 
 ### Pending Todos
 
@@ -110,6 +112,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-10T11:58:42.546Z
-Stopped at: Completed 01-08-PLAN.md
+Last session: 2026-10-10T12:08:41.885Z
+Stopped at: Completed 01-07-PLAN.md
 Resume file: None

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use pipeline::host::fake::{FakeHost, FakeMarker, Scenario};
-use pipeline::host::{LaunchSpec, Source};
+use pipeline::host::{LaunchSpec, Liveness, Source};
 use pipeline::record::{Deadlines, Event, FailCode, RecordRequest, RecordState, record};
 use pipeline::{Progress, Stage};
 use renderer::TakePlan;
@@ -553,4 +553,109 @@ fn console_log_lines_are_not_doubled_in_the_tail_while_netcon_is_up() {
         .filter(|l| l.contains("TAKE_START 1"))
         .count();
     assert_eq!(starts, 1, "{:?}", f.console_tail);
+}
+
+#[test]
+fn game_that_never_appears_names_the_hlae_code_and_the_missing_game() {
+    let (r, ..) = run("facts-no-game", Scenario::happy(3).game_never_appears(), 3);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::GameNotStarted);
+    assert!(
+        f.message
+            .ends_with("(HLAE.exe: код 0 · cs2.exe: не запускалась)"),
+        "{}",
+        f.message
+    );
+}
+
+#[test]
+fn game_exit_mid_take_reports_the_dead_game_with_its_code() {
+    let sc = Scenario::happy(3).game_dies_at(secs(20), Some(0xC0000005));
+    let (r, ..) = run("facts-game-dies", sc, 3);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::GameExited);
+    assert!(
+        f.message.contains("cs2.exe: не жива (код 0xc0000005)"),
+        "{}",
+        f.message
+    );
+    assert!(
+        f.message.contains("HLAE.exe: код 0"),
+        "лаунчер назван отдельно: {}",
+        f.message
+    );
+    assert_eq!(f.game, Liveness::Exited(Some(0xC0000005)));
+}
+
+#[test]
+fn unknown_liveness_is_reported_as_unknown_never_alive() {
+    let req = fresh("facts-unknown", 2);
+    let sc = Scenario::happy(2)
+        .liveness_override(Liveness::Unknown("отказано в доступе".to_owned()))
+        .console_never_up();
+    let fake = FakeHost::new(sc);
+    let f = record(&fake, &req, &Capture::default()).expect_err("консоль не откроется");
+    assert!(
+        f.message
+            .contains("cs2.exe: неизвестно (отказано в доступе)"),
+        "{}",
+        f.message
+    );
+    assert!(!f.message.contains("cs2.exe: жива"), "{}", f.message);
+    let log = read_log(&req);
+    assert!(
+        log.contains("cs2.exe: неизвестно (отказано в доступе)"),
+        "{log}"
+    );
+    assert!(!log.contains("cs2.exe: жива"), "{log}");
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn deadline_with_afxerror_in_tail_is_reported_as_hlae_error() {
+    let afx = "AFXERROR: COutFFMPEGVideoStream::COutFFMPEGVideoStream: CreateProcessW.";
+    let sc = Scenario::happy(2)
+        .line_at(secs(10), Source::ConsoleLog, afx)
+        .drop_marker(FakeMarker::TakeEnd(0));
+    let (r, ..) = run("facts-afx", sc, 2);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::HlaeError);
+    assert_eq!(f.state, RecordState::Take);
+    assert!(
+        f.message.contains("HLAE сообщил об ошибке"),
+        "{}",
+        f.message
+    );
+    assert!(f.message.contains("CreateProcessW"), "{}", f.message);
+    assert!(f.message.contains("«дубль»"), "{}", f.message);
+    assert!(
+        f.console_tail.iter().any(|l| l == afx),
+        "строка из console.log при живом netcon попала в хвост: {:?}",
+        f.console_tail
+    );
+}
+
+#[test]
+fn journal_reports_launcher_code_and_game_liveness_separately() {
+    let (r, cap, ..) = run("facts-journal", Scenario::happy(2), 2);
+    r.expect("запись проходит");
+    let lines = cap.lines();
+    let at = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("нет строки «{needle}»: {lines:#?}"))
+    };
+    let launcher = at("HLAE.exe завершился с кодом 0");
+    let game = at("cs2.exe запущена (PID 4242)");
+    assert!(launcher < game, "лаунчер вышел раньше, чем появилась игра");
+    at("дубль 1/2: 5 с записи на 5.0 с игры (×1.0)");
+    at("дубль 2/2: 5 с записи на 5.0 с игры (×1.0)");
+    at("cs2.exe завершилась (код 0)");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "HLAE.exe: код 0 · cs2.exe: не жива (код 0)"),
+        "итоговая строка фактов: {lines:#?}"
+    );
 }

@@ -6,12 +6,14 @@
 //! как текст: управляющие символы заменяются пробелами, профиль пользователя и секреты вида
 //! `token=…` скрываются. В исполнение ничто из этого не уходит.
 
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
 use super::failure::{RecordFailure, secs};
+use super::markers;
 
 /// Журнал записи в `out_dir/record.log`.
 pub struct RecordLog {
@@ -179,18 +181,164 @@ fn value_end(b: &[u8], from: usize) -> usize {
     e
 }
 
-/// Хвост консоли для ошибки (заготовка).
-#[derive(Default)]
-pub struct Tail;
+/// Сколько последних записей (после свёртки повторов) хранит кольцо хвоста.
+const RING: usize = 500;
+/// С скольких повторов подряд строка `AFXERROR` считается «штормом» и запоминается отдельно.
+const STORM_MIN: u32 = 3;
+
+/// Строка хвоста и сколько раз она подряд повторилась.
+#[derive(Debug, Clone)]
+struct Entry {
+    text: String,
+    n: u32,
+}
+
+impl Entry {
+    fn render(&self) -> String {
+        if self.n > 1 {
+            format!("{} ×{}", self.text, self.n)
+        } else {
+            self.text.clone()
+        }
+    }
+}
+
+/// Строка без префикса времени, BOM и секретов — так она лежит в хвосте.
+pub fn clean(text: &str) -> String {
+    let t = text.trim_start_matches('\u{feff}').trim();
+    one_line(super::markers::strip_timestamp(t).trim())
+}
+
+/// Строка — метка записи `CS2C <nonce> …` (любого nonce: чужая метка тоже улика).
+fn is_marker(s: &str) -> bool {
+    let mut w = s.split_whitespace();
+    w.next() == Some(renderer::MARKER_TAG) && w.count() >= 2
+}
+
+/// Хвост консоли для ошибки (D-07): последние строки без шума. Повторы подряд сворачиваются
+/// в «текст ×N» уже при добавлении, кольцо ограничено, а самое важное хранится отдельно и не
+/// вытесняется штормом: первая строка `AFXERROR` записи, самая частая повторяющаяся `AFXERROR`
+/// и последняя метка. Полная консоль без свёртки — в `record.log`.
+pub struct Tail {
+    ring: VecDeque<Entry>,
+    first_afx: Option<Entry>,
+    /// Серия первой `AFXERROR` ещё идёт в конце кольца — её счётчик растёт вместе с записью кольца.
+    first_afx_open: bool,
+    storm: Option<Entry>,
+    last_marker: Option<String>,
+}
+
+impl Default for Tail {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Tail {
     pub fn new() -> Self {
-        Tail
+        Tail {
+            ring: VecDeque::new(),
+            first_afx: None,
+            first_afx_open: false,
+            storm: None,
+            last_marker: None,
+        }
     }
-    pub fn push(&mut self, _source: &str, _text: &str) {}
-    pub fn shadow(&mut self, _text: &str) {}
-    pub fn render(&self, _max: usize) -> Vec<String> {
-        vec![]
+
+    /// Строка консоли или лаунчера (`source` — метка источника, как в `record.log`).
+    pub fn push(&mut self, source: &str, text: &str) {
+        let mut s = clean(text);
+        if s.is_empty() {
+            return;
+        }
+        if source.starts_with("hlae") {
+            s = format!("[hlae] {s}");
+        }
+        let afx = markers::is_afxerror(&s);
+        if is_marker(&s) {
+            self.last_marker = Some(s.clone());
+        }
+        match self.ring.back_mut() {
+            Some(last) if last.text == s => last.n += 1,
+            _ => {
+                if self.ring.len() >= RING {
+                    self.ring.pop_front();
+                }
+                self.ring.push_back(Entry { text: s, n: 1 });
+            }
+        }
+        let Some(back) = self.ring.back() else { return };
+        if self.first_afx_open {
+            match &mut self.first_afx {
+                Some(f) if f.text == back.text => f.n = back.n,
+                _ => self.first_afx_open = false,
+            }
+        }
+        if afx && self.first_afx.is_none() {
+            self.first_afx = Some(back.clone());
+            self.first_afx_open = true;
+        }
+        if afx
+            && back.n >= STORM_MIN
+            && self
+                .storm
+                .as_ref()
+                .is_none_or(|s| s.text == back.text || back.n > s.n)
+        {
+            self.storm = Some(back.clone());
+        }
+    }
+
+    /// Строка второго канала консоли, которую уже дублирует netcon: в кольцо не попадает, но
+    /// первая `AFXERROR` и метка запоминаются так же, как в [`Tail::push`].
+    pub fn shadow(&mut self, text: &str) {
+        let s = clean(text);
+        if self.first_afx.is_none() && markers::is_afxerror(&s) {
+            self.first_afx = Some(Entry {
+                text: s.clone(),
+                n: 1,
+            });
+            self.first_afx_open = false;
+        }
+        if is_marker(&s) {
+            self.last_marker = Some(s);
+        }
+    }
+
+    /// Не больше `max` строк: закреплённые важные (если не попали в окно) и последние строки кольца.
+    pub fn render(&self, max: usize) -> Vec<String> {
+        let mut pinned: Vec<Entry> = vec![];
+        if let Some(f) = &self.first_afx {
+            pinned.push(f.clone());
+        }
+        if let Some(st) = &self.storm
+            && self.first_afx.as_ref().is_none_or(|f| f.text != st.text)
+        {
+            pinned.push(st.clone());
+        }
+        if let Some(m) = &self.last_marker {
+            pinned.push(Entry {
+                text: m.clone(),
+                n: 1,
+            });
+        }
+        for reserve in 0..=pinned.len() {
+            let size = max.saturating_sub(reserve);
+            let skip = self.ring.len().saturating_sub(size);
+            let window: Vec<&Entry> = self.ring.iter().skip(skip).collect();
+            let missing: Vec<&Entry> = pinned
+                .iter()
+                .filter(|p| !window.iter().any(|w| w.text == p.text))
+                .collect();
+            if missing.len() <= reserve {
+                return missing
+                    .into_iter()
+                    .chain(window)
+                    .map(Entry::render)
+                    .collect();
+            }
+        }
+        unreachable!("при резерве, равном числу закреплённых строк, все они помещаются")
     }
 }
 

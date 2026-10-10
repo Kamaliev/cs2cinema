@@ -62,7 +62,7 @@ fn number(s: &str) -> Option<u32> {
 }
 
 /// Снять префикс времени `MM/DD HH:MM:SS ` (ровно этот вид), если он есть.
-fn strip_timestamp(s: &str) -> &str {
+pub fn strip_timestamp(s: &str) -> &str {
     let b = s.as_bytes();
     let digits = [0, 1, 3, 4, 6, 7, 9, 10, 12, 13];
     let seps = [(2, b'/'), (5, b' '), (8, b':'), (11, b':'), (14, b' ')];

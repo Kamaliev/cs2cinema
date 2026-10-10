@@ -119,6 +119,9 @@ struct Journal {
     t0: Duration,
     hlae_stdout: u32,
     hlae_stderr: u32,
+    tail: log::Tail,
+    /// Консольный порт сейчас подключён: строки `console.log` тогда дублируют netcon.
+    netcon_up: bool,
 }
 
 impl Journal {
@@ -141,6 +144,8 @@ impl Journal {
             t0,
             hlae_stdout: 0,
             hlae_stderr: 0,
+            tail: log::Tail::new(),
+            netcon_up: false,
         }
     }
 
@@ -167,10 +172,22 @@ impl Journal {
                     _ => {}
                 }
                 self.line(now, source.label(), text);
+                // netcon уже даёт те же строки, что и `console.log`: второй канал в хвост не дублируется
+                if *source == Source::ConsoleLog && self.netcon_up {
+                    self.tail.shadow(text);
+                } else {
+                    self.tail.push(source.label(), text);
+                }
             }
             SessionEvent::Note(t) => self.line(now, "host", t),
-            SessionEvent::ConsoleUp => self.line(now, "host", "консольный порт подключён"),
-            SessionEvent::ConsoleDown => self.line(now, "host", "консольный порт закрыт"),
+            SessionEvent::ConsoleUp => {
+                self.netcon_up = true;
+                self.line(now, "host", "консольный порт подключён");
+            }
+            SessionEvent::ConsoleDown => {
+                self.netcon_up = false;
+                self.line(now, "host", "консольный порт закрыт");
+            }
             SessionEvent::JobEmpty => self.line(now, "host", "в job не осталось процессов"),
             // выход лаунчера, появление и выход игры машина сама превращает в факты
             SessionEvent::LauncherExited { .. }
@@ -198,7 +215,8 @@ impl Journal {
         );
     }
 
-    fn failure(&mut self, now: Duration, f: &RecordFailure) {
+    fn failure(&mut self, now: Duration, f: &mut RecordFailure) {
+        f.console_tail = self.tail.render(30);
         self.hlae_counts(now);
         let at = now.saturating_sub(self.t0);
         if let Some(l) = &mut self.log {
@@ -230,8 +248,8 @@ pub fn record(
     let session = match host.launch(&req.launch) {
         Ok(s) => s,
         Err(e) => {
-            let f = machine.launch_failed(host.now(), &e);
-            j.failure(host.now(), &f);
+            let mut f = machine.launch_failed(host.now(), &e);
+            j.failure(host.now(), &mut f);
             return Err(f);
         }
     };
@@ -286,7 +304,7 @@ pub fn record(
                     f.game = liveness.unwrap_or_else(|| session.0.game_liveness());
                     f.launcher = machine.launcher();
                     session.0.terminate();
-                    j.failure(host.now(), &f);
+                    j.failure(host.now(), &mut f);
                     return Err(f);
                 }
             }

@@ -1,0 +1,190 @@
++0.0 [app] запуск: HLAE.exe -customLoader -noGui -autoStart -noConfig -hookDllPath "C:\Program Files (x86)\HLAE\x64\AfxHookSource2.dll" -programPath "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\cs2.exe" -cmdLine "-insecure -steam -novid -allow_third_party_software -condebug -netconport 55325 -windowed -w 1280 -h 720 +demo_ui_mode 0 +playdemo cs2cinema_spike_empty"
++0.0 [job] в job: PID 42044 HLAE.exe
++0.3 [job] в job: PID 51580 cs2.exe, IsProcessInJob=Some(true), образ C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\cs2.exe
++2.4 [job] HLAE.exe завершился: exit code: 0
++3.0 [netcon] подключено
++3.4 [netcon] Determined driver version for graphics adapter 0 [output 0] '': 32.0.16.1742
++3.4 [console.log] 10/10 16:23:31 [RenderSystem] Determined driver version for graphics adapter 0 [output 0] '': 32.0.16.1742
++3.7 [netcon] Creating render device for graphics adapter 0 'NVIDIA GeForce RTX 3060 Ti' [VendorId 0x10DE / DeviceId 0x2489]: 32.0.16.1742
++3.7 [netcon] Loaded video settings config from 'cfg\cs2_video.txt'
++3.8 [console.log] 10/10 16:23:31 [RenderSystem] Creating render device for graphics adapter 0 'NVIDIA GeForce RTX 3060 Ti' [VendorId 0x10DE / DeviceId 0x2489]: 32.0.16.1742
++3.8 [console.log] 10/10 16:23:31 [RenderSystem] Loaded video settings config from 'cfg\cs2_video.txt'
++4.1 [netcon] Successfully created dx11 swap chain [FlipDiscard | AllowTear]
++4.1 [netcon] Pagefile: estimated 3388mb CPU, 7256mb GPU needed. Pagefile free 7853mb, need ~3302mb, maximum 149917mb disk free
++4.2 [netcon] ---------------
++4.2 [netcon] command line arguments:
++4.2 [netcon] -insecure -steam -novid -allow_third_party_software -condebug -netconport 55325 -windowed -w 1280 -h 720 +demo_ui_mode 0 +playdemo cs2cinema_spike_empty
++4.2 [console.log] 10/10 16:23:31 [RenderSystem] Successfully created dx11 swap chain [FlipDiscard | AllowTear]
++4.2 [console.log] 10/10 16:23:31 Pagefile: estimated 3388mb CPU, 7256mb GPU needed. Pagefile free 7853mb, need ~3302mb, maximum 149917mb disk free
++4.4 [netcon] Initialized low level socket/threading support.
++4.4 [netcon] Set SteamNetworkingSockets P2P_STUN_ServerList to '162.254.197.40:3478' as per SteamNetworkingSocketsSerialized
++4.4 [netcon] SDR RelayNetworkStatus:  avail=Attempting  config=Attempting  anyrelay=Not Attempted   (Attempt #1 to fetch config (only-if-cached) from https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730)
++4.4 [netcon] Pending ping measurement until network config is obtained.
++4.4 [netcon] SDR RelayNetworkStatus:  avail=Attempting  config=Attempting  anyrelay=Waiting   (Attempt #1 to fetch config (only-if-cached) from https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730)
++4.4 [netcon] Got ISteamNetworkingSockets user interfaces from standalone lib
++4.4 [netcon] Network System Initialized
++4.4 [netcon] Initialized Embree v4.04.00.
++4.5 [console.log] 10/10 16:23:32 [Filesystem] ---------------
++4.5 [console.log] 10/10 16:23:32 [Filesystem] ADDONS               "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo_addons\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] CONTENT              "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\content\csgo\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] CONTENT              "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\content\core\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] CONTENTADDONS        "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\content\csgo_addons\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] CONTENTROOT          "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\content\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] DEFAULT_WRITE_PATH   "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\pak01.vpk" (vpk) C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\pak01.vpk
++4.5 [console.log] 10/10 16:23:32 [Filesystem] DEFAULT_WRITE_PATH   "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] EXECUTABLE_PATH      "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] EXECUTABLE_PATH      "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\bin\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] GAME                 "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\pak01.vpk" (vpk) C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\pak01.vpk
++4.5 [console.log] 10/10 16:23:32 [Filesystem] GAME                 "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\core\pak01.vpk" (vpk) C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\core\pak01.vpk
++4.5 [console.log] 10/10 16:23:32 [Filesystem] GAME                 "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\shaders_pc.vpk" (vpk) C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\shaders_pc.vpk
++4.5 [console.log] 10/10 16:23:32 [Filesystem] GAME                 "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\core\shaders_pc.vpk" (vpk) C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\core\shaders_pc.vpk
++4.5 [console.log] 10/10 16:23:32 [Filesystem] GAME                 "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] GAME                 "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\core\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] GAMEBIN              "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\bin\win64\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] GAMEBIN              "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\bin\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] GAMEBIN              "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\core\bin\win64\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] GAMEBIN              "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\core\bin\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] GAMEROOT             "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] MOD                  "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\pak01.vpk" (vpk) C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\pak01.vpk
++4.5 [console.log] 10/10 16:23:32 [Filesystem] MOD                  "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] OFFICIAL_ADDONS      "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo_community_addons\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] PLATFORM             "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\core\pak01.vpk" (vpk) C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\core\pak01.vpk
++4.5 [console.log] 10/10 16:23:32 [Filesystem] PLATFORM             "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\core\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] SHADER_SOURCE        "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\src\shaders\csgo\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] SHADER_SOURCE        "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\src\shaders\core\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] SHADER_SOURCE        "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\src\shaders\csgo_community_addons\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] SHADER_SOURCE_MOD    "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\src\shaders\csgo\"
++4.5 [console.log] 10/10 16:23:32 [Filesystem] SHADER_SOURCE_ROOT   "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\src\shaders\"
++4.5 [console.log] 10/10 16:23:32 [CommandLine] command line arguments:
++4.5 [console.log] 10/10 16:23:32 [CommandLine] -insecure -steam -novid -allow_third_party_software -condebug -netconport 55325 -windowed -w 1280 -h 720 +demo_ui_mode 0 +playdemo cs2cinema_spike_empty
++4.7 [console.log] 10/10 16:23:32 [SteamNetSockets] Initialized low level socket/threading support.
++4.7 [console.log] 10/10 16:23:32 [SteamNetSockets] Set SteamNetworkingSockets P2P_STUN_ServerList to '162.254.197.40:3478' as per SteamNetworkingSocketsSerialized
++4.7 [console.log] 10/10 16:23:32 [SteamNetSockets] SDR RelayNetworkStatus:  avail=Attempting  config=Attempting  anyrelay=Not Attempted   (Attempt #1 to fetch config (only-if-cached) from https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730)
++4.7 [console.log] 10/10 16:23:32 [SteamNetSockets] Pending ping measurement until network config is obtained.
++4.7 [console.log] 10/10 16:23:32 [SteamNetSockets] SDR RelayNetworkStatus:  avail=Attempting  config=Attempting  anyrelay=Waiting   (Attempt #1 to fetch config (only-if-cached) from https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730)
++4.7 [console.log] 10/10 16:23:32 [Networking] Got ISteamNetworkingSockets user interfaces from standalone lib
++4.7 [console.log] 10/10 16:23:32 [Networking] Network System Initialized
++4.7 [console.log] 10/10 16:23:32 [SteamAudio] Initialized Embree v4.04.00.
++6.2 [netcon] Attempted to register duplicate manifest name C4Precache.vrnmd!
++6.3 [netcon] Sound Initialization: Finish, Device Sampling Rate: 44100
++6.3 [netcon] ILocalize::AddFile() failed to load file "resource/keybindings_russian.txt".
++6.3 [netcon] CClientSteamContext init ok, logged on = 1
++6.3 [netcon] Steam config directory: C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\core\config
++6.3 [netcon] ILocalize::AddFile() failed to load file "resource/platform_english.txt".
++6.3 [netcon] ILocalize::AddFile() failed to load file "resource/platform_russian.txt".
++6.4 [netcon] ERROR! Cannot load RenderingPipelineCsgoDeveloperMode resource manifest for the Csgo render pipeline!
++6.4 [netcon] Unable to read video config convar videocfg_dynamic_shadows
++6.4 [netcon] 
++6.4 [netcon] 63 RTs, Total = 178525056 Bytes
++6.4 [netcon] 
++6.4 [netcon] Event System loaded 94 events from file: vpk:C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive/game/core/pak01.vpk:resource/core.gameevents.
++6.4 [netcon] Event System loaded 50 events from file: vpk:C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/pak01.vpk:resource/game.gameevents.
++6.4 [netcon] Event System loaded 145 events from file: vpk:C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/pak01.vpk:./resource/mod.gameevents.
++6.4 [netcon] GameTypes: missing mapgroupsSP entry for game type/mode (custom/custom).
++6.4 [netcon] GameTypes: missing mapgroupsSP entry for game type/mode (cooperative/cooperative).
++6.4 [netcon] GameTypes: missing mapgroupsSP entry for game type/mode (cooperative/coopmission).
++6.5 [netcon] CEntitySystem::BuildEntityNetworking (parallel build of client) took 21.544 msecs for 229 out of 315 classes
++6.5 [netcon] |
++6.5 [netcon] | AfxHookSource2 (Oct  8 2026 17:00:09)
++6.5 [netcon] | https://advancedfx.org/
++6.5 [netcon] |
++6.5 [netcon] Event System loaded 94 events from file: vpk:C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive/game/core/pak01.vpk:resource/core.gameevents.
++6.5 [netcon] Event System loaded 50 events from file: vpk:C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/pak01.vpk:resource/game.gameevents.
++6.5 [netcon] Event System loaded 145 events from file: vpk:C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/pak01.vpk:./resource/mod.gameevents.
++6.5 [netcon] CEntitySystem::BuildEntityNetworking (parallel build of server) took 21.405 msecs for 222 out of 308 classes
++6.5 [netcon] [STARTUP] {4.280} server module init ok
++6.5 [netcon] CUiComponent_OptionsMenu::CUiComponent_OptionsMenu
++6.5 [netcon] Loading Game State Integration: gamestate_integration_overwolf.cfg
++6.5 [netcon] Loading Game State Integration: gamestate_integration_overwolf2.cfg
++6.5 [netcon] Loading Game State Integration: gamestate_integration_ow_native.cfg
++6.5 [console.log] 10/10 16:23:34 Attempted to register duplicate manifest name C4Precache.vrnmd!
++6.5 [console.log] 10/10 16:23:34 [SoundSystem] Sound Initialization: Finish, Device Sampling Rate: 44100
++6.5 [console.log] 10/10 16:23:34 ILocalize::AddFile() failed to load file "resource/keybindings_russian.txt".
++6.5 [console.log] 10/10 16:23:34 [Client] CClientSteamContext init ok, logged on = 1
++6.5 [console.log] 10/10 16:23:34 Steam config directory: C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\core\config
++6.5 [console.log] 10/10 16:23:34 ILocalize::AddFile() failed to load file "resource/platform_english.txt".
++6.5 [console.log] 10/10 16:23:34 ILocalize::AddFile() failed to load file "resource/platform_russian.txt".
++6.5 [console.log] 10/10 16:23:34 [RenderPipelineCsgo] ERROR! Cannot load RenderingPipelineCsgoDeveloperMode resource manifest for the Csgo render pipeline!
++6.5 [console.log] 10/10 16:23:34 [Client] Unable to read video config convar videocfg_dynamic_shadows
++6.5 [console.log] 10/10 16:23:34 [RenderPipelineCsgo]
++6.5 [console.log] 10/10 16:23:34 [RenderPipelineCsgo] 63 RTs, Total = 178525056 Bytes
++6.5 [console.log] 
++6.5 [console.log] 10/10 16:23:34 [Client] Event System loaded 94 events from file: vpk:C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive/game/core/pak01.vpk:resource/core.gameevents.
++6.5 [console.log] 10/10 16:23:34 [Client] Event System loaded 50 events from file: vpk:C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/pak01.vpk:resource/game.gameevents.
++6.5 [console.log] 10/10 16:23:34 [Client] Event System loaded 145 events from file: vpk:C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/pak01.vpk:./resource/mod.gameevents.
++6.5 [console.log] 10/10 16:23:34 GameTypes: missing mapgroupsSP entry for game type/mode (custom/custom).
++6.5 [console.log] 10/10 16:23:34 GameTypes: missing mapgroupsSP entry for game type/mode (cooperative/cooperative).
++6.5 [console.log] 10/10 16:23:34 GameTypes: missing mapgroupsSP entry for game type/mode (cooperative/coopmission).
++6.5 [console.log] 10/10 16:23:34 [Networking] CEntitySystem::BuildEntityNetworking (parallel build of client) took 21.544 msecs for 229 out of 315 classes
++6.5 [console.log] 10/10 16:23:34 |
++6.5 [console.log] | AfxHookSource2 (Oct  8 2026 17:00:09)
++9.3 [netcon] Loaded 'cs2_user_keys.vcfg' from SteamRemoteStorage, 1669 bytes OK
++9.3 [netcon] Loaded 'cs2_user_convars.vcfg' from SteamRemoteStorage, 3265 bytes OK
++9.3 [netcon] CHostStateMgr::QueueNewRequest( Idle (levelload), 1 )
++9.3 [netcon] DELAYED COMMAND: playdemo "cs2cinema_spike_empty"
++9.3 [netcon] ChangeGameUIState: CSGO_GAME_UI_STATE_INVALID -> CSGO_GAME_UI_STATE_MAINMENU
++9.3 [netcon] Source2Init OK
++9.3 [netcon] HostStateRequest::Start(HSR_IDLE):  loop(levelload) id(1) addons() desc(Idle (levelload))
++9.3 [netcon] SwitchToLoop levelload requested:  id [1] addons []
++9.3 [console.log] 10/10 16:23:37 [SplitScreen] Loaded 'cs2_user_keys.vcfg' from SteamRemoteStorage, 1669 bytes OK
++9.3 [console.log] 10/10 16:23:37 [SplitScreen] Loaded 'cs2_user_convars.vcfg' from SteamRemoteStorage, 3265 bytes OK
++9.3 [console.log] 10/10 16:23:37 [HostStateManager] CHostStateMgr::QueueNewRequest( Idle (levelload), 1 )
++9.3 [console.log] 10/10 16:23:37 [CommandLine] DELAYED COMMAND: playdemo "cs2cinema_spike_empty"
++9.3 [console.log] 10/10 16:23:37 ChangeGameUIState: CSGO_GAME_UI_STATE_INVALID -> CSGO_GAME_UI_STATE_MAINMENU
++9.3 [console.log] 10/10 16:23:37 Source2Init OK
++9.3 [console.log] 10/10 16:23:37 [HostStateManager] HostStateRequest::Start(HSR_IDLE):  loop(levelload) id(1) addons() desc(Idle (levelload))
++9.3 [console.log] 10/10 16:23:37 [EngineServiceManager] SwitchToLoop levelload requested:  id [1] addons []
++9.5 [netcon] Unable to write video config convar videocfg_dynamic_shadows
++12.1 [console.log] 10/10 16:23:39 chicken at (0.000, 0.000, 0.000) has no model name!
++12.2 [netcon] Named camera 'cam_default' not found in map 'ui/xpshop_item'
++12.3 [netcon] prop_dynamic at (0.000, 0.000, 0.000) has no model name!
++12.4 [netcon] Executing deferred playdemo: "cs2cinema_spike_empty"
++12.4 [netcon] Requesting playback of 'cs2cinema_spike_empty.dem'
++12.4 [netcon] ReadDemoHeader: cs2cinema_spike_empty.dem has invalid demo header.
++12.4 [netcon] cs2cinema_spike_empty.dem:  unable to extract addons from file
++12.5 [console.log] 10/10 16:23:40 Named camera 'cam_default' not found in map 'ui/xpshop_item'
++12.5 [console.log] 10/10 16:23:40 prop_dynamic at (0.000, 0.000, 0.000) has no model name!
++12.5 [console.log] 10/10 16:23:40 Executing deferred playdemo: "cs2cinema_spike_empty"
++12.5 [console.log] 10/10 16:23:40 [Demo] Requesting playback of 'cs2cinema_spike_empty.dem'
++12.5 [console.log] 10/10 16:23:40 [DemoFile] ReadDemoHeader: cs2cinema_spike_empty.dem has invalid demo header.
++12.5 [console.log] 10/10 16:23:40 [Demo] cs2cinema_spike_empty.dem:  unable to extract addons from file
++33.6 [console.log] 10/10 16:24:01 [NetSteamConn] CloseSteamNetConnection handle #4236269416 (userdata 1)
++33.6 [console.log] 10/10 16:24:01 [NetSteamConn] Disassociating NetChan server @  (unknown) from Steam Net Connection handle #4236269416 (userdata 1)
++33.6 [console.log] 10/10 16:24:01 [SteamNetSockets] [#4236269416 pipe 'server'] closed by app, linger requested but not needed (1059) NETWORK_DISCONNECT_EXITING
++33.6 [console.log] 10/10 16:24:01 [NetSteamConn] Removing Steam Net Connection for loopback:1, handle #4236269416
++33.6 [console.log] 10/10 16:24:01 [Networking] Closing 'client' poll group
++33.6 [console.log] 10/10 16:24:01 [Server] SV:  Server shutting down: NETWORK_DISCONNECT_EXITING (59)
++33.6 [console.log] 10/10 16:24:01 [Server] CNetworkGameServerBase::SetServerState (ss_active -> ss_dead)
++33.6 [console.log] 10/10 16:24:01 [NetSteamConn] Closing Steam Net Connection on socket 'server' to loopback:0, handle #4151555377 (1001 NETWORK_DISCONNECT_SHUTDOWN)
++33.6 [console.log] 10/10 16:24:01 [NetSteamConn] CloseSteamNetConnection handle #4151555377 (userdata 0)
++33.6 [console.log] 10/10 16:24:01 [NetSteamConn] Disassociating NetChan курите @  (unknown) from Steam Net Connection handle #4151555377 (userdata 0)
++33.6 [console.log] 10/10 16:24:01 [NetSteamConn] Removing Steam Net Connection for loopback:0, handle #4151555377
++33.6 [console.log] 10/10 16:24:01 CPlayerVoiceListener::PostSpawnGroupUnload()
++33.6 [console.log] 10/10 16:24:01 [Server] CSource2Server::GameServerSteamAPIDeactivated()
++33.6 [console.log] 10/10 16:24:01 [Networking] Closing 'server' poll group
++33.6 [console.log] 10/10 16:24:01 [Client] CL:  IGameSystem::LoopDeactivateAllSystems {
++33.6 [console.log] 10/10 16:24:01 Annotation: Cleared 0 annotations
++33.6 [console.log] 10/10 16:24:01 [Client] CL:  } IGameSystem::LoopDeactivateAllSystems done
++33.6 [console.log] 10/10 16:24:01 [stringtables] CL: CNetworkStringTableContainer::RemoveAllTables:  removing 12 tables
++33.6 [console.log] 10/10 16:24:01 [Server] SV:  IGameSystem::LoopDeactivateAllSystems {
++33.6 [console.log] 10/10 16:24:01 [Host] HO:  IGameSystem::LoopDeactivateAllSystems {
++33.6 [console.log] 10/10 16:24:01 [Host] HO:  } IGameSystem::LoopDeactivateAllSystems done
++33.6 [console.log] 10/10 16:24:01 [Server] SV:  } IGameSystem::LoopDeactivateAllSystems done
++33.6 [console.log] 10/10 16:24:01 [stringtables] SV: CNetworkStringTableContainer::RemoveAllTables:  removing 12 tables
++33.6 [console.log] 10/10 16:24:01 [BuildSparseShadowTree] CSparseShadowTreeGameSystem::GameShutdown
++33.6 [console.log] 10/10 16:24:01 [Client] CL:  CGameRulesGameSystem::GameShutdown uninstalled game rules
++33.6 [console.log] 10/10 16:24:01 [Client] CL:  CGameRules::CGameRules destructed
++33.6 [console.log] 10/10 16:24:01 WriteSteamRemoteStorageFileAsync( "voice_ban.dt" ) -> at 31.198
++33.6 [console.log] 10/10 16:24:01 CPlayerVoiceListener::GameShutdown()
++33.6 [console.log] 10/10 16:24:01 [Server] SV:  CGameRulesGameSystem::GameShutdown uninstalled game rules
++33.6 [console.log] 10/10 16:24:01 [Server] SV:  CGameRules::CGameRules destructed
++33.6 [console.log] 10/10 16:24:01 [HostStateManager] Host activate: Quitting
++33.6 [console.log] 10/10 16:24:01 Dispatching EventAppShutdown_t {
++33.6 [console.log] 10/10 16:24:01 } Dispatched EventAppShutdown_t
++33.6 [console.log] 10/10 16:24:01 MainLoop returning
++33.6 [console.log] 10/10 16:24:01 Source2Shutdown
++33.6 [console.log] 10/10 16:24:01 ShutdownSource2Logging
++34.5 [job] EOF hlae-stderr
++34.5 [job] EOF hlae-stdout
++34.7 [job] cs2.exe завершился, код Some(0)
++35.2 [job] итог: quit->пустой job Some(1.3190157000000013) с, осталось в job [], cs2.exe в системе []

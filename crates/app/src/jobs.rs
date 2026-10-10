@@ -390,6 +390,8 @@ fn run(host: &dyn Host, job: &Job, s: &Settings, store: &Store, p: &JobReporter)
         detailed: s.detailed,
         ..Default::default()
     };
+    // record.json прошлого плана устарел, как только скрипты пишутся заново: «Повторить» не должен взять чужой план (Pitfall 7)
+    begin_plan(&out_dir)?;
     let plan = pipeline::plan_player(&mut a, hero, &o, &out_dir, p)?;
     let (shots, secs) = (plan.timeline.shots.len() as u32, plan.timeline.total_secs());
     p.log(&format!("план: {shots} шотов, ~{secs:.0} с"));
@@ -405,6 +407,8 @@ fn run(host: &dyn Host, job: &Job, s: &Settings, store: &Store, p: &JobReporter)
     // скрипты плана готовы: всё, что нужно записи и склейке, — в `RecordJson` (повтор берёт его же, D-08)
     let demo_name = format!("cs2cinema_{}", pipeline::console_name(&a.label));
     let rj = record_json_for(&plan, &a.demo_path, a.demo_len(), &demo_name, s, take_nvenc)?;
+    // без record.json «Повторить» невозможен, поэтому ошибка сохранения — ошибка задачи; файл ложится сразу после плана
+    rj.save(&out_dir).map_err(|e| format!("не удалось сохранить record.json: {e} — без него «Повторить» невозможен"))?;
     // второй проход места по плану (D-03): сумма игровых секунд дублей, размер кадра и демки; до запуска игры
     if let Some(report) = report.as_mut() {
         space_pass(host, &inputs, space::estimate(&plan.takes, s.frame_size(), a.demo_len()), report, store, job.id, p)?;
@@ -426,6 +430,12 @@ fn remember_last_good(store: &Store, report: Option<&Report>) {
             let _ = store.set_last_good(build, hlae);
         }
     }
+}
+
+/// Начало плана: устаревший `record.json` удаляется (Pitfall 7). Иначе «Повторить» после упавшего на разборе или
+/// плане первого запуска взяло бы план прошлой попытки, чьи скрипты уже перезаписаны или не дописаны.
+fn begin_plan(out_dir: &Path) -> Result<(), String> {
+    RecordJson::remove(out_dir).map_err(|e| format!("не удалось убрать устаревший record.json: {e}"))
 }
 
 /// Всё, что нужно записи и склейке, из плана и настроек: кадр, fps, дубли, аргументы ffmpeg, отпечаток скриптов.
@@ -1311,5 +1321,47 @@ mod tests {
             assert!(!dir.join("clips").exists());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_json_written_after_planning_passes_its_own_check() {
+        let dir = plan_dir("record-json", "ab12cd34", 1000);
+        let rj_sample = sample_record_json(2, PathBuf::from("match.dem"), String::new());
+        let plan = pipeline::Plan {
+            timeline: director::Timeline { map: "de_nuke".into(), tick_rate: 64.0, server_start_tick: 0, shots: vec![] },
+            out_dir: dir.clone(),
+            ffmpeg_args: rj_sample.ffmpeg_args.clone(),
+            video_secs: 10.0,
+            takes: two_takes(),
+            nonce: "ab12cd34".into(),
+        };
+        let mut s = Settings::default();
+        s.resolution = 1080;
+        let rj = record_json_for(&plan, Path::new("C:/demos/match.dem"), 4096, "cs2cinema_match_hero", &s, true).expect("record.json собирается из плана");
+        rj.save(&dir).unwrap();
+
+        let loaded = RecordJson::load(&dir).expect("record.json проходит собственную проверку");
+        assert_eq!(loaded, rj);
+        assert_eq!(loaded.nonce, "ab12cd34");
+        assert_eq!(loaded.take_plans(), two_takes());
+        assert_eq!(loaded.ffmpeg_args, plan.ffmpeg_args);
+        assert_eq!((loaded.frame, loaded.fps, loaded.take_nvenc, loaded.demo_len), ((1920, 1080), s.fps, true, 4096));
+        assert_eq!(loaded.plan_hash, plan_hash(&dir, "ab12cd34"));
+        assert_eq!(loaded.demo_name, "cs2cinema_match_hero");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_record_json_is_removed_before_planning() {
+        let dir = plan_dir("stale-record", "ab12cd34", 1000);
+        sample_record_json(1, PathBuf::from("match.dem"), "h".into()).save(&dir).unwrap();
+        assert!(RecordJson::load(&dir).is_ok());
+        begin_plan(&dir).unwrap();
+        let e = RecordJson::load(&dir).expect_err("устаревшего record.json больше нет");
+        assert!(e.contains("record.json"), "{e}");
+        // повторный вызов и несуществующая папка — не ошибки
+        begin_plan(&dir).unwrap();
+        begin_plan(&dir.join("нет такой папки")).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

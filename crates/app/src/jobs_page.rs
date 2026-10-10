@@ -107,6 +107,10 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                             }
                         }
                     }
+                    JobStatus::Cancelling => {
+                        ui.spinner();
+                        ui::pill(ui, "отменяется", MUTED);
+                    }
                     JobStatus::Done => {
                         ui::pill(ui, "готово", OK);
                     }
@@ -123,7 +127,7 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                     }
                 });
                 match j.status {
-                    JobStatus::Running if !j.phase.is_empty() => ladder(ui, j, if running { app.status.take_now } else { None }),
+                    JobStatus::Running | JobStatus::Cancelling if !j.phase.is_empty() => ladder(ui, j, if running { app.status.take_now } else { None }),
                     JobStatus::Failed if j.fail_state.is_some() => ladder(ui, j, None),
                     _ => {}
                 }
@@ -155,6 +159,9 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                             *act = Some(Act::Cancel(j.id));
                         }
                     }
+                    JobStatus::Cancelling => {
+                        ui.add_enabled(false, egui::Button::new("Отменяется…"));
+                    }
                     JobStatus::Done => {
                         if let Some(p) = &j.result {
                             if ui::primary(ui, true, "Открыть") {
@@ -173,7 +180,7 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                         }
                     }
                 }
-                if j.status != JobStatus::Running && ui.small_button("Удалить").clicked() {
+                if !matches!(j.status, JobStatus::Running | JobStatus::Cancelling) && ui.small_button("Удалить").clicked() {
                     *act = Some(Act::Delete(j.id));
                 }
                 let open = app.jobs.open_log == Some(j.id);
@@ -202,7 +209,7 @@ fn ladder(ui: &mut Ui, j: &Job, takes: Option<(u32, u32)>) {
         return;
     }
     let (current, failed) = match j.status {
-        JobStatus::Running => (RecordState::from_code(&j.phase), false),
+        JobStatus::Running | JobStatus::Cancelling => (RecordState::from_code(&j.phase), false),
         JobStatus::Failed => (j.fail_state.as_deref().and_then(RecordState::from_code), true),
         _ => return,
     };
@@ -270,7 +277,7 @@ fn thumb(app: &App, ui: &mut Ui, j: &Job) {
             let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
             ui.painter().rect_filled(rect, egui::CornerRadius::same(6), ui::BG);
             let glyph = match (j.kind, j.status) {
-                (_, JobStatus::Running) => "⏺",
+                (_, JobStatus::Running | JobStatus::Cancelling) => "⏺",
                 (JobKind::Plan, _) => "📄",
                 _ => "🎬",
             };

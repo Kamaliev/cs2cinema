@@ -45,6 +45,8 @@ impl JobKind {
 pub enum JobStatus {
     Queued,
     Running,
+    /// Отмена выполняемой задачи принята, но исполнитель ещё не довёл её до «отменена» (D-11).
+    Cancelling,
     Done,
     Failed,
     Cancelled,
@@ -55,6 +57,7 @@ impl JobStatus {
         match self {
             JobStatus::Queued => "в очереди",
             JobStatus::Running => "выполняется",
+            JobStatus::Cancelling => "отменяется",
             JobStatus::Done => "готово",
             JobStatus::Failed => "ошибка",
             JobStatus::Cancelled => "отменена",
@@ -64,6 +67,7 @@ impl JobStatus {
         match s {
             "queued" => JobStatus::Queued,
             "running" => JobStatus::Running,
+            "cancelling" => JobStatus::Cancelling,
             "done" => JobStatus::Done,
             "cancelled" => JobStatus::Cancelled,
             _ => JobStatus::Failed,
@@ -154,7 +158,7 @@ pub struct LastGood {
 
 impl Job {
     pub fn is_active(&self) -> bool {
-        matches!(self.status, JobStatus::Queued | JobStatus::Running)
+        matches!(self.status, JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling)
     }
 }
 
@@ -451,6 +455,22 @@ impl Store {
         })
     }
 
+    /// «Отменяется»: только у выполняемой задачи. Уже завершённая задача не превращается обратно (T-02-07);
+    /// `true` — статус сменился.
+    pub fn set_cancelling(&self, id: i64) -> Result<bool> {
+        self.with(|c| Ok(c.execute("UPDATE jobs SET status = 'cancelling', updated_at = ?2 WHERE id = ?1 AND status = 'running'", params![id, now()])? > 0))
+    }
+
+    /// Задачи, оставшиеся «выполняется» или «отменяется», с их папками: после падения приложения
+    /// по ним убирают файлы в папке игры (D-08), а затем зовут `reset_running`.
+    pub fn interrupted_jobs(&self) -> Result<Vec<(i64, JobStatus, Option<PathBuf>)>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT id, status, out_dir FROM jobs WHERE status IN ('running', 'cancelling') ORDER BY id")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, JobStatus::parse(&r.get::<_, String>(1)?), r.get::<_, Option<String>>(2)?.map(PathBuf::from))))?;
+            rows.collect()
+        })
+    }
+
     /// Поставить задачу в очередь заново (после ошибки или чтобы перезаписать).
     pub fn requeue(&self, id: i64) -> Result<()> {
         self.with(|c| {
@@ -469,13 +489,17 @@ impl Store {
         })
     }
 
-    /// Задачи, оставшиеся «выполняются» после падения приложения, — в ошибку.
+    /// После падения приложения: «выполняется» — в ошибку, «отменяется» — в «отменена» (TMO-06). Возвращает число строк.
     pub fn reset_running(&self) -> Result<usize> {
         self.with(|c| {
-            c.execute(
+            let tx = c.unchecked_transaction()?;
+            let failed = tx.execute(
                 "UPDATE jobs SET status = 'failed', error = 'прервано: приложение закрылось во время выполнения', phase = '', updated_at = ?1 WHERE status = 'running'",
                 [now()],
-            )
+            )?;
+            let cancelled = tx.execute("UPDATE jobs SET status = 'cancelled', stage = '', phase = '', updated_at = ?1 WHERE status = 'cancelling'", [now()])?;
+            tx.commit()?;
+            Ok(failed + cancelled)
         })
     }
 
@@ -571,6 +595,63 @@ mod tests {
         assert_eq!(s.demo_path("1-abc").unwrap(), Some(here));
         s.remember_demo("1-gone", Path::new("C:/nope/x.dem")).unwrap();
         assert!(s.demo_path("1-gone").unwrap().is_none(), "удалённый файл — как будто не скачан");
+    }
+
+    #[test]
+    fn cancelling_is_set_only_on_a_running_job_and_survives_reopen() {
+        let db = TempDb::new("cancelling");
+        let s = Store::open(&db.0).unwrap();
+        let a = s.add_job(&new_job(JobKind::Record)).unwrap();
+        assert!(!s.set_cancelling(a).unwrap(), "из очереди «отменяется» не ставится");
+        assert_eq!(s.job(a).unwrap().unwrap().status, JobStatus::Queued);
+        s.start_job(a).unwrap();
+        assert!(s.set_cancelling(a).unwrap());
+        let j = s.job(a).unwrap().unwrap();
+        assert_eq!(j.status, JobStatus::Cancelling);
+        assert!(j.is_active());
+        assert_eq!(JobStatus::Cancelling.title(), "отменяется");
+        assert!(!s.set_cancelling(a).unwrap(), "повторно статус не меняется");
+        drop(s);
+
+        let s = Store::open(&db.0).unwrap();
+        assert_eq!(s.job(a).unwrap().unwrap().status, JobStatus::Cancelling, "статус переживает перезапуск");
+        assert!(s.next_queued().unwrap().is_none(), "очередь отменяемую задачу не берёт");
+        assert!(s.running().unwrap().is_none());
+
+        let b = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.start_job(b).unwrap();
+        s.finish_job(b, Err("упала")).unwrap();
+        assert!(!s.set_cancelling(b).unwrap(), "завершённая задача не становится «отменяется»");
+        assert_eq!(s.job(b).unwrap().unwrap().status, JobStatus::Failed);
+    }
+
+    #[test]
+    fn crash_recovery_turns_cancelling_into_cancelled_and_running_into_failed() {
+        let s = Store::in_memory().unwrap();
+        let a = s.add_job(&new_job(JobKind::Record)).unwrap();
+        let b = s.add_job(&new_job(JobKind::Record)).unwrap();
+        let q = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.start_job(a).unwrap();
+        s.set_out_dir(a, Path::new("C:/out/a")).unwrap();
+        s.start_job(b).unwrap();
+        s.set_out_dir(b, Path::new("C:/out/b")).unwrap();
+        s.set_phase(b, "demo").unwrap();
+        s.set_stage(b, "Запись").unwrap();
+        assert!(s.set_cancelling(b).unwrap());
+        assert_eq!(
+            s.interrupted_jobs().unwrap(),
+            vec![(a, JobStatus::Running, Some(PathBuf::from("C:/out/a"))), (b, JobStatus::Cancelling, Some(PathBuf::from("C:/out/b")))],
+            "прерванные задачи находятся вместе с папками; задача в очереди — нет"
+        );
+        assert_eq!(s.reset_running().unwrap(), 2);
+        let ja = s.job(a).unwrap().unwrap();
+        assert_eq!(ja.status, JobStatus::Failed);
+        assert_eq!(ja.error.as_deref(), Some("прервано: приложение закрылось во время выполнения"));
+        let jb = s.job(b).unwrap().unwrap();
+        assert_eq!((jb.status, jb.stage.as_str(), jb.phase.as_str()), (JobStatus::Cancelled, "", ""));
+        assert_eq!(s.job(q).unwrap().unwrap().status, JobStatus::Queued);
+        assert!(s.interrupted_jobs().unwrap().is_empty());
+        assert_eq!(s.reset_running().unwrap(), 0);
     }
 
     /// Временный файл базы; удаляется вместе с `-wal`/`-shm`.

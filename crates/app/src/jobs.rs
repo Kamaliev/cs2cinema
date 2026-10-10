@@ -4,9 +4,9 @@
 //! делается заново в фоновом потоке — и задачу можно повторить после перезапуска.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -65,6 +65,8 @@ struct JobReporter {
     id: i64,
     ui: Reporter,
     cancel: CancelToken,
+    /// Папка задачи: известна после разбора демки; сюда `TakeDone` дописывает номера записанных дублей (D-08).
+    out_dir: OnceLock<PathBuf>,
 }
 
 impl Progress for JobReporter {
@@ -84,6 +86,10 @@ impl Progress for JobReporter {
     fn event(&self, e: &pipeline::Event) {
         if let pipeline::Event::State { state, .. } = e {
             let _ = self.store.set_phase(self.id, state.code());
+        }
+        if let (pipeline::Event::TakeDone { n, .. }, Some(dir)) = (e, self.out_dir.get()) {
+            // номер дубля в событии с единицы, в `installed.json` и в имени `takeNNNN` — с нуля
+            launch::note_take_done(dir, n.saturating_sub(1));
         }
         self.log(&e.to_string());
     }
@@ -218,7 +224,7 @@ pub fn run_next(app: &mut App) {
     app.status.start(&format!("Задача #{}: {} · {}", job.id, job.label, job.kind.title()));
     let (store, s, ui) = (app.store.clone(), app.s.clone(), app.reporter());
     std::thread::spawn(move || {
-        let rep = JobReporter { store: store.clone(), id: job.id, ui, cancel };
+        let rep = JobReporter { store: store.clone(), id: job.id, ui, cancel, out_dir: OnceLock::new() };
         let result = run(&job, &s, &store, &rep);
         let _ = finish(&store, job.id, &result);
         rep.ui.send(Msg::JobDone { id: job.id, result: result.map(|o| o.result).map_err(|e| e.message) });
@@ -248,6 +254,7 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
     let out_dir = Path::new(&s.out_root).join(pipeline::console_name(&format!("{}_{}", a.label, a.m.name(hero))));
     // папка задачи известна карточке до записи: путь к record.log виден и при сбое
     let _ = store.set_out_dir(job.id, &out_dir);
+    let _ = p.out_dir.set(out_dir.clone());
     // NVENC: для склейки — у ffmpeg из PATH, для дублей — у ffmpeg, которым пишет HLAE
     let (mut nvenc, mut take_nvenc) = (false, false);
     if s.gpu_encode && job.kind != JobKind::Plan {
@@ -302,11 +309,19 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
             std::fs::rename(&clips, out_dir.join(format!("clips_old_{stamp}"))).map_err(|e| format!("не удалось отложить прошлые дубли: {e}"))?;
         }
         let demo_name = format!("cs2cinema_{}", pipeline::console_name(&a.label));
-        launch::install_files(&s.cs2_dir, &out_dir, &demo_name, |path| a.write_demo(path))?;
+        let installed = launch::install_files(&s.cs2_dir, &out_dir, &demo_name, |path| a.write_demo(path));
         // игру закрывает сама запись при любом выходе, в том числе при отмене
-        let req = record_request(s, &out_dir, &demo_name, &plan, job.id);
-        p.log(&format!("запас по времени ×{:.2}", s.time_margin));
-        let rep = record_stage(&*host, &req, p)?;
+        let recorded_run = installed.map_err(RunError::from).and_then(|()| {
+            let req = record_request(s, &out_dir, &demo_name, &plan, job.id);
+            p.log(&format!("запас по времени ×{:.2}", s.time_margin));
+            record_stage(&*host, &req, p)
+        });
+        // папка игры чистая при любом исходе — успех, сбой, отмена (D-05, D-06, TMO-06): запись вернулась
+        // только после подтверждённого закрытия игры, поэтому копия демки уже никем не занята
+        for note in launch::cleanup_installed(&s.cs2_dir, &out_dir) {
+            p.log(&note);
+        }
+        let rep = recorded_run?;
         let _ = std::fs::write(clips.join("plan.hash"), &hash);
         p.log(&format!("запись заняла {:.0} с", rep.elapsed.as_secs_f32()));
     }
@@ -314,7 +329,11 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
     p.stage(Stage::Assemble);
     p.log("склеиваю ролик через ffmpeg…");
     let out = out_dir.join("highlights.mp4");
-    run_ffmpeg(&*host, &out_dir, &plan.ffmpeg_args, plan.video_secs, deadlines(s).ffmpeg_for(plan.video_secs), p)?;
+    if let Err(e) = run_ffmpeg(&*host, &out_dir, &plan.ffmpeg_args, plan.video_secs, deadlines(s).ffmpeg_for(plan.video_secs), p) {
+        // недописанный ролик не должен выглядеть результатом (Pitfall 11)
+        let _ = std::fs::remove_file(&out);
+        return Err(e.into());
+    }
     p.log(&format!("ролик готов: {}", out.display()));
     // пара «сборка CS2 / версия HLAE» после удачной задачи, в которой шла запись (D-04, DIF-01)
     if let (false, Some(r)) = (recorded, report.as_ref()) {

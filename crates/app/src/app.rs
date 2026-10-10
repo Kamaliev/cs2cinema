@@ -155,6 +155,15 @@ impl App {
             Ok(st) => (st, None),
             Err(e) => (Store::in_memory().expect("sqlite в памяти"), Some(e)),
         };
+        // приложение упало посреди задачи: убираем из папки игры её файлы и помечаем оборванные дубли (D-08) —
+        // до `reset_running`, пока задачи ещё «выполняется» / «отменяется»
+        for (id, _, dir) in store.interrupted_jobs().unwrap_or_default() {
+            if let Some(dir) = dir {
+                for note in crate::launch::recover(&s.cs2_dir, &dir) {
+                    let _ = store.append_log(id, &format!("уборка после перезапуска: {note}"));
+                }
+            }
+        }
         let interrupted = store.reset_running().unwrap_or(0);
         let mut app = Self {
             draft: s.clone(),

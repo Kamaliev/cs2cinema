@@ -16,16 +16,29 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::{
-    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, PrevGame, ProcInfo, Session,
-    SessionEvent, Source, WindowInfo, console_line_ok,
+    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, OrphanOutcome, PrevGame,
+    ProcIdentity, ProcInfo, Session, SessionEvent, Source, WindowInfo, console_line_ok,
 };
 
 /// PID «игры» в событии `GameAppeared`.
-const FAKE_PID: u32 = 4242;
+pub const FAKE_PID: u32 = 4242;
+/// PID «лаунчера» (HLAE) в `FakeSession::processes`.
+pub const FAKE_LAUNCHER_PID: u32 = 4241;
+/// Время создания процессов фейка (FILETIME): лаунчер.
+pub const FAKE_LAUNCHER_CREATED: u64 = 1;
+/// Время создания процессов фейка (FILETIME): игра.
+pub const FAKE_GAME_CREATED: u64 = 2;
+/// Размер кадра в ответе ffprobe, если не задан ни `video_size`, ни размер окна запуска.
+const DEFAULT_FRAME: (u32, u32) = (1280, 720);
+/// Длительность дубля в ответе ffprobe, если дубля нет в сценарии.
+const DEFAULT_TAKE: Duration = Duration::from_secs(5);
 /// Потолок виртуального времени: дальше — значит сценарий зациклился.
 const MAX_VIRTUAL: Duration = Duration::from_secs(10 * 3600);
 /// Через сколько приходит дубль метки из `console.log` (см. `duplicate_via_console_log`).
 const CONSOLE_LOG_LAG: Duration = Duration::from_millis(200);
+
+/// Ответ утилите по подстроке аргумента: (имя программы, подстрока аргумента, stdout, ответ).
+pub type ProgramFor = (String, String, Vec<String>, Result<CmdOutput, HostError>);
 
 /// Метка, которую игра печатает в консоль.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +112,21 @@ pub struct Scenario {
     pub file_version: Option<String>,
     /// Ответы утилит: (имя программы в нижнем регистре, строки stdout, ответ).
     pub programs: Vec<(String, Vec<String>, Result<CmdOutput, HostError>)>,
+    /// Ответчик `ffprobe … -show_entries … <путь>` по файлам дублей (D-17); включён по умолчанию.
+    pub ffprobe_auto: bool,
+    /// Дубли, у которых файлы обрезаны: длительность 30% от сценарной.
+    pub truncated: Vec<u32>,
+    /// Дубли без звука: у `audio.wav` нет потоков.
+    pub no_audio: Vec<u32>,
+    /// Размер кадра в ответе ffprobe; иначе размер окна последнего запуска, иначе 1280x720.
+    pub video_size: Option<(u32, u32)>,
+    /// Файлы дубля нечитаемы (как недописанные) в течение этого времени после `TAKE_END`.
+    pub finalize_lag: Duration,
+    /// Ответы утилит по подстроке аргумента: (имя программы, подстрока аргумента, stdout, ответ).
+    /// Побеждают и ответчик ffprobe, и `programs`.
+    pub programs_for: Vec<ProgramFor>,
+    /// Исходы `Host::kill_orphan` по PID; для остальных — `Gone`.
+    pub orphans: Vec<(u32, OrphanOutcome)>,
 }
 
 impl Scenario {
@@ -140,7 +168,69 @@ impl Scenario {
             free_space: Ok(500 << 30),
             file_version: Some("2.192.7.0".to_owned()),
             programs: vec![],
+            ffprobe_auto: true,
+            truncated: vec![],
+            no_audio: vec![],
+            video_size: None,
+            finalize_lag: Duration::ZERO,
+            programs_for: vec![],
+            orphans: vec![],
         }
+    }
+
+    /// Ответ на запуск утилиты, у которой имя программы содержит `name`, а какой-то аргумент —
+    /// `arg_part` (без учёта регистра и разницы `\` и `/`). Так тест подменяет ответ ffprobe
+    /// для одного дубля, не трогая остальные.
+    pub fn program_for(
+        mut self,
+        name: &str,
+        arg_part: &str,
+        stdout: &[&str],
+        result: Result<CmdOutput, HostError>,
+    ) -> Self {
+        self.programs_for.push((
+            name.to_lowercase(),
+            arg_part.replace('\\', "/").to_lowercase(),
+            stdout.iter().map(|s| (*s).to_owned()).collect(),
+            result,
+        ));
+        self
+    }
+
+    /// Файлы дубля `i` обрезаны: ffprobe видит 30% сценарной длительности.
+    pub fn truncated_take(mut self, i: u32) -> Self {
+        self.truncated.push(i);
+        self
+    }
+
+    /// У дубля `i` в `audio.wav` нет аудиопотоков.
+    pub fn take_without_audio(mut self, i: u32) -> Self {
+        self.no_audio.push(i);
+        self
+    }
+
+    /// Размер кадра в ответе ffprobe (иначе — размер окна запуска).
+    pub fn video_size(mut self, w: u32, h: u32) -> Self {
+        self.video_size = Some((w, h));
+        self
+    }
+
+    /// Файл дописывается: `lag` после `TAKE_END` ffprobe ещё не может его прочитать.
+    pub fn finalize_lag(mut self, lag: Duration) -> Self {
+        self.finalize_lag = lag;
+        self
+    }
+
+    /// Отключить ответчик ffprobe: вызовы идут по `programs` и `run` по умолчанию.
+    pub fn no_ffprobe_auto(mut self) -> Self {
+        self.ffprobe_auto = false;
+        self
+    }
+
+    /// Исход `Host::kill_orphan` для процесса с этим PID.
+    pub fn orphan(mut self, pid: u32, outcome: OrphanOutcome) -> Self {
+        self.orphans.push((pid, outcome));
+        self
     }
 
     /// Снимок процессов системы для `Host::processes`.
@@ -329,6 +419,14 @@ struct HostState {
     leftover: Option<(Duration, Option<Duration>)>,
     /// Момент последнего подтверждённого выхода своей игры.
     last_exit: Option<Duration>,
+    /// Каждый вызов `Host::run`: (виртуальное время, программа, аргументы).
+    runs: Vec<(Duration, String, Vec<String>)>,
+    /// (номер дубля, виртуальное время `TAKE_END`): когда файлы дубля появились на диске.
+    take_ends: Vec<(u32, Duration)>,
+    /// Размер окна последнего запуска.
+    launch_size: Option<(u32, u32)>,
+    /// Идентичности, с которыми вызывали `Host::kill_orphan`.
+    orphan_kills: Vec<ProcIdentity>,
 }
 
 /// Страховка от зациклившегося сценария: виртуальные часы не должны уходить за `MAX_VIRTUAL`.
@@ -361,8 +459,27 @@ impl FakeHost {
                 launches: 0,
                 leftover,
                 last_exit: None,
+                runs: vec![],
+                take_ends: vec![],
+                launch_size: None,
+                orphan_kills: vec![],
             })),
         }
+    }
+
+    /// Все вызовы `Host::run` (в том числе отменённые): виртуальное время, программа, аргументы.
+    pub fn runs(&self) -> Vec<(Duration, String, Vec<String>)> {
+        lock(&self.state).runs.clone()
+    }
+
+    /// Пары (номер дубля, виртуальное время `TAKE_END`): когда файлы дубля легли на диск.
+    pub fn take_ends(&self) -> Vec<(u32, Duration)> {
+        lock(&self.state).take_ends.clone()
+    }
+
+    /// Идентичности, с которыми вызывали `Host::kill_orphan`, по порядку.
+    pub fn orphan_kills(&self) -> Vec<ProcIdentity> {
+        lock(&self.state).orphan_kills.clone()
     }
 
     /// Команды, принятые консолью (отклонённые и отправленные до открытия порта не считаются).
@@ -388,6 +505,9 @@ impl Host for FakeHost {
             return Err(e);
         }
         st.launches += 1;
+        if spec.size != (0, 0) {
+            st.launch_size = Some(spec.size);
+        }
         let t0 = st.now;
         let mut s = FakeSession {
             host: Arc::clone(&self.state),
@@ -448,25 +568,48 @@ impl Host for FakeHost {
         cancel: &dyn Fn() -> bool,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<CmdOutput, HostError> {
-        if cancel() {
-            return Err(HostError::Cancelled);
-        }
         let name = cmd
             .program
             .file_name()
             .map(|n| n.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         let (found, default) = {
-            let st = lock(&self.state);
-            let found = st
-                .scenario
-                .programs
+            let mut st = lock(&self.state);
+            // вызов виден тесту, даже если он отменён
+            let now = st.now;
+            st.runs.push((
+                now,
+                cmd.program.to_string_lossy().into_owned(),
+                cmd.args.clone(),
+            ));
+            if cancel() {
+                return Err(HostError::Cancelled);
+            }
+            let norm: Vec<String> = cmd
+                .args
                 .iter()
-                .find(|(p, _, _)| name.contains(p.as_str()))
-                .cloned();
+                .map(|a| a.replace('\\', "/").to_lowercase())
+                .collect();
+            let by_args = st
+                .scenario
+                .programs_for
+                .iter()
+                .find(|(p, part, _, _)| {
+                    name.contains(p.as_str()) && norm.iter().any(|a| a.contains(part.as_str()))
+                })
+                .map(|(_, _, lines, result)| (lines.clone(), result.clone()));
+            let found = by_args
+                .or_else(|| {
+                    st.scenario
+                        .programs
+                        .iter()
+                        .find(|(p, _, _)| name.contains(p.as_str()))
+                        .map(|(_, lines, result)| (lines.clone(), result.clone()))
+                })
+                .or_else(|| ffprobe_reply(&st, &name, &cmd.args).map(|(l, o)| (l, Ok(o))));
             (found, st.scenario.run.clone())
         };
-        let Some((_, lines, result)) = found else {
+        let Some((lines, result)) = found else {
             return default;
         };
         for l in &lines {
@@ -477,6 +620,17 @@ impl Host for FakeHost {
 
     fn processes(&self) -> Result<Vec<ProcInfo>, HostError> {
         Ok(lock(&self.state).scenario.processes.clone())
+    }
+
+    fn kill_orphan(&self, id: &ProcIdentity) -> OrphanOutcome {
+        let mut st = lock(&self.state);
+        st.orphan_kills.push(id.clone());
+        st.scenario
+            .orphans
+            .iter()
+            .find(|(pid, _)| *pid == id.pid)
+            .map(|(_, outcome)| outcome.clone())
+            .unwrap_or(OrphanOutcome::Gone)
     }
 
     fn free_space(&self, _path: &Path) -> Result<u64, HostError> {
@@ -529,6 +683,112 @@ impl Host for FakeHost {
         check_virtual(over);
         result
     }
+}
+
+/// Номер дубля из компонента пути `take0003`.
+fn take_index(component: &str) -> Option<u32> {
+    let digits = component.strip_prefix("take")?;
+    (digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// Ответ фейка вместо настоящего `ffprobe … -show_entries … <файл дубля>`: JSON той же формы, что
+/// у ffprobe 9 (длительности — строки). Путь к файлу — последний аргумент. `None` — вызов не
+/// похож на опрос файла дубля, отвечает прежняя логика `run`.
+fn ffprobe_reply(st: &HostState, name: &str, args: &[String]) -> Option<(Vec<String>, CmdOutput)> {
+    let sc = &st.scenario;
+    if !sc.ffprobe_auto || !name.contains("ffprobe") || !args.iter().any(|a| a == "-show_entries") {
+        return None;
+    }
+    let path = args.last()?;
+    let norm = path.replace('\\', "/");
+    let file = norm.rsplit('/').next()?.to_lowercase();
+    let is_video = match file.as_str() {
+        "video.mp4" => true,
+        "audio.wav" => false,
+        _ => return None,
+    };
+    let idx = norm.split('/').find_map(take_index)?;
+    let fail = |msg: &str| {
+        Some((
+            vec![],
+            CmdOutput {
+                code: Some(1),
+                stderr_tail: vec![format!("{path}: {msg}")],
+                elapsed: Duration::ZERO,
+            },
+        ))
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return fail("No such file or directory");
+    };
+    // файл ещё пишется: заготовка на старте дубля или время дописывания после `TAKE_END`
+    let writing = bytes == b"partial"
+        || st
+            .take_ends
+            .iter()
+            .any(|(i, t)| *i == idx && st.now < *t + sc.finalize_lag);
+    if writing {
+        return fail(if is_video {
+            "moov atom not found"
+        } else {
+            "Invalid data found when processing input"
+        });
+    }
+
+    let planned = sc
+        .take_durations
+        .get(idx as usize)
+        .copied()
+        .unwrap_or(DEFAULT_TAKE);
+    let length = if sc.truncated.contains(&idx) {
+        planned.mul_f64(0.3)
+    } else {
+        planned
+    };
+    let secs = format!("{:.6}", length.as_secs_f64());
+    let mut lines: Vec<String> = vec!["{".into(), "    \"streams\": [".into()];
+    if is_video {
+        let (w, h) = sc.video_size.or(st.launch_size).unwrap_or(DEFAULT_FRAME);
+        lines.extend([
+            "        {".into(),
+            "            \"codec_type\": \"video\",".into(),
+            "            \"codec_name\": \"h264\",".into(),
+            format!("            \"width\": {w},"),
+            format!("            \"height\": {h},"),
+            format!("            \"duration\": \"{secs}\""),
+            "        }".into(),
+        ]);
+    } else if !sc.no_audio.contains(&idx) {
+        lines.extend([
+            "        {".into(),
+            "            \"codec_type\": \"audio\",".into(),
+            "            \"codec_name\": \"pcm_s16le\",".into(),
+            format!("            \"duration\": \"{secs}\""),
+            "        }".into(),
+        ]);
+    }
+    let format_secs = if !is_video && sc.no_audio.contains(&idx) {
+        "0.000000"
+    } else {
+        &secs
+    };
+    lines.extend([
+        "    ],".into(),
+        "    \"format\": {".into(),
+        format!("        \"duration\": \"{format_secs}\""),
+        "    }".into(),
+        "}".into(),
+    ]);
+    Some((
+        lines,
+        CmdOutput {
+            code: Some(0),
+            stderr_tail: vec![],
+            elapsed: Duration::ZERO,
+        },
+    ))
 }
 
 /// Что появляется на диске после метки дубля.
@@ -715,6 +975,10 @@ impl Session for FakeSession {
             };
             let item = self.queue.remove(idx);
             st.now = st.now.max(item.at);
+            if let Some(TakeFx::End(i)) = item.take_files {
+                let at = st.now;
+                st.take_ends.push((i, at));
+            }
             if let (Some(fx), Some(dir)) = (item.take_files, st.scenario.clips.as_ref()) {
                 match fx {
                     TakeFx::End(i) => write_take_files(dir, i),
@@ -797,6 +1061,22 @@ impl Session for FakeSession {
 
     fn launcher_exit(&self) -> Option<Option<i32>> {
         self.launcher_exit
+    }
+
+    fn processes(&self) -> Vec<ProcIdentity> {
+        let mut out = vec![ProcIdentity {
+            pid: FAKE_LAUNCHER_PID,
+            created: FAKE_LAUNCHER_CREATED,
+            image: "HLAE.exe".to_owned(),
+        }];
+        if self.appeared {
+            out.push(ProcIdentity {
+                pid: FAKE_PID,
+                created: FAKE_GAME_CREATED,
+                image: "cs2.exe".to_owned(),
+            });
+        }
+        out
     }
 
     fn windows(&mut self) -> Vec<WindowInfo> {
@@ -1462,5 +1742,234 @@ mod tests {
             s.game_liveness(),
             Liveness::Unknown("доступ запрещён".into())
         );
+    }
+
+    fn probe_cmd(path: &Path) -> CmdSpec {
+        CmdSpec {
+            program: PathBuf::from("ffprobe"),
+            args: ["-v", "error", "-print_format", "json", "-show_entries"]
+                .into_iter()
+                .map(str::to_owned)
+                .chain([
+                    "stream=codec_type,codec_name,width,height,duration:format=duration".to_owned(),
+                    path.to_string_lossy().into_owned(),
+                ])
+                .collect(),
+            cwd: None,
+            deadline: secs(30),
+        }
+    }
+
+    /// Запускает ffprobe фейка на файле и возвращает (stdout одной строкой, итог).
+    fn probe(host: &FakeHost, path: &Path) -> (String, CmdOutput) {
+        let mut lines = vec![];
+        let out = host
+            .run(&probe_cmd(path), &|| false, &mut |l| {
+                lines.push(l.to_owned())
+            })
+            .unwrap();
+        (lines.join("\n"), out)
+    }
+
+    /// Проигрывает запись до `ALL_DONE`: файлы всех дублей лежат в `dir`.
+    fn record_all(sc: Scenario, dir: &Path, size: (u32, u32)) -> (FakeHost, Box<dyn Session>) {
+        let _ = std::fs::remove_dir_all(dir);
+        let fake = FakeHost::new(sc.echo_commands(false).clips_dir(dir.to_path_buf()));
+        let mut s = fake.launch(&LaunchSpec { size, ..spec() }).unwrap();
+        until_console(s.as_mut());
+        s.send("exec highlights").unwrap();
+        while next(s.as_mut()) != marker("ALL_DONE") {}
+        (fake, s)
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("cs2cinema-host-{name}-{}", std::process::id()))
+    }
+
+    fn ok_output() -> CmdOutput {
+        CmdOutput {
+            code: Some(0),
+            stderr_tail: vec![],
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn ffprobe_answers_for_a_finished_take_with_planned_length_and_window_size() {
+        let dir = temp("probe-ok");
+        let (fake, _s) = record_all(Scenario::happy(2), &dir, (1920, 1080));
+
+        let (json, out) = probe(&fake, &dir.join("take0000").join("video.mp4"));
+        assert_eq!(out.code, Some(0));
+        assert!(json.contains("\"codec_type\": \"video\""), "{json}");
+        assert!(json.contains("\"width\": 1920"), "{json}");
+        assert!(json.contains("\"height\": 1080"), "{json}");
+        assert!(json.contains("\"duration\": \"5.000000\""), "{json}");
+        assert!(json.trim_start().starts_with('{') && json.trim_end().ends_with('}'));
+
+        let (json, out) = probe(&fake, &dir.join("take0001").join("audio.wav"));
+        assert_eq!(out.code, Some(0));
+        assert!(json.contains("\"codec_type\": \"audio\""), "{json}");
+        assert!(!json.contains("width"), "{json}");
+        assert!(json.contains("\"duration\": \"5.000000\""), "{json}");
+
+        // вызов -version не похож на опрос дубля и отвечает прежней логикой
+        let version = CmdSpec {
+            program: PathBuf::from("ffprobe"),
+            args: vec!["-version".to_owned()],
+            cwd: None,
+            deadline: secs(5),
+        };
+        let mut lines = vec![];
+        let out = fake.run(&version, &|| false, &mut |l| lines.push(l.to_owned()));
+        assert_eq!(out.unwrap().code, Some(0));
+        assert!(lines.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_take_and_missing_audio_are_reported_as_such() {
+        let dir = temp("probe-bad");
+        let sc = Scenario::happy(2)
+            .truncated_take(1)
+            .take_without_audio(0)
+            .video_size(1600, 900);
+        let (fake, _s) = record_all(sc, &dir, (1920, 1080));
+
+        let (json, _) = probe(&fake, &dir.join("take0001").join("video.mp4"));
+        assert!(json.contains("\"duration\": \"1.500000\""), "{json}");
+        assert!(
+            json.contains("\"width\": 1600"),
+            "размер из video_size: {json}"
+        );
+        let (json, _) = probe(&fake, &dir.join("take0001").join("audio.wav"));
+        assert!(json.contains("\"duration\": \"1.500000\""), "{json}");
+
+        let (json, out) = probe(&fake, &dir.join("take0000").join("audio.wav"));
+        assert_eq!(out.code, Some(0));
+        assert!(
+            !json.contains("codec_type"),
+            "потоков быть не должно: {json}"
+        );
+        assert!(json.contains("\"streams\""), "{json}");
+
+        // файла нет на диске
+        let (json, out) = probe(&fake, &dir.join("take0007").join("video.mp4"));
+        assert!(json.is_empty());
+        assert_eq!(out.code, Some(1));
+        assert!(out.stderr_tail[0].contains("No such file or directory"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn take_file_is_unreadable_until_the_finalize_lag_passes() {
+        let dir = temp("probe-lag");
+        let (fake, mut s) = record_all(Scenario::happy(1).finalize_lag(secs(5)), &dir, (1280, 720));
+        let video = dir.join("take0000").join("video.mp4");
+        let audio = dir.join("take0000").join("audio.wav");
+
+        let (_, out) = probe(&fake, &video);
+        assert_eq!(out.code, Some(1));
+        assert!(out.stderr_tail[0].contains("moov atom not found"));
+        let (_, out) = probe(&fake, &audio);
+        assert_eq!(out.code, Some(1));
+        assert!(out.stderr_tail[0].contains("Invalid data found when processing input"));
+
+        // часы идут только в poll: выдерживаем лаг
+        let end = fake.take_ends()[0].1;
+        while fake.now() < end + secs(5) {
+            s.poll(secs(1));
+        }
+        let (json, out) = probe(&fake, &video);
+        assert_eq!(out.code, Some(0), "{json}");
+        assert!(json.contains("\"codec_type\": \"video\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn args_matcher_wins_over_the_program_name() {
+        let dir = temp("probe-args");
+        let replaced = Ok(CmdOutput {
+            code: Some(1),
+            stderr_tail: vec!["подмена".to_owned()],
+            elapsed: Duration::ZERO,
+        });
+        let sc = Scenario::happy(3)
+            .program("ffprobe", &["{}"], Ok(ok_output()))
+            .program_for("ffprobe", "take0002", &[], replaced);
+        let (fake, _s) = record_all(sc, &dir, (1280, 720));
+
+        // только вызовы с take0002 подменены; для остальных работает `program`
+        let (json, out) = probe(&fake, &dir.join("take0002").join("video.mp4"));
+        assert_eq!(out.code, Some(1));
+        assert_eq!(out.stderr_tail, vec!["подмена".to_owned()]);
+        assert!(json.is_empty());
+        let (json, out) = probe(&fake, &dir.join("take0001").join("video.mp4"));
+        assert_eq!(out.code, Some(0));
+        assert_eq!(json, "{}", "program() выигрывает у ответчика ffprobe");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runs_and_take_ends_are_recorded_with_virtual_time() {
+        let dir = temp("probe-runs");
+        let (fake, _s) = record_all(Scenario::happy(2), &dir, (1280, 720));
+
+        let ends = fake.take_ends();
+        assert_eq!(ends.len(), 2);
+        assert_eq!((ends[0].0, ends[1].0), (0, 1));
+        assert_eq!(
+            ends[1].1 - ends[0].1,
+            secs(2 + 5),
+            "пауза между дублями и длительность дубля 1"
+        );
+
+        let before = fake.now();
+        let _ = probe(&fake, &dir.join("take0000").join("video.mp4"));
+        let cancelled = fake.run(&probe_cmd(&dir), &|| true, &mut |_| {});
+        assert_eq!(cancelled.unwrap_err(), HostError::Cancelled);
+        let runs = fake.runs();
+        assert_eq!(runs.len(), 2, "отменённый вызов тоже записан");
+        assert_eq!(runs[0].0, before);
+        assert_eq!(runs[0].1, "ffprobe");
+        assert!(runs[0].2.iter().any(|a| a == "-show_entries"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_names_launcher_and_then_the_game() {
+        let fake = FakeHost::new(Scenario::happy(1));
+        let mut s = fake.launch(&spec()).unwrap();
+        let before = s.processes();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].pid, FAKE_LAUNCHER_PID);
+        assert_eq!(before[0].image, "HLAE.exe");
+        assert_eq!(
+            next(s.as_mut()),
+            SessionEvent::GameAppeared { pid: FAKE_PID }
+        );
+        let after = s.processes();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[1].pid, FAKE_PID);
+        assert_eq!(after[1].image, "cs2.exe");
+        assert_eq!(after[1].created, FAKE_GAME_CREATED);
+    }
+
+    #[test]
+    fn orphan_kills_are_recorded_with_scripted_outcomes() {
+        let fake = FakeHost::new(
+            Scenario::happy(1).orphan(7, OrphanOutcome::Mismatch("другой образ".into())),
+        );
+        let id = |pid| ProcIdentity {
+            pid,
+            created: 5,
+            image: "cs2.exe".into(),
+        };
+        assert_eq!(
+            fake.kill_orphan(&id(7)),
+            OrphanOutcome::Mismatch("другой образ".into())
+        );
+        assert_eq!(fake.kill_orphan(&id(8)), OrphanOutcome::Gone);
+        assert_eq!(fake.orphan_kills(), vec![id(7), id(8)]);
     }
 }

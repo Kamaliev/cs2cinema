@@ -127,6 +127,14 @@ pub struct Job {
     /// Длина ролика по плану, секунды.
     pub secs: Option<f32>,
     pub log: String,
+    /// Код сбоя записи (`CONSOLE_NOT_OPEN`…); пусто — сбоя не было или он не типизирован.
+    pub fail_code: Option<String>,
+    /// Код состояния записи, в котором случился сбой (`console`…).
+    pub fail_state: Option<String>,
+    /// Подсказка, что делать со сбоем.
+    pub fail_hint: Option<String>,
+    /// Хвост консоли игры на момент сбоя, строки через `\n`.
+    pub fail_tail: Option<String>,
 }
 
 impl Job {
@@ -142,6 +150,17 @@ pub struct JobOutcome {
     pub result: PathBuf,
     pub shots: u32,
     pub secs: f32,
+}
+
+/// Сбой записи строками — store не знает типов pipeline (D-05).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct JobFailure {
+    /// Сообщение по-русски — попадает в `error`.
+    pub message: String,
+    pub code: String,
+    pub state: String,
+    pub hint: String,
+    pub tail: String,
 }
 
 /// Общее соединение: одно на приложение, безопасно делится между потоками.
@@ -192,6 +211,16 @@ CREATE TABLE IF NOT EXISTS demos (
 );
 ";
 
+// Версии схемы: 1 — сбой записи (fail_*, D-05).
+// Новая версия — только новым шагом в конце списка и только добавлением колонок.
+// Элемент k поднимает схему до версии k+1; шаг идёт в одной транзакции со своим `user_version`.
+const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE jobs ADD COLUMN fail_code TEXT;
+     ALTER TABLE jobs ADD COLUMN fail_state TEXT;
+     ALTER TABLE jobs ADD COLUMN fail_hint TEXT;
+     ALTER TABLE jobs ADD COLUMN fail_tail TEXT;",
+];
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
@@ -209,7 +238,20 @@ impl Store {
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").map_err(err)?;
         conn.execute_batch(SCHEMA).map_err(err)?;
+        Self::migrate(&conn)?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+    }
+
+    /// Применяет ещё не применённые шаги `MIGRATIONS`; ошибка шага откатывает его транзакцию.
+    fn migrate(conn: &Connection) -> Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(err)?;
+        for (k, sql) in MIGRATIONS.iter().enumerate().skip(version.max(0) as usize) {
+            let tx = conn.unchecked_transaction().map_err(err)?;
+            tx.execute_batch(sql).map_err(|e| format!("миграция базы до версии {}: {e}", k + 1))?;
+            tx.execute_batch(&format!("PRAGMA user_version = {}", k + 1)).map_err(err)?;
+            tx.commit().map_err(err)?;
+        }
+        Ok(())
     }
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
@@ -251,6 +293,10 @@ impl Store {
             shots: r.get::<_, Option<i64>>("shots")?.map(|n| n as u32),
             secs: r.get::<_, Option<f64>>("secs")?.map(|s| s as f32),
             log: r.get("log")?,
+            fail_code: r.get("fail_code")?,
+            fail_state: r.get("fail_state")?,
+            fail_hint: r.get("fail_hint")?,
+            fail_tail: r.get("fail_tail")?,
         })
     }
 
@@ -279,7 +325,7 @@ impl Store {
     pub fn start_job(&self, id: i64) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "UPDATE jobs SET status = 'running', stage = '', error = NULL, result = NULL, log = '', updated_at = ?2 WHERE id = ?1",
+                "UPDATE jobs SET status = 'running', stage = '', error = NULL, result = NULL, log = '', fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, updated_at = ?2 WHERE id = ?1",
                 params![id, now()],
             )?;
             Ok(())
@@ -313,6 +359,17 @@ impl Store {
         })
     }
 
+    /// Задача упала с типизированным сбоем записи; `stage` не трогаем — этап сбоя остаётся виден.
+    pub fn fail_job(&self, id: i64, f: &JobFailure) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE jobs SET status = 'failed', error = ?2, fail_code = ?3, fail_state = ?4, fail_hint = ?5, fail_tail = ?6, updated_at = ?7 WHERE id = ?1",
+                params![id, f.message, f.code, f.state, f.hint, f.tail, now()],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Задача отменена (из очереди или на ходу — тогда исполнитель сам доводит её до этого статуса).
     pub fn cancel_job(&self, id: i64) -> Result<()> {
         self.with(|c| {
@@ -324,7 +381,10 @@ impl Store {
     /// Поставить задачу в очередь заново (после ошибки или чтобы перезаписать).
     pub fn requeue(&self, id: i64) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE jobs SET status = 'queued', stage = '', error = NULL, updated_at = ?2 WHERE id = ?1", params![id, now()])?;
+            c.execute(
+                "UPDATE jobs SET status = 'queued', stage = '', error = NULL, fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, updated_at = ?2 WHERE id = ?1",
+                params![id, now()],
+            )?;
             Ok(())
         })
     }
@@ -438,5 +498,99 @@ mod tests {
         assert_eq!(s.demo_path("1-abc").unwrap(), Some(here));
         s.remember_demo("1-gone", Path::new("C:/nope/x.dem")).unwrap();
         assert!(s.demo_path("1-gone").unwrap().is_none(), "удалённый файл — как будто не скачан");
+    }
+
+    /// Временный файл базы; удаляется вместе с `-wal`/`-shm`.
+    struct TempDb(PathBuf);
+
+    impl TempDb {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("cs2cinema-store-{}-{}.db", std::process::id(), name));
+            let t = TempDb(p);
+            t.cleanup();
+            t
+        }
+        fn cleanup(&self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut s = self.0.clone().into_os_string();
+                s.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(s));
+            }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
+    fn user_version(s: &Store) -> i64 {
+        s.with(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0))).unwrap()
+    }
+
+    /// Задача, вставленная в базу сырым соединением, как это делала старая версия приложения.
+    fn insert_old_job(c: &Connection) {
+        c.execute(
+            "INSERT INTO jobs (created_at, updated_at, kind, source_kind, source, label, hero_name, hero_steam, map, status, error)
+             VALUES (1, 1, 'record', 'faceit', '1-abc', 'матч', 'me', 42, 'de_nuke', 'failed', 'старая ошибка')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn old_database_gains_failure_columns() {
+        let db = TempDb::new("old");
+        {
+            let c = Connection::open(&db.0).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            insert_old_job(&c);
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, 0, "старая база без версии схемы");
+        }
+        let s = Store::open(&db.0).unwrap();
+        let j = s.jobs().unwrap().pop().unwrap();
+        assert_eq!(j.error.as_deref(), Some("старая ошибка"));
+        assert_eq!((j.fail_code, j.fail_state, j.fail_hint, j.fail_tail), (None, None, None, None));
+        assert_eq!(user_version(&s), 1);
+        drop(s);
+        let s = Store::open(&db.0).unwrap();
+        assert_eq!(user_version(&s), 1, "повторное открытие ничего не меняет");
+        assert_eq!(s.jobs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn typed_failure_round_trips_and_retry_clears_it() {
+        let s = Store::in_memory().unwrap();
+        let a = s.add_job(&new_job(JobKind::Record)).unwrap();
+        let f = JobFailure {
+            message: "Игра запущена, но консольный порт не открылся за 90 с".into(),
+            code: "CONSOLE_NOT_OPEN".into(),
+            state: "console".into(),
+            hint: "Проверьте -netconport в параметрах запуска".into(),
+            tail: "строка 1\nстрока 2 'кавычка'; DROP TABLE jobs;--".into(),
+        };
+        s.start_job(a).unwrap();
+        s.set_stage(a, "Запись").unwrap();
+        s.fail_job(a, &f).unwrap();
+        let j = s.job(a).unwrap().unwrap();
+        assert_eq!(j.status, JobStatus::Failed);
+        assert_eq!(j.error.as_deref(), Some(f.message.as_str()));
+        assert_eq!(j.fail_code.as_deref(), Some("CONSOLE_NOT_OPEN"));
+        assert_eq!(j.fail_state.as_deref(), Some("console"));
+        assert_eq!(j.fail_hint.as_deref(), Some(f.hint.as_str()));
+        assert_eq!(j.fail_tail.as_deref(), Some(f.tail.as_str()));
+        assert_eq!(j.stage, "Запись", "этап сбоя остаётся виден");
+
+        s.requeue(a).unwrap();
+        let j = s.job(a).unwrap().unwrap();
+        assert_eq!((j.error, j.fail_code, j.fail_state, j.fail_hint, j.fail_tail), (None, None, None, None, None));
+
+        s.start_job(a).unwrap();
+        s.fail_job(a, &f).unwrap();
+        s.start_job(a).unwrap();
+        let j = s.job(a).unwrap().unwrap();
+        assert_eq!((j.status, j.error, j.fail_code, j.fail_state, j.fail_hint, j.fail_tail), (JobStatus::Running, None, None, None, None, None));
     }
 }

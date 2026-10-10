@@ -141,12 +141,13 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
 
     p.stage(Stage::Record);
     // дубли HLAE нумерует по порядку записи: последний записанный — take{shots-1}
-    let last = plan.timeline.shots.len().saturating_sub(1);
+    let last = plan.takes.len().saturating_sub(1);
     let clips = out_dir.join("clips");
-    // дубли этого же плана уже есть (например, упала склейка) — не пишем заново
-    let hash = plan_hash(&out_dir);
+    // дубли этого же плана уже есть (например, упала склейка) — не пишем заново;
+    // ожидаемый набор дублей берём из плана, а не считаем номера сами
+    let hash = plan_hash(&out_dir, &plan.nonce);
     let recorded = std::fs::read_to_string(clips.join("plan.hash")).is_ok_and(|h| h == hash)
-        && (0..=last).all(|i| ["video.mp4", "audio.wav"].iter().all(|f| clips.join(format!("take{i:04}")).join(f).is_file()));
+        && plan.takes.iter().all(|t| renderer::TakePlan::FILES.iter().all(|f| clips.join(t.dir_name()).join(f).is_file()));
     if recorded {
         p.log("дубли этого плана уже записаны — сразу склеиваю");
     } else {
@@ -289,7 +290,9 @@ fn record(s: &Settings, out_dir: &Path, demo_name: &str, last: usize, nonce: &st
 }
 
 /// Отпечаток скриптов записи (`highlights.cfg`, `cs2c_*`): совпал — дубли в `clips/` от этого же плана.
-fn plan_hash(out_dir: &Path) -> String {
+/// `nonce` меняется на каждый план и стоит во всех маркерах консоли, поэтому перед хешированием
+/// заменяется на `NONCE`: иначе «дубли этого плана уже записаны» никогда бы не срабатывало.
+fn plan_hash(out_dir: &Path, nonce: &str) -> String {
     let mut names: Vec<_> = std::fs::read_dir(out_dir)
         .into_iter()
         .flatten()
@@ -301,7 +304,10 @@ fn plan_hash(out_dir: &Path) -> String {
     // FNV-1a: стабилен между версиями Rust, в отличие от DefaultHasher
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for n in names {
-        for b in n.bytes().chain(std::fs::read(out_dir.join(&n)).unwrap_or_default()) {
+        let body = std::fs::read(out_dir.join(&n)).unwrap_or_default();
+        let body = String::from_utf8_lossy(&body);
+        let body = if nonce.is_empty() { body.into_owned() } else { body.replace(nonce, "NONCE") };
+        for b in n.bytes().chain(body.into_bytes()) {
             h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
         }
     }
@@ -372,4 +378,29 @@ fn run_ffmpeg(dir: &Path, args: &[String], secs: f32, p: &JobReporter) -> Result
     }
     p.log(&format!("склейка заняла {:.0} с", started.elapsed().as_secs_f32()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan_dir(tag: &str, nonce: &str, tick: u32) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cs2cinema-jobs-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("highlights.cfg"), format!("// шапка\necho CS2C {nonce} SCRIPT\nexec cs2c_01\n")).unwrap();
+        std::fs::write(dir.join("cs2c_01.cfg"), format!("mirv_cmd addAtTick {tick} \"mirv_streams record end; echo CS2C {nonce} TAKE_END 0\"\n")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn plan_hash_ignores_the_nonce() {
+        let a = plan_dir("a", "aaaa1111", 1000);
+        let b = plan_dir("b", "bbbb2222", 1000);
+        let c = plan_dir("c", "cccc3333", 1001);
+        assert_eq!(plan_hash(&a, "aaaa1111"), plan_hash(&b, "bbbb2222"), "nonce не должен менять отпечаток");
+        assert_ne!(plan_hash(&a, "aaaa1111"), plan_hash(&c, "cccc3333"), "другой тик — другой план");
+        for d in [a, b, c] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 }

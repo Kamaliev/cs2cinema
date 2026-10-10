@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::{
     CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, Session, SessionEvent, Source,
-    console_line_ok,
+    WindowInfo, console_line_ok,
 };
 
 /// PID «игры» в событии `GameAppeared`.
@@ -79,6 +79,8 @@ pub struct Scenario {
     pub ready_only_direct: bool,
     /// Каждая метка приходит второй раз из `console.log`.
     pub duplicate_log: bool,
+    /// Окна процессов job по времени от запуска: последний список с `at <= now - t0` текущий.
+    pub windows: Vec<(Duration, Vec<WindowInfo>)>,
 }
 
 impl Scenario {
@@ -108,6 +110,7 @@ impl Scenario {
             }),
             ready_only_direct: false,
             duplicate_log: false,
+            windows: vec![],
         }
     }
 
@@ -212,6 +215,12 @@ impl Scenario {
         self
     }
 
+    /// С момента `at` от запуска текущий список окон — этот; пустой список = окна закрыты.
+    pub fn windows_at(mut self, at: Duration, list: Vec<WindowInfo>) -> Self {
+        self.windows.push((at, list));
+        self
+    }
+
     fn delay_of(&self, m: FakeMarker) -> Duration {
         self.delays
             .iter()
@@ -288,6 +297,7 @@ impl Host for FakeHost {
             console_up: false,
             launcher_exit: None,
             terminated: false,
+            t0,
         };
         let sc = &st.scenario;
         if let Some((after, code)) = sc.launcher {
@@ -362,6 +372,8 @@ pub struct FakeSession {
     console_up: bool,
     launcher_exit: Option<Option<i32>>,
     terminated: bool,
+    /// Виртуальный момент запуска: от него отсчитываются окна сценария.
+    t0: Duration,
 }
 
 impl FakeSession {
@@ -567,6 +579,18 @@ impl Session for FakeSession {
 
     fn launcher_exit(&self) -> Option<Option<i32>> {
         self.launcher_exit
+    }
+
+    fn windows(&mut self) -> Vec<WindowInfo> {
+        let st = lock(&self.host);
+        let since = st.now.saturating_sub(self.t0);
+        st.scenario
+            .windows
+            .iter()
+            .filter(|(at, _)| *at <= since)
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, list)| list.clone())
+            .unwrap_or_default()
     }
 
     fn terminate(&mut self) {
@@ -876,6 +900,31 @@ mod tests {
                 text: format!("CS2C {NONCE} READY")
             }
         );
+    }
+
+    #[test]
+    fn windows_follow_the_scenario_timeline() {
+        let dialog = WindowInfo {
+            pid: FAKE_PID,
+            class: "#32770".into(),
+            title: "AfxHookSource2 - Error".into(),
+            text: "AFXERROR: тест".into(),
+        };
+        let host = FakeHost::new(
+            Scenario::happy(1)
+                .windows_at(secs(3), vec![dialog.clone()])
+                .windows_at(secs(6), vec![]),
+        );
+        let mut s = host.launch(&spec()).unwrap();
+        assert!(s.windows().is_empty(), "до 3 с окон нет");
+        while host.now() < secs(3) {
+            s.poll(Duration::from_millis(500));
+        }
+        assert_eq!(s.windows(), vec![dialog], "на 3 с появился диалог");
+        while host.now() < secs(6) {
+            s.poll(Duration::from_millis(500));
+        }
+        assert!(s.windows().is_empty(), "на 6 с окна закрыты");
     }
 
     #[test]

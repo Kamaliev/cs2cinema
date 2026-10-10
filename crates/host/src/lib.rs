@@ -161,6 +161,45 @@ pub struct CmdOutput {
     pub elapsed: Duration,
 }
 
+/// Потолок длины каждой строки [`WindowInfo`] в символах: текст окон чужого процесса недоверенный.
+pub const WINDOW_TEXT_MAX: usize = 300;
+
+/// Видимое верхнее окно процесса своего job (D-10, LCH-05).
+///
+/// Все строки — недоверенный текст чужого процесса, каждая не длиннее [`WINDOW_TEXT_MAX`] символов.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowInfo {
+    pub pid: u32,
+    /// Класс окна, например `#32770` (диалог).
+    pub class: String,
+    pub title: String,
+    /// Для диалога `#32770` — текст дочерних окон `Static` через « / »; иначе пусто.
+    pub text: String,
+}
+
+/// Процесс из снимка процессов системы.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcInfo {
+    pub pid: u32,
+    /// Имя образа, например `steam.exe`.
+    pub exe_name: String,
+}
+
+/// Итог ожидания своей игры от прошлой сессии, пережившей завершение job (D-14, TMO-07).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrevGame {
+    /// Своих оставшихся игр нет (или они вышли); `waited` — сколько ждали.
+    Clear { waited: Duration },
+    /// Своя игра жива через `limit` после завершения своего job.
+    Stuck {
+        pid: u32,
+        since_end: Duration,
+        liveness: Liveness,
+    },
+    /// Ожидание прервано отменой.
+    Cancelled,
+}
+
 /// Запущенная сессия игры: HLAE, `cs2.exe`, консоль, job.
 pub trait Session: Send {
     /// Единственное блокирующее ожидание сессии: возвращает следующее событие, но ждёт не дольше
@@ -179,6 +218,21 @@ pub trait Session: Send {
 
     /// Завершить всё дерево процессов сессии. Идемпотентно; реализации вызывают и из `Drop`.
     fn terminate(&mut self);
+
+    /// Видимые верхние окна процессов своего job. Не блокирует и ничего не отправляет окнам
+    /// (читается только кэшированный заголовок). Ошибка перечисления — пустой список (D-10).
+    fn windows(&mut self) -> Vec<WindowInfo> {
+        Vec::new()
+    }
+
+    /// Ждёт выхода игры по handle не дольше `limit`. `Exited` — игра вышла и в своём job не
+    /// осталось процессов; `Alive` — жива после `limit`; `Unknown` — проверить не удалось
+    /// (никогда не выдаётся за `Alive`); `NotStarted` — игры не было. Процессы сам не
+    /// завершает (TMO-04).
+    fn wait_exit(&mut self, limit: Duration) -> Liveness {
+        let _ = limit;
+        self.game_liveness()
+    }
 }
 
 /// Хост: запускает сессии и утилиты, отдаёт часы.
@@ -197,6 +251,21 @@ pub trait Host: Send + Sync {
         cancel: &dyn Fn() -> bool,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<CmdOutput, HostError>;
+
+    /// Ждёт по handle выхода своих `cs2.exe`, переживших свою сессию; после последнего выхода
+    /// выдерживает паузу `settle`. Игра, живая через `limit` после завершения своего job, —
+    /// `Stuck`. Чужие процессы хост не видит и не трогает (D-14, TMO-05, TMO-07).
+    fn wait_previous_game(
+        &self,
+        limit: Duration,
+        settle: Duration,
+        cancel: &dyn Fn() -> bool,
+    ) -> PrevGame {
+        let _ = (limit, settle, cancel);
+        PrevGame::Clear {
+            waited: Duration::ZERO,
+        }
+    }
 }
 
 /// Годится ли строка для консоли игры: не пустая и без `\r`, `\n`, `\0`.

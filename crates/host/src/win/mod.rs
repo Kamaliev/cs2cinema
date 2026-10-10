@@ -13,6 +13,7 @@ pub mod job;
 pub mod netcon;
 pub mod process;
 pub mod watch;
+pub mod windows;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -26,7 +27,7 @@ use std::time::{Duration, Instant};
 use crate::gate::{DemoGate, Verdict};
 use crate::{
     CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, Session, SessionEvent, Source,
-    console_line_ok,
+    WindowInfo, console_line_ok,
 };
 use job::Job;
 use process::OwnedProc;
@@ -402,6 +403,17 @@ impl Session for WinSession {
 
     fn launcher_exit(&self) -> Option<Option<i32>> {
         *lock(&self.shared.launcher_exit)
+    }
+
+    fn windows(&mut self) -> Vec<WindowInfo> {
+        let mut pids = self.job.pids().unwrap_or_default();
+        // игра, принятая без job, не числится в списке job, но окна у неё свои
+        if self.shared.adopted_without_job.load(Ordering::SeqCst)
+            && let Some(game) = lock(&self.shared.game).as_ref()
+        {
+            pids.push(game.pid());
+        }
+        windows::list(&pids)
     }
 
     fn terminate(&mut self) {

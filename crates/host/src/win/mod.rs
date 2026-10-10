@@ -12,6 +12,7 @@ pub mod console_log;
 pub mod job;
 pub mod netcon;
 pub mod process;
+pub mod system;
 pub mod watch;
 pub mod windows;
 
@@ -26,8 +27,8 @@ use std::time::{Duration, Instant};
 
 use crate::gate::{DemoGate, Verdict};
 use crate::{
-    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, PrevGame, Session, SessionEvent,
-    Source, WindowInfo, console_line_ok,
+    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, PrevGame, ProcInfo, Session,
+    SessionEvent, Source, WindowInfo, console_line_ok,
 };
 use job::Job;
 use process::OwnedProc;
@@ -347,6 +348,24 @@ impl Host for WinHost {
         on_line: &mut dyn FnMut(&str),
     ) -> Result<CmdOutput, HostError> {
         crate::runner::run_bounded(cmd, cancel, on_line)
+    }
+
+    fn processes(&self) -> Result<Vec<ProcInfo>, HostError> {
+        Ok(process::snapshot_processes()?
+            .into_iter()
+            .map(|e| ProcInfo {
+                pid: e.pid,
+                exe_name: e.exe_name,
+            })
+            .collect())
+    }
+
+    fn free_space(&self, path: &Path) -> Result<u64, HostError> {
+        system::free_space(path)
+    }
+
+    fn file_version(&self, path: &Path) -> Option<String> {
+        system::file_version(path)
     }
 
     fn wait_previous_game(

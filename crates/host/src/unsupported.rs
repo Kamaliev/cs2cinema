@@ -56,4 +56,21 @@ mod tests {
         let a = host.now();
         assert!(host.now() >= a, "часы должны быть монотонными");
     }
+
+    #[test]
+    fn unsupported_host_has_no_environment_facts() {
+        let host = UnsupportedHost;
+        assert_eq!(host.processes(), Err(HostError::Unsupported));
+        assert_eq!(
+            host.free_space(std::path::Path::new(".")),
+            Err(HostError::Unsupported)
+        );
+        assert_eq!(host.file_version(std::path::Path::new("HLAE.exe")), None);
+        assert_eq!(
+            host.wait_previous_game(Duration::from_secs(1), Duration::ZERO, &|| false),
+            crate::PrevGame::Clear {
+                waited: Duration::ZERO
+            }
+        );
+    }
 }

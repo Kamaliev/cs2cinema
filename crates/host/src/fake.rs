@@ -11,13 +11,13 @@
 //! `quit` — выход игры и пустой job. Любую метку сценарий может убрать или задержать (задержка
 //! сдвигает и все последующие метки той же цепочки — как медленная игра).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::{
-    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, PrevGame, Session, SessionEvent,
-    Source, WindowInfo, console_line_ok,
+    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, PrevGame, ProcInfo, Session,
+    SessionEvent, Source, WindowInfo, console_line_ok,
 };
 
 /// PID «игры» в событии `GameAppeared`.
@@ -91,6 +91,14 @@ pub struct Scenario {
     pub take_dirs: bool,
     /// На `quit`: `JobEmpty` приходит через столько после `GameExited`; `None` — не приходит.
     pub job_empty_after_exit: Option<Duration>,
+    /// Снимок процессов системы; по умолчанию один `steam.exe` — здоровое окружение со Steam.
+    pub processes: Vec<ProcInfo>,
+    /// Ответ `Host::free_space`; по умолчанию 500 ГиБ.
+    pub free_space: Result<u64, HostError>,
+    /// Ответ `Host::file_version`; по умолчанию `2.192.7.0` (как у проверенного HLAE).
+    pub file_version: Option<String>,
+    /// Ответы утилит: (имя программы в нижнем регистре, строки stdout, ответ).
+    pub programs: Vec<(String, Vec<String>, Result<CmdOutput, HostError>)>,
 }
 
 impl Scenario {
@@ -125,7 +133,49 @@ impl Scenario {
             previous_game: None,
             take_dirs: false,
             job_empty_after_exit: Some(Duration::ZERO),
+            processes: vec![ProcInfo {
+                pid: 100,
+                exe_name: "steam.exe".to_owned(),
+            }],
+            free_space: Ok(500 << 30),
+            file_version: Some("2.192.7.0".to_owned()),
+            programs: vec![],
         }
+    }
+
+    /// Снимок процессов системы для `Host::processes`.
+    pub fn processes(mut self, list: Vec<ProcInfo>) -> Self {
+        self.processes = list;
+        self
+    }
+
+    /// Ответ `Host::free_space`.
+    pub fn free_space(mut self, r: Result<u64, HostError>) -> Self {
+        self.free_space = r;
+        self
+    }
+
+    /// Ответ `Host::file_version`.
+    pub fn file_version(mut self, v: Option<String>) -> Self {
+        self.file_version = v;
+        self
+    }
+
+    /// Ответ на запуск утилиты, чьё имя входит в имя программы (без учёта регистра): строки
+    /// `stdout` уходят в `on_line`, затем возвращается `result`. Так тест задаёт «ffmpeg
+    /// отвечает, ffprobe не запускается».
+    pub fn program(
+        mut self,
+        name: &str,
+        stdout: &[&str],
+        result: Result<CmdOutput, HostError>,
+    ) -> Self {
+        self.programs.push((
+            name.to_lowercase(),
+            stdout.iter().map(|s| (*s).to_owned()).collect(),
+            result,
+        ));
+        self
     }
 
     pub fn launcher_exit(mut self, code: Option<i32>, after: Duration) -> Self {
@@ -394,14 +444,47 @@ impl Host for FakeHost {
 
     fn run(
         &self,
-        _cmd: &CmdSpec,
+        cmd: &CmdSpec,
         cancel: &dyn Fn() -> bool,
-        _on_line: &mut dyn FnMut(&str),
+        on_line: &mut dyn FnMut(&str),
     ) -> Result<CmdOutput, HostError> {
         if cancel() {
             return Err(HostError::Cancelled);
         }
-        lock(&self.state).scenario.run.clone()
+        let name = cmd
+            .program
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let (found, default) = {
+            let st = lock(&self.state);
+            let found = st
+                .scenario
+                .programs
+                .iter()
+                .find(|(p, _, _)| name.contains(p.as_str()))
+                .cloned();
+            (found, st.scenario.run.clone())
+        };
+        let Some((_, lines, result)) = found else {
+            return default;
+        };
+        for l in &lines {
+            on_line(l);
+        }
+        result
+    }
+
+    fn processes(&self) -> Result<Vec<ProcInfo>, HostError> {
+        Ok(lock(&self.state).scenario.processes.clone())
+    }
+
+    fn free_space(&self, _path: &Path) -> Result<u64, HostError> {
+        lock(&self.state).scenario.free_space.clone()
+    }
+
+    fn file_version(&self, _path: &Path) -> Option<String> {
+        lock(&self.state).scenario.file_version.clone()
     }
 
     fn wait_previous_game(
@@ -1277,6 +1360,73 @@ mod tests {
         for _ in 0..60 {
             assert_eq!(s.poll(secs(1)), None, "JobEmpty убран — его не будет");
         }
+    }
+
+    #[test]
+    fn program_answers_are_picked_by_file_name() {
+        let ok = CmdOutput {
+            code: Some(0),
+            stderr_tail: vec![],
+            elapsed: secs(1),
+        };
+        let host = FakeHost::new(
+            Scenario::happy(1)
+                .program("ffmpeg", &["ffmpeg version 7.1"], Ok(ok.clone()))
+                .program("ffprobe", &[], Err(HostError::Spawn("нет ffprobe".into()))),
+        );
+        let cmd = |p: &str| CmdSpec {
+            program: PathBuf::from(p),
+            args: vec![],
+            cwd: None,
+            deadline: secs(10),
+        };
+        let mut lines = Vec::new();
+        let r = host.run(&cmd(r"C:\tools\FFmpeg.exe"), &|| false, &mut |l| {
+            lines.push(l.to_owned())
+        });
+        assert_eq!(r, Ok(ok));
+        assert_eq!(lines, vec!["ffmpeg version 7.1".to_owned()]);
+        assert_eq!(
+            host.run(&cmd("ffprobe"), &|| false, &mut |_| {}),
+            Err(HostError::Spawn("нет ffprobe".into()))
+        );
+        // незнакомая программа — прежний ответ сценария
+        assert_eq!(
+            host.run(&cmd("nvidia-smi"), &|| false, &mut |_| {})
+                .unwrap()
+                .code,
+            Some(0)
+        );
+        assert_eq!(
+            host.run(&cmd("ffmpeg"), &|| true, &mut |_| {}),
+            Err(HostError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn environment_facts_come_from_the_scenario() {
+        let host = FakeHost::new(Scenario::happy(1));
+        let procs = host.processes().unwrap();
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].exe_name, "steam.exe");
+        assert_eq!(host.free_space(Path::new("C:/x")), Ok(500 << 30));
+        assert_eq!(
+            host.file_version(Path::new("HLAE.exe")).as_deref(),
+            Some("2.192.7.0")
+        );
+
+        let host = FakeHost::new(
+            Scenario::happy(1)
+                .processes(vec![])
+                .free_space(Err(HostError::Io("диск".into())))
+                .file_version(None),
+        );
+        assert_eq!(host.processes(), Ok(vec![]));
+        assert_eq!(
+            host.free_space(Path::new("C:/x")),
+            Err(HostError::Io("диск".into()))
+        );
+        assert_eq!(host.file_version(Path::new("HLAE.exe")), None);
     }
 
     #[test]

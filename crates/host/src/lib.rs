@@ -16,7 +16,7 @@ mod unsupported;
 #[cfg(windows)]
 pub mod win;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use unsupported::UnsupportedHost;
@@ -265,6 +265,25 @@ pub trait Host: Send + Sync {
         PrevGame::Clear {
             waited: Duration::ZERO,
         }
+    }
+
+    /// Снимок процессов системы — только для проверок «Steam запущен» и «запущен чужой CS2».
+    /// Завершать по нему нечем: у хоста нет метода «завершить по PID или имени» (PRE-04, PRE-05).
+    fn processes(&self) -> Result<Vec<ProcInfo>, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    /// Байты, доступные вызывающему (с учётом квот), на томе пути; у несуществующего пути —
+    /// на томе ближайшего существующего предка (PRE-06).
+    fn free_space(&self, path: &Path) -> Result<u64, HostError> {
+        let _ = path;
+        Err(HostError::Unsupported)
+    }
+
+    /// Версия файла `a.b.c.d` из ресурса версии, например `HLAE.exe` -> `2.192.7.0` (DIF-01).
+    fn file_version(&self, path: &Path) -> Option<String> {
+        let _ = path;
+        None
     }
 }
 

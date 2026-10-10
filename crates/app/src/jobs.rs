@@ -507,8 +507,11 @@ fn record_takes(
     let installed = launch::install_files(&s.cs2_dir, out_dir, &rj.demo_name, |path| pipeline::write_demo_copy(&rj.demo_path, path));
     // игру закрывает сама запись при любом выходе, в том числе при отмене
     let recorded_run = installed.map_err(RunError::from).and_then(|()| {
-        let verify = Verify { ffprobe: "ffprobe".into(), plan_hash: rj.plan_hash.clone(), attempt: p.attempt, env: Some(env) };
-        let req = record_request(s, out_dir, rj, job.id, Some(verify));
+        // каждая попытка записи в приложении идёт с проверкой дублей и ведением манифеста (TAK-03, D-05)
+        let req = RecordRequest {
+            verify: Some(Verify { ffprobe: "ffprobe".into(), plan_hash: rj.plan_hash.clone(), attempt: p.attempt, env: Some(env) }),
+            ..record_request(s, out_dir, rj, job.id, None)
+        };
         p.log(&format!("запас по времени ×{:.2}", s.time_margin));
         record_stage(host, &req, p)
     });

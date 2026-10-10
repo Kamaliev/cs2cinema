@@ -207,6 +207,7 @@ pub fn record_request(s: &Settings, out_dir: &Path, demo_name: &str, plan: &pipe
         deadlines: deadlines(s),
         header: format!("задача #{job_id} · {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")),
         afxerror_ignore: s.afxerror_ignore.clone(),
+        verify: None,
     }
 }
 
@@ -592,6 +593,7 @@ mod tests {
             deadlines: Deadlines::default(),
             header: "задача #1 · тест".into(),
             afxerror_ignore: Vec::new(),
+            verify: None,
         }
     }
 

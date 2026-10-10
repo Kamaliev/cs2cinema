@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use pipeline::host::fake::{FakeHost, FakeMarker, Scenario};
 use pipeline::host::{Host, LaunchSpec, Liveness, Source};
 use pipeline::record::{
-    Deadlines, Event, FailCode, RecordRequest, RecordState, mark_partial, record,
+    Deadlines, Event, FailCode, RecordRequest, RecordState, Verify, mark_partial, record,
 };
+use pipeline::manifest::{Manifest, TakeStatus};
 use pipeline::{Progress, Stage};
 use renderer::TakePlan;
 
@@ -43,6 +44,7 @@ fn request(name: &str, n: u32) -> RecordRequest {
         deadlines: Deadlines::default(),
         header: String::new(),
         afxerror_ignore: vec![],
+        verify: None,
     }
 }
 
@@ -929,4 +931,115 @@ fn job_that_never_empties_after_exit_is_closed_after_game_close() {
         "{:?}",
         cap.lines()
     );
+}
+
+/// Запрос записи `n` дублей с проверкой `ffprobe` и папка `clips` для `Scenario::clips_dir`.
+fn verified(name: &str, n: u32) -> (RecordRequest, PathBuf) {
+    let mut req = fresh(name, n);
+    req.verify = Some(Verify {
+        ffprobe: "ffprobe".into(),
+        plan_hash: "h".into(),
+        attempt: 1,
+        env: None,
+    });
+    let clips = req.out_dir.join("clips");
+    (req, clips)
+}
+
+fn manifest_of(req: &RecordRequest) -> Manifest {
+    Manifest::load(&req.out_dir.join("clips")).expect("clips/manifest.json должен лежать на диске")
+}
+
+#[test]
+fn verified_recording_validates_every_take_in_the_manifest() {
+    let (req, clips) = verified("verify-ok", 3);
+    let fake = FakeHost::new(Scenario::happy(3).clips_dir(clips));
+    record(&fake, &req, &Capture::default()).expect("честные дубли проходят проверку");
+
+    let m = manifest_of(&req);
+    assert_eq!(m.takes.len(), 3);
+    for t in &m.takes {
+        assert_eq!(t.status, TakeStatus::Validated, "{t:?}");
+        let secs = t.video_secs.expect("измеренная длительность");
+        assert!((secs - 5.0).abs() < 0.1, "{secs}");
+        assert_eq!((t.width, t.height), (Some(1280), Some(720)));
+        assert_eq!(t.attempt, 1);
+    }
+    assert_eq!(m.attempts.len(), 1);
+    assert_eq!(m.attempts[0].n, 1);
+    assert_eq!(m.attempts[0].outcome.as_deref(), Some("готово"));
+    let log = read_log(&req);
+    assert!(log.contains("дубль 3/3 проверен"), "{log}");
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn ffprobe_never_reads_a_take_before_its_take_end() {
+    let (req, clips) = verified("verify-order", 3);
+    let fake = FakeHost::new(Scenario::happy(3).clips_dir(clips));
+    record(&fake, &req, &Capture::default()).expect("запись удаётся");
+
+    let ends = fake.take_ends();
+    assert_eq!(ends.len(), 3);
+    let runs = fake.runs();
+    assert!(!runs.is_empty(), "ffprobe вообще не запускался");
+    for (at, _, args) in &runs {
+        let path = args.last().expect("путь к файлу — последний аргумент");
+        let idx: u32 = path
+            .split(['/', '\\'])
+            .find_map(|c| c.strip_prefix("take").and_then(|d| d.parse().ok()))
+            .expect("в пути есть takeNNNN");
+        let end = ends.iter().find(|(i, _)| *i == idx).expect("TAKE_END был").1;
+        assert!(*at >= end, "дубль {idx} читали в {at:?}, а TAKE_END был в {end:?}");
+    }
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn truncated_take_fails_with_take_invalid_within_seconds_naming_the_take() {
+    let (req, clips) = verified("verify-truncated", 3);
+    let fake = FakeHost::new(Scenario::happy(3).clips_dir(clips).truncated_take(1));
+    let f = record(&fake, &req, &Capture::default()).expect_err("обрезанный дубль роняет запись");
+
+    assert_eq!(f.code, FailCode::TakeInvalid);
+    assert_eq!(f.state, RecordState::Take);
+    assert!(f.message.contains("дубль 2 из 3"), "{}", f.message);
+    assert!(f.message.contains("take0001"), "{}", f.message);
+    assert!(f.hint.contains("take0001"), "{}", f.hint);
+    let end_1 = fake.take_ends().iter().find(|(i, _)| *i == 1).expect("TAKE_END 1").1;
+    let spent = fake.now() - end_1;
+    assert!(spent <= secs(10), "сбой пришёл через {spent:?} после TAKE_END 1");
+    assert_eq!(fake.take_ends().len(), 2, "третий дубль не дописывали");
+
+    let m = manifest_of(&req);
+    assert_eq!(m.entry(0).unwrap().status, TakeStatus::Validated);
+    let bad = m.entry(1).unwrap();
+    assert_eq!(bad.status, TakeStatus::Invalid);
+    assert!(bad.error.as_deref().is_some_and(|e| e.contains("длительность")), "{bad:?}");
+    assert!(m.attempts[0].outcome.as_deref().is_some_and(|o| o.contains("TAKE_INVALID")));
+    assert!(read_log(&req).contains("TAKE_INVALID"));
+    assert!(req.out_dir.join("clips").join("take0001").is_dir(), "негодный дубль остаётся уликой");
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn take_without_audio_is_invalid() {
+    let (req, clips) = verified("verify-silent", 2);
+    let fake = FakeHost::new(Scenario::happy(2).clips_dir(clips).take_without_audio(0));
+    let f = record(&fake, &req, &Capture::default()).expect_err("беззвучный дубль");
+    assert_eq!(f.code, FailCode::TakeInvalid);
+    assert!(f.message.contains("дубль 1 из 2"), "{}", f.message);
+    assert!(f.message.contains("audio.wav: нет аудиопотока"), "{}", f.message);
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn wrong_resolution_is_invalid_and_names_both_sizes() {
+    let (req, clips) = verified("verify-size", 2);
+    let fake = FakeHost::new(Scenario::happy(2).clips_dir(clips).video_size(1920, 1080));
+    let f = record(&fake, &req, &Capture::default()).expect_err("другое разрешение");
+    assert_eq!(f.code, FailCode::TakeInvalid);
+    assert!(f.message.contains("1920x1080"), "{}", f.message);
+    assert!(f.message.contains("1280x720"), "{}", f.message);
+    let _ = std::fs::remove_dir_all(&req.out_dir);
 }

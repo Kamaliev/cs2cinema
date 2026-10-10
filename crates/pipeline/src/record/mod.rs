@@ -19,7 +19,7 @@ use std::time::Duration;
 use host::{Host, LaunchSpec, Liveness, Session, SessionEvent, Source};
 use renderer::TakePlan;
 
-use crate::Progress;
+use crate::{Progress, manifest};
 pub use deadlines::Deadlines;
 pub use failure::{FailCode, LauncherFact, RecordFailure, facts_line};
 pub use machine::{Action, Input, Machine, RecordState};
@@ -41,6 +41,22 @@ pub struct RecordRequest {
     pub header: String,
     /// Подстроки строк `AFXERROR`, которые не останавливают запись (D-09, из `settings.json`).
     pub afxerror_ignore: Vec<String>,
+    /// Проверка дублей `ffprobe` и `clips/manifest.json` (D-02); `None` — без проверки, как раньше
+    /// (старые тесты и CLI до фазы 4).
+    pub verify: Option<Verify>,
+}
+
+/// Как проверять дубли по ходу записи (D-02, D-04, D-05).
+#[derive(Debug, Clone)]
+pub struct Verify {
+    /// `ffprobe`: полный путь или имя из `PATH`.
+    pub ffprobe: PathBuf,
+    /// Хеш скриптов плана для `clips/manifest.json`.
+    pub plan_hash: String,
+    /// Номер попытки записи (с единицы) — в манифест.
+    pub attempt: u32,
+    /// Снимок окружения попытки (OBS-03); без него в манифест идёт пустой.
+    pub env: Option<manifest::EnvSnapshot>,
 }
 
 /// Сколько заняла запись одного дубля — для будущей настройки дедлайнов.
@@ -412,6 +428,208 @@ pub fn mark_partial(clips: &Path, done: &[u32]) -> Vec<String> {
     notes
 }
 
+/// Дубль, закончившийся по `TAKE_END`, но ещё не получивший окончательного решения.
+struct Pending {
+    /// Позиция дубля в `takes`.
+    take: usize,
+    /// Когда пришёл `TAKE_END`.
+    first_at: Duration,
+    /// Не раньше этого момента проверять снова.
+    next_at: Duration,
+    /// Размеры `video.mp4` и `audio.wav` при прошлой проверке.
+    sizes: Option<(u64, u64)>,
+    /// Первое «ещё дописывается» уже записано в журнал.
+    noted: bool,
+}
+
+/// Через сколько повторять проверку недописанного файла.
+const REPROBE: Duration = Duration::from_secs(1);
+
+/// Негодный ответ при неизменных размерах файлов становится окончательным через столько.
+const SETTLE: Duration = Duration::from_secs(2);
+
+/// Решение по проверенному дублю.
+enum Verdict {
+    /// Дубль годен или проверка будет повторена позже.
+    Settled,
+    /// Пользователь отменил задачу во время `ffprobe`.
+    Cancelled,
+    /// Дубль негоден окончательно: готовое сообщение сбоя.
+    Rejected(String),
+}
+
+/// Ведёт `clips/manifest.json` и очередь проверок дублей. Ничего не ждёт: каждая проверка — один
+/// вызов `Host::run` с дедлайном и отменой, не больше одной за шаг цикла драйвера (T-03-11).
+struct Verifier<'a> {
+    cfg: &'a Verify,
+    clips: PathBuf,
+    manifest: manifest::Manifest,
+    pending: Vec<Pending>,
+    /// (номер, папка) негодного дубля — для подсказки сбоя (D-04).
+    invalid: Option<(u32, String)>,
+}
+
+impl<'a> Verifier<'a> {
+    /// Манифест попытки: все дубли `pending`, снимок окружения, первая запись на диск.
+    fn open(req: &RecordRequest, cfg: &'a Verify, now: Duration, j: &mut Journal) -> Self {
+        let mut manifest = manifest::Manifest::new(
+            cfg.plan_hash.clone(),
+            req.launch.nonce.clone(),
+            req.launch.size,
+            &req.takes,
+        );
+        manifest.begin_attempt(cfg.attempt, cfg.env.clone().unwrap_or_default());
+        let v = Verifier {
+            cfg,
+            clips: req.out_dir.join("clips"),
+            manifest,
+            pending: vec![],
+            invalid: None,
+        };
+        v.save(now, j);
+        v
+    }
+
+    /// Сохранить манифест; ошибка — строка журнала, запись идёт дальше.
+    fn save(&self, now: Duration, j: &mut Journal) {
+        if let Err(e) = self.manifest.save(&self.clips) {
+            j.line(now, "app", &format!("manifest.json не записан: {e}"));
+        }
+    }
+
+    /// Размеры файлов дубля, если оба на месте.
+    fn sizes(&self, dir: &str) -> Option<(u64, u64)> {
+        let size = |file: &str| {
+            std::fs::metadata(self.clips.join(dir).join(file))
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+        };
+        Some((size(TakePlan::FILES[0])?, size(TakePlan::FILES[1])?))
+    }
+
+    /// `TAKE_END` принят: файлы дубля легли на диск, проверка — сразу (D-02).
+    fn take_ended(&mut self, take: usize, req: &RecordRequest, now: Duration, j: &mut Journal) {
+        let plan = &req.takes[take];
+        let sizes = self.sizes(&plan.dir_name());
+        if let Some(s) = sizes {
+            self.manifest.mark_recorded(plan.index, s);
+            self.save(now, j);
+        }
+        self.pending.push(Pending {
+            take,
+            first_at: now,
+            next_at: now,
+            sizes,
+            noted: false,
+        });
+    }
+
+    /// Проверить первый дубль, которому пора. Возвращает действия машины, если проверка её
+    /// остановила (сбой дубля или отмена).
+    fn probe_due(
+        &mut self,
+        host: &dyn Host,
+        req: &RecordRequest,
+        p: &dyn Progress,
+        j: &mut Journal,
+        machine: &mut Machine,
+    ) -> Vec<Action> {
+        let Some(pos) = self.pending.iter().position(|x| x.next_at <= host.now()) else {
+            return vec![];
+        };
+        match self.probe(pos, host, req, p, j, false) {
+            Verdict::Settled => vec![],
+            Verdict::Cancelled => machine.step(host.now(), Input::Cancel),
+            Verdict::Rejected(message) => machine.step(host.now(), Input::TakeInvalid { message }),
+        }
+    }
+
+    /// Одна проверка дубля `pos` из очереди и решение по ней. Окончательно решённый дубль уходит из
+    /// очереди. `last` — игра закрыта, ждать дописывания больше нечего: повторов нет.
+    fn probe(
+        &mut self,
+        pos: usize,
+        host: &dyn Host,
+        req: &RecordRequest,
+        p: &dyn Progress,
+        j: &mut Journal,
+        last: bool,
+    ) -> Verdict {
+        let take = self.pending[pos].take;
+        let plan = &req.takes[take];
+        let dir = plan.dir_name();
+        let (n, m) = (take as u32 + 1, req.takes.len() as u32);
+        let current = self.sizes(&dir);
+        let outcome = verify::probe_take(
+            host,
+            &self.cfg.ffprobe,
+            &self.clips,
+            plan,
+            req.launch.size,
+            req.deadlines.ffprobe,
+            &|| p.cancelled() || p.force_cancelled(),
+        );
+        let now = host.now();
+        let finalize = req.deadlines.take_finalize;
+        let pend = &mut self.pending[pos];
+        let changed = current != pend.sizes;
+        pend.sizes = current;
+        let waited = now.saturating_sub(pend.first_at);
+        let reason = match outcome {
+            verify::ProbeOutcome::Cancelled => return Verdict::Cancelled,
+            verify::ProbeOutcome::Valid(f) => {
+                self.manifest
+                    .mark_validated(plan.index, &f, self.cfg.attempt);
+                self.save(now, j);
+                j.emit(now, p, &Event::Fact(failure::msg_take_validated(n, m, &f)));
+                self.pending.remove(pos);
+                return Verdict::Settled;
+            }
+            verify::ProbeOutcome::NotReady(r) => {
+                if !last && waited < finalize {
+                    pend.next_at = now + REPROBE;
+                    if !pend.noted {
+                        pend.noted = true;
+                        let text = format!(
+                            "дубль {n}/{m}: {dir} ещё дописывается (ffmpeg HLAE), проверю снова: {r}"
+                        );
+                        j.line(now, "app", &text);
+                    }
+                    return Verdict::Settled;
+                }
+                failure::msg_take_not_final(&dir, finalize, &r)
+            }
+            verify::ProbeOutcome::Invalid(r) => {
+                if !last && waited < finalize && (changed || waited < SETTLE) {
+                    pend.next_at = now + REPROBE;
+                    return Verdict::Settled;
+                }
+                r
+            }
+        };
+        self.manifest
+            .mark_invalid(plan.index, &reason, self.cfg.attempt);
+        self.save(now, j);
+        self.pending.remove(pos);
+        self.invalid.get_or_insert((n, dir.clone()));
+        Verdict::Rejected(failure::msg_take_invalid(n, m, &dir, &reason))
+    }
+
+    /// Подсказка сбоя `TAKE_INVALID` с номером и папкой дубля (D-04).
+    fn hint(&self) -> Option<String> {
+        self.invalid
+            .as_ref()
+            .map(|(n, dir)| failure::hint_take_invalid(*n, dir))
+    }
+
+    /// Итог попытки в манифест.
+    fn end(&mut self, outcome: &str, now: Duration, j: &mut Journal) {
+        self.manifest.end_attempt(outcome);
+        self.save(now, j);
+    }
+}
+
 /// Записать все дубли плана. Успех — все метки пришли в срок и игра закрыта; иначе `RecordFailure`
 /// с кодом, состоянием и прошедшим временем. Игра в любом случае завершается до возврата.
 pub fn record(
@@ -441,11 +659,22 @@ pub fn record(
             j.emit(t0, p, &e);
         }
     }
+    let mut verifier = req
+        .verify
+        .as_ref()
+        .map(|v| Verifier::open(req, v, t0, &mut j));
     let session = match host.launch(&req.launch) {
         Ok(s) => s,
         Err(e) => {
             let mut f = machine.launch_failed(host.now(), &e);
             j.failure(host.now(), p, &mut f);
+            if let Some(vf) = &mut verifier {
+                vf.end(
+                    &format!("{}: {}", f.code.as_str(), f.message),
+                    host.now(),
+                    &mut j,
+                );
+            }
             return Err(f);
         }
     };
@@ -487,77 +716,109 @@ pub fn record(
             // у завершённой машины `step` ничего не возвращает
             queue.extend(machine.step(now, Input::Windows(w)));
         }
-        while let Some(action) = queue.pop_front() {
-            match action {
-                Action::Send(line) => {
-                    j.line(host.now(), "app", &format!("→ {line}"));
-                    if let Err(e) = session.0.send(&line) {
-                        let more = machine.step(
-                            host.now(),
-                            Input::SendFailed {
-                                line,
-                                error: e.to_string(),
-                            },
+        let mut probed = false;
+        loop {
+            while let Some(action) = queue.pop_front() {
+                match action {
+                    Action::Verify { take } => {
+                        if let Some(vf) = &mut verifier {
+                            vf.take_ended(take, req, host.now(), &mut j);
+                        }
+                    }
+                    Action::Send(line) => {
+                        j.line(host.now(), "app", &format!("→ {line}"));
+                        if let Err(e) = session.0.send(&line) {
+                            let more = machine.step(
+                                host.now(),
+                                Input::SendFailed {
+                                    line,
+                                    error: e.to_string(),
+                                },
+                            );
+                            queue.extend(more);
+                        }
+                    }
+                    Action::Emit(e) => j.emit(host.now(), p, &e),
+                    Action::Finish(Ok(())) => {
+                        // как была игра в момент решения, до закрытия: закрываем её мы сами
+                        let game = session.0.game_liveness();
+                        let launcher = machine.launcher();
+                        let stop = stop_for(&Ok(()));
+                        shutdown(
+                            host,
+                            &mut session,
+                            &machine,
+                            &mut j,
+                            p,
+                            &req.deadlines,
+                            stop,
                         );
-                        queue.extend(more);
+                        let now = host.now();
+                        j.success(now, p, req.takes.len(), &launcher, &game);
+                        if let Some(vf) = &mut verifier {
+                            vf.end("готово", now, &mut j);
+                        }
+                        return Ok(RecordReport {
+                            takes: machine.timings().to_vec(),
+                            elapsed: now.saturating_sub(t0),
+                            launcher,
+                            game,
+                        });
+                    }
+                    Action::Finish(Err(mut f)) => {
+                        f.game = session.0.game_liveness();
+                        f.launcher = machine.launcher();
+                        if matches!(
+                            f.code,
+                            FailCode::LauncherFailed
+                                | FailCode::GameNotStarted
+                                | FailCode::ConsoleNotOpen
+                                | FailCode::DemoNotLoaded
+                        ) {
+                            // дедлайн запуска: заголовки окон игры объясняют, чего она ждёт (D-10)
+                            let w = session.0.windows();
+                            f.message.push_str(&failure::msg_windows(&w));
+                        }
+                        if f.code == FailCode::TakeInvalid
+                            && let Some(hint) = verifier.as_ref().and_then(|v| v.hint())
+                        {
+                            f.hint = hint;
+                        }
+                        let stop = stop_for(&Err(f.clone()));
+                        shutdown(
+                            host,
+                            &mut session,
+                            &machine,
+                            &mut j,
+                            p,
+                            &req.deadlines,
+                            stop,
+                        );
+                        // дубль могла держать запись до самого выхода игры: помечаем после него
+                        let done: Vec<u32> = machine.timings().iter().map(|t| t.index).collect();
+                        for note in mark_partial(&req.out_dir.join("clips"), &done) {
+                            j.line(host.now(), "app", &note);
+                        }
+                        j.failure(host.now(), p, &mut f);
+                        if let Some(vf) = &mut verifier {
+                            let outcome = format!("{}: {}", f.code.as_str(), f.message);
+                            vf.end(&outcome, host.now(), &mut j);
+                        }
+                        return Err(f);
                     }
                 }
-                Action::Emit(e) => j.emit(host.now(), p, &e),
-                Action::Finish(Ok(())) => {
-                    // как была игра в момент решения, до закрытия: закрываем её мы сами
-                    let game = session.0.game_liveness();
-                    let launcher = machine.launcher();
-                    let stop = stop_for(&Ok(()));
-                    shutdown(
-                        host,
-                        &mut session,
-                        &machine,
-                        &mut j,
-                        p,
-                        &req.deadlines,
-                        stop,
-                    );
-                    let now = host.now();
-                    j.success(now, p, req.takes.len(), &launcher, &game);
-                    return Ok(RecordReport {
-                        takes: machine.timings().to_vec(),
-                        elapsed: now.saturating_sub(t0),
-                        launcher,
-                        game,
-                    });
-                }
-                Action::Finish(Err(mut f)) => {
-                    f.game = session.0.game_liveness();
-                    f.launcher = machine.launcher();
-                    if matches!(
-                        f.code,
-                        FailCode::LauncherFailed
-                            | FailCode::GameNotStarted
-                            | FailCode::ConsoleNotOpen
-                            | FailCode::DemoNotLoaded
-                    ) {
-                        // дедлайн запуска: заголовки окон игры объясняют, чего она ждёт (D-10)
-                        let w = session.0.windows();
-                        f.message.push_str(&failure::msg_windows(&w));
-                    }
-                    let stop = stop_for(&Err(f.clone()));
-                    shutdown(
-                        host,
-                        &mut session,
-                        &machine,
-                        &mut j,
-                        p,
-                        &req.deadlines,
-                        stop,
-                    );
-                    // дубль могла держать запись до самого выхода игры: помечаем после него
-                    let done: Vec<u32> = machine.timings().iter().map(|t| t.index).collect();
-                    for note in mark_partial(&req.out_dir.join("clips"), &done) {
-                        j.line(host.now(), "app", &note);
-                    }
-                    j.failure(host.now(), p, &mut f);
-                    return Err(f);
-                }
+            }
+            // проверка дублей: не больше одной за шаг, чтобы смерть игры, AFXERROR, отмена и
+            // следующая метка не ждали файла (T-03-11)
+            if probed {
+                break;
+            }
+            probed = true;
+            if let Some(vf) = &mut verifier {
+                queue.extend(vf.probe_due(host, req, p, &mut j, &mut machine));
+            }
+            if queue.is_empty() {
+                break;
             }
         }
     }

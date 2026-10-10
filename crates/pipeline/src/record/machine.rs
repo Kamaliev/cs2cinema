@@ -117,6 +117,10 @@ pub enum Input {
         line: String,
         error: String,
     },
+    /// Проверка дубля не прошла: сбой `TAKE_INVALID` с готовым сообщением (D-04).
+    TakeInvalid {
+        message: String,
+    },
 }
 
 /// Что должен сделать драйвер.
@@ -126,6 +130,9 @@ pub enum Action {
     Send(String),
     /// Сообщить о событии.
     Emit(Event),
+    /// Дубль `take` (позиция в `takes`) закончен по `TAKE_END` с nonce задачи — драйвер проверяет
+    /// его файлы (D-02).
+    Verify { take: usize },
     /// Запись закончена: успех или сбой.
     Finish(Result<(), RecordFailure>),
 }
@@ -256,6 +263,19 @@ impl Machine {
             Input::Event(ev) => self.on_event(now, ev, &mut acts),
             Input::Windows(list) => self.on_windows(now, &list, &mut acts),
             Input::SendFailed { line, error } => self.on_send_failed(&line, &error, &mut acts),
+            Input::TakeInvalid { message } => {
+                // сбой про дубль, а не про закрытие игры: состояние `Take` и в `Closing`
+                self.finished = true;
+                let mut f = RecordFailure::new(
+                    FailCode::TakeInvalid,
+                    RecordState::Take,
+                    message,
+                    now.saturating_sub(self.entered),
+                );
+                f.launcher = self.launcher;
+                acts.push(Action::Finish(Err(f)));
+                return acts;
+            }
         }
         if !self.finished {
             self.advance(now, &mut acts);
@@ -454,6 +474,7 @@ impl Machine {
                     now.saturating_sub(self.take_started),
                     self.takes[self.take].game_secs,
                 ))));
+                acts.push(Action::Verify { take: self.take });
                 if (self.take + 1) < self.takes.len() {
                     self.begin_take_wait(self.take + 1, now, acts);
                 } else {
@@ -905,5 +926,84 @@ mod tests {
             }
             other => panic!("ждали HLAE_ERROR, получили {other:?}"),
         }
+    }
+
+    #[test]
+    fn take_end_asks_the_driver_to_verify_that_take() {
+        let d = Deadlines::fast();
+        let mut m = Machine::new(NONCE.into(), takes(2), d.clone());
+        let mut now = up_to_take_wait(&mut m, &d);
+        for i in 0..2usize {
+            now += ms(1);
+            let acts = m.step(now, marker(&format!("TAKE_START {i}")));
+            assert!(
+                !acts.iter().any(|a| matches!(a, Action::Verify { .. })),
+                "до TAKE_END проверять нечего: {acts:?}"
+            );
+            now += ms(1);
+            let acts = m.step(now, marker(&format!("TAKE_END {i}")));
+            let verify: Vec<usize> = acts
+                .iter()
+                .filter_map(|a| match a {
+                    Action::Verify { take } => Some(*take),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(verify, vec![i], "{acts:?}");
+        }
+        // повтор принятой метки из второго канала дубль второй раз не проверяет
+        let acts = m.step(now + ms(1), marker("TAKE_END 1"));
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::Verify { .. })),
+            "{acts:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_take_fails_in_the_take_state_even_while_closing() {
+        let d = Deadlines::fast();
+        let (mut m, now) = closing(&d);
+        let acts = m.step(
+            now + ms(1),
+            Input::TakeInvalid {
+                message: "дубль 1 из 1 (take0000) не прошёл проверку: тест".to_owned(),
+            },
+        );
+        match finish(&acts) {
+            Some(Err(f)) => {
+                assert_eq!(f.code, FailCode::TakeInvalid);
+                assert_eq!(
+                    f.state,
+                    RecordState::Take,
+                    "сбой про дубль, не про закрытие"
+                );
+                assert!(f.message.contains("take0000"), "{}", f.message);
+            }
+            other => panic!("ждали сбой TAKE_INVALID, получили {other:?}"),
+        }
+        // у завершённой машины ввод игнорируется
+        let acts = m.step(
+            now + ms(2),
+            Input::TakeInvalid {
+                message: "ещё раз".to_owned(),
+            },
+        );
+        assert!(acts.is_empty());
+
+        // и в самом дубле
+        let mut m = Machine::new(NONCE.into(), takes(2), d.clone());
+        let mut t = up_to_take_wait(&mut m, &d);
+        t += ms(1);
+        m.step(t, marker("TAKE_START 0"));
+        let acts = m.step(
+            t + ms(1),
+            Input::TakeInvalid {
+                message: "x".to_owned(),
+            },
+        );
+        assert!(matches!(
+            finish(&acts),
+            Some(Err(f)) if f.code == FailCode::TakeInvalid && f.state == RecordState::Take
+        ));
     }
 }

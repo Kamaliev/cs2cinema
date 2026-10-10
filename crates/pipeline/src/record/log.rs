@@ -179,6 +179,21 @@ fn value_end(b: &[u8], from: usize) -> usize {
     e
 }
 
+/// Хвост консоли для ошибки (заготовка).
+#[derive(Default)]
+pub struct Tail;
+
+impl Tail {
+    pub fn new() -> Self {
+        Tail
+    }
+    pub fn push(&mut self, _source: &str, _text: &str) {}
+    pub fn shadow(&mut self, _text: &str) {}
+    pub fn render(&self, _max: usize) -> Vec<String> {
+        vec![]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +215,40 @@ mod tests {
         );
         assert_eq!(redact("CS2C ab12cd34 READY"), "CS2C ab12cd34 READY");
         assert_eq!(one_line("a\r\nb\0c"), "a  b c");
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    #[test]
+    fn tail_folds_repeats_and_keeps_the_first_afxerror() {
+        let mut t = Tail::new();
+        t.push(
+            "netcon",
+            "AFXERROR: COutFFMPEGVideoStream::COutFFMPEGVideoStream: CreateProcessW.",
+        );
+        for i in 0..800 {
+            t.push(
+                "netcon",
+                &format!(
+                    "10/09 01:{:02}:00 AFXERROR: Failed writing image for screen recording.",
+                    i % 60
+                ),
+            );
+        }
+        for i in 0..40 {
+            t.push("netcon", &format!("обычная строка {i}"));
+        }
+        let out = t.render(30);
+        assert!(out.len() <= 32, "{}", out.len());
+        assert!(out.iter().any(|l| l.contains("CreateProcessW")), "{out:?}");
+        assert!(
+            out.iter()
+                .any(|l| l == "AFXERROR: Failed writing image for screen recording. ×800"),
+            "{out:?}"
+        );
+        assert!(out.iter().any(|l| l == "обычная строка 39"), "{out:?}");
     }
 }

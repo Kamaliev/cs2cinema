@@ -509,3 +509,48 @@ fn cancelled_recording_still_leaves_a_complete_record_log() {
     assert!(log.contains("stdout — 0 строк"), "{log}");
     let _ = std::fs::remove_dir_all(&req.out_dir);
 }
+
+#[test]
+fn failure_tail_contains_recent_console_lines() {
+    // консольный порт так и не открылся, поэтому строки идут только из console.log
+    let sc = Scenario::happy(2)
+        .console_never_up()
+        .line_at(secs(10), Source::ConsoleLog, "[Demo] первая строка")
+        .line_at(
+            secs(11),
+            Source::ConsoleLog,
+            "10/09 01:37:32 [Demo] вторая строка",
+        )
+        .line_at(secs(12), Source::HlaeStderr, "hlae жалуется");
+    let (r, ..) = run("tail-recent", sc, 2);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::ConsoleNotOpen);
+    assert!(!f.console_tail.is_empty());
+    assert!(f.console_tail.len() <= 32, "{}", f.console_tail.len());
+    assert!(
+        f.console_tail.iter().any(|l| l == "[hlae] hlae жалуется"),
+        "{:?}",
+        f.console_tail
+    );
+    assert!(
+        f.console_tail.iter().any(|l| l == "[Demo] вторая строка"),
+        "префикс времени снят: {:?}",
+        f.console_tail
+    );
+}
+
+#[test]
+fn console_log_lines_are_not_doubled_in_the_tail_while_netcon_is_up() {
+    let sc = Scenario::happy(2)
+        .duplicate_via_console_log()
+        .drop_marker(FakeMarker::TakeEnd(1));
+    let (r, ..) = run("tail-dups", sc, 2);
+    let f = fail_of(r);
+    assert_eq!(f.code, FailCode::TakeTimeout);
+    let starts = f
+        .console_tail
+        .iter()
+        .filter(|l| l.contains("TAKE_START 1"))
+        .count();
+    assert_eq!(starts, 1, "{:?}", f.console_tail);
+}

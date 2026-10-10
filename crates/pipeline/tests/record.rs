@@ -511,7 +511,7 @@ fn record_log_is_written_on_success_and_on_failure_with_source_tags() {
         "{after_first}"
     );
 
-    // повторная попытка в ту же папку: журнал дописывается, а не перезаписывается
+    // повторная попытка в ту же папку: прошлый журнал переезжает в record.log.1, а не затирается
     let f = record(
         &FakeHost::new(Scenario::happy(2).console_never_up()),
         &req,
@@ -519,20 +519,76 @@ fn record_log_is_written_on_success_and_on_failure_with_source_tags() {
     )
     .expect_err("консоль не откроется");
     assert_eq!(f.code, FailCode::ConsoleNotOpen);
+    let old = std::fs::read_to_string(req.out_dir.join("record.log.1"))
+        .expect("первая попытка сохранена как record.log.1");
+    assert_eq!(old, after_first, "прошлая попытка на месте без изменений");
     let log = read_log(&req);
-    assert!(log.starts_with(&after_first), "прошлая попытка на месте");
-    assert_eq!(log.matches("==== запись").count(), 2, "{log}");
-    assert_eq!(log.matches(NONCE).count() >= 2, true);
-    assert_eq!(log.matches("stdout — 0 строк").count(), 2, "{log}");
-    let tail = &log[after_first.len()..];
+    assert_eq!(log.matches("==== запись").count(), 1, "{log}");
+    assert!(log.contains(NONCE));
+    assert!(
+        log.contains("прошлая попытка: record.log.1"),
+        "ссылка на прошлый журнал: {log}"
+    );
+    assert_eq!(log.matches("stdout — 0 строк").count(), 1, "{log}");
     for need in [
         "CONSOLE_NOT_OPEN",
         "консольный порт не открылся за 90 с",
         "Закройте CS2",
         "прошло 90 с",
     ] {
-        assert!(tail.contains(need), "в итоге нет «{need}»: {tail}");
+        assert!(log.contains(need), "в итоге нет «{need}»: {log}");
     }
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn record_log_rotation_never_overwrites_old_logs() {
+    let req = fresh("log-rotate", 2);
+    let attempt = |sc: Scenario| {
+        let _ = record(&FakeHost::new(sc), &req, &Capture::default());
+    };
+    let file = |name: &str| std::fs::read_to_string(req.out_dir.join(name));
+
+    attempt(Scenario::happy(2));
+    assert!(
+        file("record.log.1").is_err(),
+        "первой попытке переносить нечего"
+    );
+    let first = read_log(&req);
+    attempt(Scenario::happy(2).console_never_up());
+    attempt(Scenario::happy(2));
+    assert_eq!(file("record.log.1").unwrap(), first);
+    assert!(
+        file("record.log.2")
+            .unwrap()
+            .contains("прошлая попытка: record.log.1")
+    );
+    assert!(read_log(&req).contains("прошлая попытка: record.log.2"));
+    for log in ["record.log.1", "record.log.2", "record.log"] {
+        assert_eq!(
+            file(log).unwrap().matches("==== запись").count(),
+            1,
+            "{log}"
+        );
+    }
+
+    // номер — наибольший + 1, а не «первый свободный»: удалённый .1 не занимается заново
+    std::fs::remove_file(req.out_dir.join("record.log.1")).unwrap();
+    let before = read_log(&req);
+    attempt(Scenario::happy(2));
+    assert!(
+        file("record.log.1").is_err(),
+        "дыру в нумерации не заполняем"
+    );
+    assert_eq!(file("record.log.3").unwrap(), before);
+
+    // пустой record.log не переносится
+    std::fs::write(req.out_dir.join("record.log"), b"").unwrap();
+    attempt(Scenario::happy(2));
+    assert!(
+        file("record.log.4").is_err(),
+        "пустой журнал не нужен как улика"
+    );
     let _ = std::fs::remove_dir_all(&req.out_dir);
 }
 

@@ -1,7 +1,8 @@
 //! Журнал записи `record.log` и хвост консоли для ошибки.
 //!
-//! `record.log` лежит в папке задачи и открывается на дозапись до запуска лаунчера: повторная
-//! попытка в ту же папку добавляет новый блок, а улики прошлых попыток остаются (LCH-04). Строки
+//! `record.log` лежит в папке задачи и создаётся заново до запуска лаунчера. Журнал прошлой попытки
+//! не затирается: он становится `record.log.N` (N — на единицу больше наибольшего существующего,
+//! число файлов не ограничено), так улики всех попыток остаются (LCH-04, D-12, RET-06). Строки
 //! консоли недоверенные (netcon слушает не только localhost), поэтому они попадают в файл только
 //! как текст: управляющие символы заменяются пробелами, профиль пользователя и секреты вида
 //! `token=…` скрываются. В исполнение ничто из этого не уходит.
@@ -15,20 +16,47 @@ use std::time::Duration;
 use super::failure::{RecordFailure, secs};
 use super::markers;
 
+/// Перенести непустой `out_dir/record.log` в `record.log.N`, где N — наибольший номер среди
+/// `record.log.<цифры>` в папке плюс один (нет таких — 1). `Ok(None)` — переносить нечего.
+fn rotate(out_dir: &Path) -> io::Result<Option<u32>> {
+    let current = out_dir.join("record.log");
+    match std::fs::metadata(&current) {
+        Ok(m) if m.is_file() && m.len() > 0 => {}
+        _ => return Ok(None),
+    }
+    let mut last = 0u32;
+    for entry in std::fs::read_dir(out_dir)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(digits) = name.strip_prefix("record.log.")
+            && !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = digits.parse::<u32>()
+        {
+            last = last.max(n);
+        }
+    }
+    let n = last
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("номер журнала переполнен"))?;
+    std::fs::rename(&current, out_dir.join(format!("record.log.{n}")))?;
+    Ok(Some(n))
+}
+
 /// Журнал записи в `out_dir/record.log`.
 pub struct RecordLog {
     file: std::fs::File,
 }
 
 impl RecordLog {
-    /// Открыть `record.log` на дозапись и написать разделитель попытки. Файл никогда не
-    /// обрезается; если папки нет, она создаётся.
+    /// Начать журнал новой попытки: прежний непустой `record.log` переносится в `record.log.N`
+    /// (D-12), затем создаётся новый файл с разделителем попытки и строкой «прошлая попытка».
+    /// Старые журналы не обрезаются и не перезаписываются; если перенос не удался, запись
+    /// дописывается в старый файл с отметкой (улики важнее порядка). Папка создаётся, если её нет.
     pub fn open(out_dir: &Path, header: &str, nonce: &str, takes: usize) -> io::Result<Self> {
         std::fs::create_dir_all(out_dir)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(out_dir.join("record.log"))?;
+        let path = out_dir.join("record.log");
+        let rotated = rotate(out_dir);
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let mut log = RecordLog { file };
         let used = log.file.metadata().map(|m| m.len() > 0).unwrap_or(false);
         let who = match one_line(header).as_str() {
@@ -37,6 +65,14 @@ impl RecordLog {
         };
         let sep = format!("==== запись{who} · nonce {nonce} · дублей {takes} ====\n");
         log.put(&format!("{}{sep}", if used { "\n" } else { "" }));
+        match rotated {
+            Ok(Some(n)) => log.put(&format!("прошлая попытка: record.log.{n}\n")),
+            Ok(None) => {}
+            Err(e) => log.put(&format!(
+                "прошлый record.log не перенесён в record.log.N ({}): дописываю в тот же файл\n",
+                one_line(&e.to_string())
+            )),
+        }
         Ok(log)
     }
 

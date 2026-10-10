@@ -142,6 +142,14 @@ pub struct Machine {
     accepted: Vec<Marker>,
     timings: Vec<TakeTiming>,
     game_exited_at: Option<Duration>,
+    /// Первый признак того, что демка уже идёт (строка консоли).
+    evidence_at: Option<Duration>,
+    /// Прямой запрос READY уже отправлен (не больше одного).
+    direct_sent: bool,
+    /// Последняя метка не по порядку — для сообщения о сбое.
+    misordered: Option<String>,
+    /// Уже показанные в журнале замечания, чтобы не повторять.
+    facts_seen: Vec<String>,
     finished: bool,
 }
 
@@ -164,6 +172,10 @@ impl Machine {
             accepted: vec![],
             timings: vec![],
             game_exited_at: None,
+            evidence_at: None,
+            direct_sent: false,
+            misordered: None,
+            facts_seen: vec![],
             finished: false,
         }
     }
@@ -271,9 +283,18 @@ impl Machine {
             SessionEvent::GameAppeared { .. } => {
                 self.appeared_at.get_or_insert(now);
             }
-            SessionEvent::ConsoleUp => self.console_up = true,
+            SessionEvent::ConsoleUp => {
+                self.console_up = true;
+                // порт переподключился, пока ждём READY: запрос мог потеряться (это не `exec`)
+                if self.state == RecordState::Demo {
+                    acts.push(Action::Send(markers::ready_request(&self.nonce)));
+                }
+            }
             SessionEvent::ConsoleDown => self.console_up = false,
             SessionEvent::Line { text, .. } => {
+                if markers::is_demo_running_evidence(&text) {
+                    self.evidence_at.get_or_insert(now);
+                }
                 if let Some(mk) = markers::parse_marker(&text, &self.nonce) {
                     self.on_marker(now, mk, acts);
                 }
@@ -306,12 +327,18 @@ impl Machine {
         acts.push(f);
     }
 
-    fn on_send_failed(&mut self, now: Duration, line: &str, _error: &str, acts: &mut Vec<Action>) {
+    fn on_send_failed(&mut self, now: Duration, line: &str, error: &str, acts: &mut Vec<Action>) {
         if line == "quit" {
             // игра не приняла quit — закрываем свой job и считаем запись законченной
             acts.push(Action::Terminate);
             self.finish_ok(now, acts);
+            return;
         }
+        // `exec highlights` повторно не отправляется (D-10): если он потерялся, скажет дедлайн
+        // SCRIPT. Запрос READY повторит следующий `ConsoleUp`.
+        acts.push(Action::Emit(Event::Fact(failure::msg_send_failed(
+            line, error,
+        ))));
     }
 
     /// Метка, которую ждёт машина прямо сейчас.
@@ -339,10 +366,19 @@ impl Machine {
             }
             return;
         }
-        if self.accepted.contains(&mk) || self.expected() != Some(mk) {
+        // повтор принятой метки (второй канал: netcon и console.log) — молча
+        if self.accepted.contains(&mk) {
+            return;
+        }
+        let Some(expected) = self.expected() else {
+            return;
+        };
+        if expected != mk {
+            self.out_of_order(mk, expected, acts);
             return;
         }
         self.accepted.push(mk);
+        self.misordered = None;
         match mk {
             Marker::Ready => {
                 self.enter(RecordState::Script, now, now, acts);
@@ -377,6 +413,17 @@ impl Machine {
                 }
             }
             Marker::AllDone => {}
+        }
+    }
+
+    /// Метка не та, что ждём: состояние и дедлайн не трогаем (LCH-03), только запоминаем для
+    /// сообщения о сбое и один раз сообщаем в журнал.
+    fn out_of_order(&mut self, got: Marker, expected: Marker, acts: &mut Vec<Action>) {
+        let text = failure::msg_misordered(&got.label(), &expected.label());
+        self.misordered = Some(text.clone());
+        if !self.facts_seen.contains(&text) {
+            self.facts_seen.push(text.clone());
+            acts.push(Action::Emit(Event::Fact(text)));
         }
     }
 
@@ -463,6 +510,7 @@ impl Machine {
             }
             return;
         }
+        self.ask_ready_directly(now, acts);
         let Some((limit, code)) = self.limit() else {
             return;
         };
@@ -474,11 +522,44 @@ impl Machine {
         acts.push(f);
     }
 
+    /// Сообщение о сбое по истёкшему дедлайну; для ожиданий метки добавляет «пришла метка … вместо …».
     fn timeout_message(&self, code: FailCode, limit: Duration) -> String {
-        match code {
-            FailCode::LauncherFailed => failure::msg_launcher_timeout(limit),
-            FailCode::DemoNotLoaded => failure::msg_demo_not_loaded(limit, false),
-            _ => failure::msg_generic(code, limit),
+        let msg = match code {
+            FailCode::LauncherFailed => return failure::msg_launcher_timeout(limit),
+            FailCode::GameNotStarted => return failure::msg_game_not_started(limit),
+            FailCode::ConsoleNotOpen => return failure::msg_console_not_open(limit),
+            FailCode::DemoNotLoaded => {
+                failure::msg_demo_not_loaded(limit, self.evidence_at.is_some())
+            }
+            FailCode::ScriptNotRun => failure::msg_script_not_run(limit),
+            FailCode::TakeTimeout => {
+                let (n, m) = (self.take as u32 + 1, self.takes.len() as u32);
+                let kind = if self.recording {
+                    "TAKE_END"
+                } else {
+                    "TAKE_START"
+                };
+                failure::msg_take_timeout(n, m, kind, limit)
+            }
+            // остальные коды по таймеру не возникают
+            _ => return format!("{}: ожидание не уложилось в срок", code.as_str()),
+        };
+        match &self.misordered {
+            Some(seen) => format!("{msg}; {seen}"),
+            None => msg,
+        }
+    }
+
+    /// Демка уже идёт, а READY нет: один раз просим метку напрямую (это не повтор `exec`, D-10).
+    fn ask_ready_directly(&mut self, now: Duration, acts: &mut Vec<Action>) {
+        if self.direct_sent || self.state != RecordState::Demo {
+            return;
+        }
+        let Some(seen) = self.evidence_at else { return };
+        if now.saturating_sub(seen.max(self.entered)) >= self.d.ready_grace {
+            self.direct_sent = true;
+            acts.push(Action::Emit(Event::Fact(failure::msg_ready_direct())));
+            acts.push(Action::Send(markers::ready_direct(&self.nonce)));
         }
     }
 }

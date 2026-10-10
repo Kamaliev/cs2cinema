@@ -201,13 +201,48 @@ pub fn msg_game_not_closed(limit: Duration) -> String {
     format!("игра не закрылась за {} с — завершаю свой job", secs(limit))
 }
 
-/// Временное сообщение для кодов, чей каталог дописывается следующей задачей плана.
-pub fn msg_generic(code: FailCode, limit: Duration) -> String {
+/// Игра не появилась после выхода лаунчера.
+pub fn msg_game_not_started(limit: Duration) -> String {
+    format!("CS2 не запустилась за {} с после выхода HLAE", secs(limit))
+}
+
+/// Консольный порт не открылся.
+pub fn msg_console_not_open(limit: Duration) -> String {
     format!(
-        "{}: ожидание не уложилось в {} с",
-        code.as_str(),
+        "Игра запущена, но консольный порт не открылся за {} с",
         secs(limit)
     )
+}
+
+/// Скрипт `highlights` не выполнился.
+pub fn msg_script_not_run(limit: Duration) -> String {
+    format!(
+        "Демка загружена, но скрипт highlights не выполнился: метка SCRIPT не пришла за {} с",
+        secs(limit)
+    )
+}
+
+/// Метка дубля не пришла; `n` — номер дубля с единицы, `kind` — `TAKE_START` или `TAKE_END`.
+pub fn msg_take_timeout(n: u32, m: u32, kind: &str, limit: Duration) -> String {
+    format!(
+        "Дубль {n} из {m}: метка {kind} не пришла за {} с",
+        secs(limit)
+    )
+}
+
+/// Пришла метка, но не та, что ждали.
+pub fn msg_misordered(got: &str, expected: &str) -> String {
+    format!("пришла метка {got} вместо {expected}")
+}
+
+/// Машина просит READY напрямую, потому что демка уже идёт.
+pub fn msg_ready_direct() -> String {
+    "демка идёт, а метки READY нет — запрашиваю её напрямую".to_owned()
+}
+
+/// Команду в консоль отправить не удалось.
+pub fn msg_send_failed(line: &str, error: &str) -> String {
+    format!("не удалось отправить в консоль «{line}»: {error}")
 }
 
 #[cfg(test)]

@@ -1,0 +1,33 @@
+{
+  "contract": "1.0.0",
+  "flavor": "core",
+  "milestone": null,
+  "phases": [
+    {
+      "number": "1",
+      "name": "Новый путь записи с понятными сбоями",
+      "status": "in_progress"
+    },
+    {
+      "number": "2",
+      "name": "Предпроверка, отмена и только свои процессы",
+      "status": "pending"
+    },
+    {
+      "number": "3",
+      "name": "Проверенные дубли, повтор и восстановление",
+      "status": "pending"
+    },
+    {
+      "number": "4",
+      "name": "Очередь без присмотра и приёмка",
+      "status": "pending"
+    }
+  ],
+  "next": {
+    "command": "/gsd:progress --next",
+    "label": "Advance to the next step",
+    "reason": "Phase 1 of 4 · 0% · executing"
+  },
+  "updated_at": "2026-10-10T10:21:02.239Z"
+}

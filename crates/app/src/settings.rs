@@ -28,6 +28,8 @@ pub struct Settings {
     pub gpu_encode: bool,
     /// Подробный ролик: весь KAST и все ракурсы (в ~2 раза длиннее).
     pub detailed: bool,
+    /// Подстроки строк AFXERROR, которые не останавливают запись (D-09). Правится руками в settings.json, экрана нет; по умолчанию пусто.
+    pub afxerror_ignore: Vec<String>,
 }
 
 impl Settings {
@@ -55,14 +57,16 @@ impl Default for Settings {
             resolution: 720,
             gpu_encode: true,
             detailed: false,
+            afxerror_ignore: Vec::new(),
         }
     }
 }
 
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("XDG_DATA_HOME")).map(PathBuf::from).or_else(|| {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
-    });
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("XDG_DATA_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
     base.unwrap_or_else(|| PathBuf::from(".")).join("cs2cinema")
 }
 
@@ -97,5 +101,13 @@ mod tests {
         let s: Settings = serde_json::from_str(r#"{"hlae_dir":"C:/hlae","load_wait_secs":40,"fps":90}"#).unwrap();
         assert_eq!((s.hlae_dir.as_str(), s.fps), ("C:/hlae", 90));
         assert_eq!(s.time_margin, 1.0, "прежнее поле игнорируется, запас по умолчанию ×1.0");
+    }
+
+    #[test]
+    fn settings_without_afxerror_ignore_still_load() {
+        let old: Settings = serde_json::from_str(r#"{"hlae_dir":"C:/hlae","fps":90}"#).unwrap();
+        assert!(old.afxerror_ignore.is_empty(), "старый файл без поля — пустой список");
+        let new: Settings = serde_json::from_str(r#"{"afxerror_ignore":["shader cache","audio"]}"#).unwrap();
+        assert_eq!(new.afxerror_ignore, vec!["shader cache".to_owned(), "audio".to_owned()]);
     }
 }

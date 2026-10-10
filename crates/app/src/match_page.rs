@@ -238,7 +238,7 @@ fn hint(app: &mut App, ui: &mut Ui) {
     });
 }
 
-/// Поставить задачу на монтаж; для записи сначала проверяем HLAE и CS2 (путь к HLAE ищем сами).
+/// Поставить задачу на монтаж; для записи путь к HLAE ищем сами, остальное проверяет предпроверка задачи.
 fn enqueue(app: &mut App, kind: JobKind) {
     if kind == JobKind::Record {
         if !Path::new(&app.s.hlae_dir).join("HLAE.exe").is_file() {
@@ -248,11 +248,7 @@ fn enqueue(app: &mut App, kind: JobKind) {
                 app.s.save();
             }
         }
-        if let Err(e) = launch::check_paths(&app.s.hlae_dir, &app.s.cs2_dir) {
-            app.status.finish(Err(e));
-            app.page = Page::Settings;
-            return;
-        }
+        // пути HLAE и CS2 проверит предпроверка задачи: неисправное окружение остановит её за секунды с понятной причиной
     }
     match app.enqueue(kind) {
         Ok(id) => {

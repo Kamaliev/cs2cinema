@@ -132,7 +132,7 @@ pub fn record_request(s: &Settings, out_dir: &Path, demo_name: &str, plan: &pipe
         takes: plan.takes.clone(),
         deadlines: deadlines(s),
         header: format!("задача #{job_id} · {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")),
-        afxerror_ignore: Vec::new(),
+        afxerror_ignore: s.afxerror_ignore.clone(),
     }
 }
 
@@ -258,9 +258,14 @@ fn run(job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOut
     // NVENC: для склейки — у ffmpeg из PATH, для дублей — у ffmpeg, которым пишет HLAE
     let (mut nvenc, mut take_nvenc) = (false, false);
     if s.gpu_encode && job.kind != JobKind::Plan {
-        let check = launch::nvenc_check(Path::new("ffmpeg"));
+        // проба с дедлайном и отменой задачи (TMO-03): зависший ffmpeg не вешает задачу
+        let probe_for = deadlines(s).nvenc_probe;
+        let cancel = || p.cancelled();
+        let check = launch::nvenc_check(&*host, Path::new("ffmpeg"), probe_for, &cancel);
+        take_nvenc = launch::hlae_ffmpeg(&s.hlae_dir).is_some_and(|f| launch::has_nvenc(&*host, &f, probe_for, &cancel));
+        // отмена во время пробы прерывает задачу, а не превращается в «NVENC недоступен»
+        pipeline::check(p)?;
         nvenc = check.is_ok();
-        take_nvenc = launch::hlae_ffmpeg(&s.hlae_dir).is_some_and(|f| launch::has_nvenc(&f));
         p.log(&format!("кодирование: дубли — {}, склейка — {}", if take_nvenc { "NVENC" } else { "процессор" }, if nvenc { "NVENC" } else { "процессор" }));
         if let Err(e) = check {
             p.log(&format!("NVENC недоступен: {e}"));
@@ -627,5 +632,30 @@ mod tests {
         assert_eq!(j.phase, "", "лестница спрятана до начала записи");
         assert_eq!(Report::from_json(j.precheck.as_deref().unwrap()), Some(report));
         let _ = std::fs::remove_dir_all(std::path::Path::new(&s.cs2_dir).parent().unwrap());
+    }
+
+    #[test]
+    fn nvenc_probe_that_hangs_is_cut_by_its_deadline() {
+        let host = FakeHost::new(Scenario::happy(1).run_result(Err(HostError::Timeout)));
+        let e = launch::nvenc_check(&host, Path::new("ffmpeg"), Duration::from_secs(20), &|| false).unwrap_err();
+        assert!(e.contains("не уложилась"), "{e}");
+        assert!(e.contains("20 с"), "{e}");
+        assert!(!launch::has_nvenc(&host, Path::new("ffmpeg"), Duration::from_secs(20), &|| false));
+    }
+
+    #[test]
+    fn afxerror_ignore_from_settings_reaches_the_record_request() {
+        let mut s = Settings::default();
+        let plan = pipeline::Plan {
+            timeline: director::Timeline { map: "de_nuke".into(), tick_rate: 64.0, server_start_tick: 0, shots: vec![] },
+            out_dir: std::path::PathBuf::new(),
+            ffmpeg_args: vec![],
+            video_secs: 0.0,
+            takes: two_takes(),
+            nonce: "ab12cd34".into(),
+        };
+        assert!(record_request(&s, Path::new("out"), "cs2cinema_m", &plan, 7).afxerror_ignore.is_empty(), "по умолчанию список пуст");
+        s.afxerror_ignore = vec!["shader cache".into()];
+        assert_eq!(record_request(&s, Path::new("out"), "cs2cinema_m", &plan, 7).afxerror_ignore, vec!["shader cache".to_owned()]);
     }
 }

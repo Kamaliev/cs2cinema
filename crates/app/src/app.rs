@@ -57,6 +57,12 @@ pub struct Reporter {
 }
 
 impl Reporter {
+    /// Отчёт без окна для тестов: сообщения уходят в никуда.
+    #[cfg(test)]
+    pub fn detached() -> Self {
+        Reporter { tx: channel().0, ctx: egui::Context::default() }
+    }
+
     pub fn send(&self, m: Msg) {
         let _ = self.tx.send(m);
         self.ctx.request_repaint();
@@ -367,6 +373,11 @@ impl App {
     /// У выполняемой статус «отменяется» ставится в этом же кадре (D-11), не дожидаясь потока задачи.
     pub fn cancel_job(&mut self, id: i64) {
         match &self.jobs.running {
+            // второе нажатие: игра уже закрывается — закрыть свой job сразу, без `quit` и ожидания (D-12)
+            Some((rid, token)) if *rid == id && token.is_cancelled() => {
+                token.force();
+                self.status.push(&format!("задача #{id}: закрываю игру сразу, без ожидания"));
+            }
             Some((rid, token)) if *rid == id => {
                 token.cancel();
                 if let Err(e) = self.store.set_cancelling(id) {

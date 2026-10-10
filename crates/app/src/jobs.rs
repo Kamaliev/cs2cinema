@@ -29,14 +29,26 @@ use crate::{
 /// Токен отмены: кнопка в окне ставит флаг, исполнитель проверяет его между этапами
 /// и во всех ожиданиях (загрузка игры, запись, ffmpeg).
 #[derive(Clone, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+pub struct CancelToken {
+    cancel: Arc<AtomicBool>,
+    /// Второе нажатие (D-12): закрыть свой job сразу, без `quit` и ожидания.
+    force: Arc<AtomicBool>,
+}
 
 impl CancelToken {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+    /// «Закрыть игру сразу»: подразумевает обычную отмену.
+    pub fn force(&self) {
+        self.cancel();
+        self.force.store(true, Ordering::SeqCst);
     }
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.cancel.load(Ordering::SeqCst)
+    }
+    pub fn is_forced(&self) -> bool {
+        self.force.load(Ordering::SeqCst)
     }
 }
 
@@ -80,6 +92,9 @@ impl Progress for JobReporter {
     }
     fn cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+    fn force_cancelled(&self) -> bool {
+        self.cancel.is_forced()
     }
     /// Состояние записи — в строку задачи (для лестницы в карточке), любое событие — в журнал.
     /// Подсостояние не пишем в `stage`: полоска прогресса сопоставляет `stage` с `Stage::ALL`.
@@ -443,6 +458,20 @@ mod tests {
         for d in [a, b, c] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn force_implies_cancel_and_is_seen_by_the_reporter() {
+        let token = CancelToken::default();
+        assert!(!token.is_cancelled() && !token.is_forced());
+        token.cancel();
+        assert!(token.is_cancelled() && !token.is_forced(), "обычная отмена не закрывает сразу");
+        let token = CancelToken::default();
+        let rep = JobReporter { store: Store::in_memory().unwrap(), id: 1, ui: Reporter::detached(), cancel: token.clone(), out_dir: OnceLock::new() };
+        assert!(!rep.force_cancelled());
+        token.force();
+        assert!(token.is_cancelled(), "force включает и отмену");
+        assert!(rep.cancelled() && rep.force_cancelled());
     }
 
     #[test]

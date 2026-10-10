@@ -193,6 +193,11 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                     }
                     JobStatus::Cancelling => {
                         ui.add_enabled(false, egui::Button::new("Отменяется…"));
+                        // второе нажатие (D-12): не ждать `quit`, если игра зависла на выходе
+                        if ui.small_button("Закрыть игру сразу").on_hover_text("Завершить свой job без ожидания quit — если игра зависла на выходе").clicked()
+                        {
+                            *act = Some(Act::Cancel(j.id));
+                        }
                     }
                     JobStatus::Done => {
                         if let Some(p) = &j.result {

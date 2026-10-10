@@ -196,6 +196,23 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                 if matches!(j.status, JobStatus::Failed | JobStatus::Interrupted) && j.fail_code.is_some() {
                     error_block(ui, j);
                 }
+                // у задач, которые не выполняются: сводка длительности этапов и журналы прошлых попыток (D-11, D-13, RET-06)
+                if !matches!(j.status, JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling) {
+                    if let Some(text) = stage_summary_text(&j.log) {
+                        ui.add(egui::Label::new(RichText::new(text).color(MUTED).size(12.5)).wrap());
+                    }
+                    if let Some(logs) = app.jobs.old_logs.get(&j.id).filter(|l| !l.is_empty()) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("прошлые попытки:").color(MUTED).size(12.5));
+                            for p in logs {
+                                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                if ui.small_button(&name).on_hover_text(p.display().to_string()).clicked() {
+                                    ui::open_path(p);
+                                }
+                            }
+                        });
+                    }
+                }
                 // мета: шоты, длина, размер файла
                 let mut meta: Vec<String> = Vec::new();
                 if let Some(n) = j.shots {
@@ -378,11 +395,33 @@ fn ladder(ui: &mut Ui, j: &Job, takes: Option<(u32, u32)>) {
     });
 }
 
-/// Блок типизированной ошибки: код и состояние, сообщение, подсказка, время, путь к `record.log` и хвост консоли (D-07).
+/// Строка над сообщением об ошибке: «Попытка N · этап X · КОД · состояние». Пустые части пропускаются (D-13, OBS-02).
+fn attempt_line(j: &Job, code: &str, state: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if j.attempt > 0 {
+        parts.push(format!("Попытка {}", j.attempt));
+    }
+    if !j.stage.is_empty() {
+        parts.push(format!("этап {}", j.stage));
+    }
+    parts.extend([code, state].into_iter().filter(|p| !p.is_empty()).map(str::to_owned));
+    parts.join(" · ")
+}
+
+/// Сводка «по этапам» последней попытки из журнала задачи: «по этапам: Скачивание 12 с · Разбор 4 с». Нет строк этапов — `None` (D-11).
+pub fn stage_summary_text(log: &str) -> Option<String> {
+    let stages = store::journal::stage_summary(log);
+    if stages.is_empty() {
+        return None;
+    }
+    Some(format!("по этапам: {}", stages.iter().map(|(name, dur)| format!("{name} {dur}")).collect::<Vec<_>>().join(" · ")))
+}
+
+/// Блок типизированной ошибки: попытка, этап, код и состояние, сообщение, подсказка, время, путь к `record.log` и хвост консоли (D-07).
 fn error_block(ui: &mut Ui, j: &Job) {
     let code = j.fail_code.as_deref().unwrap_or_default();
     let state = j.fail_state.as_deref().and_then(RecordState::from_code).map_or("", RecordState::title);
-    ui.label(RichText::new(format!("{code} · {state}")).color(MUTED).size(12.5));
+    ui.label(RichText::new(attempt_line(j, code, state)).color(MUTED).size(12.5));
     if let Some(e) = j.error.as_deref().filter(|e| !e.is_empty()) {
         ui.add(egui::Label::new(RichText::new(e).color(BAD)).wrap());
     }
@@ -464,5 +503,25 @@ mod tests {
             assert_eq!(card_buttons(status, true, true, false), CardButtons { retry: None, redo: false, open_dir: false }, "{status:?}");
         }
         assert_eq!(card_buttons(Done, false, true, false), CardButtons { retry: None, redo: false, open_dir: true });
+    }
+
+    #[test]
+    fn stage_summary_text_lists_the_last_attempt() {
+        use std::time::Duration;
+        use store::journal::{StartKind, outcome_line, separator, stage_line};
+        let log = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            separator(1, "10:00", StartKind::First),
+            stage_line("Скачивание", Duration::from_secs(99)),
+            outcome_line(1, "сбой"),
+            separator(2, "10:30", StartKind::Retry),
+            stage_line("Скачивание", Duration::from_secs(12)),
+            stage_line("Разбор", Duration::from_secs(4)),
+            stage_line("Запись", Duration::from_secs(252)),
+            outcome_line(2, "готово"),
+        );
+        assert_eq!(stage_summary_text(&log).as_deref(), Some("по этапам: Скачивание 12 с · Разбор 4 с · Запись 4 мин 12 с"));
+        assert_eq!(stage_summary_text("просто строка\nдругая"), None);
+        assert_eq!(stage_summary_text(""), None);
     }
 }

@@ -204,9 +204,16 @@ pub fn console_line_ok(line: &str) -> bool {
     !line.is_empty() && !line.contains(['\r', '\n', '\0'])
 }
 
-/// Хост по умолчанию. Пока везде `UnsupportedHost`; на Windows его заменит `WinHost`.
+/// Хост по умолчанию: `WinHost` на Windows, на остальных платформах — заглушка `UnsupportedHost`.
 pub fn default_host() -> Box<dyn Host> {
-    Box::new(UnsupportedHost)
+    #[cfg(windows)]
+    {
+        Box::new(win::WinHost::new())
+    }
+    #[cfg(not(windows))]
+    {
+        Box::new(UnsupportedHost)
+    }
 }
 
 #[cfg(test)]

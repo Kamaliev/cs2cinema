@@ -20,11 +20,12 @@ impl Host for UnsupportedHost {
 
     fn run(
         &self,
-        _cmd: &CmdSpec,
-        _cancel: &dyn Fn() -> bool,
-        _on_line: &mut dyn FnMut(&str),
+        cmd: &CmdSpec,
+        cancel: &dyn Fn() -> bool,
+        on_line: &mut dyn FnMut(&str),
     ) -> Result<CmdOutput, HostError> {
-        Err(HostError::Unsupported)
+        // ffmpeg склейки работает и вне Windows (CI): дедлайн нужен везде, не только игре
+        crate::runner::run_bounded(cmd, cancel, on_line)
     }
 }
 
@@ -42,7 +43,7 @@ mod tests {
         assert!(e.to_string().contains("только в Windows"));
         let run = host.run(
             &CmdSpec {
-                program: "x".into(),
+                program: "cs2cinema-no-such-program".into(),
                 args: vec![],
                 cwd: None,
                 deadline: Duration::from_secs(1),
@@ -50,7 +51,8 @@ mod tests {
             &|| false,
             &mut |_| {},
         );
-        assert_eq!(run, Err(HostError::Unsupported));
+        // утилиты запускаются и без игры (ffmpeg склейки): ошибка запуска, а не «не поддерживается»
+        assert!(matches!(run, Err(HostError::Spawn(_))), "{run:?}");
         let a = host.now();
         assert!(host.now() >= a, "часы должны быть монотонными");
     }

@@ -340,11 +340,11 @@ impl Host for WinHost {
 
     fn run(
         &self,
-        _cmd: &CmdSpec,
-        _cancel: &dyn Fn() -> bool,
-        _on_line: &mut dyn FnMut(&str),
+        cmd: &CmdSpec,
+        cancel: &dyn Fn() -> bool,
+        on_line: &mut dyn FnMut(&str),
     ) -> Result<CmdOutput, HostError> {
-        Err(HostError::Unsupported)
+        crate::runner::run_bounded(cmd, cancel, on_line)
     }
 }
 

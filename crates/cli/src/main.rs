@@ -16,6 +16,7 @@ cs2-cli — хайлайт-ролик из матча FACEIT
   --chronological   показывать по порядку матча, а не «от слабого к лучшему»
   --player <ник>    ролик про одного игрока: все его убийства по порядку (с пролётами)
   --cinematic       пролёт-интро, смена ракурса и замедление на каждом убийстве
+  --detailed        с --player: весь KAST и все ракурсы (в ~2 раза длиннее)
   --fps <N>         fps записи                       (по умолчанию 60)
   --size <ШxВ>      размер кадра ролика = размер окна игры при записи (по умолчанию 1280x720)
   --list            только показать найденные хайлайты
@@ -40,6 +41,7 @@ struct Args {
     order: Order,
     player: Option<String>,
     cinematic: bool,
+    detailed: bool,
     fps: u32,
     size: (u32, u32),
     list_only: bool,
@@ -61,6 +63,7 @@ fn parse_args() -> Result<Args, String> {
         order: Order::BuildUp,
         player: None,
         cinematic: false,
+        detailed: false,
         fps: 60,
         size: (1280, 720),
         list_only: false,
@@ -89,6 +92,7 @@ fn parse_args() -> Result<Args, String> {
             "--chronological" => args.order = Order::Chronological,
             "--player" => args.player = Some(value("--player")?),
             "--cinematic" => args.cinematic = true,
+            "--detailed" => args.detailed = true,
             "--list" => args.list_only = true,
             "--no-flybys" => args.flybys = false,
             "--no-walls" => args.walls = false,
@@ -214,6 +218,7 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
         max_shots: args.max_shots,
         order: args.order,
         cinematic: args.cinematic || hero.is_some(),
+        density: if args.detailed { director::Density::Full } else { director::Density::Balanced },
         ..Default::default()
     };
     let (track, mesh);
@@ -257,15 +262,13 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&out_dir)?;
     // HLAE пишет относительные пути от папки exe игры — в скрипт идут только абсолютные
     let out_dir = std::path::absolute(&out_dir)?;
-    let title = hero.map(|id| {
-        let kills = m.kills.iter().filter(|k| k.attacker == id).count();
-        (m.name(id), format!("{} · {}", m.map, director::plural(kills, "убийство", "убийства", "убийств")))
-    });
+    let (title, outro) = hero.map(|id| director::cards(&m, id)).unzip();
     let rcfg = renderer::Config {
         fps: args.fps,
         size: args.size,
         font_file: font_file(),
         title,
+        outro,
         out_dir: slashes(&out_dir),
         ..Default::default()
     };

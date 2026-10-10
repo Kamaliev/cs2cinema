@@ -114,6 +114,9 @@ pub struct Utility {
     pub tags: Vec<String>,
 }
 
+/// Ослепление короче этого — не считается (экран едва мигнул): и в оценке, и в подписях режиссёра.
+pub const MIN_BLIND_SECS: f32 = 1.2;
+
 /// Оценка гранаты; `None` — ничего важного не сделала.
 pub fn score_grenade(g: &Grenade) -> Option<Utility> {
     let kills = g.kills.len() as f32;
@@ -127,7 +130,8 @@ pub fn score_grenade(g: &Grenade) -> Option<Utility> {
             (s, vec![format!("молотов {} урона", g.damage)], g.damage >= 30 || kills > 0.0)
         }
         GrenadeKind::Flash => {
-            let n = g.blinded.len();
+            // считаем только тех, кого ослепило по-настоящему — иначе в ролик попадают «мигнувшие» флешки
+            let n = g.blinded.iter().filter(|b| b.1 >= MIN_BLIND_SECS).count();
             let longest = g.blinded.iter().map(|b| b.1).fold(0.0, f32::max);
             let s = 6.0 + 7.0 * n as f32 + 2.0 * longest + 12.0 * kills;
             (s, vec![format!("флешка: ослепила {n}")], n >= 2 || kills > 0.0)

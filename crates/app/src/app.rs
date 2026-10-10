@@ -39,6 +39,8 @@ pub enum Msg {
     Stats(String, Result<MatchStats, String>),
     UpdateFound(Result<Option<update::Release>, String>),
     Updated(Result<PathBuf, String>),
+    /// Кадр готового ролика для карточки задачи (RGBA).
+    Thumb { id: i64, size: [usize; 2], rgba: Vec<u8> },
 }
 
 /// Отчёт конвейера из фонового потока в окно.
@@ -97,7 +99,14 @@ pub struct JobsState {
     pub open_log: Option<i64>,
     /// Список надо перечитать из базы (пришли новые строки журнала).
     pub dirty: bool,
+    /// Превью готовых роликов и размеры файлов — по id задачи.
+    pub thumbs: HashMap<i64, egui::TextureHandle>,
+    pub thumb_requested: std::collections::HashSet<i64>,
+    pub sizes: HashMap<i64, u64>,
 }
+
+/// Размер превью ролика в карточке задачи.
+pub const THUMB: [usize; 2] = [192, 108];
 
 impl MatchState {
     /// Пересчитать разбор под выбранного игрока.
@@ -277,6 +286,34 @@ impl App {
             Err(e) => self.status.push(&e),
         }
         self.jobs.dirty = false;
+        for j in &self.jobs.list {
+            if let Some(p) = j.result.as_ref().filter(|p| p.extension().is_some_and(|e| e == "mp4")) {
+                if !self.jobs.sizes.contains_key(&j.id) {
+                    if let Ok(md) = std::fs::metadata(p) {
+                        self.jobs.sizes.insert(j.id, md.len());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Превью готовых роликов: один кадр через ffmpeg в фоне (без декодера в приложении).
+    pub fn request_thumbs(&mut self) {
+        let want: Vec<(i64, PathBuf)> = self
+            .jobs
+            .list
+            .iter()
+            .filter(|j| j.status == store::JobStatus::Done && !self.jobs.thumbs.contains_key(&j.id) && !self.jobs.thumb_requested.contains(&j.id))
+            .filter_map(|j| j.result.clone().filter(|p| p.extension().is_some_and(|e| e == "mp4") && p.is_file()).map(|p| (j.id, p)))
+            .collect();
+        for (id, path) in want {
+            self.jobs.thumb_requested.insert(id);
+            self.spawn(move |r| {
+                if let Some(rgba) = thumbnail(&path) {
+                    r.send(Msg::Thumb { id, size: THUMB, rgba });
+                }
+            });
+        }
     }
 
     /// Поставить задачу на открытый матч и выбранного игрока; возвращает её id.
@@ -389,7 +426,11 @@ impl App {
                         self.jobs.running = None;
                     }
                     match result {
-                        Ok(p) => self.status.finish(Ok(format!("Задача #{id} готова: {}", p.display()))),
+                        Ok(p) => {
+                            let what = if p.extension().is_some_and(|e| e == "mp4") { "ролик" } else { "план и скрипты" };
+                            self.status.finish(Ok(format!("Задача #{id} готова: {what} — {}", p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default())));
+                            self.status.result = Some(p);
+                        }
                         Err(e) if e == pipeline::CANCELLED => {
                             self.status.busy = false;
                             self.status.stage = None;
@@ -428,40 +469,103 @@ impl App {
                     std::process::exit(0);
                 }
                 Msg::Updated(Err(e)) => self.status.finish(Err(format!("обновление не удалось: {e}"))),
+                Msg::Thumb { id, size, rgba } => {
+                    let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+                    let tex = self.ctx.load_texture(format!("thumb-{id}"), img, egui::TextureOptions::LINEAR);
+                    self.jobs.thumbs.insert(id, tex);
+                }
             }
         }
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("CS2 Cinema").strong().size(18.0).color(ui::ACCENT));
-        });
-        ui.label(RichText::new(update::current().unwrap_or("dev")).weak().small());
         ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui::logo(ui, 30.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(ui::b("CS2 Cinema").size(17.0));
+                ui.label(RichText::new(update::current().unwrap_or("dev")).color(ui::MUTED).size(11.5));
+            });
+        });
+        ui.add_space(18.0);
         let active = self.jobs.list.iter().filter(|j| j.is_active()).count();
-        let jobs_title = if active > 0 { format!("Задачи · {active}") } else { "Задачи".to_owned() };
-        for (page, title) in [(Page::Player, "Игрок".to_owned()), (Page::Match, "Матч".to_owned()), (Page::Jobs, jobs_title), (Page::Settings, "Настройки".to_owned())] {
-            let sel = self.page == page;
-            if ui.add_sized([ui.available_width(), 32.0], egui::SelectableLabel::new(sel, RichText::new(title).size(15.0))).clicked() {
+        let items = [(Page::Player, "👤", "Игрок", 0), (Page::Match, "🎯", "Матч", 0), (Page::Jobs, "🎬", "Задачи", active), (Page::Settings, "⚙", "Настройки", 0)];
+        for (page, glyph, title, badge) in items {
+            if nav_item(ui, self.page == page, glyph, title, badge) {
                 self.page = page;
             }
         }
         if let Some(r) = self.update.clone() {
             ui.add_space(16.0);
-            ui.label(RichText::new(format!("Новая версия {}", r.tag)).color(ui::OK));
-            if ui.add_enabled(!self.status.busy, egui::Button::new("Обновить")).clicked() {
-                self.status.start("Скачиваю обновление…");
-                self.spawn(move |r2| r2.send(Msg::Updated(update::install(&r))));
-            }
+            ui::card(ui, |ui| {
+                ui.label(ui::b(format!("Новая версия {}", r.tag)).color(ui::OK));
+                if ui.add_enabled(!self.status.busy, egui::Button::new("Обновить")).clicked() {
+                    self.status.start("Скачиваю обновление…");
+                    self.spawn(move |r2| r2.send(Msg::Updated(update::install(&r))));
+                }
+            });
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(8.0);
-            if let Some(p) = &self.matches.player {
-                ui.label(RichText::new(format!("{} · lvl {} · {} elo", p.nickname, p.level, p.elo)).small().weak());
+            ui.add_space(10.0);
+            if let Some(p) = self.matches.player.clone() {
+                let r = ui
+                    .horizontal(|ui| {
+                        ui.add_space(6.0);
+                        ui::level_badge(ui, p.level);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.add(egui::Label::new(ui::b(&p.nickname).size(14.0)).truncate());
+                            ui.label(RichText::new(format!("{} elo", p.elo)).color(ui::MUTED).size(12.0));
+                        });
+                    })
+                    .response;
+                if r.interact(egui::Sense::click()).clicked() {
+                    self.page = Page::Player;
+                }
             }
         });
     }
+}
+
+/// Пункт навигации: глиф, название, бейдж со счётчиком; у активного — оранжевая полоска слева.
+fn nav_item(ui: &mut egui::Ui, selected: bool, glyph: &str, title: &str, badge: usize) -> bool {
+    let h = 38.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
+    let hovered = resp.hovered();
+    if selected || hovered {
+        let fill = if selected { ui::ACCENT.linear_multiply(0.16) } else { ui::CARD_HOVER };
+        ui.painter().rect_filled(rect.shrink2(egui::vec2(4.0, 1.0)), egui::CornerRadius::same(6), fill);
+    }
+    if selected {
+        let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(4.0, 8.0), egui::vec2(3.0, h - 16.0));
+        ui.painter().rect_filled(bar, egui::CornerRadius::same(2), ui::ACCENT);
+    }
+    let color = if selected { ui::TEXT } else { ui::MUTED };
+    let p = ui.painter();
+    p.text(rect.left_center() + egui::vec2(18.0, 0.0), egui::Align2::LEFT_CENTER, glyph, egui::FontId::proportional(16.0), color);
+    p.text(rect.left_center() + egui::vec2(46.0, 0.0), egui::Align2::LEFT_CENTER, title, egui::FontId::new(15.0, if selected { ui::bold() } else { egui::FontFamily::Proportional }), color);
+    if badge > 0 {
+        let c = rect.right_center() - egui::vec2(20.0, 0.0);
+        p.circle_filled(c, 10.0, ui::ACCENT);
+        p.text(c, egui::Align2::CENTER_CENTER, badge.to_string(), egui::FontId::new(12.0, ui::bold()), egui::Color32::WHITE);
+    }
+    resp.clicked()
+}
+
+/// Кадр ролика (6-я секунда — после заставки) в RGBA размером `THUMB` — через ffmpeg из PATH.
+fn thumbnail(path: &Path) -> Option<Vec<u8>> {
+    let mut c = std::process::Command::new("ffmpeg");
+    c.args(["-nostdin", "-v", "error", "-ss", "6", "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-vf", &format!("scale={}:{}", THUMB[0], THUMB[1]), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    crate::launch::no_window(&mut c);
+    let out = c.output().ok()?;
+    (out.status.success() && out.stdout.len() == THUMB[0] * THUMB[1] * 4).then_some(out.stdout)
 }
 
 impl eframe::App for App {
@@ -480,9 +584,17 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status.ui(ui));
-        egui::SidePanel::left("nav").exact_width(170.0).show(ctx, |ui| self.sidebar(ui));
-        egui::CentralPanel::default().show(ctx, |ui| match self.page {
+        egui::TopBottomPanel::bottom("status").frame(egui::Frame::new().fill(ui::PANEL).inner_margin(egui::Margin::symmetric(12, 6))).show(ctx, |ui| self.status.ui(ui));
+        egui::SidePanel::left("nav")
+            .exact_width(196.0)
+            .resizable(false)
+            .frame(egui::Frame::new().fill(ui::PANEL).inner_margin(egui::Margin::symmetric(6, 4)))
+            .show(ctx, |ui| self.sidebar(ui));
+        if self.page == Page::Jobs {
+            self.request_thumbs();
+        }
+        let central = egui::Frame::new().fill(ui::BG).inner_margin(egui::Margin::symmetric(20, 14));
+        egui::CentralPanel::default().frame(central).show(ctx, |ui| match self.page {
             Page::Player => crate::player::ui(self, ui),
             Page::Match => crate::match_page::ui(self, ui),
             Page::Jobs => crate::jobs_page::ui(self, ui),

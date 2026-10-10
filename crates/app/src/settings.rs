@@ -22,6 +22,19 @@ pub struct Settings {
     pub auto_update: bool,
     /// Сколько секунд ждать загрузки демки перед `exec highlights`.
     pub load_wait_secs: u32,
+    /// Высота кадра (720 / 1080 / 1440): окно игры и ролик, 16:9.
+    pub resolution: u32,
+    /// Кодировать на видеокарте NVIDIA (NVENC), если она есть.
+    pub gpu_encode: bool,
+    /// Подробный ролик: весь KAST и все ракурсы (в ~2 раза длиннее).
+    pub detailed: bool,
+}
+
+impl Settings {
+    pub fn frame_size(&self) -> (u32, u32) {
+        let h = self.resolution.clamp(360, 2160) / 2 * 2;
+        (h * 16 / 9 / 2 * 2, h)
+    }
 }
 
 impl Default for Settings {
@@ -39,6 +52,9 @@ impl Default for Settings {
             minimize_to_tray: true,
             auto_update: true,
             load_wait_secs: 25,
+            resolution: 720,
+            gpu_encode: true,
+            detailed: false,
         }
     }
 }

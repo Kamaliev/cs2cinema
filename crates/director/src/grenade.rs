@@ -1,34 +1,55 @@
-//! Шоты гранаты: камера из-за плеча бросающего (саму гранату игра рендерит — траектория настоящая),
-//! с подъездом по земле к точке взрыва, если путь свободен, -> общий план на взрыв и пострадавших
-//! вблизи и невысоко; затем взрыв глазами тех, кого она решила (видно, сработала ли), и, для флешки,
-//! убийства под неё — повтором со стороны, где видно и убийцу, и ослеплённого.
+//! Шоты гранаты:
+//! * режиссёрский — nade-cam: камера цепляется за настоящий снаряд (полёт из демки) сзади-сверху
+//!   и несётся за ним, перед взрывом тормозит — граната улетает вперёд в кадр, взрыв в замедлении,
+//!   затем облёт на взрыв и пострадавших;
+//! * взрыв глазами тех, кого граната решила (видно, сработала ли), и, для флешки, убийства под неё —
+//!   повтором со стороны, где видно и убийцу, и ослеплённого.
 //!
-//! Камера нигде не отрывается от земли выше роста и не проходит сквозь стены: каждый шаг
-//! проверяется лучом по геометрии карты.
+//! Камера не проходит сквозь стены: каждый шаг проверяется лучом по геометрии карты, а за гранатой
+//! она держится на «пружинной руке» — у стены подтягивается к снаряду, а не замирает.
 
 use cs2::{GrenadeKind, Match, PlayerId};
-use highlights::Utility;
+use highlights::{MIN_BLIND_SECS, Utility};
 
-use crate::{Camera, CamKey, Config, Pose, PositionSource, ScaleKey, Segment, Shot, look_at, rig, tier_of};
+use crate::{Camera, CamKey, Config, Density, Pose, PositionSource, ScaleKey, Segment, Shot, look_at, plural, rig, tier_of};
 
-/// Шаг ключей камеры: полёт быстрый, ключи чаще, чем у пресетов.
-const KEY_EVERY_SECS: f32 = 0.1;
 /// Насколько камера не доезжает до стены, юниты.
 const MARGIN: f32 = 32.0;
-/// Ослепление короче этого — не считается (экран едва мигнул).
-const MIN_BLIND_SECS: f32 = 1.2;
+/// Шаг ключей nade-cam, тики: снаряд быстрый.
+const CHASE_STEP: i32 = 2;
+/// Где камера за снарядом: позади по ходу полёта и выше.
+const CHASE_BACK: f32 = 70.0;
+const CHASE_UP: f32 = 18.0;
+/// Быстрее камера не разворачивается (отскок — плавный разворот, а не рывок), °/с.
+const CHASE_TURN: f32 = 220.0;
+/// Рука, освободившаяся от стены, отрастает не быстрее, юнитов/с.
+const ARM_GROW: f32 = 300.0;
+/// Камера смотрит на точку полёта на столько вперёд, с.
+const AHEAD_SECS: f32 = 0.15;
+/// После взрыва камера ещё столько стоит на нём (наезд), потом облёт, с.
+const SETTLE_SECS: f32 = 0.5;
+/// Флешка ближе этого засвечивает весь кадр — камера встаёт дальше, юниты.
+const FLASH_KEEP: f32 = 300.0;
 
+/// Полёт снаряда: `(тик, позиция)` по возрастанию тиков.
+type Path = [(i32, [f32; 3])];
 
-/// Режиссёрский шот гранаты: камера за гранатой от броска -> общий план на взрыв и пострадавших.
-/// Замедление — только на самом взрыве. Бросок от первого лица уже есть в отрезке раунда.
+/// Режиссёрский шот гранаты: бросок от первого лица -> nade-cam -> встреча со взрывом -> облёт.
+/// Длинный полёт чуть ускорен, взрыв — в замедлении.
 pub fn shoot_grenade(m: &Match, u: &Utility, cfg: &Config, pos: &dyn PositionSource) -> Option<Shot> {
     let g = &u.grenade;
     let tr = m.tick_rate;
     let secs = |s: f32| (s * tr).round() as i32;
     let det = g.detonate_tick;
     let throw = g.throw_tick.unwrap_or(det - secs(1.6)).clamp(det - secs(4.0), det - secs(0.2));
-    let start = (throw - secs(0.3)).max(0);
-    let release = (throw + secs(0.15)).min(det - 1);
+    // настоящий полёт, иначе — расчётная дуга, если она не задевает стен; без них показывать нечего
+    let path = pos.grenade_path(g).filter(|p| p.len() >= 2).or_else(|| ballistic(g, pos, throw, det))?;
+    let release = (throw + secs(0.15)).max(path[0].0).min(det - 1);
+    // бросок от первого лица уже был в отрезке раунда — в сбалансированном монтаже сразу летим за снарядом
+    let start = match cfg.density {
+        Density::Full => (throw - secs(0.3)).max(0),
+        Density::Balanced => release,
+    };
     let seg = |a, b, camera, style: Option<&str>| Segment { start_tick: a, end_tick: b, camera, style: style.map(str::to_owned), colorfulness: None };
 
     let affected = affected(g);
@@ -47,30 +68,22 @@ pub fn shoot_grenade(m: &Match, u: &Utility, cfg: &Config, pos: &dyn PositionSou
     };
     let end = det + secs(after);
 
-    let mut segments = vec![seg(start, release, Camera::Pov { player: g.thrower }, None)];
-    match flight(m, g, pos, release, det, end, wide.as_ref()) {
-        Some(mut keys) => match keys.windows(2).position(|w| w[0].tick == det && w[1].tick == det + 1) {
-            // склейка на общий план — отдельным участком со своим путём камеры
-            Some(i) => {
-                let mut after = keys.split_off(i + 1);
-                after[0].tick = det;
-                segments.push(seg(release, det, Camera::Free { keys }, Some("grenade_chase")));
-                segments.push(seg(det, end, Camera::Free { keys: after }, Some("grenade_wide")));
-            }
-            None => segments.push(seg(release, end, Camera::Free { keys }, Some("grenade_chase"))),
-        },
-        // нет позиции бросающего — полёт показать не из чего
-        None => return None,
+    let mut segments = Vec::new();
+    if start < release {
+        segments.push(seg(start, release, Camera::Pov { player: g.thrower }, None));
+    }
+    let NadeCam { keys, cut } = nade_cam(&path, pos, g.kind, release, det, end, wide.as_ref(), tr);
+    match cut {
+        // облёт упёрся в стену — склейка на общий план отдельным участком со своим путём камеры
+        Some((at, wide_keys)) => {
+            segments.push(seg(release, at, Camera::Free { keys }, Some("nade_cam")));
+            segments.push(seg(at, end, Camera::Free { keys: wide_keys }, Some("grenade_wide")));
+        }
+        None => segments.push(seg(release, end, Camera::Free { keys }, Some("nade_cam"))),
     }
 
-    let what = match g.kind {
-        GrenadeKind::Flash => "Флешка",
-        GrenadeKind::He => "HE",
-        GrenadeKind::Fire => "Молотов",
-        GrenadeKind::Smoke => "Дым",
-    };
     Some(Shot {
-        title: format!("{} — {} (R{}): полёт", m.name(g.thrower), u.tags.join(", "), g.round),
+        title: format!("{} — {} (R{})", m.name(g.thrower), u.tags.join(", "), g.round),
         tier: tier_of(u.score),
         score: u.score,
         player: g.thrower,
@@ -78,11 +91,250 @@ pub fn shoot_grenade(m: &Match, u: &Utility, cfg: &Config, pos: &dyn PositionSou
         start_tick: start,
         end_tick: end,
         segments,
-        timescale: effect_slow(&[det], g.kind, cfg, tr),
+        timescale: nade_speed(release, det, g.kind, cfg, tr),
         zoom: vec![],
-        caption: format!("{what} · полёт и общий план"),
+        caption: grenade_caption(g),
         card: None,
     })
+}
+
+/// Что сделала граната — подписью в кадре: «Флешка · ослепил 3 · до 2.4 с», «HE · 87 урона · 1 убийство».
+fn grenade_caption(g: &cs2::Grenade) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match g.kind {
+        GrenadeKind::Flash => {
+            parts.push("Флешка".into());
+            let blind: Vec<f32> = g.blinded.iter().map(|b| b.1).filter(|&d| d >= MIN_BLIND_SECS).collect();
+            if !blind.is_empty() {
+                parts.push(format!("ослепил {}", blind.len()));
+                parts.push(format!("до {:.1} с", blind.iter().copied().fold(0.0, f32::max)));
+            }
+            if !g.kills.is_empty() {
+                parts.push(format!("{} под неё", plural(g.kills.len(), "убийство", "убийства", "убийств")));
+            }
+        }
+        kind => {
+            parts.push(match kind {
+                GrenadeKind::He => "HE",
+                GrenadeKind::Fire => "Молотов",
+                _ => "Дым",
+            }.into());
+            if g.damage > 0 {
+                parts.push(format!("{} урона", g.damage));
+            }
+            if !g.kills.is_empty() {
+                parts.push(plural(g.kills.len(), "убийство", "убийства", "убийств"));
+            }
+        }
+    }
+    parts.join(" · ")
+}
+
+/// Скорость режиссёрского шота: длинный полёт ускорен (1.4×) и рампой уходит в замедление на взрыве.
+fn nade_speed(release: i32, det: i32, kind: GrenadeKind, cfg: &Config, tr: f32) -> Vec<ScaleKey> {
+    let secs = |s: f32| (s * tr).round() as i32;
+    let slow = if kind == GrenadeKind::Fire { cfg.slow.max(0.5) } else { cfg.slow.min(0.3) };
+    let (a, b) = (det - secs(0.1), det + secs(0.45));
+    let (fast_in, fast_full, brake) = (release + secs(0.2), release + secs(0.45), a - secs(0.35));
+    let mut keys = Vec::new();
+    if (det - release) as f32 / tr > 1.4 && brake > fast_full {
+        keys.extend([ScaleKey { tick: fast_in, scale: 1.0 }, ScaleKey { tick: fast_full, scale: 1.4 }, ScaleKey { tick: brake, scale: 1.4 }]);
+    } else {
+        keys.push(ScaleKey { tick: a - secs(0.22), scale: 1.0 });
+    }
+    keys.extend([ScaleKey { tick: a, scale: slow }, ScaleKey { tick: b, scale: slow }, ScaleKey { tick: b + secs(0.2), scale: 1.0 }]);
+    keys
+}
+
+/// Позиция снаряда в тик (между точками — линейно, за краями — крайняя точка).
+fn path_at(p: &Path, t: i32) -> [f32; 3] {
+    let i = p.partition_point(|x| x.0 <= t);
+    match (i.checked_sub(1).map(|i| p[i]), p.get(i)) {
+        (Some(a), Some(b)) => lerp3(a.1, b.1, (t - a.0) as f32 / (b.0 - a.0).max(1) as f32),
+        (Some(a), None) => a.1,
+        (None, Some(b)) => b.1,
+        (None, None) => [0.0; 3],
+    }
+}
+
+/// Полёта в демке нет — дуга от глаз бросающего до взрыва; `None`, если она задевает стену.
+fn ballistic(g: &cs2::Grenade, pos: &dyn PositionSource, throw: i32, det: i32) -> Option<Vec<(i32, [f32; 3])>> {
+    let eye = pos.eye_pose(g.thrower, throw)?;
+    let p0 = add(eye.pos, scale(dir(eye.ang), 16.0));
+    let p1 = add(g.pos, [0.0, 0.0, 8.0]);
+    let apex = (0.25 * dist(p0, p1)).clamp(20.0, 220.0);
+    let mut path: Vec<(i32, [f32; 3])> = (throw..det).step_by(CHASE_STEP as usize).chain([det]).map(|t| {
+        let u = (t - throw) as f32 / (det - throw).max(1) as f32;
+        (t, add(lerp3(p0, p1, u), [0.0, 0.0, 4.0 * apex * u * (1.0 - u)]))
+    }).collect();
+    path.dedup_by_key(|p| p.0);
+    path.windows(2).all(|w| pos.raycast(w[0].1, w[1].1).is_none()).then_some(path)
+}
+
+/// Повернуть единичный `from` к `to` не больше чем на `max` радиан.
+fn turn_toward(from: [f32; 3], to: [f32; 3], max: f32) -> [f32; 3] {
+    let cos = (from[0] * to[0] + from[1] * to[1] + from[2] * to[2]).clamp(-1.0, 1.0);
+    let angle = cos.acos();
+    if angle <= max {
+        return to;
+    }
+    normalize(lerp3(from, to, max / angle)).unwrap_or(to)
+}
+
+struct NadeCam {
+    keys: Vec<CamKey>,
+    /// Склейка на общий план: с какого тика и его ключи.
+    cut: Option<(i32, Vec<CamKey>)>,
+}
+
+/// Камера режиссёрского шота на `[t0, t1]`:
+/// 1. nade-cam: позади снаряда по ходу полёта и выше, взгляд — на полёт чуть впереди, FOV растёт (скорость);
+/// 2. встреча: за `lead` до взрыва камера тормозит (скорость плавно до нуля), снаряд уходит в кадр,
+///    взгляд переходит на точку взрыва; после взрыва — наезд FOV;
+/// 3. облёт дугой к общему плану `wide` (если дуга свободна от стен, иначе склейка).
+fn nade_cam(path: &Path, pos: &dyn PositionSource, kind: GrenadeKind, t0: i32, det: i32, t1: i32, wide: Option<&Wide>, tr: f32) -> NadeCam {
+    let secs = |s: f32| (s * tr).round() as i32;
+    // ближе этого камера к взрыву не подходит
+    let keep = if kind == GrenadeKind::Flash { FLASH_KEEP } else { 0.0 };
+    let p1 = add(path_at(path, det), [0.0, 0.0, 8.0]);
+    let ahead = |t: i32| path_at(path, (t + secs(AHEAD_SECS)).min(det));
+    let lead = secs(0.45).min(((det - t0) as f32 * 0.4) as i32).max(1);
+    let settle = (det + secs(SETTLE_SECS)).min(t1);
+    let dt = CHASE_STEP as f32 / tr;
+    let arm_full = CHASE_BACK.hypot(CHASE_UP);
+
+    // 1. за снарядом — до взрыва целиком: из него берётся и разгон для торможения
+    let mut chase: Vec<CamKey> = Vec::new();
+    let (mut d_prev, mut arm_prev): (Option<[f32; 3]>, Option<f32>) = (None, None);
+    let mut ticks: Vec<i32> = (t0..det).step_by(CHASE_STEP as usize).collect();
+    ticks.push(det);
+    for &t in &ticks {
+        let g = path_at(path, t);
+        let v = sub(path_at(path, t + 6), path_at(path, t - 6));
+        // по вертикали направление мягче: на взлёте камера не уходит под гранату, на падении — не над ней
+        let want = normalize([v[0], v[1], 0.5 * v[2]]).or(d_prev).unwrap_or([1.0, 0.0, 0.0]);
+        let d = d_prev.map_or(want, |p| turn_toward(p, want, CHASE_TURN.to_radians() * dt));
+        d_prev = Some(d);
+        let off = normalize(add(scale(d, -CHASE_BACK), [0.0, 0.0, CHASE_UP])).unwrap_or([0.0, 0.0, 1.0]);
+        // пружинная рука: у стены — сразу короче, отошли от стены — отрастает плавно
+        let avail = dist(pull(pos, g, add(g, scale(off, arm_full))), g);
+        let arm = match arm_prev {
+            Some(a) if avail > a => (a + ARM_GROW * dt).min(avail),
+            _ => avail,
+        };
+        arm_prev = Some(arm);
+        let cam = add(g, scale(off, arm));
+        let u = (t - t0) as f32 / (det - t0).max(1) as f32;
+        // взгляд вперёд по полёту на отскоке поворачивает резко — тоже ограничиваем скорость поворота
+        let mut ang = look_at(cam, ahead(t));
+        if let Some(prev) = chase.last() {
+            let max = CHASE_TURN * dt;
+            for i in 0..2 {
+                let d = (ang[i] - prev.ang[i] + 540.0).rem_euclid(360.0) - 180.0;
+                ang[i] = prev.ang[i] + d.clamp(-max, max);
+            }
+        }
+        chase.push(CamKey { tick: t, pos: cam, ang, fov: 80.0 + 15.0 * smooth(2.0 * u) });
+    }
+
+    // 2. встреча: от позиции на `meet` камера тормозит до нуля за `lead` (x = c0 + Δ·(2s − s²) —
+    //    скорость в начале как у nade-cam, в конце ноль); если с точки остановки взрыва не видно —
+    //    летим за снарядом до самого взрыва и встаём там
+    let meet = det - lead;
+    let mut i_meet = chase.iter().position(|k| k.tick >= meet).unwrap_or(chase.len() - 1);
+    // флешка засвечивает кадр вблизи — тормозим заранее, пока камера ещё далеко от хлопка
+    if keep > 0.0 {
+        i_meet = chase[..=i_meet].iter().rposition(|k| dist(k.pos, p1) >= keep + 60.0).unwrap_or(0);
+    }
+    let c0 = chase[i_meet].pos;
+    let v0 = match i_meet.checked_sub(1).map(|i| &chase[i]) {
+        Some(prev) => scale(sub(c0, prev.pos), 1.0 / (chase[i_meet].tick - prev.tick).max(1) as f32),
+        None => [0.0; 3],
+    };
+    let span = (det - chase[i_meet].tick).max(1);
+    let mut travel = scale(v0, span as f32 / 2.0);
+    // тормозной путь — не ближе `keep` к взрыву
+    for _ in 0..12 {
+        if keep <= 0.0 || dist(add(c0, travel), p1) >= keep {
+            break;
+        }
+        travel = scale(travel, 0.7);
+    }
+    let stop = pull(pos, c0, add(c0, travel));
+    let brake = pos.raycast(stop, p1).is_none() && pos.raycast(p1, stop).is_none();
+    let mut keys: Vec<CamKey> = Vec::new();
+    let hold = if brake {
+        keys.extend_from_slice(&chase[..i_meet]);
+        let m0 = chase[i_meet].tick;
+        for t in (m0..det).step_by(CHASE_STEP as usize) {
+            let s = (t - m0) as f32 / span as f32;
+            let cam = lerp3(c0, stop, 2.0 * s - s * s);
+            keys.push(CamKey { tick: t, pos: cam, ang: look_at(cam, lerp3(ahead(t), p1, smooth(s))), fov: 95.0 });
+        }
+        stop
+    } else {
+        keys.extend(chase.iter().filter(|k| k.tick < det).cloned());
+        chase.last().map_or(stop, |k| k.pos)
+    };
+    // на взрыве и сразу после: стоим и наезжаем
+    for t in (det..settle).step_by(CHASE_STEP as usize).chain([settle]) {
+        let e = smooth((t - det) as f32 / (settle - det).max(1) as f32);
+        keys.push(CamKey { tick: t, pos: hold, ang: look_at(hold, p1), fov: lerp(95.0, 75.0, e) });
+    }
+    keys.dedup_by_key(|k| k.tick);
+    if settle >= t1 {
+        return NadeCam { keys, cut: None };
+    }
+
+    // 3. облёт от точки остановки к общему плану
+    let step = CHASE_STEP as usize * 2;
+    let mut tail: Vec<i32> = (settle + step as i32..t1).step_by(step).collect();
+    tail.push(t1);
+    let Some(w) = wide else {
+        // общего плана нет: стоим и медленно наезжаем на взрыв
+        for &t in &tail {
+            let e = smooth((t - settle) as f32 / (t1 - settle).max(1) as f32);
+            keys.push(CamKey { tick: t, pos: hold, ang: look_at(hold, p1), fov: lerp(75.0, 65.0, e) });
+        }
+        return NadeCam { keys, cut: None };
+    };
+    let (o0, o1) = (sub(hold, w.target), sub(w.cam, w.target));
+    let (az0, az1) = (o0[1].atan2(o0[0]), o1[1].atan2(o1[0]));
+    let daz = (az1 - az0 + std::f32::consts::PI).rem_euclid(2.0 * std::f32::consts::PI) - std::f32::consts::PI;
+    let (r0, r1) = (o0[0].hypot(o0[1]), o1[0].hypot(o1[1]));
+    let mut orbit = Vec::with_capacity(tail.len());
+    let mut prev = hold;
+    let mut clear = r0 >= 40.0 && daz.abs() <= 60f32.to_radians();
+    for &t in &tail {
+        if !clear {
+            break;
+        }
+        let e = smooth((t - settle) as f32 / (t1 - settle).max(1) as f32);
+        let (az, r) = (az0 + daz * e, lerp(r0, r1, e));
+        let cam = add(w.target, [r * az.cos(), r * az.sin(), lerp(o0[2], o1[2], e)]);
+        let target = lerp3(p1, w.target, e);
+        let ang = look_at(cam, target);
+        // дуга свободна от стен и камера не задирается в небо (иначе в кадре только небо и пальмы)
+        clear = pos.raycast(prev, cam).is_none() && pos.raycast(cam, target).is_none() && ang[0] > -20.0;
+        prev = cam;
+        orbit.push(CamKey { tick: t, pos: cam, ang, fov: lerp(75.0, w.fov, e) });
+    }
+    if clear {
+        keys.extend(orbit);
+        return NadeCam { keys, cut: None };
+    }
+    // склейка: общий план с лёгким дрейфом вокруг группы
+    let r = o1[0].hypot(o1[1]);
+    let wide_keys = std::iter::once(settle)
+        .chain(tail)
+        .map(|t| {
+            let drift = smooth((t - settle) as f32 / (t1 - settle).max(1) as f32);
+            let az = az1 + 8f32.to_radians() * drift;
+            let cam = pull(pos, w.target, [w.target[0] + r * az.cos(), w.target[1] + r * az.sin(), w.cam[2]]);
+            CamKey { tick: t, pos: cam, ang: look_at(cam, w.target), fov: w.fov }
+        })
+        .collect();
+    NadeCam { keys, cut: Some((settle, wide_keys)) }
 }
 
 /// Взрыв залпа глазами тех, кого он решил (убитых ослеплёнными, иначе — самого «наглухо»
@@ -136,6 +388,10 @@ pub fn grenade_victims(m: &Match, volley: &[&Utility], cfg: &Config, pos: &dyn P
     // кого это решило: убитых под гранатой, иначе одного самого «наглухо» ослеплённого / раненых
     let killed: Vec<PlayerId> = volley.iter().flat_map(|u| u.grenade.kills.iter().copied()).collect();
     let mut victims: Vec<PlayerId> = volley.iter().flat_map(|u| affected(&u.grenade)).filter(|p| killed.contains(p)).collect();
+    // сбалансированный монтаж: белый экран ослеплённого или вспышка у раненого без убийства — пустые секунды
+    if victims.is_empty() && cfg.density == Density::Balanced {
+        return Vec::new();
+    }
     if victims.is_empty() {
         let mut rest: Vec<PlayerId> = volley.iter().flat_map(|u| affected(&u.grenade)).collect();
         if kind == GrenadeKind::Flash {
@@ -275,80 +531,6 @@ pub(crate) fn shoulder(pos: &dyn PositionSource, eye: &Pose, toward: [f32; 3]) -
     if dist(b, eye.pos) > dist(a, eye.pos) { b } else { a }
 }
 
-/// Ключи камеры на `[t0, t1]`: до взрыва — из-за плеча бросающего, с подъездом по земле к точке
-/// взрыва, пока путь свободен (саму гранату рендерит игра); после — общий план.
-/// `None` — нет позиции бросающего.
-fn flight(m: &Match, g: &cs2::Grenade, pos: &dyn PositionSource, t0: i32, det: i32, t1: i32, wide: Option<&Wide>) -> Option<Vec<CamKey>> {
-    let eye0 = pos.eye_pose(g.thrower, t0)?;
-    let p1 = add(g.pos, [0.0, 0.0, 8.0]);
-    // куда смотрит камера: от направления броска к точке взрыва по пологой дуге —
-    // примерно так и летит граната, а на рикошете взгляд просто приходит к взрыву
-    let aim = add(eye0.pos, scale(dir(eye0.ang), 400.0));
-    let look = |u: f32| {
-        let u = u.clamp(0.0, 1.0);
-        let p = lerp3(aim, p1, smooth(u));
-        [p[0], p[1], p[2] + 60.0 * u * (1.0 - u)]
-    };
-    let ground = sub(p1, eye0.pos);
-    let base = shoulder(pos, &eye0, ground);
-    // докуда можно подъехать: по земле к взрыву, не ближе 140 юнитов и не дальше первой стены
-    let reach = {
-        let far = ground[0].hypot(ground[1]);
-        let f = normalize([ground[0], ground[1], 0.0]).unwrap_or([0.0; 3]);
-        let want = add(base, scale(f, (far - 140.0).clamp(0.0, 0.6 * far)));
-        pull(pos, base, want)
-    };
-
-    let step = ((KEY_EVERY_SECS * m.tick_rate) as usize).max(1);
-    let mut ticks: Vec<i32> = (t0..t1).step_by(step).collect();
-    ticks.extend([t1, det]);
-    ticks.sort_unstable();
-    ticks.dedup();
-
-    let mut keys = Vec::with_capacity(ticks.len() + 1);
-    let mut cam_prev = base;
-    for &t in ticks.iter().filter(|&&t| t <= det) {
-        let u = (t - t0) as f32 / (det - t0).max(1) as f32;
-        // бросающий может двигаться — держимся за его плечом, постепенно подъезжая к взрыву
-        let e = pos.eye_pose(g.thrower, t).unwrap_or(eye0);
-        let want = lerp3(shoulder(pos, &e, ground), reach, smooth(u));
-        // шаг делаем, только если на пути и до точки взгляда нет стены; иначе стоим
-        let cam = if pos.raycast(cam_prev, want).is_none() && pos.raycast(want, look(u)).is_none() { want } else { cam_prev };
-        keys.push(CamKey { tick: t, pos: cam, ang: look_at(cam, look(u)), fov: 90.0 });
-        cam_prev = cam;
-    }
-    let last_flight = cam_prev;
-    // плавный переезд к общему плану — только если по пути нет стен, иначе склейка
-    let glide = wide.is_some_and(|w| pos.raycast(last_flight, w.cam).is_none() && pos.raycast(w.cam, last_flight).is_none());
-    let reveal = (0.6 * m.tick_rate).max(1.0);
-
-    for t in ticks.into_iter().filter(|&t| t > det) {
-        let Some(w) = wide else {
-            // общего плана нет: держим последний ракурс на точке взрыва
-            keys.push(CamKey { tick: t, pos: last_flight, ang: look_at(last_flight, p1), fov: 85.0 });
-            continue;
-        };
-        let e = if glide { smooth((t - det) as f32 / reveal) } else { 1.0 };
-        if !glide && keys.last().is_some_and(|k: &CamKey| k.tick == det) {
-            // склейка: следующий тик уже на общем плане
-            keys.push(CamKey { tick: det + 1, pos: w.cam, ang: look_at(w.cam, w.target), fov: w.fov });
-            if t == det + 1 {
-                continue;
-            }
-        }
-        // лёгкий дрейф вокруг группы
-        let drift = ((t - det) as f32 / (t1 - det).max(1) as f32).clamp(0.0, 1.0);
-        let off = sub(w.cam, w.target);
-        let az = off[1].atan2(off[0]) + (8.0f32).to_radians() * smooth(drift);
-        let r = off[0].hypot(off[1]);
-        let orbit = pull(pos, w.target, [w.target[0] + r * az.cos(), w.target[1] + r * az.sin(), w.cam[2]]);
-        let cam = lerp3(last_flight, orbit, e);
-        let target = lerp3(p1, w.target, e);
-        keys.push(CamKey { tick: t, pos: cam, ang: look_at(cam, target), fov: lerp(85.0, w.fov, e) });
-    }
-    Some(keys)
-}
-
 struct Wide {
     cam: [f32; 3],
     target: [f32; 3],
@@ -451,4 +633,221 @@ fn normalize(a: [f32; 3]) -> Option<[f32; 3]> {
 
 fn lerp3(a: [f32; 3], b: [f32; 3], e: f32) -> [f32; 3] {
     [a[0] + (b[0] - a[0]) * e, a[1] + (b[1] - a[1]) * e, a[2] + (b[2] - a[2]) * e]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const THROW: i32 = 1000;
+    const BOUNCE: i32 = 1064;
+    const DET: i32 = 1128;
+
+    /// Флешка: 1 с дугой вдоль +x до (800, 0), отскок, ещё 1 с вдоль +y до (800, 300).
+    /// Бросающий (1) в начале координат, ослеплённый (2) — у точки взрыва.
+    fn flight() -> Vec<(i32, [f32; 3])> {
+        (THROW..=DET)
+            .step_by(2)
+            .map(|t| {
+                let p = if t <= BOUNCE {
+                    let u = (t - THROW) as f32 / (BOUNCE - THROW) as f32;
+                    [800.0 * u, 0.0, 64.0 * (1.0 - u) + 300.0 * u * (1.0 - u)]
+                } else {
+                    let u = (t - BOUNCE) as f32 / (DET - BOUNCE) as f32;
+                    [800.0, 300.0 * u, 60.0 * u * (1.0 - u)]
+                };
+                (t, p)
+            })
+            .collect()
+    }
+
+    /// `wall_x` — бесконечная стена-плоскость x = const.
+    struct Scene {
+        path: Option<Vec<(i32, [f32; 3])>>,
+        wall_x: Option<f32>,
+    }
+
+    impl PositionSource for Scene {
+        fn eye_pose(&self, p: PlayerId, _: i32) -> Option<Pose> {
+            match p.0 {
+                1 => Some(Pose { pos: [0.0, 0.0, 64.0], ang: [0.0, 0.0, 0.0] }),
+                2 => Some(Pose { pos: [900.0, 320.0, 64.0], ang: [0.0, 180.0, 0.0] }),
+                _ => None,
+            }
+        }
+        fn raycast(&self, a: [f32; 3], b: [f32; 3]) -> Option<f32> {
+            let x = self.wall_x?;
+            ((a[0] - x) * (b[0] - x) < 0.0).then(|| (x - a[0]) / (b[0] - a[0]))
+        }
+        fn grenade_path(&self, _: &cs2::Grenade) -> Option<Vec<(i32, [f32; 3])>> {
+            self.path.clone()
+        }
+    }
+
+    fn setup(kind: GrenadeKind) -> (Match, Utility) {
+        let m = Match::build("de_test".into(), 64.0, vec![(1, 0, "ace".into(), 1), (2, 1, "bob".into(), 2)], &[]);
+        let grenade = cs2::Grenade {
+            kind,
+            thrower: PlayerId(1),
+            round: 3,
+            throw_tick: Some(THROW),
+            detonate_tick: DET,
+            pos: [800.0, 300.0, 0.0],
+            damage: if kind == GrenadeKind::Flash { 0 } else { 87 },
+            hurt: if kind == GrenadeKind::Flash { vec![] } else { vec![PlayerId(2)] },
+            blinded: if kind == GrenadeKind::Flash { vec![(PlayerId(2), 2.43)] } else { vec![] },
+            kills: vec![],
+        };
+        (m, Utility { grenade, score: 20.0, tags: vec!["флешка".into()] })
+    }
+
+    /// Подробный монтаж: бросок от первого лица отдельным участком перед nade-cam.
+    fn full() -> Config {
+        Config { density: Density::Full, ..Config::default() }
+    }
+
+    fn free_keys(shot: &Shot) -> Vec<CamKey> {
+        shot.segments.iter().flat_map(|s| match &s.camera {
+            Camera::Free { keys } => keys.clone(),
+            _ => vec![],
+        }).collect()
+    }
+
+    #[test]
+    fn camera_chases_the_real_grenade_then_brakes_before_blast() {
+        let (m, u) = setup(GrenadeKind::He);
+        let pos = Scene { path: Some(flight()), wall_x: None };
+        let shot = shoot_grenade(&m, &u, &full(), &pos).unwrap();
+        assert!(matches!(shot.segments[0].camera, Camera::Pov { .. }), "бросок от первого лица");
+        assert_eq!(shot.segments[1].style.as_deref(), Some("nade_cam"));
+        let keys = free_keys(&shot);
+        let path = flight();
+        let release = THROW + 10;
+        let lead = (0.45f32 * 64.0).round() as i32;
+        // nade-cam: позади снаряда по ходу полёта, рядом, снаряд в кадре
+        for k in keys.iter().filter(|k| k.tick >= release && k.tick < DET - lead) {
+            let g = path_at(&path, k.tick);
+            let d = dist(k.pos, g);
+            assert!((30.0..=80.0).contains(&d), "тик {}: до гранаты {d}", k.tick);
+            assert!(rig::visibility(k, g) > 0.5, "тик {}: граната вне кадра", k.tick);
+        }
+        // до отскока камера позади по +x
+        let k = keys.iter().find(|k| k.tick == 1040).unwrap();
+        assert!(k.pos[0] < path_at(&path, 1040)[0] - 30.0, "{k:?}");
+        // отскок: разворот камеры не быстрее CHASE_TURN (+ запас на взгляд вперёд)
+        for w in keys.windows(2).filter(|w| w[0].tick >= release && w[1].tick < DET - lead) {
+            let dyaw = (w[1].ang[1] - w[0].ang[1] + 540.0).rem_euclid(360.0) - 180.0;
+            let rate = dyaw.abs() / ((w[1].tick - w[0].tick) as f32 / 64.0);
+            assert!(rate < 2.0 * CHASE_TURN, "{rate}°/с на тике {}", w[1].tick);
+        }
+        // встреча: к взрыву камера останавливается, а граната — у взрыва в кадре
+        // скорость камеры (юнитов за тик) у первого ключа с тиком ≥ t
+        let speed = |t: i32| {
+            let i = keys.iter().position(|k| k.tick >= t).unwrap();
+            dist(keys[i - 1].pos, keys[i].pos) / (keys[i].tick - keys[i - 1].tick) as f32
+        };
+        assert!(speed(DET - lead + 4) > 3.0 * speed(DET - 2), "{} -> {}", speed(DET - lead + 4), speed(DET - 2));
+        let at_det = keys.iter().find(|k| k.tick == DET).unwrap();
+        assert!(rig::visibility(at_det, [800.0, 300.0, 8.0]) > 0.9);
+        assert!(at_det.fov > 90.0, "на взрыве широкий кадр, дальше наезд");
+        for s in &shot.segments {
+            if let Camera::Free { keys } = &s.camera {
+                assert!(keys.windows(2).all(|w| w[0].tick < w[1].tick), "тики по возрастанию: {:?}", keys.iter().map(|k| k.tick).collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(keys.last().unwrap().tick, shot.end_tick);
+    }
+
+    #[test]
+    fn flash_is_watched_from_a_distance() {
+        // вблизи хлопок засвечивает весь кадр: камера встаёт не ближе FLASH_KEEP и видит его
+        let (m, u) = setup(GrenadeKind::Flash);
+        let pos = Scene { path: Some(flight()), wall_x: None };
+        let shot = shoot_grenade(&m, &u, &full(), &pos).unwrap();
+        let keys = free_keys(&shot);
+        let blast = [800.0, 300.0, 8.0];
+        let at_det = keys.iter().find(|k| k.tick == DET).unwrap();
+        assert!(dist(at_det.pos, blast) >= FLASH_KEEP - 1.0, "{}", dist(at_det.pos, blast));
+        assert!(rig::visibility(at_det, blast) > 0.9);
+        // пока хлопок яркий (до конца наезда) — не ближе; облёт к ослеплённым потом может подойти
+        for k in keys.iter().filter(|k| (DET - 20..DET + 32).contains(&k.tick)) {
+            assert!(dist(k.pos, blast) >= FLASH_KEEP - 1.0, "тик {}: {}", k.tick, dist(k.pos, blast));
+        }
+    }
+
+    #[test]
+    fn long_flight_is_sped_up_and_blast_is_slow() {
+        let (m, u) = setup(GrenadeKind::Flash);
+        let pos = Scene { path: Some(flight()), wall_x: None };
+        let shot = shoot_grenade(&m, &u, &full(), &pos).unwrap();
+        let ts = &shot.timescale;
+        assert!(ts.iter().any(|k| k.scale > 1.3), "{ts:?}");
+        let slow = ts.iter().filter(|k| k.tick >= DET - 10 && k.tick <= DET + 30).map(|k| k.scale).fold(1.0, f32::min);
+        assert!(slow <= 0.3, "{ts:?}");
+        assert!(ts.windows(2).all(|w| w[0].tick < w[1].tick));
+        // короткий полёт — без ускорения
+        let mut short = u.clone();
+        short.grenade.throw_tick = Some(DET - 50);
+        let path: Vec<_> = flight().into_iter().filter(|p| p.0 >= DET - 50).collect();
+        let shot = shoot_grenade(&m, &short, &Config::default(), &Scene { path: Some(path), wall_x: None }).unwrap();
+        assert!(shot.timescale.iter().all(|k| k.scale <= 1.0), "{:?}", shot.timescale);
+    }
+
+    #[test]
+    fn camera_never_goes_through_walls() {
+        let (m, u) = setup(GrenadeKind::He);
+        // стена за точкой отскока (пострадавший — за ней): внутри участка камера её не пересекает,
+        // на ту сторону — только склейкой
+        let pos = Scene { path: Some(flight()), wall_x: Some(830.0) };
+        let shot = shoot_grenade(&m, &u, &full(), &pos).unwrap();
+        for s in &shot.segments {
+            if let Camera::Free { keys } = &s.camera {
+                for w in keys.windows(2) {
+                    assert!(pos.raycast(w[0].pos, w[1].pos).is_none(), "сквозь стену: {:?} -> {:?}", w[0], w[1]);
+                }
+            }
+        }
+        let chase = match &shot.segments[1].camera {
+            Camera::Free { keys } => keys,
+            _ => unreachable!(),
+        };
+        assert!(chase.iter().all(|k| k.pos[0] < 830.0), "за гранатой камера не заходит за стену");
+    }
+
+    #[test]
+    fn falls_back_to_ballistic_arc_without_flight_data() {
+        let (m, u) = setup(GrenadeKind::He);
+        let shot = shoot_grenade(&m, &u, &full(), &Scene { path: None, wall_x: None }).unwrap();
+        assert_eq!(shot.segments[1].style.as_deref(), Some("nade_cam"));
+        // дуга упирается в стену — полёта нет, шота нет (пострадавших покажут их глазами)
+        assert!(shoot_grenade(&m, &u, &Config::default(), &Scene { path: None, wall_x: Some(400.0) }).is_none());
+    }
+
+    #[test]
+    fn blinded_without_a_kill_is_shown_only_in_full_montage() {
+        let (m, u) = setup(GrenadeKind::Flash);
+        let pos = Scene { path: None, wall_x: None };
+        assert!(grenade_victims(&m, &[&u], &Config::default(), &pos, &mut vec![]).is_empty(), "белый экран без убийства — пустые секунды");
+        assert_eq!(grenade_victims(&m, &[&u], &full(), &pos, &mut vec![]).len(), 1);
+        let mut killed = u.clone();
+        killed.grenade.kills.push(PlayerId(2));
+        assert_eq!(grenade_victims(&m, &[&killed], &Config::default(), &pos, &mut vec![]).len(), 1);
+        // сбалансированный монтаж: без броска от первого лица, сразу за снарядом
+        let shot = shoot_grenade(&m, &u, &Config::default(), &Scene { path: Some(flight()), wall_x: None }).unwrap();
+        assert_eq!(shot.segments[0].style.as_deref(), Some("nade_cam"));
+    }
+
+    #[test]
+    fn caption_says_what_the_grenade_did() {
+        let (_, mut u) = setup(GrenadeKind::Flash);
+        u.grenade.blinded.push((PlayerId(3), 1.6));
+        u.grenade.blinded.push((PlayerId(4), 0.7)); // едва мигнуло — не считается
+        u.grenade.kills.push(PlayerId(2));
+        assert_eq!(grenade_caption(&u.grenade), "Флешка · ослепил 2 · до 2.4 с · 1 убийство под неё");
+        let (_, mut u) = setup(GrenadeKind::He);
+        u.grenade.kills = vec![PlayerId(2), PlayerId(3)];
+        assert_eq!(grenade_caption(&u.grenade), "HE · 87 урона · 2 убийства");
+        let (_, u) = setup(GrenadeKind::Fire);
+        assert_eq!(grenade_caption(&u.grenade), "Молотов · 87 урона");
+    }
 }

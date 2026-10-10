@@ -125,11 +125,31 @@ pub struct PlanOptions {
     pub refresh_maps: bool,
     pub offline: bool,
     pub maps_dir: Option<PathBuf>,
+    /// Размер кадра: и окно игры, и ролик.
+    pub size: (u32, u32),
+    /// Кодер склейки.
+    pub encoder: renderer::Encoder,
+    /// Дубли HLAE кодировать на видеокарте (`renderer::TAKE_NVENC`).
+    pub take_nvenc: bool,
+    /// Подробный ролик про игрока: весь KAST и все ракурсы (`director::Density::Full`).
+    pub detailed: bool,
 }
 
 impl Default for PlanOptions {
     fn default() -> Self {
-        Self { fps: 60, chronological: false, flybys: true, walls: true, refresh_maps: false, offline: false, maps_dir: None }
+        Self {
+            fps: 60,
+            chronological: false,
+            flybys: true,
+            walls: true,
+            refresh_maps: false,
+            offline: false,
+            maps_dir: None,
+            size: (1280, 720),
+            encoder: renderer::Encoder::default(),
+            take_nvenc: false,
+            detailed: false,
+        }
     }
 }
 
@@ -138,6 +158,8 @@ pub struct Plan {
     pub out_dir: PathBuf,
     /// Аргументы ffmpeg для склейки дублей (запускать в `out_dir`).
     pub ffmpeg_args: Vec<String>,
+    /// Длина готового ролика, с.
+    pub video_secs: f32,
 }
 
 /// Игрок демки по FACEIT: сначала по SteamID, затем по нику (точно, потом подстрокой без учёта регистра).
@@ -168,6 +190,7 @@ pub fn plan_player(a: &mut Analysis, hero: PlayerId, o: &PlanOptions, out_dir: &
     let cfg = director::Config {
         order: if o.chronological { Order::Chronological } else { Order::BuildUp },
         cinematic: true,
+        density: if o.detailed { director::Density::Full } else { director::Density::Balanced },
         ..Default::default()
     };
     let mesh = load_positions(a, o, p)?;
@@ -185,14 +208,31 @@ pub fn plan_player(a: &mut Analysis, hero: PlayerId, o: &PlanOptions, out_dir: &
     };
 
     std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
-    let kills = a.m.kills.iter().filter(|k| k.attacker == hero).count();
-    let title = (a.m.name(hero), format!("{} · {}", a.m.map, director::plural(kills, "убийство", "убийства", "убийств")));
+    let (title, outro) = director::cards(&a.m, hero);
     // HLAE ищет campath относительно game\bin\win64, поэтому в скрипте нужен абсолютный путь
-    let rcfg = renderer::Config { fps: o.fps, out_dir: absolute_slash(out_dir), font_file: font_file(), title: Some(title), ..Default::default() };
+    let mut rcfg = renderer::Config {
+        fps: o.fps,
+        size: o.size,
+        out_dir: absolute_slash(out_dir),
+        font_file: font_file(),
+        title: Some(title),
+        outro: Some(outro),
+        encoder: o.encoder,
+        ..Default::default()
+    };
+    if o.take_nvenc {
+        rcfg.dialect.record_ffmpeg = Some(renderer::TAKE_NVENC.into());
+    }
     let out = renderer::render(&a.m, &timeline, &rcfg);
-    let ffmpeg_args = renderer::ffmpeg_args(&timeline, &rcfg).unwrap_or_default();
+    let (ffmpeg_args, video_secs) = renderer::ffmpeg_args(&timeline, &rcfg).unwrap_or_default();
+    // скрипты и пути камер прошлого плана (их могло быть больше) — убираем, чтобы не путали
+    for e in std::fs::read_dir(out_dir).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with("cs2c_") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
     out.write_to(out_dir).map_err(|e| format!("запись в {}: {e}", out_dir.display()))?;
-    Ok(Plan { timeline, out_dir: out_dir.to_path_buf(), ffmpeg_args })
+    Ok(Plan { timeline, out_dir: out_dir.to_path_buf(), ffmpeg_args, video_secs })
 }
 
 /// Позиции игроков (для пролётов) и геометрия карты (чтобы камера не смотрела сквозь стены).

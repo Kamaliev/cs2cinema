@@ -323,7 +323,7 @@ pub fn build(preset: &Preset, pos: &dyn PositionSource, s: &Scene, t0: i32, t1: 
 }
 
 /// Насколько точка видна в кадре: 1 — внутри (с полями), дальше спад до 0.
-fn visibility(cam: &CamKey, point: [f32; 3]) -> f32 {
+pub(crate) fn visibility(cam: &CamKey, point: [f32; 3]) -> f32 {
     let a = look_at(cam.pos, point);
     let dyaw = wrap(a[1] - cam.ang[1]).abs();
     let dpitch = wrap(a[0] - cam.ang[0]).abs();

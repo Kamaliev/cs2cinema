@@ -1,10 +1,11 @@
 //! Запуск CS2 через HLAE, управление консолью игры и ожидание готовых клипов.
 
 use std::{
-    io::Write,
+    io::{BufRead, BufReader, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command},
+    sync::mpsc,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -119,10 +120,48 @@ pub fn install_files(cs2_dir: &str, out_dir: &Path, demo_name: &str, write_demo:
     write_demo(&csgo.join(format!("{demo_name}.dem")))
 }
 
-pub fn launch(hlae_dir: &str, cs2_dir: &str, demo_name: &str) -> Result<Child, String> {
+/// ffmpeg, которым пишет HLAE: `Path=` из `ffmpeg\ffmpeg.ini` в папке HLAE.
+pub fn hlae_ffmpeg(hlae_dir: &str) -> Option<PathBuf> {
+    let ini = std::fs::read_to_string(Path::new(hlae_dir).join("ffmpeg/ffmpeg.ini")).ok()?;
+    let path = ini.lines().find_map(|l| l.trim().strip_prefix("Path=").map(|p| p.trim().trim_matches('"').to_owned()))?;
+    Some(PathBuf::from(path)).filter(|p| p.is_file())
+}
+
+/// Работает ли NVENC у этого ffmpeg: короткий пробный энкод (кодер может быть в сборке, но без драйвера NVIDIA).
+pub fn has_nvenc(ffmpeg: &Path) -> bool {
+    nvenc_check(ffmpeg).is_ok()
+}
+
+/// Пробное кодирование NVENC; в ошибке — первая строка ffmpeg (например, «драйвер старее, чем нужно»).
+pub fn nvenc_check(ffmpeg: &Path) -> Result<(), String> {
+    let mut c = Command::new(ffmpeg);
+    c.args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=256x144:d=0.2", "-c:v", "h264_nvenc", "-f", "null", "-"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    no_window(&mut c);
+    let out = c.output().map_err(|e| format!("ffmpeg не запустился: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    let line = err.lines().find(|l| l.contains("nvenc") || l.contains("driver") || l.contains("Driver")).or_else(|| err.lines().next()).unwrap_or("");
+    // «[h264_nvenc @ 0x…] Driver does not support…» — префикс не нужен
+    let msg = line.rsplit("] ").next().unwrap_or(line).trim();
+    Err(if msg.is_empty() { "h264_nvenc не заработал".into() } else { msg.to_owned() })
+}
+
+/// Свободный TCP-порт для консоли игры (если не нашёлся — `NETCON_PORT`).
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0)).and_then(|l| l.local_addr()).map(|a| a.port()).unwrap_or(NETCON_PORT)
+}
+
+pub fn launch(hlae_dir: &str, cs2_dir: &str, demo_name: &str, (w, h): (u32, u32), port: u16) -> Result<Child, String> {
     let hook = Path::new(hlae_dir).join("x64/AfxHookSource2.dll");
+    // окно = кадр ролика: лишние пиксели игра рендерит и кодирует зря
     let cmdline = format!(
-        "-insecure -steam -novid -allow_third_party_software -netconport {NETCON_PORT} -windowed -w 1920 -h 1080 +demo_ui_mode 0 +playdemo {demo_name}"
+        "-insecure -steam -novid -allow_third_party_software -netconport {port} -windowed -w {w} -h {h} +demo_ui_mode 0 +playdemo {demo_name}"
     );
     let mut cmd = Command::new(Path::new(hlae_dir).join("HLAE.exe"));
     cmd.current_dir(hlae_dir)
@@ -134,21 +173,58 @@ pub fn launch(hlae_dir: &str, cs2_dir: &str, demo_name: &str) -> Result<Child, S
     cmd.spawn().map_err(|e| format!("не удалось запустить HLAE: {e}"))
 }
 
-/// Ждёт, пока игра откроет консольный порт, и отправляет команды.
-pub fn send_console(cmds: &[&str], timeout: Duration) -> Result<(), String> {
-    let start = Instant::now();
-    loop {
-        match TcpStream::connect(("127.0.0.1", NETCON_PORT)) {
-            Ok(mut s) => {
-                for c in cmds {
-                    s.write_all(format!("{c}\n").as_bytes()).map_err(|e| e.to_string())?;
-                    std::thread::sleep(Duration::from_millis(300));
-                }
-                return Ok(());
+/// Консоль игры по netcon: команды туда, строки вывода — обратно (читаются в своём потоке).
+pub struct Console {
+    stream: TcpStream,
+    lines: mpsc::Receiver<String>,
+}
+
+impl Console {
+    /// Ждёт, пока игра откроет консольный порт.
+    pub fn connect(port: u16, timeout: Duration, cancelled: &dyn Fn() -> bool) -> Result<Self, String> {
+        let start = Instant::now();
+        loop {
+            if cancelled() {
+                return Err(pipeline::CANCELLED.to_owned());
             }
-            Err(e) if start.elapsed() > timeout => return Err(format!("консоль игры не открылась ({e})")),
-            Err(_) => std::thread::sleep(Duration::from_secs(2)),
+            match Self::open(port) {
+                Ok(c) => return Ok(c),
+                Err(e) if start.elapsed() > timeout => return Err(format!("консоль игры не открылась ({e})")),
+                Err(_) => std::thread::sleep(Duration::from_secs(1)),
+            }
         }
+    }
+
+    /// Одна попытка подключиться (для повторов, пока ждём дубли).
+    pub fn try_connect(port: u16) -> Option<Self> {
+        Self::open(port).ok()
+    }
+
+    fn open(port: u16) -> std::io::Result<Self> {
+        let stream = TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_secs(2))?;
+        let (tx, lines) = mpsc::channel();
+        let reader = stream.try_clone()?;
+        std::thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            let mut buf = Vec::new();
+            // вывод консоли не обязан быть UTF-8 — читаем байты
+            while r.read_until(b'\n', &mut buf).is_ok_and(|n| n > 0) {
+                if tx.send(String::from_utf8_lossy(&buf).trim().to_owned()).is_err() {
+                    break;
+                }
+                buf.clear();
+            }
+        });
+        Ok(Self { stream, lines })
+    }
+
+    pub fn send(&mut self, cmd: &str) -> Result<(), String> {
+        self.stream.write_all(format!("{cmd}\n").as_bytes()).map_err(|e| format!("консоль игры: {e}"))
+    }
+
+    /// Строки, пришедшие с прошлого вызова.
+    pub fn drain(&self) -> Vec<String> {
+        self.lines.try_iter().collect()
     }
 }
 
@@ -198,40 +274,45 @@ pub fn kill_game() {
     }
 }
 
-/// Ждёт, пока HLAE допишет клип последнего шота (папка появилась после `since` и перестала меняться).
-/// `alive` — вернуть false, если игра закрыта: тогда ждать дальше нечего; `cancelled` — отмена задачи.
+/// Ждёт, пока HLAE допишет клип последнего дубля (папка появилась после `since` и перестала меняться).
+/// `finished` — игра сообщила, что последний дубль записан (маркер в консоли): тогда хватает 3 с тишины,
+/// иначе — 20 с. `alive` — false, если игра закрыта: ждать дальше нечего; `cancelled` — отмена задачи.
 pub fn wait_for_clips(
     out_dir: &Path,
-    last_shot: usize,
+    last_take: usize,
     since: SystemTime,
+    finished: &mut dyn FnMut() -> bool,
     alive: &dyn Fn() -> bool,
     cancelled: &dyn Fn() -> bool,
-    progress: &dyn Fn(&str),
 ) -> Result<(), String> {
-    let dir = out_dir.join("clips").join(format!("take{last_shot:04}"));
-    let mut last_seen: Option<(SystemTime, usize, Instant)> = None;
+    let dir = out_dir.join("clips").join(format!("take{last_take:04}"));
+    // размер, а не только время: HLAE дописывает mp4 после конца записи
+    let mut last_seen: Option<(SystemTime, u64, Instant)> = None;
     loop {
         if cancelled() {
             return Err(pipeline::CANCELLED.to_owned());
         }
-        if let Some((t, n)) = newest_mtime(&dir) {
+        // спрашиваем каждый раз: заодно показывает прогресс по дублям
+        let finished = finished();
+        if let Some((t, size)) = newest_mtime(&dir).map(|(t, _)| (t, dir_size(&dir))) {
             if t >= since {
-                progress(&format!("записано кадров: {n}"));
                 match last_seen {
-                    Some((pt, pn, since_i)) if pt == t && pn == n => {
-                        if since_i.elapsed() > Duration::from_secs(8) && !alive() {
-                            return Ok(());
-                        }
-                        if since_i.elapsed() > Duration::from_secs(20) {
+                    Some((pt, ps, quiet)) if pt == t && ps == size => {
+                        let q = quiet.elapsed();
+                        if q > Duration::from_secs(3) && finished || q > Duration::from_secs(8) && !alive() || q > Duration::from_secs(20) {
                             return Ok(());
                         }
                     }
-                    _ => last_seen = Some((t, n, Instant::now())),
+                    _ => last_seen = Some((t, size, Instant::now())),
                 }
             }
         } else if !alive() {
             return Err("игра закрыта, а последний клип так и не появился".into());
         }
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()
 }

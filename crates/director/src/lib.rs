@@ -43,6 +43,12 @@ pub trait PositionSource {
     fn raycast(&self, _from: [f32; 3], _to: [f32; 3]) -> Option<f32> {
         None
     }
+
+    /// Настоящий полёт снаряда гранаты: точки `(тик, позиция)` от броска до взрыва.
+    /// По умолчанию неизвестен.
+    fn grenade_path(&self, _g: &cs2::Grenade) -> Option<Vec<(i32, [f32; 3])>> {
+        None
+    }
 }
 
 /// Заглушка: позиций нет, свободные пролёты отключены.
@@ -155,6 +161,18 @@ pub enum Order {
     Chronological,
 }
 
+/// Плотность ролика про игрока (`direct_all`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Density {
+    /// Весь KAST: каждый раунд с ассистом или разменом, все ракурсы на каждое убийство,
+    /// гранаты и глазами всех пострадавших. В ~2 раза длиннее.
+    Full,
+    /// Только раунды с убийствами (гранаты — если под них убили), не больше одного
+    /// дополнительного ракурса на убийство и двух на раунд, короткие отрезки от первого лица.
+    #[default]
+    Balanced,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Целевая длина ролика, секунды.
@@ -166,11 +184,12 @@ pub struct Config {
     /// Подача «как у эпика» для любого момента: пролёт-интро, смена ракурса на каждом
     /// убийстве, пролёт в финале и замедление на всех убийствах.
     pub cinematic: bool,
+    pub density: Density,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { target_secs: 60.0, max_shots: 12, order: Order::BuildUp, slow: 0.4, slow_final: 0.18, cinematic: false }
+        Self { target_secs: 60.0, max_shots: 12, order: Order::BuildUp, slow: 0.4, slow_final: 0.18, cinematic: false, density: Density::default() }
     }
 }
 
@@ -193,14 +212,30 @@ impl Timeline {
 
 /// За сколько секунд после смерти тиммейта ответное убийство — размен.
 const TRADE_SECS: f32 = 5.0;
+/// Длиннее этого отрезок от первого лица режем по самой долгой паузе между действиями (сбалансированный монтаж), с.
+const MAX_CHUNK_SECS: f32 = 9.0;
+/// Дополнительных ракурсов на убийства в раунде (сбалансированный монтаж); гранаты и размен — сверх того.
+const MAX_ALT_PER_ROUND: usize = 2;
+/// Одиночное убийство с оценкой ниже этой — рядовое: без дополнительного ракурса.
+const ALT_MIN_SCORE: f32 = 12.0;
 
-/// Ролик про одного игрока (`hero`) — весь его полезный KAST за игру, по раундам. В каждом раунде,
-/// где он убил, ассистировал (в том числе гранатой) или его смерть разменяли:
+/// Дополнительный шот раунда (повтор, глазами противника, граната, размен) и к какому моменту
+/// он относится — после отрезка от первого лица с этим тиком он и встанет.
+struct Extra {
+    anchor: i32,
+    priority: f32,
+    shot: Shot,
+}
+
+/// Ролик про одного игрока (`hero`) по раундам. В каждом раунде:
 /// 1. отрезок раунда его глазами — кусками вокруг действий, нормальная скорость;
-/// 2. режиссура — только на сильных моментах (серии, эффектные убийства) и важных гранатах;
-/// 3. глазами противников: каждое убийство с момента, когда игрок у них появился
-///    (иначе — из-за плеча противника); взрыв гранаты глазами тех, кого она решила;
-///    размен — глазами тиммейта.
+/// 2. сразу после куска — дополнительные ракурсы на то, что в нём было: повтор со стороны
+///    (серии, эффектные убийства), глазами противника (с момента, когда игрок у него появился),
+///    полёт гранаты и её взрыв глазами того, кого она решила, размен — глазами тиммейта.
+///
+/// `Density::Full` — весь KAST (раунды с ассистом или разменом тоже) и все ракурсы;
+/// `Density::Balanced` — только раунды с убийствами, не больше одного ракурса на убийство и двух на раунд,
+/// лучший раунд — в финале (если порядок не хронологический).
 ///
 /// Шоты перекрываются по времени — запись отматывает демку назад.
 pub fn direct_all(m: &Match, hero: PlayerId, highlights: &[Highlight], utility: &[Utility], cfg: &Config, pos: &dyn PositionSource) -> Timeline {
@@ -211,6 +246,7 @@ pub fn direct_all(m: &Match, hero: PlayerId, highlights: &[Highlight], utility: 
         shots.sort_by_key(|s| s.start_tick);
         return Timeline { map: m.map.clone(), tick_rate: m.tick_rate, server_start_tick: m.server_start_tick, shots };
     }
+    let full = cfg.density == Density::Full;
     let tr = m.tick_rate;
     let secs = |s: f32| (s * tr).round() as i32;
     let name = m.name(hero);
@@ -233,17 +269,21 @@ pub fn direct_all(m: &Match, hero: PlayerId, highlights: &[Highlight], utility: 
         })
         .collect();
 
+    // раунд попадает в ролик: с убийством — всегда; с гранатой — если под неё убили (Full: любая важная);
+    // ассист и размен сами по себе — только в Full
     let mut rounds: Vec<u32> = highlights
         .iter()
         .map(|h| h.round)
-        .chain(utility.iter().map(|u| u.grenade.round))
-        .chain(assists.iter().map(|k| k.round))
-        .chain(trades.iter().map(|(d, _)| d.round))
+        .chain(utility.iter().filter(|u| full || !u.grenade.kills.is_empty()).map(|u| u.grenade.round))
+        .chain(assists.iter().filter(|_| full).map(|k| k.round))
+        .chain(trades.iter().filter(|_| full).map(|(d, _)| d.round))
         .collect();
     rounds.sort_unstable();
     rounds.dedup();
 
-    let mut shots: Vec<Shot> = Vec::new();
+    let (pre, post) = if full { (2.5, 1.5) } else { (1.8, 1.2) };
+    let gap = secs(if full { 5.0 } else { 3.0 });
+    let mut blocks: Vec<(f32, Vec<Shot>)> = Vec::new();
     for round in rounds {
         let mut hs: Vec<&Highlight> = highlights.iter().filter(|h| h.round == round).collect();
         hs.sort_by_key(|h| h.first_tick());
@@ -254,27 +294,23 @@ pub fn direct_all(m: &Match, hero: PlayerId, highlights: &[Highlight], utility: 
         // гранаты залпом (две поп-флешки подряд) — один полёт и один набор вставок
         let volleys = volleys(&us, secs(3.0));
 
-        // 1. раунд глазами игрока — кусками вокруг действий, пустой бег между ними вырезаем
-        let floor = m.round(round).and_then(|r| r.freeze_end_tick.or(Some(r.start_tick))).unwrap_or(0);
+        // 1. раунд глазами игрока — кусками вокруг действий, пустой бег между ними вырезаем;
+        // раньше конца фриза (с запасом: на старте раунда экран выходит из затемнения) не начинаем
+        let floor = m.round(round).map_or(0, |r| r.freeze_end_tick.map_or(r.start_tick + secs(1.5), |f| f + secs(0.5)));
         let mut spans: Vec<(i32, i32)> = hs
             .iter()
-            .flat_map(|h| h.kills.iter().map(|k| (k.tick - secs(2.5), k.tick + secs(1.5))))
+            .flat_map(|h| h.kills.iter().map(|k| (k.tick - secs(pre), k.tick + secs(post))))
             .chain(us.iter().map(|u| {
                 let g = &u.grenade;
-                (g.throw_tick.unwrap_or(g.detonate_tick - secs(1.5)) - secs(1.0), g.detonate_tick + secs(1.2))
+                let throw = g.throw_tick.unwrap_or(g.detonate_tick - secs(1.5));
+                if full { (throw - secs(1.0), g.detonate_tick + secs(1.2)) } else { (throw - secs(0.5), g.detonate_tick + secs(1.0)) }
             }))
-            .chain(assists_here.iter().map(|k| (k.tick - secs(2.5), k.tick + secs(1.5))))
-            .chain(trades_here.iter().map(|(d, _)| (d.tick - secs(2.5), d.tick + secs(0.6))))
+            .chain(assists_here.iter().map(|k| (k.tick - secs(pre), k.tick + secs(post))))
+            .chain(trades_here.iter().map(|(d, _)| (d.tick - secs(pre), d.tick + secs(0.6))))
             .map(|(a, b)| (a.max(floor), b))
             .collect();
         spans.sort_unstable();
-        let mut chunks: Vec<(i32, i32)> = Vec::new();
-        for (a, b) in spans {
-            match chunks.last_mut() {
-                Some(last) if a - last.1 <= secs(5.0) => last.1 = last.1.max(b),
-                _ => chunks.push((a, b)),
-            }
-        }
+        let chunks = chunk_spans(&spans, gap, if full { i32::MAX } else { secs(MAX_CHUNK_SECS) });
         let kills: usize = hs.iter().map(|h| h.kills.len()).sum();
         let mut summary: Vec<String> = Vec::new();
         if kills > 0 {
@@ -296,8 +332,10 @@ pub fn direct_all(m: &Match, hero: PlayerId, highlights: &[Highlight], utility: 
         }
         let tier = hs.iter().map(|h| tier_of(h.score)).max_by_key(|t| *t as u8).unwrap_or(Tier::Good);
         let score = hs.iter().map(|h| h.score).fold(0.0, f32::max);
-        for (i, &(from, to)) in chunks.iter().enumerate() {
-            shots.push(Shot {
+        let pov_chunks: Vec<Shot> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, &(from, to))| Shot {
                 title: format!("{name} — раунд {round}, кусок {} из {}", i + 1, chunks.len()),
                 tier,
                 score,
@@ -308,35 +346,47 @@ pub fn direct_all(m: &Match, hero: PlayerId, highlights: &[Highlight], utility: 
                 segments: vec![Segment { start_tick: from, end_tick: to, camera: Camera::Pov { player: hero }, style: None, colorfulness: None }],
                 timescale: vec![],
                 zoom: vec![],
-                caption: format!("Раунд {round} · глазами {name}"),
-                card: (i == 0).then(|| (format!("Раунд {round}"), summary.join(" · "))),
-            });
-        }
+                // плашка раунда на первом куске говорит, чей это раунд; подпись не дублируем
+                caption: if full { format!("Раунд {round} · глазами {name}") } else { String::new() },
+                card: (i == 0).then(|| (round_title(m, hero, round), summary.join(" · "))),
+            })
+            .collect();
 
-        // 2. режиссура: только сильные моменты и гранаты, по порядку
-        let mut director: Vec<Shot> = Vec::new();
-        for h in hs.iter().filter(|h| is_strong(h)) {
+        // 2. дополнительные ракурсы: на убийство — повтор со стороны (серии, эффектные) или глазами противника
+        let mut alts: Vec<Extra> = Vec::new();
+        for h in &hs {
             for k in &h.kills {
-                director.extend(replay_shot(m, h, k, pos, &mut used));
+                let (ks, _) = score_kill(k);
+                let priority = ks + if h.kills.len() >= 2 { 10.0 } else { 0.0 };
+                let replay = is_strong(h).then(|| replay_shot(m, h, k, cfg, pos, &mut used)).flatten();
+                let victim = || victim_shot(m, h, k, pos, cfg, full);
+                if full {
+                    alts.extend(replay.map(|shot| Extra { anchor: k.tick, priority, shot }));
+                    alts.extend(victim().map(|shot| Extra { anchor: k.tick, priority, shot }));
+                } else if let Some(shot) = replay.or_else(|| (ks >= ALT_MIN_SCORE || h.kills.len() >= 2).then(victim).flatten()) {
+                    alts.push(Extra { anchor: k.tick, priority, shot });
+                }
             }
         }
-        for v in &volleys {
-            // в залпе летим за той гранатой, что сделала больше
-            let best = v.iter().max_by(|a, b| a.score.total_cmp(&b.score)).expect("залп не пуст");
-            director.extend(shoot_grenade(m, best, cfg, pos));
+        if !full {
+            alts.sort_by(|a, b| b.priority.total_cmp(&a.priority));
+            alts.truncate(MAX_ALT_PER_ROUND);
         }
-        director.sort_by_key(|s| s.start_tick);
-        shots.extend(director);
-
-        // 3. глазами противников и тиммейтов
-        let mut enemies: Vec<Shot> = hs.iter().flat_map(|h| h.kills.iter().filter_map(move |k| victim_shot(m, h, k, pos, cfg))).collect();
+        // гранаты: полёт за той, что сделала больше, и взрыв глазами того, кого она решила;
+        // в сбалансированном монтаже флешка без убийства под неё полёта не заслуживает
         for v in &volleys {
-            enemies.extend(grenade_victims(m, v, cfg, pos, &mut used));
+            let best = v.iter().max_by(|a, b| a.score.total_cmp(&b.score)).expect("залп не пуст");
+            let det = best.grenade.detonate_tick;
+            let flight = full || !best.grenade.kills.is_empty() || matches!(best.grenade.kind, cs2::GrenadeKind::He | cs2::GrenadeKind::Fire);
+            if flight {
+                alts.extend(shoot_grenade(m, best, cfg, pos).map(|shot| Extra { anchor: det, priority: best.score, shot }));
+            }
+            alts.extend(grenade_victims(m, v, cfg, pos, &mut used).into_iter().map(|shot| Extra { anchor: det, priority: best.score, shot }));
         }
         // размен — глазами тиммейта, который отомстил
-        enemies.extend(trades_here.iter().map(|(_, x)| {
+        alts.extend(trades_here.iter().map(|(d, x)| {
             let (a, b) = (x.tick - secs(1.5), x.tick + secs(0.5));
-            Shot {
+            let shot = Shot {
                 title: format!("{} разменивает {} за {name}", m.name(x.attacker), m.name(x.victim)),
                 tier: Tier::Good,
                 score: 0.0,
@@ -349,12 +399,108 @@ pub fn direct_all(m: &Match, hero: PlayerId, highlights: &[Highlight], utility: 
                 zoom: vec![],
                 caption: format!("Размен · {} за {name}", m.name(x.attacker)),
                 card: None,
-            }
+            };
+            Extra { anchor: d.tick, priority: 0.0, shot }
         }));
-        enemies.sort_by_key(|s| s.start_tick);
-        shots.extend(enemies);
+        blocks.push((score, interleave(pov_chunks, alts)));
     }
+    // финал — лучший раунд (в хронологическом порядке — как есть)
+    if !full && cfg.order != Order::Chronological && blocks.len() > 1 {
+        if let Some(best) = blocks.iter().enumerate().max_by(|a, b| a.1.0.total_cmp(&b.1.0)).map(|(i, _)| i) {
+            let b = blocks.remove(best);
+            blocks.push(b);
+        }
+    }
+    let shots = blocks.into_iter().flat_map(|(_, s)| s).collect();
     Timeline { map: m.map.clone(), tick_rate: m.tick_rate, server_start_tick: m.server_start_tick, shots }
+}
+
+/// Отрезки действий -> куски от первого лица: соседние (пауза ≤ `gap`) сливаются, кусок длиннее
+/// `max_len` режется по самой долгой паузе внутри (пока режется).
+fn chunk_spans(spans: &[(i32, i32)], gap: i32, max_len: i32) -> Vec<(i32, i32)> {
+    let mut groups: Vec<Vec<(i32, i32)>> = Vec::new();
+    for &(a, b) in spans {
+        match groups.last_mut() {
+            Some(g) if a - g.last().map_or(a, |l| l.1) <= gap => g.push((a, b)),
+            _ => groups.push(vec![(a, b)]),
+        }
+    }
+    let mut out = Vec::new();
+    let mut queue: Vec<Vec<(i32, i32)>> = groups.into_iter().rev().collect();
+    while let Some(g) = queue.pop() {
+        let (from, to) = (g[0].0, g.iter().map(|s| s.1).max().unwrap_or(g[0].1));
+        // самая долгая пауза между соседними отрезками (конец предыдущего — начало следующего)
+        let cut = g
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| (w[1].0 - w[0].1, i))
+            .filter(|(d, _)| *d > 0)
+            .max();
+        match cut {
+            Some((_, i)) if to - from > max_len => {
+                let (left, right) = g.split_at(i + 1);
+                queue.push(right.to_vec());
+                queue.push(left.to_vec());
+            }
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
+/// Куски от первого лица по порядку, после каждого — ракурсы на то, что в нём было (по тику).
+/// Ракурс между кусками встаёт после предыдущего, раньше первого — после первого.
+fn interleave(chunks: Vec<Shot>, mut extras: Vec<Extra>) -> Vec<Shot> {
+    extras.sort_by_key(|e| e.anchor);
+    let mut slots: Vec<Vec<Shot>> = (0..chunks.len()).map(|_| Vec::new()).collect();
+    for e in extras {
+        let i = chunks.iter().rposition(|c| c.start_tick <= e.anchor).unwrap_or(0);
+        slots[i].push(e.shot);
+    }
+    chunks.into_iter().zip(slots).flat_map(|(c, s)| std::iter::once(c).chain(s)).collect()
+}
+
+/// Заставки ролика про игрока: интро «Sihnel / de_dust2 · 23 убийства · победа 13:11»
+/// и итоги «Sihnel / 23-15-4 · HS 48 % · K/D 1.53».
+pub fn cards(m: &Match, hero: PlayerId) -> ((String, String), (String, String)) {
+    let r = cs2::report::player_report(m, hero);
+    let name = m.name(hero);
+    let (won, lost) = r.rounds.iter().fold((0, 0), |(w, l), row| match row.won {
+        Some(true) => (w + 1, l),
+        Some(false) => (w, l + 1),
+        None => (w, l),
+    });
+    let result = match (won + lost > 0, won.cmp(&lost)) {
+        (false, _) => None,
+        (_, std::cmp::Ordering::Greater) => Some(format!("победа {won}:{lost}")),
+        (_, std::cmp::Ordering::Less) => Some(format!("поражение {won}:{lost}")),
+        (_, std::cmp::Ordering::Equal) => Some(format!("ничья {won}:{lost}")),
+    };
+    let mut intro = vec![m.map.clone(), plural(r.duels.kills as usize, "убийство", "убийства", "убийств")];
+    intro.extend(result.clone());
+    let mut outro = vec![format!("{}-{}-{}", r.duels.kills, r.duels.deaths, r.duels.assists), format!("HS {:.0} %", r.duels.hs_pct()), format!("K/D {:.2}", r.duels.kd())];
+    outro.extend(result);
+    ((name.clone(), intro.join(" · ")), (name, outro.join(" · ")))
+}
+
+/// «Раунд 12 · CT · 7:4»: сторона и счёт героя перед раундом, если демка сообщила команды и победителей.
+fn round_title(m: &Match, hero: PlayerId, round: u32) -> String {
+    let Some(r) = m.round(round) else { return format!("Раунд {round}") };
+    let Some(team) = m.team_at(hero, r.start_tick) else { return format!("Раунд {round}") };
+    let side = match team {
+        2 => "T",
+        3 => "CT",
+        _ => return format!("Раунд {round}"),
+    };
+    let (mut mine, mut theirs) = (0, 0);
+    for prev in m.rounds.iter().filter(|p| p.number < round) {
+        match (prev.winner_team, m.team_at(hero, prev.start_tick)) {
+            (Some(w), Some(t)) if w == t => mine += 1,
+            (Some(_), Some(_)) => theirs += 1,
+            _ => {}
+        }
+    }
+    format!("Раунд {round} · {side} · {mine}:{theirs}")
 }
 
 /// Гранаты одного игрока, взорвавшиеся с разницей не больше `gap` тиков, — один залп.
@@ -384,8 +530,35 @@ fn is_strong(h: &Highlight) -> bool {
     h.kills.len() >= 2 || h.kills.iter().any(|k| score_kill(k).0 >= 16.0)
 }
 
-/// Повтор убийства со стороны: свободная камера, на которой видно и убийцу, и жертву.
-fn replay_shot(m: &Match, h: &Highlight, k: &cs2::Kill, pos: &dyn PositionSource, used: &mut Vec<String>) -> Option<Shot> {
+/// Окно `[a, b]` на скорости `v` с плавным входом и выходом за `ramp` тиков.
+fn slow_window(a: i32, b: i32, v: f32, ramp: i32) -> Vec<ScaleKey> {
+    slow_windows(&[(a, b)], v, ramp)
+}
+
+/// Несколько окон замедления; соседние (ближе чем две рампы) сливаются в одно.
+fn slow_windows(windows: &[(i32, i32)], v: f32, ramp: i32) -> Vec<ScaleKey> {
+    let mut merged: Vec<(i32, i32)> = Vec::new();
+    for &(a, b) in windows {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 + 2 * ramp => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
+        .into_iter()
+        .flat_map(|(a, b)| {
+            [
+                ScaleKey { tick: a - ramp, scale: 1.0 },
+                ScaleKey { tick: a, scale: v },
+                ScaleKey { tick: b, scale: v },
+                ScaleKey { tick: b + ramp, scale: 1.0 },
+            ]
+        })
+        .collect()
+}
+
+/// Повтор убийства со стороны: свободная камера, на которой видно и убийцу, и жертву; сам выстрел — в замедлении.
+fn replay_shot(m: &Match, h: &Highlight, k: &cs2::Kill, cfg: &Config, pos: &dyn PositionSource, used: &mut Vec<String>) -> Option<Shot> {
     let tr = m.tick_rate;
     let secs = |s: f32| (s * tr).round() as i32;
     let (start, end) = (k.tick - secs(1.4), k.tick + secs(0.9));
@@ -408,7 +581,7 @@ fn replay_shot(m: &Match, h: &Highlight, k: &cs2::Kill, pos: &dyn PositionSource
             style: Some(pick.preset.name.to_owned()),
             colorfulness: Some(pick.score.total),
         }],
-        timescale: vec![],
+        timescale: slow_window(k.tick - secs(0.25), k.tick + secs(0.2), cfg.slow, secs(0.15)),
         zoom: vec![],
         caption: format!("Повтор · {} против {}", m.name(h.player), m.name(k.victim)),
         card: None,
@@ -417,23 +590,18 @@ fn replay_shot(m: &Match, h: &Highlight, k: &cs2::Kill, pos: &dyn PositionSource
 
 /// Дуэль дальше этого (метры) — дальняя: там приближение помогает разглядеть игрока.
 const FAR_DUEL_METERS: f32 = 25.0;
+/// Сколько держим кадр глазами противника после попадания: смерть видна, камера ещё не упала в пол, с.
+const VICTIM_AFTER_SECS: f32 = 0.3;
 
-/// Мой пик глазами противника: с момента, когда я у него появляюсь, до его смерти.
-/// Если он меня так и не увидел — камера из-за его плеча, развёрнутая туда, откуда я вышел.
-/// `None` — показать нечем (из-за плеча меня тоже не видно).
-fn victim_shot(m: &Match, h: &Highlight, k: &cs2::Kill, pos: &dyn PositionSource, cfg: &Config) -> Option<Shot> {
+/// Мой пик глазами противника: с момента, когда я у него появляюсь, и до его смерти (чуть после
+/// попадания, пока камера не упала в пол); замедление — на появлении и на самом попадании.
+/// Если он меня так и не увидел и `shoulder` — камера из-за его плеча, развёрнутая туда, откуда
+/// я вышел. `None` — показать нечем.
+fn victim_shot(m: &Match, h: &Highlight, k: &cs2::Kill, pos: &dyn PositionSource, cfg: &Config, shoulder: bool) -> Option<Shot> {
     let tr = m.tick_rate;
     let secs = |s: f32| (s * tr).round() as i32;
     let ramp = secs(0.15);
-    let curve = |a: i32, b: i32, v: f32| {
-        vec![
-            ScaleKey { tick: a - ramp, scale: 1.0 },
-            ScaleKey { tick: a, scale: v },
-            ScaleKey { tick: b, scale: v },
-            ScaleKey { tick: b + ramp, scale: 1.0 },
-        ]
-    };
-    let base = |start: i32, end: i32, segment: Segment, timescale: Vec<ScaleKey>, zoom: Vec<ScaleKey>, caption: String| Shot {
+    let base = |start: i32, end: i32, segment: Segment, timescale: Vec<ScaleKey>, caption: String| Shot {
         title: format!("{} -> {}: глазами противника", m.name(h.player), m.name(k.victim)),
         tier: tier_of(h.score),
         score: h.score,
@@ -443,30 +611,29 @@ fn victim_shot(m: &Match, h: &Highlight, k: &cs2::Kill, pos: &dyn PositionSource
         end_tick: end,
         segments: vec![segment],
         timescale,
-        zoom,
+        zoom: vec![],
         caption,
         card: None,
     };
-    let end = k.tick + secs(0.3);
+    let end = k.tick + secs(VICTIM_AFTER_SECS);
+    // попадание — в замедлении, чтобы смерть читалась
+    let hit = (k.tick - secs(0.15), k.tick + secs(0.2));
     // момент, когда я появляюсь у противника: в поле зрения и без стены между нами
     if let Some(peek) = peek_tick(pos, k.victim, h.player, k.tick - secs(2.5), k.tick) {
         let start = (peek - secs(1.0)).min(k.tick - secs(1.6));
-        // замедление на появлении; приближение — только если я далеко и иначе мелкий
-        let (a, b) = (peek - secs(0.1), (peek + secs(0.7)).min(k.tick));
-        let far = match (pos.eye_pose(k.victim, peek), pos.eye_pose(h.player, peek)) {
-            (Some(v), Some(p)) => grenade::dist(v.pos, p.pos) >= FAR_DUEL_METERS * 52.5,
-            _ => k.distance >= FAR_DUEL_METERS,
-        };
-        let zoom = if far { curve(a, b, 0.65) } else { Vec::new() };
+        // замедление на появлении; без приближения — на дальних дуэлях противник и так в прицеле
+        let reveal = (peek - secs(0.1), (peek + secs(0.7)).min(hit.0));
         let seg = Segment { start_tick: start, end_tick: end, camera: Camera::Pov { player: k.victim }, style: Some("victim_pov".into()), colorfulness: None };
-        return Some(base(start, end, seg, curve(a, b, cfg.slow), zoom, format!("Глазами {}", m.name(k.victim))));
+        return Some(base(start, end, seg, slow_windows(&[reveal, hit], cfg.slow, ramp), format!("Глазами {}", m.name(k.victim))));
+    }
+    if !shoulder {
+        return None;
     }
     // противник меня не увидел: из-за его плеча, камера смотрит на меня
     let start = k.tick - secs(1.6);
     let keys = shoulder_keys(pos, k.victim, h.player, start, end, k.tick, tr)?;
     let seg = Segment { start_tick: start, end_tick: end, camera: Camera::Free { keys }, style: Some("victim_shoulder".into()), colorfulness: None };
-    let (a, b) = (k.tick - secs(0.45), k.tick + secs(0.15));
-    Some(base(start, end, seg, curve(a, b, cfg.slow), Vec::new(), format!("Из-за плеча {}", m.name(k.victim))))
+    Some(base(start, end, seg, slow_window(k.tick - secs(0.45), hit.1, cfg.slow, ramp), format!("Из-за плеча {}", m.name(k.victim))))
 }
 
 /// Камера из-за плеча `viewer`, повёрнутая на `target`, на `[t0, t1]`; после `freeze`
@@ -1047,6 +1214,106 @@ mod tests {
             let (da, db) = (a[0] + 50.0, b[0] + 50.0);
             (da * db < 0.0).then(|| da / (da - db))
         }
+    }
+
+    fn kill_in(tick: i32, round: u32, victim: i32, headshot: bool) -> Kill {
+        Kill { tick, round, victim: PlayerId(victim), headshot, ..kill(tick, victim) }
+    }
+
+    /// Герой 0: раунд 1 — серия из двух (хедшот + обычное), раунд 2 — рядовое убийство,
+    /// раунд 3 — только ассист, раунд 4 — одно эффектное (сквозь дым) далеко от первого.
+    fn player_match() -> Match {
+        let mut m = Match::build("de_test".into(), 64.0, (0..6).map(|i| (i, i, format!("p{i}"), 1)).collect(), &[]);
+        m.rounds = (1..=4)
+            .map(|n| cs2::Round { number: n, start_tick: n as i32 * 10_000, freeze_end_tick: Some(n as i32 * 10_000 + 500), end_tick: None, winner_team: None })
+            .collect();
+        let mut assist = kill_in(31_000, 3, 4, false);
+        assist.attacker = PlayerId(5);
+        assist.assister = Some(PlayerId(0));
+        let mut smoke = kill_in(41_000, 4, 2, false);
+        smoke.through_smoke = true;
+        m.kills = vec![kill_in(11_000, 1, 1, true), kill_in(11_100, 1, 2, false), kill_in(21_000, 2, 3, false), assist, smoke];
+        m
+    }
+
+    fn player_timeline(density: Density, order: Order) -> Timeline {
+        let m = player_match();
+        let hs = highlights::for_player(&m, PlayerId(0), &highlights::Config::default());
+        let cfg = Config { cinematic: true, density, order, ..Config::default() };
+        direct_all(&m, PlayerId(0), &hs, &[], &cfg, &Duel)
+    }
+
+    fn is_hero_pov(s: &Shot) -> bool {
+        s.player == PlayerId(0) && matches!(s.segments[0].camera, Camera::Pov { .. }) && s.segments[0].style.is_none()
+    }
+
+    #[test]
+    fn balanced_montage_keeps_kill_rounds_and_interleaves_angles() {
+        let t = player_timeline(Density::Balanced, Order::BuildUp);
+        let rounds: Vec<u32> = t.shots.iter().map(|s| s.round).collect();
+        assert!(!rounds.contains(&3), "раунд из одного ассиста — не момент: {rounds:?}");
+        // лучший раунд (серия) — в финале, остальные по порядку
+        let mut seen = Vec::new();
+        for r in &rounds {
+            if !seen.contains(r) {
+                seen.push(*r);
+            }
+        }
+        assert_eq!(seen, vec![2, 4, 1], "{rounds:?}");
+        // в каждом раунде: сначала от первого лица с плашкой, потом ракурсы на то, что в нём было
+        for r in [1, 2, 4] {
+            let block: Vec<&Shot> = t.shots.iter().filter(|s| s.round == r).collect();
+            assert!(is_hero_pov(block[0]) && block[0].card.is_some(), "раунд {r}: {:?}", block[0].title);
+            assert!(block[0].caption.is_empty(), "подпись дублирует плашку");
+            let alts = block.iter().filter(|s| !is_hero_pov(s)).count();
+            assert!(alts <= MAX_ALT_PER_ROUND, "раунд {r}: ракурсов {alts}");
+            let last_pov = block.iter().rposition(|s| is_hero_pov(s)).unwrap();
+            for s in &block[last_pov + 1..] {
+                assert!(s.start_tick >= block[last_pov].start_tick - 64 * 3, "ракурс относится к своему куску: {}", s.title);
+            }
+        }
+        // рядовое убийство (раунд 2) — без дополнительного ракурса, серия (раунд 1) — с ними
+        assert_eq!(t.shots.iter().filter(|s| s.round == 2 && !is_hero_pov(s)).count(), 0);
+        assert!(t.shots.iter().any(|s| s.round == 1 && !is_hero_pov(s)));
+        // глазами противника — смерть в кадре и в замедлении, но без долгой камеры смерти
+        for s in t.shots.iter().filter(|s| s.segments[0].style.as_deref() == Some("victim_pov")) {
+            let k = player_match().kills.into_iter().find(|k| k.victim == s.player).unwrap();
+            assert!(s.end_tick > k.tick && s.end_tick <= k.tick + 64 / 2, "{}: {} vs {}", s.title, s.end_tick, k.tick);
+            assert!(s.scale_at(k.tick) < 1.0, "попадание в замедлении: {:?}", s.timescale);
+            assert!(s.timescale.windows(2).all(|w| w[0].tick <= w[1].tick), "{:?}", s.timescale);
+            assert!(s.zoom.is_empty());
+        }
+        // повтор — с замедлением на выстреле
+        if let Some(r) = t.shots.iter().find(|s| s.caption.starts_with("Повтор")) {
+            assert!(r.timescale.iter().any(|k| k.scale < 1.0), "{:?}", r.timescale);
+        }
+        assert_eq!(t.shots.iter().find(|s| s.round == 1).unwrap().card.as_ref().unwrap().0, "Раунд 1");
+    }
+
+    #[test]
+    fn full_montage_keeps_everything_in_match_order() {
+        let t = player_timeline(Density::Full, Order::BuildUp);
+        let rounds: Vec<u32> = t.shots.iter().map(|s| s.round).collect();
+        assert!(rounds.contains(&3), "ассист — тоже KAST: {rounds:?}");
+        assert!(rounds.windows(2).all(|w| w[0] <= w[1]), "по порядку матча: {rounds:?}");
+        let alts = t.shots.iter().filter(|s| s.round == 1 && !is_hero_pov(s)).count();
+        assert!(alts > MAX_ALT_PER_ROUND, "все ракурсы: {alts}");
+        let chrono = player_timeline(Density::Balanced, Order::Chronological);
+        let rounds: Vec<u32> = chrono.shots.iter().map(|s| s.round).collect();
+        assert!(rounds.windows(2).all(|w| w[0] <= w[1]), "{rounds:?}");
+    }
+
+    #[test]
+    fn long_pov_chunks_are_cut_at_the_longest_pause() {
+        // три отрезка с паузами 100 и 200 тиков: при пороге 300 сливаются в один (900 тиков),
+        // длиннее 576 — режем по самой долгой паузе
+        let spans = [(0, 200), (300, 500), (700, 900)];
+        assert_eq!(chunk_spans(&spans, 300, i32::MAX), vec![(0, 900)]);
+        assert_eq!(chunk_spans(&spans, 300, 576), vec![(0, 500), (700, 900)]);
+        // пауза больше порога — отдельные куски и без ограничения
+        assert_eq!(chunk_spans(&spans, 150, i32::MAX), vec![(0, 500), (700, 900)]);
+        // перекрывающиеся отрезки резать негде
+        assert_eq!(chunk_spans(&[(0, 400), (100, 800)], 10, 100), vec![(0, 800)]);
     }
 
     #[test]

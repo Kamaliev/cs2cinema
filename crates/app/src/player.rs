@@ -15,11 +15,11 @@ pub fn kd_color(kd: f32) -> Color32 {
 
 pub fn ui(app: &mut App, ui: &mut Ui) {
     ui.horizontal(|ui| {
-        ui.heading("Игрок");
+        ui::heading(ui, "Игрок");
         ui.add_space(12.0);
-        let resp = ui.add(egui::TextEdit::singleline(&mut app.matches.nickname).hint_text("ник на FACEIT").desired_width(200.0));
+        let resp = ui.add(egui::TextEdit::singleline(&mut app.matches.nickname).hint_text("ник на FACEIT").desired_width(220.0));
         let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if ui.add_enabled(!app.matches.loading, egui::Button::new("Загрузить")).clicked() || enter {
+        if ui::primary(ui, !app.matches.loading, "Загрузить") || enter {
             app.load_matches();
         }
         if app.matches.loading {
@@ -30,21 +30,23 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
         ui.colored_label(BAD, e);
     }
     let Some(p) = app.matches.player.clone() else {
-        ui.add_space(30.0);
+        ui::empty_state(ui, "👤", "Введите свой ник на FACEIT", "Покажу статистику за последние 20 матчей; из матча можно разобрать демку и собрать ролик про себя.");
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("Введите свой ник на FACEIT — покажу статистику за последние 20 матчей.").weak().size(15.0));
-            ui.label(RichText::new("Откройте матч, чтобы разобрать демку и собрать ролик про себя.").weak());
-            ui.label(RichText::new("Демку с диска можно просто перетащить в окно.").weak());
+            ui.label(RichText::new("Демку с диска можно просто перетащить в окно.").color(MUTED));
         });
         return;
     };
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(&p.nickname).strong().size(18.0));
-        ui.label(RichText::new(format!("уровень {}", p.level)).color(ui::ACCENT));
-        ui.label(format!("{} elo", p.elo));
-        if !p.country.is_empty() {
-            ui.label(RichText::new(p.country.to_uppercase()).weak());
-        }
+    ui.add_space(6.0);
+    ui::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui::level_badge(ui, p.level);
+            ui.label(ui::b(&p.nickname).size(20.0));
+            ui.label(RichText::new(format!("{} elo", p.elo)).color(ui::ACCENT).size(16.0));
+            ui.label(RichText::new(format!("уровень {}", p.level)).color(MUTED));
+            if !p.country.is_empty() {
+                ui::pill(ui, &p.country.to_uppercase(), MUTED);
+            }
+        });
     });
 
     let loaded: Vec<&MatchStats> = app.matches.list.iter().filter_map(|m| app.matches.stats.get(&m.match_id)?.as_ref().ok()).collect();
@@ -57,20 +59,17 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
             if pending > 0 {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new(format!("загружаю статистику, осталось {pending}")).weak());
+                    ui.label(RichText::new(format!("загружаю статистику, осталось {pending}")).color(MUTED));
                 });
             }
-            cards(ui, &summary.total);
+            tiles(ui, &summary.total);
         });
         if !summary.maps.is_empty() {
             ui::section(ui, "По картам", |ui| {
-                egui::Grid::new("maps").striped(true).num_columns(6).spacing([24.0, 4.0]).show(ui, |ui| {
-                    for h in ["Карта", "Матчей", "Винрейт", "K/D", "ADR", "HS%"] {
-                        ui.label(RichText::new(h).weak().small());
-                    }
-                    ui.end_row();
+                egui::Grid::new("maps").striped(true).num_columns(6).spacing([24.0, 6.0]).show(ui, |ui| {
+                    ui::table_header(ui, &["Карта", "Матчей", "Винрейт", "K/D", "ADR", "HS%"]);
                     for (map, t) in &summary.maps {
-                        ui.label(RichText::new(map).strong());
+                        ui.label(ui::b(map));
                         ui.label(t.matches.to_string());
                         ui.colored_label(if t.winrate() >= 50.0 { OK } else { BAD }, format!("{:.0}%", t.winrate()));
                         ui.colored_label(kd_color(t.kd), format!("{:.2}", t.kd));
@@ -82,15 +81,15 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
             });
         }
         ui::section(ui, "Матчи", |ui| {
-            egui::Grid::new("matches").striped(true).num_columns(8).spacing([16.0, 6.0]).show(ui, |ui| {
-                for h in ["Дата", "Карта", "Счёт", "Исход", "K-D-A", "K/D", "ADR", ""] {
-                    ui.label(RichText::new(h).weak().small());
-                }
-                ui.end_row();
+            ui.label(RichText::new("Нажмите на матч, чтобы открыть таблицу и разобрать демку.").color(MUTED).size(12.5));
+            ui.add_space(4.0);
+            egui::Grid::new("matches").striped(true).num_columns(8).spacing([16.0, 7.0]).show(ui, |ui| {
+                ui::table_header(ui, &["Дата", "Карта", "Счёт", "Исход", "K-D-A", "K/D", "ADR", ""]);
                 for m in &app.matches.list {
+                    let row_top = ui.cursor().min;
                     let mine = app.matches.stats.get(&m.match_id).and_then(|s| s.as_ref().ok()).and_then(|s| s.find(&p.id));
-                    ui.label(ui::date(m.started_at));
-                    ui.label(mine.map_or("—".into(), |(map, _, _)| map.map.clone()));
+                    ui.label(ui::date_short(m.started_at));
+                    ui.label(ui::b(mine.map_or("—".into(), |(map, _, _)| map.map.clone())));
                     // счёт со своей стороны: у победителя очков больше
                     let (hi, lo) = (m.score1.max(m.score2), m.score1.min(m.score2));
                     ui.label(match m.won {
@@ -99,9 +98,9 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
                         None => format!("{}:{}", m.score1, m.score2),
                     });
                     match m.won {
-                        Some(true) => ui.colored_label(OK, "Победа"),
-                        Some(false) => ui.colored_label(BAD, "Поражение"),
-                        None => ui.colored_label(MUTED, "—"),
+                        Some(true) => ui::pill(ui, "победа", OK),
+                        Some(false) => ui::pill(ui, "поражение", BAD),
+                        None => ui::pill(ui, "—", MUTED),
                     };
                     match mine {
                         Some((_, s, _)) => {
@@ -111,11 +110,15 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
                         }
                         None => {
                             for _ in 0..3 {
-                                ui.label(RichText::new("—").weak());
+                                ui.label(RichText::new("—").color(MUTED));
                             }
                         }
                     }
-                    if ui.button("Открыть").clicked() {
+                    if ui.small_button("Открыть").clicked() {
+                        open = Some(m.match_id.clone());
+                    }
+                    let row = egui::Rect::from_min_max(row_top, egui::pos2(ui.max_rect().right(), ui.cursor().min.y + 22.0));
+                    if ui::row_hover(ui, row, egui::Id::new(("match-row", &m.match_id))).clicked() {
                         open = Some(m.match_id.clone());
                     }
                     ui.end_row();
@@ -129,26 +132,13 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
 }
 
 /// Крупные цифры в ряд.
-fn cards(ui: &mut Ui, t: &Totals) {
+fn tiles(ui: &mut Ui, t: &Totals) {
     ui.horizontal_wrapped(|ui| {
-        let card = |ui: &mut Ui, title: &str, value: String, color: Option<Color32>| {
-            egui::Frame::group(ui.style()).inner_margin(egui::vec2(14.0, 8.0)).show(ui, |ui| {
-                ui.set_min_width(90.0);
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(title).weak().small());
-                    let v = RichText::new(value).size(22.0).strong();
-                    ui.label(match color {
-                        Some(c) => v.color(c),
-                        None => v,
-                    });
-                });
-            });
-        };
-        card(ui, "Винрейт", format!("{:.0}%", t.winrate()), Some(if t.winrate() >= 50.0 { OK } else { BAD }));
-        card(ui, "K/D", format!("{:.2}", t.kd), Some(kd_color(t.kd)));
-        card(ui, "ADR", format!("{:.0}", t.adr), None);
-        card(ui, "HS%", format!("{:.0}%", t.hs_pct), None);
-        card(ui, "K/R", format!("{:.2}", t.kr), None);
-        card(ui, "Убийств", t.kills.to_string(), None);
+        ui::stat_tile(ui, "Винрейт", &format!("{:.0}%", t.winrate()), Some(if t.winrate() >= 50.0 { OK } else { BAD }));
+        ui::stat_tile(ui, "K/D", &format!("{:.2}", t.kd), Some(kd_color(t.kd)));
+        ui::stat_tile(ui, "ADR", &format!("{:.0}", t.adr), None);
+        ui::stat_tile(ui, "HS%", &format!("{:.0}%", t.hs_pct), None);
+        ui::stat_tile(ui, "K/R", &format!("{:.2}", t.kr), None);
+        ui::stat_tile(ui, "Убийств", &t.kills.to_string(), None);
     });
 }

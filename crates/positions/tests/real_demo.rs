@@ -46,6 +46,28 @@ fn shooters_look_at_their_victims() {
     assert!(checked >= 170 && aimed * 100 >= checked * 95, "{aimed}/{checked}");
 }
 
+/// Полёт снаряда находится почти у каждой гранаты и приходит в точку взрыва из события.
+#[test]
+fn grenades_have_real_flights() {
+    let Some(data) = load() else { return };
+    let parsed = demo::parse(&data).unwrap();
+    let players = parsed.players.iter().map(|p| (p.userid, p.slot, p.name.clone(), p.xuid)).collect();
+    let m = cs2::Match::build(parsed.map_name.clone(), parsed.tick_rate(), players, &parsed.events);
+    let track = positions::track(&data, 4).unwrap();
+    let thrown: Vec<&cs2::Grenade> = m.grenades.iter().filter(|g| g.throw_tick.is_some()).collect();
+    let mut found = 0;
+    for g in &thrown {
+        if let Some(p) = track.grenade_flight(g) {
+            found += 1;
+            let first = p.first().unwrap();
+            assert!(p.len() >= 3 && first.0 <= g.throw_tick.unwrap() + 32, "{g:?} {first:?}");
+            assert_eq!(p.last().unwrap().0, g.detonate_tick);
+        }
+    }
+    println!("полёт найден у {found} из {} гранат (снарядов всего {})", thrown.len(), track.flights().len());
+    assert!(!thrown.is_empty() && found * 100 >= thrown.len() * 80, "{found}/{}", thrown.len());
+}
+
 #[test]
 fn positions_match_reference_samples() {
     let Some(data) = load() else { return };

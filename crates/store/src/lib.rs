@@ -50,6 +50,8 @@ pub enum JobStatus {
     Done,
     Failed,
     Cancelled,
+    /// Приложение закрылось, пока задача выполнялась: виден достигнутый этап, повтор — кнопкой (D-14).
+    Interrupted,
 }
 
 impl JobStatus {
@@ -61,6 +63,7 @@ impl JobStatus {
             JobStatus::Done => "готово",
             JobStatus::Failed => "ошибка",
             JobStatus::Cancelled => "отменена",
+            JobStatus::Interrupted => "прервана",
         }
     }
     fn parse(s: &str) -> Self {
@@ -70,6 +73,7 @@ impl JobStatus {
             "cancelling" => JobStatus::Cancelling,
             "done" => JobStatus::Done,
             "cancelled" => JobStatus::Cancelled,
+            "interrupted" => JobStatus::Interrupted,
             _ => JobStatus::Failed,
         }
     }
@@ -183,6 +187,17 @@ pub struct JobFailure {
     /// Прошедшее время до сбоя, мс.
     pub elapsed_ms: Option<i64>,
 }
+
+/// Сколько строк `reset_running` привёл в порядок после падения приложения.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Reset {
+    /// Было «выполняется» — стало «прервана».
+    pub interrupted: usize,
+    /// Было «отменяется» — стало «отменена».
+    pub cancelled: usize,
+}
+
+const INTERRUPTED_HINT: &str = "Нажмите «Повторить», чтобы продолжить с записи без скачивания и плана, или «Заново», чтобы начать сначала.";
 
 /// Общее соединение: одно на приложение, безопасно делится между потоками.
 #[derive(Clone)]
@@ -403,7 +418,10 @@ impl Store {
     /// Запомнить пару последней удачной записи; прежняя заменяется.
     pub fn set_last_good(&self, cs2_build: &str, hlae_version: &str) -> Result<()> {
         self.with(|c| {
-            c.execute("INSERT OR REPLACE INTO last_good (id, cs2_build, hlae_version, recorded_at) VALUES (1, ?1, ?2, ?3)", params![cs2_build, hlae_version, now()])?;
+            c.execute(
+                "INSERT OR REPLACE INTO last_good (id, cs2_build, hlae_version, recorded_at) VALUES (1, ?1, ?2, ?3)",
+                params![cs2_build, hlae_version, now()],
+            )?;
             Ok(())
         })
     }
@@ -466,7 +484,8 @@ impl Store {
     pub fn interrupted_jobs(&self) -> Result<Vec<(i64, JobStatus, Option<PathBuf>)>> {
         self.with(|c| {
             let mut st = c.prepare("SELECT id, status, out_dir FROM jobs WHERE status IN ('running', 'cancelling') ORDER BY id")?;
-            let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, JobStatus::parse(&r.get::<_, String>(1)?), r.get::<_, Option<String>>(2)?.map(PathBuf::from))))?;
+            let rows =
+                st.query_map([], |r| Ok((r.get::<_, i64>(0)?, JobStatus::parse(&r.get::<_, String>(1)?), r.get::<_, Option<String>>(2)?.map(PathBuf::from))))?;
             rows.collect()
         })
     }
@@ -489,17 +508,18 @@ impl Store {
         })
     }
 
-    /// После падения приложения: «выполняется» — в ошибку, «отменяется» — в «отменена» (TMO-06). Возвращает число строк.
-    pub fn reset_running(&self) -> Result<usize> {
+    /// После падения приложения: «выполняется» — в «прервана» (этап остаётся, достигнутое состояние записи уходит в `fail_state`, D-14),
+    /// «отменяется» — в «отменена» (TMO-06). Возвращает оба счётчика.
+    pub fn reset_running(&self) -> Result<Reset> {
         self.with(|c| {
             let tx = c.unchecked_transaction()?;
-            let failed = tx.execute(
-                "UPDATE jobs SET status = 'failed', error = 'прервано: приложение закрылось во время выполнения', phase = '', updated_at = ?1 WHERE status = 'running'",
-                [now()],
+            let interrupted = tx.execute(
+                "UPDATE jobs SET status = 'interrupted', fail_code = 'INTERRUPTED', fail_state = NULLIF(phase, ''), error = 'приложение закрылось во время выполнения', fail_hint = ?2, phase = '', updated_at = ?1 WHERE status = 'running'",
+                params![now(), INTERRUPTED_HINT],
             )?;
             let cancelled = tx.execute("UPDATE jobs SET status = 'cancelled', stage = '', phase = '', updated_at = ?1 WHERE status = 'cancelling'", [now()])?;
             tx.commit()?;
-            Ok(failed + cancelled)
+            Ok(Reset { interrupted, cancelled })
         })
     }
 
@@ -527,10 +547,7 @@ impl Store {
 
     pub fn remember_demo(&self, match_id: &str, path: &Path) -> Result<()> {
         self.with(|c| {
-            c.execute(
-                "INSERT OR REPLACE INTO demos (match_id, path, downloaded_at) VALUES (?1, ?2, ?3)",
-                params![match_id, path.to_string_lossy(), now()],
-            )?;
+            c.execute("INSERT OR REPLACE INTO demos (match_id, path, downloaded_at) VALUES (?1, ?2, ?3)", params![match_id, path.to_string_lossy(), now()])?;
             Ok(())
         })
     }
@@ -582,8 +599,8 @@ mod tests {
         let s = Store::in_memory().unwrap();
         let a = s.add_job(&new_job(JobKind::Plan)).unwrap();
         s.start_job(a).unwrap();
-        assert_eq!(s.reset_running().unwrap(), 1);
-        assert_eq!(s.job(a).unwrap().unwrap().status, JobStatus::Failed);
+        assert_eq!(s.reset_running().unwrap(), Reset { interrupted: 1, cancelled: 0 });
+        assert_eq!(s.job(a).unwrap().unwrap().status, JobStatus::Interrupted);
 
         assert!(s.cache_get("stats:1").unwrap().is_none());
         s.cache_put("stats:1", &serde_json::json!({"rounds": []})).unwrap();
@@ -626,13 +643,15 @@ mod tests {
     }
 
     #[test]
-    fn crash_recovery_turns_cancelling_into_cancelled_and_running_into_failed() {
+    fn crash_recovery_turns_cancelling_into_cancelled_and_running_into_interrupted() {
         let s = Store::in_memory().unwrap();
         let a = s.add_job(&new_job(JobKind::Record)).unwrap();
         let b = s.add_job(&new_job(JobKind::Record)).unwrap();
         let q = s.add_job(&new_job(JobKind::Record)).unwrap();
         s.start_job(a).unwrap();
         s.set_out_dir(a, Path::new("C:/out/a")).unwrap();
+        s.set_stage(a, "Запись").unwrap();
+        s.set_phase(a, "take").unwrap();
         s.start_job(b).unwrap();
         s.set_out_dir(b, Path::new("C:/out/b")).unwrap();
         s.set_phase(b, "demo").unwrap();
@@ -643,15 +662,32 @@ mod tests {
             vec![(a, JobStatus::Running, Some(PathBuf::from("C:/out/a"))), (b, JobStatus::Cancelling, Some(PathBuf::from("C:/out/b")))],
             "прерванные задачи находятся вместе с папками; задача в очереди — нет"
         );
-        assert_eq!(s.reset_running().unwrap(), 2);
+        assert_eq!(s.reset_running().unwrap(), Reset { interrupted: 1, cancelled: 1 });
         let ja = s.job(a).unwrap().unwrap();
-        assert_eq!(ja.status, JobStatus::Failed);
-        assert_eq!(ja.error.as_deref(), Some("прервано: приложение закрылось во время выполнения"));
+        assert_eq!(ja.status, JobStatus::Interrupted);
+        assert_eq!(ja.error.as_deref(), Some("приложение закрылось во время выполнения"));
+        assert_eq!(ja.stage, "Запись", "этап сбоя остаётся виден");
+        assert_eq!(ja.fail_state.as_deref(), Some("take"), "достигнутое состояние записи переходит в fail_state");
+        assert_eq!(ja.fail_code.as_deref(), Some("INTERRUPTED"));
+        assert_eq!(ja.phase, "");
+        assert!(!ja.is_active(), "прерванная задача не считается выполняемой");
         let jb = s.job(b).unwrap().unwrap();
         assert_eq!((jb.status, jb.stage.as_str(), jb.phase.as_str()), (JobStatus::Cancelled, "", ""));
         assert_eq!(s.job(q).unwrap().unwrap().status, JobStatus::Queued);
         assert!(s.interrupted_jobs().unwrap().is_empty());
-        assert_eq!(s.reset_running().unwrap(), 0);
+        assert_eq!(s.reset_running().unwrap(), Reset::default());
+    }
+
+    #[test]
+    fn interrupted_without_a_reached_state_has_no_fail_state() {
+        let s = Store::in_memory().unwrap();
+        let a = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.start_job(a).unwrap();
+        assert_eq!(s.reset_running().unwrap(), Reset { interrupted: 1, cancelled: 0 });
+        let j = s.job(a).unwrap().unwrap();
+        assert_eq!((j.status, j.fail_state, j.fail_code.as_deref()), (JobStatus::Interrupted, None, Some("INTERRUPTED")));
+        assert!(j.fail_hint.is_some());
+        assert_eq!(JobStatus::Interrupted.title(), "прервана");
     }
 
     /// Временный файл базы; удаляется вместе с `-wal`/`-shm`.

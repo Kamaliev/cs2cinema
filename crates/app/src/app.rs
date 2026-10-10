@@ -118,9 +118,21 @@ pub struct JobsState {
     pub thumbs: HashMap<i64, egui::TextureHandle>,
     pub thumb_requested: std::collections::HashSet<i64>,
     pub sizes: HashMap<i64, u64>,
-    /// Очередь стоит после отмены выполняемой задачи до «Продолжить» (D-13). Только в памяти: после
-    /// перезапуска приложения задачи из очереди продолжаются.
+    /// Очередь стоит после отмены выполняемой задачи и после задачи, прерванной закрытием приложения, до «Продолжить» (D-13, D-16).
+    /// Только в памяти: если при запуске прерванных задач нет, задачи из очереди продолжаются.
     pub paused: bool,
+    /// Почему очередь на паузе — для текста баннера.
+    pub paused_reason: PauseReason,
+}
+
+/// Причина паузы очереди (D-16).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PauseReason {
+    /// Пользователь отменил выполняемую задачу.
+    #[default]
+    Cancelled,
+    /// При запуске приложения нашлась задача, прерванная его закрытием.
+    Interrupted,
 }
 
 /// Размер превью ролика в карточке задачи.
@@ -185,7 +197,7 @@ impl App {
                 }
             }
         }
-        let interrupted = store.reset_running().unwrap_or(0);
+        let reset = store.reset_running().unwrap_or_default();
         let mut app = Self {
             draft: s.clone(),
             matches: MatchesState { nickname: s.nickname.clone(), ..Default::default() },
@@ -219,15 +231,18 @@ impl App {
         if let Some(e) = store_note {
             app.status.push(&format!("база не открылась ({e}) — задачи не сохранятся"));
         }
-        if interrupted > 0 {
-            app.status.push(&format!("задач прервано при прошлом запуске: {interrupted}"));
+        if reset.interrupted > 0 {
+            // прерванная задача останавливает очередь до «Продолжить» (D-16); без неё оставшиеся задачи продолжаются
+            app.jobs.paused = true;
+            app.jobs.paused_reason = PauseReason::Interrupted;
+            app.status.push(&format!("задач прервано при прошлом запуске: {} — очередь на паузе, нажмите «Продолжить»", reset.interrupted));
         }
         app.refresh_jobs();
         // `cs2cinema.exe demo.dem` — открыть демку сразу (и для «Открыть с помощью»)
         if let Some(p) = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file()) {
             app.open_source(pipeline::Source::File(p));
         } else if !first_run {
-            // задачи, оставшиеся в очереди, продолжаем
+            // задачи, оставшиеся в очереди, продолжаем (при паузе `run_next` ничего не берёт)
             jobs::run_next(&mut app);
         }
         #[cfg(debug_assertions)]
@@ -480,6 +495,7 @@ impl App {
                     // осознанная отмена останавливает очередь, сбой и успех — нет (D-13)
                     if jobs::pauses_queue(&result) {
                         self.jobs.paused = true;
+                        self.jobs.paused_reason = PauseReason::Cancelled;
                         self.status.push("очередь на паузе после отмены — нажмите «Продолжить»");
                     }
                     if self.jobs.running.as_ref().is_some_and(|(rid, _)| *rid == id) {

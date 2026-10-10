@@ -8,7 +8,7 @@ use pipeline::{
 use store::{Job, JobKind, JobStatus};
 
 use crate::{
-    app::{App, Page, THUMB},
+    app::{App, Page, PauseReason, THUMB},
     jobs,
     ui::{self, ACCENT, BAD, MUTED, OK},
 };
@@ -45,7 +45,7 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
     }
 
     let mut act: Option<Act> = None;
-    // очередь стоит после отмены, пока пользователь не нажмёт «Продолжить» (D-13)
+    // очередь стоит после отмены или прерванной задачи, пока пользователь не нажмёт «Продолжить» (D-13, D-16)
     let waiting = app.jobs.list.iter().filter(|j| j.status == JobStatus::Queued).count();
     if app.jobs.paused && waiting > 0 {
         egui::Frame::new().stroke(egui::Stroke::new(1.0_f32, ACCENT)).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(
@@ -53,7 +53,7 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
             |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Очередь на паузе после отмены: {} ждут", plural(waiting, "задача", "задачи", "задач"))).color(ACCENT));
+                    ui.label(RichText::new(pause_banner(app.jobs.paused_reason, waiting)).color(ACCENT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui::primary(ui, true, "Продолжить") {
                             act = Some(Act::Resume);
@@ -151,6 +151,9 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                     JobStatus::Cancelled => {
                         ui::pill(ui, "отменена", MUTED);
                     }
+                    JobStatus::Interrupted => {
+                        ui::pill(ui, "прервана", ACCENT);
+                    }
                 });
                 // отчёт предпроверки: у упавшей на ней задачи раскрыт
                 if j.kind == JobKind::Record {
@@ -160,10 +163,10 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                 }
                 match j.status {
                     JobStatus::Running | JobStatus::Cancelling if !j.phase.is_empty() => ladder(ui, j, if running { app.status.take_now } else { None }),
-                    JobStatus::Failed if j.fail_state.is_some() => ladder(ui, j, None),
+                    JobStatus::Failed | JobStatus::Interrupted if j.fail_state.is_some() => ladder(ui, j, None),
                     _ => {}
                 }
-                if j.status == JobStatus::Failed && j.fail_code.is_some() {
+                if matches!(j.status, JobStatus::Failed | JobStatus::Interrupted) && j.fail_code.is_some() {
                     error_block(ui, j);
                 }
                 // мета: шоты, длина, размер файла
@@ -211,7 +214,7 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                             }
                         }
                     }
-                    JobStatus::Failed | JobStatus::Cancelled => {
+                    JobStatus::Failed | JobStatus::Cancelled | JobStatus::Interrupted => {
                         if ui.add_enabled(!app.status.busy, egui::Button::new("Повторить")).clicked() {
                             *act = Some(Act::Retry(j.id));
                         }
@@ -237,6 +240,15 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
             });
         }
     });
+}
+
+/// Текст баннера паузы очереди: называет причину (D-16).
+pub fn pause_banner(reason: PauseReason, waiting: usize) -> String {
+    let n = plural(waiting, "задача", "задачи", "задач");
+    match reason {
+        PauseReason::Cancelled => format!("Очередь на паузе после отмены: {n} ждут"),
+        PauseReason::Interrupted => format!("Очередь на паузе: задача прервана закрытием приложения — {n} ждут"),
+    }
 }
 
 /// Число с существительным в нужной форме: 1 ошибка, 2 ошибки, 5 ошибок.
@@ -291,7 +303,7 @@ fn ladder(ui: &mut Ui, j: &Job, takes: Option<(u32, u32)>) {
     }
     let (current, failed) = match j.status {
         JobStatus::Running | JobStatus::Cancelling => (RecordState::from_code(&j.phase), false),
-        JobStatus::Failed => (j.fail_state.as_deref().and_then(RecordState::from_code), true),
+        JobStatus::Failed | JobStatus::Interrupted => (j.fail_state.as_deref().and_then(RecordState::from_code), true),
         _ => return,
     };
     let Some(current) = current else { return };
@@ -377,4 +389,17 @@ fn progress(app: &App, stage: &str) -> (f32, Option<String>) {
         _ => (0.0, None),
     };
     (((idx + inner) / n).clamp(0.0, 1.0), text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pause_banner_names_the_reason() {
+        assert_eq!(pause_banner(PauseReason::Cancelled, 1), "Очередь на паузе после отмены: 1 задача ждут");
+        assert_eq!(pause_banner(PauseReason::Cancelled, 2), "Очередь на паузе после отмены: 2 задачи ждут");
+        assert_eq!(pause_banner(PauseReason::Interrupted, 1), "Очередь на паузе: задача прервана закрытием приложения — 1 задача ждут");
+        assert_eq!(pause_banner(PauseReason::Interrupted, 2), "Очередь на паузе: задача прервана закрытием приложения — 2 задачи ждут");
+    }
 }

@@ -3,6 +3,10 @@
 
 use std::path::{Path, PathBuf};
 
+pub use host;
+pub mod record;
+pub use record::{Deadlines, Event, FailCode, RecordFailure, RecordReport, RecordRequest, RecordState, record};
+
 use cs2::{Match, PlayerId};
 use director::{Order, PositionSource, Timeline};
 use highlights::Highlight;
@@ -46,6 +50,10 @@ pub trait Progress: Sync {
     /// Пользователь отменил задачу: конвейер останавливается на ближайшей границе этапа.
     fn cancelled(&self) -> bool {
         false
+    }
+    /// Типизированное событие записи; по умолчанию — строка журнала.
+    fn event(&self, e: &record::Event) {
+        self.log(&e.to_string())
     }
 }
 

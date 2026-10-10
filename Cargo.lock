@@ -2967,6 +2967,7 @@ dependencies = [
  "faceit",
  "geometry",
  "highlights",
+ "host",
  "positions",
  "renderer",
 ]

@@ -12,3 +12,4 @@ renderer = { path = "../renderer" }
 faceit = { path = "../faceit" }
 positions = { path = "../positions" }
 geometry = { path = "../geometry" }
+host = { path = "../host" }

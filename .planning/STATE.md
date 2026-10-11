@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 07
 current_phase_name: Telegram-бот и доставка
 status: executing
-stopped_at: Completed 07-01-PLAN.md
-last_updated: "2026-10-11T19:47:23.752Z"
+stopped_at: Completed 07-02-PLAN.md
+last_updated: "2026-10-11T19:57:36.898Z"
 last_activity: 2026-10-12
 last_activity_desc: Phase 07 execution started
-state_head: 800a122400901b7a240b4b7a195b08a8eabad1f7
+state_head: c932b21a546d355946a46476c9aee6348ee5515c
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 27
-  completed_plans: 17
+  completed_plans: 18
   percent: 40
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 07 (Telegram-бот и доставка) — EXECUTING
-Plan: 2 of 11
+Plan: 3 of 11
 Status: Ready to execute
 Last activity: 2026-10-12 — Phase 07 execution started
 
@@ -110,6 +110,7 @@ Progress: [████░░░░░░] 40%
 | Phase 06 P09 | 60 min | 3 tasks | 9 files |
 | Phase 06 P10 | 75min | 3 tasks | 10 files |
 | Phase 07 P01 | 35min | 2 tasks | 10 files |
+| Phase 07 P02 | 40min | 2 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -203,6 +204,8 @@ Recent decisions affecting current work:
 - [Phase 06]: 06-10: токен раннера только печатные ASCII-знаки (не-ASCII в Authorization давал вечные повторы)
 - [Phase 07]: 07-01: копия tiny_http 0.12.0 в vendor/ с ограниченным дочитыванием тела (CR-01); MAX_BODY = CHUNK_SIZE + 64 КиБ
 - [Phase 07]: 07-01: Event::Release отменённой задачи даёт Cancelled (WR-01); Connection: close в ответе tiny_http игнорируется
+- [Phase 07]: Бот живёт модулями server::tg и server::bot внутри крейта server и зовёт Core напрямую; jobs.state бот не пишет
+- [Phase 07]: Приём документов: tg_inbox и смещение getUpdates в одной транзакции, getFile только отдельным шагом ingest_once; доставка пишет sending до вызова, после перезапуска sending становится uncertain без повтора
 
 ### Pending Todos
 
@@ -232,6 +235,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T19:47:23.668Z
-Stopped at: Completed 07-01-PLAN.md
+Last session: 2026-10-11T19:57:36.815Z
+Stopped at: Completed 07-02-PLAN.md
 Resume file: None

@@ -26,11 +26,21 @@ cs2-server — сервер очереди монтажа
   runner revoke {имя}                                    отозвать токен раннера
   user add {имя} [--tg {id}] [--admin]                   добавить пользователя
   user list                                              список пользователей
+  config show                                            итоговые настройки (токен бота скрыт)
 
 Общие флаги:
-  --config {файл}      файл настроек (JSON)
+  --config {файл}      файл настроек (JSON; образец — cs2-server.example.json)
   --data-dir {папка}   папка данных (база server.db и blobs/)
+  --bind {адрес}       адрес HTTP (по умолчанию 127.0.0.1:8080)
+  --threads {n}        число обработчиков HTTP (по умолчанию 16)
   -h, --help           эта справка
+
+Порядок настроек: умолчания < файл < переменные окружения < флаги.
+Переменные окружения: CS2_SERVER_CONFIG, CS2_SERVER_BIND, CS2_SERVER_DATA_DIR,
+  CS2_SERVER_THREADS, CS2_SERVER_LEASE_TTL_SECS, CS2_SERVER_HEARTBEAT_SECS,
+  CS2_SERVER_LONGPOLL_SECS, CS2_SERVER_MAX_GRANTS, CS2_SERVER_STARTUP_GRACE_SECS,
+  CS2_SERVER_MAX_DEMO_MIB, CS2_SERVER_MAX_RESULT_MIB, TELEGRAM_BOT_TOKEN
+  (или CS2_SERVER_TELEGRAM_BOT_TOKEN), STATE_DIRECTORY (папка данных по умолчанию).
 ";
 
 #[derive(Default)]
@@ -42,6 +52,8 @@ struct Args {
     user: Option<String>,
     tg: Option<i64>,
     admin: bool,
+    bind: Option<String>,
+    threads: Option<usize>,
 }
 
 enum CliError {
@@ -79,6 +91,14 @@ fn parse_args(args: Vec<String>) -> std::result::Result<Args, CliError> {
                 )
             }
             "--admin" => out.admin = true,
+            "--bind" => out.bind = Some(value("--bind")?),
+            "--threads" => {
+                out.threads = Some(
+                    value("--threads")?
+                        .parse()
+                        .map_err(|_| CliError::Usage("--threads: нужно целое число".to_owned()))?,
+                )
+            }
             s if s.starts_with("--") => {
                 return Err(CliError::Usage(format!("неизвестный флаг {s}")));
             }
@@ -107,26 +127,61 @@ pub fn run_cli(args: Vec<String>, env: &dyn Fn(&str) -> Option<String>) -> ExitC
     }
 }
 
+/// Загружает настройки, ставит `Redactor` процесса и печатает предупреждения.
+fn load_config(
+    a: &Args,
+    env: &dyn Fn(&str) -> Option<String>,
+    redactor: &mut Redactor,
+) -> Result<config::Loaded> {
+    let flags = Flags {
+        config: a.config.clone(),
+        data_dir: a.data_dir.clone(),
+        bind: a.bind.clone(),
+        threads: a.threads,
+    };
+    let loaded = config::load(&flags, env)?;
+    *redactor = loaded.config.redactor();
+    for w in &loaded.warnings {
+        eprintln!("внимание: {}", redactor.redact(w));
+    }
+    Ok(loaded)
+}
+
 fn open_core(
     a: &Args,
     env: &dyn Fn(&str) -> Option<String>,
     redactor: &mut Redactor,
 ) -> Result<Core> {
-    let flags = Flags {
-        config: a.config.clone(),
-        data_dir: a.data_dir.clone(),
-        ..Flags::default()
-    };
-    let loaded = config::load(&flags, env)?;
-    for w in &loaded.warnings {
-        eprintln!("внимание: {}", redactor.redact(w));
-    }
+    let loaded = load_config(a, env, redactor)?;
     Core::open(CoreOptions {
         data_dir: loaded.config.data_dir.clone(),
         limits: loaded.config.limits(),
         clock: Arc::new(SystemClock),
         redactor: redactor.clone(),
     })
+}
+
+/// `config show`: итоговые настройки; секрет печатается как `***`.
+fn show_config(loaded: &config::Loaded) {
+    let c = &loaded.config;
+    match &loaded.file {
+        Some(p) => println!("файл настроек: {}", p.display()),
+        None => println!("файл настроек: нет"),
+    }
+    println!("bind = {}", c.bind);
+    println!("data_dir = {}", c.data_dir.display());
+    println!("threads = {}", c.threads);
+    println!("lease_ttl_secs = {}", c.lease_ttl_secs);
+    println!("heartbeat_secs = {}", c.heartbeat_secs);
+    println!("longpoll_secs = {}", c.longpoll_secs);
+    println!("max_grants = {}", c.max_grants);
+    println!("startup_grace_secs = {}", c.startup_grace_secs);
+    println!("max_demo_mib = {}", c.max_demo_mib);
+    println!("max_result_mib = {}", c.max_result_mib);
+    match &c.telegram_bot_token {
+        Some(t) => println!("telegram_bot_token = {t}"),
+        None => println!("telegram_bot_token = не задан"),
+    }
 }
 
 fn execute(
@@ -259,6 +314,11 @@ fn execute(
                 let tg = u.tg_id.map(|t| format!("  tg {t}")).unwrap_or_default();
                 println!("{}  {}{}  создан {}", u.name, u.role, tg, utc(u.created_at));
             }
+            Ok(())
+        }
+        ["config", "show"] => {
+            let loaded = load_config(&a, env, redactor)?;
+            show_config(&loaded);
             Ok(())
         }
         [] => Err(CliError::Usage(String::new())),

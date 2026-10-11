@@ -26,6 +26,15 @@ jobs:
         run: cargo test --release --workspace
       - name: Build cs2-cli
         run: cargo build --release -p cli
+      - name: Build cs2-server
+        run: cargo build --release -p server
+      - name: Upload Linux server build
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cs2-server-linux-x64
+          path: target/release/cs2-server
+          if-no-files-found: error
       - name: Upload Windows build
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4

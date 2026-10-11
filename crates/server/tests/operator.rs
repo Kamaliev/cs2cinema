@@ -284,3 +284,80 @@ fn submit_for_an_unknown_user_is_refused() {
     assert!(!jobs.contains("#1"), "{jobs}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+const SENTINEL_TOKEN: &str = "123456789:AAEsentinelSENTINELsentinelSENTINEL01";
+
+#[test]
+fn config_show_hides_the_bot_token() {
+    let d = test_dir("show-token");
+    let out = bin()
+        .args(["config", "show", "--data-dir", &data_arg(&d)])
+        .env("TELEGRAM_BOT_TOKEN", SENTINEL_TOKEN)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stdout.contains("telegram_bot_token = ***"), "{stdout}");
+    assert!(!stdout.contains(SENTINEL_TOKEN) && !stderr.contains(SENTINEL_TOKEN));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn config_file_values_apply_and_env_overrides_them() {
+    let d = test_dir("file-env");
+    let file = d.join("cfg.json");
+    std::fs::write(&file, r#"{"threads": 4, "max_grants": 5}"#).unwrap();
+    let args = ["--config", file.to_str().unwrap(), "config", "show"];
+    let (code, out, err) = run(&args);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("threads = 4") && out.contains("max_grants = 5"),
+        "{out}"
+    );
+    assert!(out.contains("cfg.json"), "{out}");
+    let over = bin()
+        .args(args)
+        .env("CS2_SERVER_THREADS", "6")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&over.stdout);
+    assert!(
+        out.contains("threads = 6") && out.contains("max_grants = 5"),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn invalid_config_names_the_place_but_not_the_value() {
+    let d = test_dir("bad-cfg");
+    let file = d.join("cfg.json");
+    std::fs::write(&file, format!(r#"{{"threads": "{SENTINEL_TOKEN}"}}"#)).unwrap();
+    let (code, out, err) = run(&[
+        "--config",
+        file.to_str().unwrap(),
+        "job",
+        "list",
+        "--data-dir",
+        &data_arg(&d),
+    ]);
+    assert_eq!(code, 1);
+    assert!(err.contains("строка"), "{err}");
+    assert!(
+        !err.contains(SENTINEL_TOKEN) && !out.contains(SENTINEL_TOKEN),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn example_config_is_accepted() {
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("cs2-server.example.json");
+    let (code, out, err) = run(&["--config", example.to_str().unwrap(), "config", "show"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("lease_ttl_secs = 45") && out.contains("telegram_bot_token = не задан"),
+        "{out}"
+    );
+}

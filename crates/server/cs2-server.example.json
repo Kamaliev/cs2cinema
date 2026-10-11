@@ -1,0 +1,13 @@
+{
+  "bind": "127.0.0.1:8080",
+  "data_dir": "/var/lib/cs2-server",
+  "threads": 16,
+  "lease_ttl_secs": 45,
+  "heartbeat_secs": 10,
+  "longpoll_secs": 25,
+  "max_grants": 3,
+  "startup_grace_secs": 90,
+  "max_demo_mib": 2000,
+  "max_result_mib": 2000,
+  "telegram_bot_token": null
+}

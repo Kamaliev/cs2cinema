@@ -1,10 +1,20 @@
-//! Настройки сервера: умолчания, переменные окружения и флаги.
+//! Настройки сервера (SRV-01): умолчания < файл JSON < переменные окружения < флаги.
 //!
 //! Окружение передаётся замыканием, чтобы тесты не трогали переменные процесса.
+//! Ошибки разбора называют место (файл, строка, столбец, переменная) и никогда не повторяют значения:
+//! в настройках лежит токен бота (SEC-04).
 
 use crate::Result;
 use crate::core::Limits;
+use crate::secret::{Redactor, Secret};
+use serde::Deserialize;
+use std::io::Read;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
+
+/// Файл настроек больше этого размера не читается.
+const MAX_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -18,6 +28,8 @@ pub struct Config {
     pub startup_grace_secs: u64,
     pub max_demo_mib: u64,
     pub max_result_mib: u64,
+    /// Токен Telegram-бота (понадобится в фазе 7); `Debug` у `Secret` печатает `***`.
+    pub telegram_bot_token: Option<Secret>,
 }
 
 impl Default for Config {
@@ -35,6 +47,7 @@ impl Default for Config {
             startup_grace_secs: 90,
             max_demo_mib: 2000,
             max_result_mib: 2000,
+            telegram_bot_token: None,
         }
     }
 }
@@ -51,6 +64,12 @@ impl Config {
             max_demo_bytes: self.max_demo_mib * MIB,
             max_result_bytes: self.max_result_mib * MIB,
         }
+    }
+
+    /// Маскировщик со всеми секретами настроек.
+    pub fn redactor(&self) -> Redactor {
+        let secrets: Vec<&Secret> = self.telegram_bot_token.iter().collect();
+        Redactor::new(&secrets)
     }
 }
 
@@ -69,23 +88,410 @@ pub struct Loaded {
     pub file: Option<PathBuf>,
 }
 
+/// Содержимое файла настроек: все ключи необязательные, неизвестные — ошибка.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+struct FileConfig {
+    bind: Option<String>,
+    data_dir: Option<PathBuf>,
+    threads: Option<usize>,
+    lease_ttl_secs: Option<u64>,
+    heartbeat_secs: Option<u64>,
+    longpoll_secs: Option<u64>,
+    max_grants: Option<u32>,
+    startup_grace_secs: Option<u64>,
+    max_demo_mib: Option<u64>,
+    max_result_mib: Option<u64>,
+    telegram_bot_token: Option<String>,
+}
+
+fn read_file(path: &std::path::Path) -> Result<FileConfig> {
+    let shown = path.display();
+    let file = std::fs::File::open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => format!("файл настроек {shown} не найден"),
+        _ => format!("файл настроек {shown}: не удалось открыть ({})", e.kind()),
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("файл настроек {shown}: не удалось прочитать ({})", e.kind()))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!(
+            "файл настроек {shown} больше {} КиБ",
+            MAX_FILE_BYTES / 1024
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|e| {
+        // Текст ошибки serde_json целиком не выводим: в нём бывают значения.
+        let (l, c) = (e.line(), e.column());
+        match e.classify() {
+            serde_json::error::Category::Data => format!(
+                "{shown}: строка {l}, столбец {c}: неизвестный ключ или неверный тип значения (образец — cs2-server.example.json)"
+            ),
+            serde_json::error::Category::Io => format!("{shown}: ошибка чтения"),
+            _ => format!("{shown}: строка {l}, столбец {c}: неверный JSON"),
+        }
+    })
+}
+
+fn env_num<T: FromStr>(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Result<Option<T>> {
+    match env(name).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => v
+            .trim()
+            .parse::<T>()
+            .map(Some)
+            .map_err(|_| format!("переменная {name}: нужно целое число")),
+    }
+}
+
 pub fn load(flags: &Flags, env: &dyn Fn(&str) -> Option<String>) -> Result<Loaded> {
-    let mut config = Config::default();
+    let mut c = Config::default();
+    let mut warnings = Vec::new();
+
+    // Каталог состояния от systemd — умолчание для папки данных (первый путь списка).
     if let Some(dir) = env("STATE_DIRECTORY")
         .and_then(|v| v.split(':').next().map(str::to_owned))
         .filter(|v| !v.is_empty())
     {
-        config.data_dir = PathBuf::from(dir);
+        c.data_dir = PathBuf::from(dir);
     }
-    if let Some(dir) = env("CS2_SERVER_DATA_DIR").filter(|v| !v.is_empty()) {
-        config.data_dir = PathBuf::from(dir);
+
+    // Файл: указанный, но отсутствующий — ошибка; без указания не читается.
+    let file_path = flags.config.clone().or_else(|| {
+        env("CS2_SERVER_CONFIG")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    });
+    let mut file_token = None;
+    if let Some(path) = &file_path {
+        let f = read_file(path)?;
+        if let Some(v) = f.bind {
+            c.bind = v;
+        }
+        if let Some(v) = f.data_dir {
+            c.data_dir = v;
+        }
+        if let Some(v) = f.threads {
+            c.threads = v;
+        }
+        if let Some(v) = f.lease_ttl_secs {
+            c.lease_ttl_secs = v;
+        }
+        if let Some(v) = f.heartbeat_secs {
+            c.heartbeat_secs = v;
+        }
+        if let Some(v) = f.longpoll_secs {
+            c.longpoll_secs = v;
+        }
+        if let Some(v) = f.max_grants {
+            c.max_grants = v;
+        }
+        if let Some(v) = f.startup_grace_secs {
+            c.startup_grace_secs = v;
+        }
+        if let Some(v) = f.max_demo_mib {
+            c.max_demo_mib = v;
+        }
+        if let Some(v) = f.max_result_mib {
+            c.max_result_mib = v;
+        }
+        file_token = f.telegram_bot_token.filter(|v| !v.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(path) {
+                if meta.permissions().mode() & 0o077 != 0 {
+                    warnings.push(format!(
+                        "файл настроек {} доступен группе или всем: выполните chmod 600",
+                        path.display()
+                    ));
+                }
+            }
+        }
     }
-    if let Some(dir) = &flags.data_dir {
-        config.data_dir = dir.clone();
+
+    // Окружение.
+    if let Some(v) = env("CS2_SERVER_BIND").filter(|v| !v.is_empty()) {
+        c.bind = v;
+    }
+    if let Some(v) = env("CS2_SERVER_DATA_DIR").filter(|v| !v.is_empty()) {
+        c.data_dir = PathBuf::from(v);
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_THREADS")? {
+        c.threads = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_LEASE_TTL_SECS")? {
+        c.lease_ttl_secs = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_HEARTBEAT_SECS")? {
+        c.heartbeat_secs = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_LONGPOLL_SECS")? {
+        c.longpoll_secs = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_MAX_GRANTS")? {
+        c.max_grants = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_STARTUP_GRACE_SECS")? {
+        c.startup_grace_secs = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_MAX_DEMO_MIB")? {
+        c.max_demo_mib = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_MAX_RESULT_MIB")? {
+        c.max_result_mib = v;
+    }
+    let env_token = env("CS2_SERVER_TELEGRAM_BOT_TOKEN")
+        .filter(|v| !v.is_empty())
+        .or_else(|| env("TELEGRAM_BOT_TOKEN").filter(|v| !v.is_empty()));
+    c.telegram_bot_token = env_token.or(file_token).map(Secret::new);
+
+    // Флаги.
+    if let Some(v) = &flags.bind {
+        c.bind = v.clone();
+    }
+    if let Some(v) = &flags.data_dir {
+        c.data_dir = v.clone();
+    }
+    if let Some(v) = flags.threads {
+        c.threads = v;
+    }
+
+    validate(&c)?;
+    if let Ok(addr) = c.bind.parse::<SocketAddr>() {
+        if !addr.ip().is_loopback() {
+            warnings.push(format!(
+                "{} — не loopback: HTTP без TLS, ставьте впереди Tailscale Serve или Caddy (D-03)",
+                c.bind
+            ));
+        }
     }
     Ok(Loaded {
-        config,
-        warnings: Vec::new(),
-        file: None,
+        config: c,
+        warnings,
+        file: file_path,
     })
+}
+
+/// Проверка согласованности. Сообщения называют ключ и правило, но не повторяют значение.
+pub fn validate(c: &Config) -> Result<()> {
+    if c.bind.parse::<SocketAddr>().is_err() {
+        return Err("bind: нужен адрес вида 127.0.0.1:8080".to_owned());
+    }
+    if !(1..=256).contains(&c.threads) {
+        return Err("threads: нужно число от 1 до 256".to_owned());
+    }
+    if c.heartbeat_secs < 1 {
+        return Err("heartbeat_secs: нужно не меньше 1".to_owned());
+    }
+    if c.lease_ttl_secs < 2 * c.heartbeat_secs {
+        return Err("lease_ttl_secs: нужно не меньше удвоенного heartbeat_secs".to_owned());
+    }
+    if c.longpoll_secs < 1 || c.longpoll_secs >= c.lease_ttl_secs {
+        return Err("longpoll_secs: нужно от 1 и меньше lease_ttl_secs".to_owned());
+    }
+    if c.max_grants < 1 {
+        return Err("max_grants: нужно не меньше 1".to_owned());
+    }
+    if !(1..=4096).contains(&c.max_demo_mib) {
+        return Err("max_demo_mib: нужно число от 1 до 4096".to_owned());
+    }
+    if !(1..=4096).contains(&c.max_result_mib) {
+        return Err("max_result_mib: нужно число от 1 до 4096".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const SENTINEL_TOKEN: &str = "123456789:AAEsentinelSENTINELsentinelSENTINEL01";
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    fn temp_file(tag: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cs2srv-cfg-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("cfg.json");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    fn load_with(
+        file_body: Option<&str>,
+        tag: &str,
+        env: &[(&str, &str)],
+        flags: Flags,
+    ) -> Result<Loaded> {
+        let mut flags = flags;
+        if let Some(body) = file_body {
+            flags.config = Some(temp_file(tag, body));
+        }
+        load(&flags, &env_of(env))
+    }
+
+    #[test]
+    fn file_env_and_flags_override_in_order() {
+        let flags = Flags {
+            data_dir: Some(PathBuf::from("/flag/dir")),
+            ..Flags::default()
+        };
+        let got = load_with(
+            Some(r#"{"threads": 4, "max_grants": 5, "data_dir": "/file/dir"}"#),
+            "order",
+            &[
+                ("CS2_SERVER_THREADS", "6"),
+                ("CS2_SERVER_DATA_DIR", "/env/dir"),
+            ],
+            flags,
+        )
+        .unwrap();
+        assert_eq!(got.config.threads, 6, "окружение сильнее файла");
+        assert_eq!(got.config.max_grants, 5, "файл сильнее умолчания");
+        assert_eq!(
+            got.config.data_dir,
+            PathBuf::from("/flag/dir"),
+            "флаг сильнее окружения"
+        );
+        assert!(got.file.is_some());
+    }
+
+    #[test]
+    fn unknown_file_key_is_an_error_without_values() {
+        let e = load_with(Some(r#"{"thread": 4}"#), "unknown", &[], Flags::default())
+            .err()
+            .unwrap();
+        assert!(e.contains("строка 1"), "{e}");
+        let e = load_with(
+            Some(r#"{"threads": "SENTINEL-VALUE-12345"}"#),
+            "badtype",
+            &[],
+            Flags::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            e.contains("строка 1") && !e.contains("SENTINEL-VALUE-12345"),
+            "{e}"
+        );
+        let e = load_with(
+            Some(r#"{"threads": SENTINEL-VALUE-12345}"#),
+            "syntax",
+            &[],
+            Flags::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(!e.contains("SENTINEL-VALUE-12345"), "{e}");
+    }
+
+    #[test]
+    fn missing_config_file_is_an_error() {
+        let flags = Flags {
+            config: Some(PathBuf::from("/нет/такого/файла.json")),
+            ..Flags::default()
+        };
+        assert!(load(&flags, &env_of(&[])).is_err());
+    }
+
+    #[test]
+    fn bad_number_in_env_names_the_variable_only() {
+        let e = load(&Flags::default(), &env_of(&[("CS2_SERVER_THREADS", "abc")]))
+            .err()
+            .unwrap();
+        assert_eq!(e, "переменная CS2_SERVER_THREADS: нужно целое число");
+    }
+
+    #[test]
+    fn bot_token_from_env_is_a_secret() {
+        let got = load(
+            &Flags::default(),
+            &env_of(&[("TELEGRAM_BOT_TOKEN", SENTINEL_TOKEN)]),
+        )
+        .unwrap();
+        let c = got.config;
+        assert!(c.telegram_bot_token.is_some());
+        assert!(!format!("{c:?}").contains(SENTINEL_TOKEN));
+        assert!(
+            !c.redactor()
+                .redact(&format!("ключ {SENTINEL_TOKEN} конец"))
+                .contains(SENTINEL_TOKEN)
+        );
+    }
+
+    #[test]
+    fn invalid_limits_are_refused() {
+        let e = load(
+            &Flags::default(),
+            &env_of(&[("CS2_SERVER_LEASE_TTL_SECS", "15")]),
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains("lease_ttl_secs"), "{e}");
+        let e = load(
+            &Flags::default(),
+            &env_of(&[("CS2_SERVER_LONGPOLL_SECS", "45")]),
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains("longpoll_secs"), "{e}");
+        let e = load(
+            &Flags::default(),
+            &env_of(&[("CS2_SERVER_BIND", "не адрес")]),
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains("bind") && !e.contains("не адрес"), "{e}");
+        let e = load(
+            &Flags::default(),
+            &env_of(&[("CS2_SERVER_MAX_GRANTS", "0")]),
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains("max_grants"), "{e}");
+    }
+
+    #[test]
+    fn state_directory_is_the_default_data_dir() {
+        let got = load(
+            &Flags::default(),
+            &env_of(&[("STATE_DIRECTORY", "/var/lib/cs2-server:/other")]),
+        )
+        .unwrap();
+        assert_eq!(got.config.data_dir, PathBuf::from("/var/lib/cs2-server"));
+        assert_eq!(
+            load(&Flags::default(), &env_of(&[]))
+                .unwrap()
+                .config
+                .data_dir,
+            PathBuf::from("./data")
+        );
+    }
+
+    #[test]
+    fn non_loopback_bind_warns() {
+        let got = load(
+            &Flags::default(),
+            &env_of(&[("CS2_SERVER_BIND", "0.0.0.0:8080")]),
+        )
+        .unwrap();
+        assert!(
+            got.warnings
+                .iter()
+                .any(|w| w.contains("не loopback: HTTP без TLS")),
+            "{:?}",
+            got.warnings
+        );
+        let quiet = load(&Flags::default(), &env_of(&[])).unwrap();
+        assert!(quiet.warnings.is_empty());
+    }
 }

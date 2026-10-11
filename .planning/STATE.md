@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 04
 current_phase_name: Очередь без присмотра и приёмка
 status: executing
-stopped_at: Completed 04-05-PLAN.md
-last_updated: "2026-10-11T07:48:39.747Z"
+stopped_at: Completed 04-06-PLAN.md
+last_updated: "2026-10-11T07:52:45.755Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 04 execution started
-state_head: 9044492ce2b72bd16aeddfc6700455e9870b74b1
+state_head: a4ea63283ac76ae290d27adb01f5eeb1f0048143
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 36
-  completed_plans: 29
+  completed_plans: 30
   percent: 50
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 04 (Очередь без присмотра и приёмка) — EXECUTING
-Plan: 6 of 12
+Plan: 7 of 12
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 04 execution started
 
@@ -84,6 +84,7 @@ Progress: [█████░░░░░] 50%
 | Phase 04 P03 | 25min | 3 tasks | 6 files |
 | Phase 04 P04 | 75min | 3 tasks | 8 files |
 | Phase 04 P05 | 35 min | 2 tasks | 7 files |
+| Phase 04 P06 | 12 min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -133,6 +134,7 @@ Recent decisions affecting current work:
 - [Phase 04]: 04-03: Host::notify через Shell_NotifyIconW на отдельном потоке (DC-6); A1 и A3 спайка не проверены, кириллица не подтверждена, A2 подтверждено; 04-08 не опирается на A1, D6 в 04-11 проверяет A1/A3
 - [Phase 04]: 04-04: граница pipeline без Store — Progress::artifact, JobSpec/JobConfig; Debug JobConfig без ключа FACEIT
 - [Phase 04]: 04-05: record_request принимает Verify обязательно — запись через pipeline::job всегда с проверкой дублей (DC-1 закреплён типом)
+- [Phase 04]: cs2-cli retry отвергает флаги плана (--player/--out/--size/--fps): план берётся из record.json
 
 ### Pending Todos
 
@@ -161,6 +163,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T07:48:39.621Z
-Stopped at: Completed 04-05-PLAN.md
+Last session: 2026-10-11T07:52:45.630Z
+Stopped at: Completed 04-06-PLAN.md
 Resume file: None

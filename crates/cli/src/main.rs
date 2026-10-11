@@ -2,6 +2,10 @@ use std::{env, error::Error, path::PathBuf, process::ExitCode};
 
 use director::{NoPositions, Order, PositionSource};
 
+mod record;
+
+use record::ConsoleProgress;
+
 const USAGE: &str = "\
 cs2-cli — хайлайт-ролик из матча FACEIT
 
@@ -29,6 +33,9 @@ cs2-cli — хайлайт-ролик из матча FACEIT
 
 Склейка проверенных дублей задачи:
   cs2-cli assemble <папка задачи> — берёт record.json и clips/manifest.json, пишет highlights.mp4 через временный highlights.part.mp4
+
+Запись и повтор задачи:
+  cs2-cli record … / cs2-cli retry … (подробно: cs2-cli record --help)
 
 Ключ FACEIT берётся из переменной FACEIT_API_KEY.";
 
@@ -112,8 +119,10 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
-    if env::args().nth(1).as_deref() == Some("assemble") {
-        return assemble_cmd();
+    match env::args().nth(1).as_deref() {
+        Some("assemble") => return assemble_cmd(),
+        Some("retry") => return record::retry_cmd(),
+        _ => {}
     }
     let args = match parse_args() {
         Ok(a) => a,
@@ -392,19 +401,6 @@ fn list_cameras() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Прогресс в консоли: этапы и строки журнала идут в stderr. Отмены нет: остановка CLI закрывает
-/// дескриптор Job Object, и игра уходит вместе с ним.
-struct ConsoleProgress;
-
-impl pipeline::Progress for ConsoleProgress {
-    fn stage(&self, s: pipeline::Stage) {
-        eprintln!("== {}", s.title());
-    }
-    fn log(&self, msg: &str) {
-        eprintln!("{msg}");
-    }
-}
-
 /// `cs2-cli assemble <папка задачи>`: склеивает проверенные дубли задачи в `highlights.mp4` тем же кодом, что и приложение.
 fn assemble_cmd() -> ExitCode {
     let mut rest = env::args().skip(2);
@@ -434,10 +430,7 @@ fn assemble_cmd() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            match e.fail {
-                Some(f) => eprintln!("ошибка: {}: {}\nподсказка: {}", f.code.as_str(), f.message, f.hint),
-                None => eprintln!("ошибка: {}", e.message),
-            }
+            record::print_failure(&e);
             ExitCode::FAILURE
         }
     }

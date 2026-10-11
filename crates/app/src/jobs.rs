@@ -13,11 +13,9 @@ use std::{
 };
 
 use pipeline::{
-    Artifact, PlanOptions, Progress, RecordFailure, RecordState, RunError, Source, Stage,
-    assemble::assemble_stage,
-    host::Host,
+    Artifact, Progress, RecordFailure, RecordState, RunError, Stage,
     job::{self, DemoSource, JobConfig, JobSpec},
-    precheck::{Demo, Inputs, space},
+    precheck::{Demo, Inputs},
 };
 use store::{
     Job, JobFailure, JobKind, JobOutcome, JobSource, Store,
@@ -26,7 +24,6 @@ use store::{
 
 use crate::{
     app::{App, Msg, Reporter},
-    launch,
     settings::Settings,
     ui,
 };
@@ -189,11 +186,6 @@ pub fn finish(store: &Store, id: i64, result: &Result<JobOutcome, RunError>) -> 
     }
 }
 
-/// Нужна ли задаче предпроверка окружения: «только план» ничего не пишет, поэтому её пропускает (D-01).
-pub fn needs_precheck(kind: JobKind) -> bool {
-    kind != JobKind::Plan
-}
-
 /// Настройки приложения в настройки задачи `pipeline`: пути, кадр и остальное поле в поле.
 pub fn job_config(s: &Settings) -> JobConfig {
     JobConfig {
@@ -243,17 +235,6 @@ pub fn precheck_inputs(s: &Settings, demo: Demo, last_good: Option<store::LastGo
     job::precheck_inputs(&job_config(s), demo, last_good.map(|g| (g.cs2_build, g.hlae_version)))
 }
 
-/// Демка задачи для предпроверки: файл, готовая скачанная копия из реестра или «ещё скачать».
-fn job_demo(job: &Job, store: &Store) -> Demo {
-    match &job.source {
-        JobSource::File(p) => Demo::File(p.clone()),
-        JobSource::Faceit(id) => match store.demo_path(id) {
-            Ok(Some(path)) => Demo::File(path),
-            _ => Demo::Download,
-        },
-    }
-}
-
 /// Останавливает ли итог задачи очередь: только осознанная отмена (D-13); сбой и успех — очередь идёт дальше.
 pub fn pauses_queue(result: &Result<PathBuf, String>) -> bool {
     matches!(result, Err(e) if e == pipeline::CANCELLED)
@@ -290,11 +271,11 @@ pub fn run_next(app: &mut App) {
     std::thread::spawn(move || {
         let host = pipeline::host::default_host();
         let rep = JobReporter::new(store.clone(), job.id, ui, cancel, attempt);
-        let result = run(&*host, &job, &s, &store, &rep);
+        let result = job::run_job(&*host, &job_spec(&job, &store, &s, attempt), &rep).map(store_outcome);
         // длительность последнего этапа — до итога попытки (успех, сбой и отмена)
         rep.close_stage();
         let _ = finish(&store, job.id, &result);
-        // готовый ролик открываем в плеере здесь, а не в `run`: тесты `run` плеер не запускают
+        // готовый ролик открываем в плеере здесь, а не в `run_job`: тесты `pipeline` плеер не запускают
         if let Ok(o) = &result {
             if o.result.extension().is_some_and(|e| e == "mp4") {
                 ui::open_path(&o.result);
@@ -305,92 +286,6 @@ pub fn run_next(app: &mut App) {
     app.refresh_jobs();
 }
 
-/// Весь путь задачи: демка -> план -> (запись -> склейка); исполняется в фоновом потоке.
-fn run(host: &dyn Host, job: &Job, s: &Settings, store: &Store, p: &JobReporter) -> Result<JobOutcome, RunError> {
-    // «Повторить»: всё берётся из record.json в папке задачи, без скачивания, разбора и плана (RET-02, D-08)
-    if job.resume {
-        return job::resume(host, &job_spec(job, store, s, p.attempt), p).map(store_outcome);
-    }
-    let cfg = job_config(s);
-    // предпроверка окружения — до скачивания, разбора и плана (PRE-02): неисправное окружение видно за секунды
-    let inputs = precheck_inputs(s, job_demo(job, store), store.last_good().ok().flatten());
-    let mut report = if needs_precheck(job.kind) { Some(job::precheck_stage(host, &inputs, p)?) } else { None };
-    let src = match &job.source {
-        // скачанную демку берём из реестра, иначе качаем
-        JobSource::Faceit(id) => match store.demo_path(id)? {
-            Some(path) => Source::File(path),
-            None => Source::Faceit { link: id.clone(), key: s.faceit_key.clone(), demo_index: 0, dir: Path::new(&s.out_root).join("demos") },
-        },
-        JobSource::File(path) => Source::File(path.clone()),
-    };
-    let mut a = pipeline::analyze(&src, p)?;
-    if let JobSource::Faceit(id) = &job.source {
-        let _ = store.remember_demo(id, &a.demo_path);
-    }
-    let hero = pipeline::find_player(&a.m, Some(job.hero_steam), &job.hero_name).ok_or_else(|| format!("игрок {} в демке не найден", job.hero_name))?;
-    let out_dir = Path::new(&s.out_root).join(pipeline::console_name(&format!("{}_{}", a.label, a.m.name(hero))));
-    // папка задачи известна карточке до записи: путь к record.log виден и при сбое
-    let _ = store.set_out_dir(job.id, &out_dir);
-    // NVENC: для склейки — у ffmpeg из PATH, для дублей — у ffmpeg, которым пишет HLAE
-    let (mut nvenc, mut take_nvenc) = (false, false);
-    if s.gpu_encode && job.kind != JobKind::Plan {
-        // проба с дедлайном и отменой задачи (TMO-03): зависший ffmpeg не вешает задачу
-        let probe_for = job::deadlines(&cfg).nvenc_probe;
-        let cancel = || p.cancelled();
-        let check = launch::nvenc_check(host, Path::new("ffmpeg"), probe_for, &cancel);
-        take_nvenc = launch::hlae_ffmpeg(&s.hlae_dir).is_some_and(|f| launch::has_nvenc(host, &f, probe_for, &cancel));
-        // отмена во время пробы прерывает задачу, а не превращается в «NVENC недоступен»
-        pipeline::check(p)?;
-        nvenc = check.is_ok();
-        p.log(&format!("кодирование: дубли — {}, склейка — {}", if take_nvenc { "NVENC" } else { "процессор" }, if nvenc { "NVENC" } else { "процессор" }));
-        if let Err(e) = check {
-            p.log(&format!("NVENC недоступен: {e}"));
-        }
-    }
-    let o = PlanOptions {
-        fps: s.fps,
-        chronological: s.chronological,
-        flybys: s.flybys,
-        walls: s.walls,
-        size: s.frame_size(),
-        encoder: if nvenc { renderer::Encoder::Nvenc } else { renderer::Encoder::X264 },
-        take_nvenc,
-        detailed: s.detailed,
-        ..Default::default()
-    };
-    // record.json прошлого плана устарел, как только скрипты пишутся заново: «Повторить» не должен взять чужой план (Pitfall 7)
-    job::begin_plan(&out_dir)?;
-    let plan = pipeline::plan_player(&mut a, hero, &o, &out_dir, p)?;
-    let (shots, secs) = (plan.timeline.shots.len() as u32, plan.timeline.total_secs());
-    p.log(&format!("план: {shots} шотов, ~{secs:.0} с"));
-    if job.kind == JobKind::Plan {
-        return Ok(JobOutcome { out_dir: out_dir.clone(), result: out_dir, shots, secs });
-    }
-    pipeline::check(p)?;
-    // пути HLAE и CS2 проверила предпроверка; путь результатов должен годиться для консоли HLAE
-    if !renderer::console_safe(&pipeline::absolute_slash(&out_dir)) {
-        return Err("в пути результатов есть пробелы — HLAE не загрузит campath; выберите папку без пробелов".into());
-    }
-
-    // скрипты плана готовы: всё, что нужно записи и склейке, — в `RecordJson` (повтор берёт его же, D-08)
-    let demo_name = format!("cs2cinema_{}", pipeline::console_name(&a.label));
-    let rj = job::record_json_for(&plan, &a.demo_path, a.demo_len(), &demo_name, &cfg, take_nvenc)?;
-    // без record.json «Повторить» невозможен, поэтому ошибка сохранения — ошибка задачи; файл ложится сразу после плана
-    rj.save(&out_dir).map_err(|e| format!("не удалось сохранить record.json: {e} — без него «Повторить» невозможен"))?;
-    // второй проход места по плану (D-03): сумма игровых секунд дублей, размер кадра и демки; до запуска игры
-    if let Some(report) = report.as_mut() {
-        job::space_pass(host, &inputs, space::estimate(&plan.takes, s.frame_size(), a.demo_len()), report, p)?;
-    }
-    // первый запуск и «Заново» всегда пишут дубли с проверкой, прежние не переиспользуют (решение 2)
-    job::record_takes(host, &cfg, (job.id, p.attempt), &out_dir, &rj, report.as_ref(), p)?;
-
-    p.stage(Stage::Assemble);
-    let out = assemble_stage(host, &out_dir, &plan.takes, &plan.ffmpeg_args, plan.video_secs, job::deadlines(&cfg).ffmpeg_for(plan.video_secs), p)?;
-    // пара «сборка CS2 / версия HLAE» после удачной задачи, в которой шла запись (D-04, DIF-01)
-    job::last_good(report.as_ref(), p);
-    Ok(JobOutcome { out_dir, result: out, shots, secs })
-}
-
 /// Итог общей задачи `pipeline` в строку базы: поля перекладываются как есть.
 fn store_outcome(o: job::Outcome) -> JobOutcome {
     JobOutcome { out_dir: o.out_dir, result: o.result, shots: o.shots, secs: o.secs }
@@ -399,7 +294,6 @@ fn store_outcome(o: job::Outcome) -> JobOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     use pipeline::{Deadlines, RecordRequest, host::LaunchSpec};
 
@@ -569,12 +463,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_job_skips_the_precheck() {
-        assert!(!needs_precheck(JobKind::Plan));
-        assert!(needs_precheck(JobKind::Record));
-    }
-
-    #[test]
     fn job_reporter_turns_artifacts_into_store_rows() {
         let (store, id, dir) = running_job("artifacts");
         let rep = reporter_for(&store, id);
@@ -610,14 +498,5 @@ mod tests {
 
     fn reporter_for(store: &Store, id: i64) -> JobReporter {
         JobReporter::new(store.clone(), id, Reporter::detached(), CancelToken::default(), 1)
-    }
-
-    #[test]
-    fn nvenc_probe_that_hangs_is_cut_by_its_deadline() {
-        let host = FakeHost::new(Scenario::happy(1).run_result(Err(pipeline::host::HostError::Timeout)));
-        let e = launch::nvenc_check(&host, Path::new("ffmpeg"), Duration::from_secs(20), &|| false).unwrap_err();
-        assert!(e.contains("не уложилась"), "{e}");
-        assert!(e.contains("20 с"), "{e}");
-        assert!(!launch::has_nvenc(&host, Path::new("ffmpeg"), Duration::from_secs(20), &|| false));
     }
 }

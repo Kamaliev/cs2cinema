@@ -1,12 +1,11 @@
-//! Поиск CS2 и HLAE, восстановление после падения приложения, проба NVENC. Файлы записи в папке игры — `pipeline::gamedir`; проверку окружения делает предпроверка (`pipeline::precheck`); запуск игры, консоль и живость — в `host::win::WinHost`.
+//! Поиск CS2 и HLAE, восстановление после падения приложения. Файлы записи в папке игры — `pipeline::gamedir`; проверку окружения делает предпроверка (`pipeline::precheck`); запуск игры, консоль и живость — в `host::win::WinHost`.
 
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
 };
 
-use pipeline::host::{CmdSpec, Host, HostError};
+use pipeline::host::Host;
 use store::Store;
 
 #[cfg(windows)]
@@ -124,41 +123,6 @@ pub fn old_logs(out_dir: &Path) -> Vec<PathBuf> {
         .collect();
     found.sort();
     found.into_iter().map(|(_, p)| p).collect()
-}
-
-/// ffmpeg, которым пишет HLAE: `Path=` из `ffmpeg\ffmpeg.ini` в папке HLAE. Разбор — в одном месте, в предпроверке.
-pub fn hlae_ffmpeg(hlae_dir: &str) -> Option<PathBuf> {
-    pipeline::precheck::hlae_ffmpeg(Path::new(hlae_dir))
-}
-
-/// Работает ли NVENC у этого ffmpeg: короткий пробный энкод (кодер может быть в сборке, но без драйвера NVIDIA).
-pub fn has_nvenc(host: &dyn Host, ffmpeg: &Path, deadline: Duration, cancel: &dyn Fn() -> bool) -> bool {
-    nvenc_check(host, ffmpeg, deadline, cancel).is_ok()
-}
-
-/// Пробное кодирование NVENC через `Host::run` — с дедлайном и отменой (TMO-03). В ошибке — строка ffmpeg
-/// (например, «драйвер старее, чем нужно»), «проба NVENC не уложилась в N с» или `pipeline::CANCELLED`.
-pub fn nvenc_check(host: &dyn Host, ffmpeg: &Path, deadline: Duration, cancel: &dyn Fn() -> bool) -> Result<(), String> {
-    let args = ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=256x144:d=0.2", "-c:v", "h264_nvenc", "-f", "null", "-"];
-    let cmd = CmdSpec { program: ffmpeg.to_path_buf(), args: args.map(String::from).into(), cwd: None, deadline };
-    match host.run(&cmd, cancel, &mut |_| {}) {
-        Ok(out) if out.code == Some(0) => Ok(()),
-        Ok(out) => {
-            let line = out
-                .stderr_tail
-                .iter()
-                .find(|l| l.contains("nvenc") || l.contains("driver") || l.contains("Driver"))
-                .or_else(|| out.stderr_tail.first())
-                .map_or("", String::as_str);
-            // «[h264_nvenc @ 0x…] Driver does not support…» — префикс не нужен
-            let msg = line.rsplit("] ").next().unwrap_or(line).trim();
-            Err(if msg.is_empty() { "h264_nvenc не заработал".into() } else { msg.to_owned() })
-        }
-        Err(HostError::Timeout) => Err(format!("проба NVENC не уложилась в {} с", deadline.as_secs())),
-        Err(HostError::Cancelled) => Err(pipeline::CANCELLED.to_owned()),
-        Err(HostError::Spawn(e)) => Err(format!("ffmpeg не запустился: {e}")),
-        Err(e) => Err(format!("ffmpeg: {e}")),
-    }
 }
 
 #[cfg(test)]
@@ -285,27 +249,5 @@ mod tests {
         assert_eq!(names, ["record.log.1", "record.log.2", "record.log.10"]);
         assert!(old_logs(&root.join("no-such-job")).is_empty());
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn nvenc_failure_names_the_driver_line_without_the_ffmpeg_prefix() {
-        use pipeline::host::{
-            CmdOutput,
-            fake::{FakeHost, Scenario},
-        };
-        let failed = CmdOutput {
-            code: Some(1),
-            stderr_tail: vec!["Stream mapping:".into(), "[h264_nvenc @ 0x1] Driver does not support the required nvenc API version".into()],
-            elapsed: Duration::ZERO,
-        };
-        let host = FakeHost::new(Scenario::happy(1).run_result(Ok(failed)));
-        let e = nvenc_check(&host, Path::new("ffmpeg"), Duration::from_secs(20), &|| false).unwrap_err();
-        assert_eq!(e, "Driver does not support the required nvenc API version");
-
-        let host = FakeHost::new(Scenario::happy(1).run_result(Err(HostError::Spawn("нет файла".into()))));
-        assert!(nvenc_check(&host, Path::new("ffmpeg"), Duration::from_secs(20), &|| false).unwrap_err().contains("не запустился"));
-        let host = FakeHost::new(Scenario::happy(1));
-        assert_eq!(nvenc_check(&host, Path::new("ffmpeg"), Duration::from_secs(20), &|| true), Err(pipeline::CANCELLED.to_owned()), "отмена прерывает пробу");
-        assert!(nvenc_check(&host, Path::new("ffmpeg"), Duration::from_secs(20), &|| false).is_ok());
     }
 }

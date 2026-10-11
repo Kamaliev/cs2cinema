@@ -5,8 +5,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use pipeline::assemble::assemble_stage;
-use pipeline::host::CmdOutput;
 use pipeline::host::fake::{FakeHost, Scenario};
+use pipeline::host::{CmdOutput, ProcInfo};
 use pipeline::job::{self, DemoSource, JobConfig, JobSpec};
 use pipeline::manifest::{EnvSnapshot, Manifest, RecordJson, TakeSpec, TakeStatus};
 use pipeline::record::verify::TakeFacts;
@@ -487,4 +487,87 @@ fn retry_with_an_invalid_take_sets_clips_aside_and_records_again() {
         "{artifacts:?}"
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// Описание первого запуска задачи (не «Повторить») на временном дереве.
+fn first_run_spec(tag: &str, record: bool, source: DemoSource) -> JobSpec {
+    JobSpec {
+        job_id: 1,
+        attempt: 1,
+        record,
+        resume: false,
+        source,
+        hero_steam: 42,
+        hero_name: "me".into(),
+        known_demo: None,
+        last_good: None,
+        out_dir: None,
+        cfg: healthy_config(tag),
+    }
+}
+
+#[test]
+fn record_job_with_a_failing_precheck_stops_before_the_demo() {
+    let mut spec = first_run_spec("first-foreign", true, DemoSource::Faceit("1-abc".into()));
+    with_steam_layout(&mut spec.cfg);
+    // чужой cs2.exe: запись невозможна, а скачивание демки ещё не началось бы
+    let host = FakeHost::new(Scenario::happy(1).processes(vec![ProcInfo {
+        pid: 777,
+        exe_name: "cs2.exe".into(),
+    }]));
+    let cap = Capture::default();
+    let e = job::run_job(&host, &spec, &cap).expect_err("чужая игра блокирует задачу");
+
+    let f = e.fail.as_ref().expect("сбой типизирован");
+    assert_eq!(f.code, FailCode::ForeignGameRunning);
+    assert_eq!(f.code.as_str(), "FOREIGN_GAME_RUNNING");
+    let artifacts = cap.artifacts.lock().unwrap();
+    assert!(
+        artifacts
+            .iter()
+            .any(|a| matches!(a, Artifact::Precheck { passed: false, .. })),
+        "{artifacts:?}"
+    );
+    assert!(
+        !artifacts.iter().any(|a| matches!(a, Artifact::Demo { .. })),
+        "демку не скачивали: {artifacts:?}"
+    );
+    let log = cap.log_text();
+    assert!(!log.contains("качаю демку"), "{log}");
+    assert_eq!(host.launches(), 0);
+    cleanup(&spec.cfg);
+}
+
+#[test]
+fn plan_only_job_skips_the_precheck_and_reports_a_missing_demo() {
+    let missing = std::env::temp_dir().join(format!(
+        "cs2cinema-job-{}-no-such-demo.dem",
+        std::process::id()
+    ));
+    let spec = first_run_spec("first-plan", false, DemoSource::File(missing.clone()));
+    let host = FakeHost::new(Scenario::happy(1));
+    let cap = Capture::default();
+    let e = job::run_job(&host, &spec, &cap).expect_err("демки нет");
+
+    assert!(
+        e.message.contains(&*missing.to_string_lossy()),
+        "в ошибке путь к файлу: {}",
+        e.message
+    );
+    assert!(e.fail.is_none(), "это не сбой записи: {e:?}");
+    let runs = host.runs();
+    assert!(
+        !runs
+            .iter()
+            .any(|(_, _, args)| args.iter().any(|a| a == "-version")),
+        "предпроверка пропущена, `-version` не запускали: {runs:?}"
+    );
+    assert!(
+        !cap.artifacts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|a| matches!(a, Artifact::Precheck { .. }))
+    );
+    cleanup(&spec.cfg);
 }

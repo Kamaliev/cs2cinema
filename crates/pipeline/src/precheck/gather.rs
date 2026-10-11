@@ -180,6 +180,71 @@ pub fn hlae_ffmpeg(hlae_dir: &Path) -> Option<PathBuf> {
     bundled.is_file().then_some(bundled)
 }
 
+/// Работает ли NVENC у этого ffmpeg: короткий пробный энкод (кодер может быть в сборке, но без драйвера NVIDIA).
+pub fn has_nvenc(
+    host: &dyn Host,
+    ffmpeg: &Path,
+    deadline: Duration,
+    cancel: &dyn Fn() -> bool,
+) -> bool {
+    nvenc_check(host, ffmpeg, deadline, cancel).is_ok()
+}
+
+/// Пробное кодирование NVENC через `Host::run` — с дедлайном и отменой (TMO-03). В ошибке — строка ffmpeg
+/// (например, «драйвер старее, чем нужно»), «проба NVENC не уложилась в N с» или `CANCELLED`.
+pub fn nvenc_check(
+    host: &dyn Host,
+    ffmpeg: &Path,
+    deadline: Duration,
+    cancel: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    let args = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=256x144:d=0.2",
+        "-c:v",
+        "h264_nvenc",
+        "-f",
+        "null",
+        "-",
+    ];
+    let cmd = CmdSpec {
+        program: ffmpeg.to_path_buf(),
+        args: args.map(String::from).into(),
+        cwd: None,
+        deadline,
+    };
+    match host.run(&cmd, cancel, &mut |_| {}) {
+        Ok(out) if out.code == Some(0) => Ok(()),
+        Ok(out) => {
+            let line = out
+                .stderr_tail
+                .iter()
+                .find(|l| l.contains("nvenc") || l.contains("driver") || l.contains("Driver"))
+                .or_else(|| out.stderr_tail.first())
+                .map_or("", String::as_str);
+            // «[h264_nvenc @ 0x…] Driver does not support…» — префикс не нужен
+            let msg = line.rsplit("] ").next().unwrap_or(line).trim();
+            Err(if msg.is_empty() {
+                "h264_nvenc не заработал".into()
+            } else {
+                msg.to_owned()
+            })
+        }
+        Err(HostError::Timeout) => Err(format!(
+            "проба NVENC не уложилась в {} с",
+            deadline.as_secs()
+        )),
+        Err(HostError::Cancelled) => Err(CANCELLED.to_owned()),
+        Err(HostError::Spawn(e)) => Err(format!("ffmpeg не запустился: {e}")),
+        Err(e) => Err(format!("ffmpeg: {e}")),
+    }
+}
+
 /// Ответ утилиты на `-version`. Вывод утилиты — недоверенный текст: берётся только первая
 /// непустая строка и хвост stderr.
 fn probe(
@@ -262,5 +327,55 @@ fn out_fact(out_root: &Path) -> OutFact {
         console_safe: renderer::console_safe(&path),
         path,
         writable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use host::{
+        CmdOutput,
+        fake::{FakeHost, Scenario},
+    };
+
+    #[test]
+    fn nvenc_probe_that_hangs_is_cut_by_its_deadline() {
+        let host = FakeHost::new(Scenario::happy(1).run_result(Err(HostError::Timeout)));
+        let ffmpeg = Path::new("ffmpeg");
+        let d = Duration::from_secs(20);
+        let e = nvenc_check(&host, ffmpeg, d, &|| false).unwrap_err();
+        assert!(e.contains("не уложилась"), "{e}");
+        assert!(e.contains("20 с"), "{e}");
+        assert!(!has_nvenc(&host, ffmpeg, d, &|| false));
+    }
+
+    #[test]
+    fn nvenc_failure_names_the_driver_line_without_the_ffmpeg_prefix() {
+        let failed = CmdOutput {
+            code: Some(1),
+            stderr_tail: vec![
+                "Stream mapping:".into(),
+                "[h264_nvenc @ 0x1] Driver does not support the required nvenc API version".into(),
+            ],
+            elapsed: Duration::ZERO,
+        };
+        let ffmpeg = Path::new("ffmpeg");
+        let d = Duration::from_secs(20);
+        let host = FakeHost::new(Scenario::happy(1).run_result(Ok(failed)));
+        let e = nvenc_check(&host, ffmpeg, d, &|| false).unwrap_err();
+        assert_eq!(e, "Driver does not support the required nvenc API version");
+
+        let spawn_failed = Err(HostError::Spawn("нет файла".into()));
+        let host = FakeHost::new(Scenario::happy(1).run_result(spawn_failed));
+        let e = nvenc_check(&host, ffmpeg, d, &|| false).unwrap_err();
+        assert!(e.contains("не запустился"), "{e}");
+
+        let host = FakeHost::new(Scenario::happy(1));
+        assert_eq!(
+            nvenc_check(&host, ffmpeg, d, &|| true),
+            Err(CANCELLED.to_owned()),
+            "отмена прерывает пробу"
+        );
+        assert!(nvenc_check(&host, ffmpeg, d, &|| false).is_ok());
     }
 }

@@ -11,7 +11,7 @@ use renderer::TakePlan;
 
 use crate::{
     Artifact, Deadlines, Event, FailCode, Progress, RecordFailure, RecordReport, RecordRequest,
-    RecordState, RunError, Stage,
+    RecordState, RunError, Source, Stage,
     assemble::assemble_stage,
     gamedir,
     host::{Host, LaunchSpec},
@@ -466,6 +466,171 @@ pub fn all_takes_validated(m: &Manifest, takes: &[TakePlan]) -> bool {
             m.entry(t.index)
                 .is_some_and(|e| e.status == TakeStatus::Validated)
         })
+}
+
+/// Демка задачи для предпроверки: файл, готовая скачанная копия или «ещё скачать».
+fn job_demo(spec: &JobSpec) -> Demo {
+    match (&spec.source, &spec.known_demo) {
+        (DemoSource::File(path), _) => Demo::File(path.clone()),
+        (DemoSource::Faceit(_), Some(path)) => Demo::File(path.clone()),
+        (DemoSource::Faceit(_), None) => Demo::Download,
+    }
+}
+
+/// Вся задача: предпроверка → демка → разбор → план → (запись → склейка). «Повторить» — ветка `resume`:
+/// по `record.json` из папки задачи, без скачивания, разбора и плана. Приложение и `cs2-cli` зовут только её.
+pub fn run_job(host: &dyn Host, spec: &JobSpec, p: &dyn Progress) -> Result<Outcome, RunError> {
+    if spec.resume {
+        return resume(host, spec, p);
+    }
+    let cfg = &spec.cfg;
+    // предпроверка окружения — до скачивания, разбора и плана (PRE-02): неисправное окружение видно за секунды;
+    // «только план» ничего не пишет, поэтому предпроверку пропускает (D-01)
+    let inputs = precheck_inputs(cfg, job_demo(spec), spec.last_good.clone());
+    let mut report = if spec.record {
+        Some(precheck_stage(host, &inputs, p)?)
+    } else {
+        None
+    };
+    let src = match (&spec.source, &spec.known_demo) {
+        (DemoSource::File(path), _) => Source::File(path.clone()),
+        // скачанную демку берём из памяти вызывающего, иначе качаем
+        (DemoSource::Faceit(_), Some(path)) => Source::File(path.clone()),
+        (DemoSource::Faceit(id), None) => Source::Faceit {
+            link: id.clone(),
+            key: cfg.faceit_key.clone(),
+            demo_index: 0,
+            dir: cfg.out_root.join("demos"),
+        },
+    };
+    let mut a = crate::analyze(&src, p)?;
+    if let DemoSource::Faceit(id) = &spec.source {
+        p.artifact(&Artifact::Demo {
+            match_id: id.clone(),
+            path: a.demo_path.clone(),
+        });
+    }
+    let hero = crate::find_player(&a.m, Some(spec.hero_steam), &spec.hero_name)
+        .ok_or_else(|| format!("игрок {} в демке не найден", spec.hero_name))?;
+    let out_dir = cfg.out_root.join(crate::console_name(&format!(
+        "{}_{}",
+        a.label,
+        a.m.name(hero)
+    )));
+    // папка задачи известна вызывающему до записи: путь к record.log виден и при сбое
+    p.artifact(&Artifact::OutDir(out_dir.clone()));
+    // NVENC: для склейки — у ffmpeg из PATH, для дублей — у ffmpeg, которым пишет HLAE
+    let (mut nvenc, mut take_nvenc) = (false, false);
+    if cfg.gpu_encode && spec.record {
+        // проба с дедлайном и отменой задачи (TMO-03): зависший ffmpeg не вешает задачу
+        let probe_for = deadlines(cfg).nvenc_probe;
+        let cancel = || p.cancelled();
+        let check = precheck::nvenc_check(host, &cfg.ffmpeg, probe_for, &cancel);
+        take_nvenc = precheck::hlae_ffmpeg(&cfg.hlae_dir)
+            .is_some_and(|f| precheck::has_nvenc(host, &f, probe_for, &cancel));
+        // отмена во время пробы прерывает задачу, а не превращается в «NVENC недоступен»
+        crate::check(p)?;
+        nvenc = check.is_ok();
+        p.log(&format!(
+            "кодирование: дубли — {}, склейка — {}",
+            if take_nvenc {
+                "NVENC"
+            } else {
+                "процессор"
+            },
+            if nvenc { "NVENC" } else { "процессор" }
+        ));
+        if let Err(e) = check {
+            p.log(&format!("NVENC недоступен: {e}"));
+        }
+    }
+    let o = crate::PlanOptions {
+        fps: cfg.fps,
+        chronological: cfg.chronological,
+        flybys: cfg.flybys,
+        walls: cfg.walls,
+        size: cfg.frame,
+        encoder: if nvenc {
+            renderer::Encoder::Nvenc
+        } else {
+            renderer::Encoder::X264
+        },
+        take_nvenc,
+        detailed: cfg.detailed,
+        ..Default::default()
+    };
+    // record.json прошлого плана устарел, как только скрипты пишутся заново: «Повторить» не должен взять чужой план (Pitfall 7)
+    begin_plan(&out_dir)?;
+    let plan = crate::plan_player(&mut a, hero, &o, &out_dir, p)?;
+    let (shots, secs) = (plan.timeline.shots.len() as u32, plan.timeline.total_secs());
+    p.log(&format!("план: {shots} шотов, ~{secs:.0} с"));
+    if !spec.record {
+        return Ok(Outcome {
+            out_dir: out_dir.clone(),
+            result: out_dir,
+            shots,
+            secs,
+        });
+    }
+    crate::check(p)?;
+    // пути HLAE и CS2 проверила предпроверка; путь результатов должен годиться для консоли HLAE
+    if !renderer::console_safe(&crate::absolute_slash(&out_dir)) {
+        return Err("в пути результатов есть пробелы — HLAE не загрузит campath; выберите папку без пробелов".into());
+    }
+
+    // скрипты плана готовы: всё, что нужно записи и склейке, — в `RecordJson` (повтор берёт его же, D-08)
+    let demo_name = format!("cs2cinema_{}", crate::console_name(&a.label));
+    let rj = record_json_for(
+        &plan,
+        &a.demo_path,
+        a.demo_len(),
+        &demo_name,
+        cfg,
+        take_nvenc,
+    )?;
+    // без record.json «Повторить» невозможен, поэтому ошибка сохранения — ошибка задачи; файл ложится сразу после плана
+    rj.save(&out_dir).map_err(|e| {
+        format!("не удалось сохранить record.json: {e} — без него «Повторить» невозможен")
+    })?;
+    // второй проход места по плану (D-03): сумма игровых секунд дублей, размер кадра и демки; до запуска игры
+    if let Some(report) = report.as_mut() {
+        space_pass(
+            host,
+            &inputs,
+            space::estimate(&plan.takes, cfg.frame, a.demo_len()),
+            report,
+            p,
+        )?;
+    }
+    // первый запуск и «Заново» всегда пишут дубли с проверкой, прежние не переиспользуют (решение 2)
+    record_takes(
+        host,
+        cfg,
+        (spec.job_id, spec.attempt),
+        &out_dir,
+        &rj,
+        report.as_ref(),
+        p,
+    )?;
+
+    p.stage(Stage::Assemble);
+    let out = assemble_stage(
+        host,
+        &out_dir,
+        &plan.takes,
+        &plan.ffmpeg_args,
+        plan.video_secs,
+        deadlines(cfg).ffmpeg_for(plan.video_secs),
+        p,
+    )?;
+    // пара «сборка CS2 / версия HLAE» после удачной задачи, в которой шла запись (D-04, DIF-01)
+    last_good(report.as_ref(), p);
+    Ok(Outcome {
+        out_dir,
+        result: out,
+        shots,
+        secs,
+    })
 }
 
 /// «Повторить» (RET-02, RET-03, D-07, D-08): без скачивания, разбора демки и плана — по `record.json` из папки задачи.

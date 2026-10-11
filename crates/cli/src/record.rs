@@ -182,6 +182,43 @@ pub fn parse_retry(args: &[String], env: Env) -> Result<JobSpec, String> {
     })
 }
 
+/// `cs2-cli record <ссылка|.dem> --player <ник>`: полная задача.
+pub fn parse_record(args: &[String], env: Env) -> Result<JobSpec, String> {
+    let Parsed {
+        mut positional,
+        cfg,
+        player,
+    } = parse_cfg(args, env, true)?;
+    if positional.is_empty() {
+        return Err("укажите ссылку FACEIT или путь к .dem".into());
+    }
+    let input = positional.remove(0);
+    if let Some(extra) = positional.first() {
+        return Err(format!("лишний аргумент {extra}"));
+    }
+    let Some(player) = player else {
+        return Err("укажите --player <ник>".into());
+    };
+    // существующий файл важнее ссылки: как и в обычном режиме cs2-cli
+    let source = match faceit::parse_match_id(&input) {
+        Some(id) if !Path::new(&input).exists() => DemoSource::Faceit(id),
+        _ => DemoSource::File(PathBuf::from(&input)),
+    };
+    Ok(JobSpec {
+        job_id: 0,
+        attempt: 1,
+        record: true,
+        resume: false,
+        source,
+        hero_steam: 0,
+        hero_name: player,
+        known_demo: None,
+        last_good: None,
+        out_dir: None,
+        cfg,
+    })
+}
+
 fn process_env(k: &str) -> Option<String> {
     env::var(k).ok()
 }
@@ -235,6 +272,24 @@ fn run_cmd(
             ExitCode::FAILURE
         }
     }
+}
+
+/// `cs2-cli record …`.
+pub fn record_cmd() -> ExitCode {
+    run_cmd(parse_record, |s| {
+        let source = match &s.source {
+            DemoSource::File(p) => p.display().to_string(),
+            DemoSource::Faceit(id) => format!("матч FACEIT {id}"),
+        };
+        // ключ FACEIT в строку не попадает (T-04-16)
+        Some(format!(
+            "запись: {source} · игрок {} · кадр {}x{} · результаты в {}",
+            s.hero_name,
+            s.cfg.frame.0,
+            s.cfg.frame.1,
+            s.cfg.out_root.display()
+        ))
+    })
 }
 
 /// `cs2-cli retry …`.
@@ -306,6 +361,74 @@ mod tests {
             parse_retry(&args(&["a", "--size", "1920x1080"]), &env)
                 .unwrap_err()
                 .contains("неизвестный параметр --size")
+        );
+    }
+
+    #[test]
+    fn record_parses_a_faceit_link() {
+        let env = env_of(&[("FACEIT_API_KEY", "секрет")]);
+        let s = parse_record(
+            &args(&[
+                "https://www.faceit.com/ru/cs2/room/1-0e0b2a0c-6a3b-4b2d-9c3e-1a2b3c4d5e6f",
+                "--player",
+                "wytom",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            s.source,
+            DemoSource::Faceit("1-0e0b2a0c-6a3b-4b2d-9c3e-1a2b3c4d5e6f".into())
+        );
+        assert!(s.record && !s.resume);
+        assert_eq!((s.hero_name.as_str(), s.hero_steam), ("wytom", 0));
+        assert_eq!(s.cfg.faceit_key, "секрет");
+        assert!(
+            !format!("{s:?}").contains("секрет"),
+            "ключ не должен попасть в Debug"
+        );
+    }
+
+    #[test]
+    fn record_parses_a_demo_file_with_frame_and_fps() {
+        let env = env_of(&[]);
+        let s = parse_record(
+            &args(&[
+                "match.dem",
+                "--player",
+                "wytom",
+                "--size",
+                "1920x1080",
+                "--fps",
+                "30",
+                "--margin",
+                "1.5",
+                "--no-gpu",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(s.source, DemoSource::File(PathBuf::from("match.dem")));
+        assert_eq!((s.cfg.frame, s.cfg.fps), ((1920, 1080), 30));
+        assert_eq!(s.cfg.time_margin, 1.5);
+        assert!(!s.cfg.gpu_encode);
+    }
+
+    #[test]
+    fn record_reports_argument_errors_in_russian() {
+        let env = env_of(&[]);
+        let err = |a: &[&str]| parse_record(&args(a), &env).unwrap_err();
+        assert_eq!(err(&["match.dem"]), "укажите --player <ник>");
+        assert_eq!(
+            err(&["match.dem", "--player", "x", "--size", "1920"]),
+            "--size: нужно ШxВ"
+        );
+        assert!(err(&["a.dem", "b.dem", "--player", "x"]).contains("лишний аргумент b.dem"));
+        assert!(err(&["a.dem", "--player", "x", "--nope"]).contains("неизвестный параметр --nope"));
+        assert!(err(&["a.dem", "--player"]).contains("--player требует значение"));
+        assert_eq!(
+            err(&["--player", "x"]),
+            "укажите ссылку FACEIT или путь к .dem"
         );
     }
 }

@@ -121,6 +121,7 @@ fn parse_args() -> Result<Args, String> {
 fn main() -> ExitCode {
     match env::args().nth(1).as_deref() {
         Some("assemble") => return assemble_cmd(),
+        Some("record") => return record::record_cmd(),
         Some("retry") => return record::retry_cmd(),
         _ => {}
     }

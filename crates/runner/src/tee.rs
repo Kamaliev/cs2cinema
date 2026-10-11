@@ -500,9 +500,7 @@ impl Pulse {
                     self.lose(TOKEN_REJECTED, true);
                     return;
                 }
-                Err(LinkError::Status { error, status, .. })
-                    if error == STALE_EPOCH || (status == 409 && error.is_empty()) =>
-                {
+                Err(LinkError::Status { error, .. }) if error == STALE_EPOCH => {
                     self.lose(
                         &format!(
                             "сервер отозвал выдачу задачи или выдал её заново ({STALE_EPOCH})"

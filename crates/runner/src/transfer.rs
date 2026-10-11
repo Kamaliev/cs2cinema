@@ -136,13 +136,13 @@ pub(crate) enum Verdict {
     Retry,
 }
 
-/// Окончательные отказы: чужая эпоха, закрытая или неизвестная серверу задача. `HEAD` приходит без тела, поэтому
-/// 409 без кода тоже считается отзывом выдачи. Всё остальное (сеть, 5xx, 401, перегрузка) — временное.
+/// Окончательные отказы: чужая эпоха, закрытая или неизвестная серверу задача, и только с распознанным кодом
+/// `ApiError` в теле. 404/409 без кода может дать прокси или балансировщик, пока сервер перенастраивается, и это
+/// временная неисправность: готовый результат из-за неё не выбрасывается. Всё остальное (сеть, 5xx, 401,
+/// перегрузка) — тоже временное.
 pub(crate) fn judge(e: &LinkError) -> Verdict {
     match e {
-        LinkError::Status { error, status, .. }
-            if error == STALE_EPOCH || (*status == 409 && error.is_empty()) =>
-        {
+        LinkError::Status { error, .. } if error == STALE_EPOCH => {
             Verdict::Drop(format!(
                 "сервер отозвал выдачу задачи или выдал её заново ({STALE_EPOCH})"
             ))
@@ -150,10 +150,26 @@ pub(crate) fn judge(e: &LinkError) -> Verdict {
         LinkError::Status { error, .. } if error == JOB_TERMINAL => {
             Verdict::Drop(format!("задача уже закрыта на сервере ({JOB_TERMINAL})"))
         }
-        LinkError::Status { error, status, .. } if error == NOT_FOUND || *status == 404 => {
+        LinkError::Status { error, .. } if error == NOT_FOUND => {
             Verdict::Drop(format!("сервер не знает такой задачи ({NOT_FOUND})"))
         }
         _ => Verdict::Retry,
+    }
+}
+
+/// Решение по отказу на `HEAD`: ответ приходит без тела, кода нет, поэтому 409 и 404 без кода считаются отзывом
+/// выдачи или неизвестной задачей (остальные ответы разбирает `judge`).
+pub(crate) fn judge_head(e: &LinkError) -> Verdict {
+    match e {
+        LinkError::Status { error, status, .. } if error.is_empty() && *status == 409 => {
+            Verdict::Drop(format!(
+                "сервер отозвал выдачу задачи или выдал её заново ({STALE_EPOCH})"
+            ))
+        }
+        LinkError::Status { error, status, .. } if error.is_empty() && *status == 404 => {
+            Verdict::Drop(format!("сервер не знает такой задачи ({NOT_FOUND})"))
+        }
+        e => judge(e),
     }
 }
 
@@ -295,7 +311,7 @@ pub fn upload_result(
         }
         let mut offset = match link.result_head(id, epoch) {
             Ok(o) => o,
-            Err(e) => match judge(&e) {
+            Err(e) => match judge_head(&e) {
                 Verdict::Drop(reason) => return TransferEnd::Dropped(reason),
                 Verdict::Retry => {
                     let pause = backoff.next();

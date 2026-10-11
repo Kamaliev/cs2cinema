@@ -47,6 +47,8 @@ pub struct JobConfig {
     pub afxerror_ignore: Vec<String>,
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
+    /// Потолки чтения демки в самом `run_job`: раннер передаёт сюда те же числа, что и дочерней предпроверке.
+    pub demo_limits: demo::DemoLimits,
 }
 
 impl Default for JobConfig {
@@ -67,6 +69,7 @@ impl Default for JobConfig {
             afxerror_ignore: Vec::new(),
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
+            demo_limits: demo::DemoLimits::default(),
         }
     }
 }
@@ -97,6 +100,7 @@ impl std::fmt::Debug for JobConfig {
             .field("afxerror_ignore", &self.afxerror_ignore)
             .field("ffmpeg", &self.ffmpeg)
             .field("ffprobe", &self.ffprobe)
+            .field("demo_limits", &self.demo_limits)
             .finish()
     }
 }
@@ -511,7 +515,7 @@ pub fn run_job(host: &dyn Host, spec: &JobSpec, p: &dyn Progress) -> Result<Outc
             dir: cfg.out_root.join("demos"),
         },
     };
-    let mut a = crate::analyze_with(&src, &demo::DemoLimits::default(), p)?;
+    let mut a = crate::analyze_with(&src, &cfg.demo_limits, p)?;
     if let DemoSource::Faceit(id) = &spec.source {
         p.artifact(&Artifact::Demo {
             match_id: id.clone(),

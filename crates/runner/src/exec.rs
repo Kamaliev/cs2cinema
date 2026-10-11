@@ -167,7 +167,8 @@ impl PipelineExecutor {
             known_demo: None,
             last_good: None,
             out_dir: if resume { task.out_dir.clone() } else { None },
-            cfg: self.cfg.clone(),
+            // потолки чтения демки в run_job те же, что у дочерней предпроверки (флаги раннера)
+            cfg: JobConfig { demo_limits: self.inspect.limits.demo, ..self.cfg.clone() },
         };
         let job_fn = &self.job_fn;
         match catch_unwind(AssertUnwindSafe(|| job_fn(&*self.host, &spec, p))) {

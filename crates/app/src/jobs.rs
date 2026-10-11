@@ -202,6 +202,7 @@ pub fn job_config(s: &Settings) -> JobConfig {
         afxerror_ignore: s.afxerror_ignore.clone(),
         ffmpeg: PathBuf::from("ffmpeg"),
         ffprobe: PathBuf::from("ffprobe"),
+        demo_limits: Default::default(),
     }
 }
 

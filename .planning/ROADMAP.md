@@ -75,7 +75,7 @@ Plans:
   4. Враждебные входы проверены тестами: ник или имя карты с переводом строки, `;`, кавычками и управляющими символами не меняют грамматику `highlights.cfg` и не попадают в cfg, а `drawtext` читает подпись из файла. Обрезанная демка, демка с испорченными битами, zstd-бомба и файл сверх лимита заканчиваются кодами `BAD_DEMO` или `DEMO_TOO_LARGE`; разбор идёт в дочернем процессе с лимитом памяти, и раннер после этого продолжает брать задачи.
   5. Неоднозначный ник даёт `PLAYER_AMBIGUOUS` со списком до 10 очищенных кандидатов, отсутствующий — `PLAYER_NOT_FOUND`, демка без подходящих моментов — `NO_HIGHLIGHTS`; всё это ещё до запуска CS2. `crates/cli/tests/pipeline.rs` и `cargo test --workspace` остаются зелёными.
 
-**Plans**: 6/11 plans executed
+**Plans**: 7/11 plans executed
 
 Plans:
 **Wave 1**
@@ -87,7 +87,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 - [x] 06-06-PLAN.md — outbox `runner_state.json`: докачка после перезапуска, `hello` с удерживаемой задачей, чистка outbox при окончательном отказе сервера (RUN-02)
-- [ ] 06-07-PLAN.md — дочерний разбор `cs2-cli inspect` с самоограничением памяти и `pipeline::inspect::preflight`; типизированный `analyze_with` (SEC-02, SEC-03, RUN-05)
+- [x] 06-07-PLAN.md — дочерний разбор `cs2-cli inspect` с самоограничением памяти и `pipeline::inspect::preflight`; типизированный `analyze_with` (SEC-02, SEC-03, RUN-05)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 - [ ] 06-08-PLAN.md — пульс и отмена (`Tee`, `Uplink`): этап и дубль на сервере, эскалация мягкой отмены в жёсткую через 10 с, остановка без закрытия задачи (RUN-03, RUN-02)
@@ -158,7 +158,7 @@ Phases execute in numeric order: 5 → 6 → 7 → 8 → 9 (фаза 7 може�
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 5. Ядро сервера и протокол | 5/5 | In Progress | - |
-| 6. Раннер, защита входа и первый живой прогон | 6/11 | In Progress | - |
+| 6. Раннер, защита входа и первый живой прогон | 7/11 | In Progress | - |
 | 7. Telegram-бот и доставка | 0/TBD | Not started | - |
 | 8. Режим раннера в приложении | 0/TBD | Not started | - |
 | 9. Уборка, развёртывание и учения | 0/TBD | Not started | - |

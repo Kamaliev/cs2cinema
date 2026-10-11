@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 06
 current_phase_name: Раннер, защита входа и первый живой прогон
 status: executing
-stopped_at: Completed 06-03-PLAN.md
-last_updated: "2026-10-11T15:37:37.221Z"
+stopped_at: Completed 06-04-PLAN.md
+last_updated: "2026-10-11T15:42:38.901Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 06 execution started
-state_head: 81c4053b53f222644f92421806df64367c55a980
+state_head: 074295b40d2ca424e5b2259a2448c57c2bdf624d
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 16
-  completed_plans: 8
+  completed_plans: 9
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 06 (Раннер, защита входа и первый живой прогон) — EXECUTING
-Plan: 4 of 11
+Plan: 5 of 11
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 06 execution started
 
@@ -100,6 +100,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 06 P01 | 25 min | 2 tasks | 4 files |
 | Phase 06 P02 | 40min | 2 tasks | 6 files |
 | Phase 06 P03 | 15min | 2 tasks | 5 files |
+| Phase 06 P04 | 15min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -173,6 +174,7 @@ Recent decisions affecting current work:
 - [Phase 06]: JOB_ERROR — только строка в wire::fail, в FailCode его нет; Phase::Precheck добавлен аддитивно (ALL = 10)
 - [Phase 06]: 06-02: текст из демки очищается в Match::build и не пишется в cfg вовсе; подписи drawtext читаются из cap_NNN.txt
 - [Phase 06]: 06-03: стартовые лимиты чтения демки — файл 2000 МиБ, распакованная 3 ГиБ; команда демки до 128 МиБ после snappy; read_demo/decompress не менялись
+- [Phase 06]: 06-04: самоограничение памяти через самоприсвоение Job Object без KILL_ON_JOB_CLOSE; лимит задаёт вызывающий
 
 ### Pending Todos
 
@@ -202,6 +204,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T15:37:37.106Z
-Stopped at: Completed 06-03-PLAN.md
+Last session: 2026-10-11T15:42:38.792Z
+Stopped at: Completed 06-04-PLAN.md
 Resume file: None

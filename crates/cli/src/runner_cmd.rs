@@ -41,6 +41,7 @@ cs2-cli runner — раннер очереди сервера: сам забир
 
 Токен в командной строке не принимается: он виден в списке процессов. Задайте его переменной CS2_RUNNER_TOKEN
 или файлом --token-file.
+Ключ FACEIT для ссылок на матчи берётся из переменной FACEIT_API_KEY (в командной строке не принимается).
 
 Раннер сам ходит к серверу исходящими запросами, входящий порт не нужен. Задачи идут по одной.
 Не запускайте очередь приложения одновременно с раннером: CS2 записывает только один экземпляр.
@@ -117,7 +118,12 @@ pub fn parse_runner(args: &[String], env: Env) -> Result<RunnerArgs, String> {
     let mut dir = None;
     let mut hlae = nonempty("HLAE_DIR");
     let mut cs2 = nonempty("CS2_DIR");
-    let mut cfg = JobConfig::default();
+    // Ключ FACEIT только из окружения: флаг командной строки виден в списке процессов. Пустой ключ не ошибка:
+    // файлы раннер берёт и без него, а задача по ссылке упадёт с FACEIT_FETCH_FAILED.
+    let mut cfg = JobConfig {
+        faceit_key: nonempty("FACEIT_API_KEY").unwrap_or_default(),
+        ..JobConfig::default()
+    };
     let mut limits = InspectLimits::default();
     let mut max_demo_mib = None;
     let mut upload_chunk_limit = None;
@@ -390,6 +396,33 @@ mod tests {
         let shown = format!("{a:?}");
         assert!(!shown.contains(TOKEN.1), "токен в Debug: {shown}");
         assert!(shown.contains("***"), "{shown}");
+    }
+
+
+    #[test]
+    fn faceit_key_comes_from_the_environment_only() {
+        let a = parse(
+            &["--server", "http://127.0.0.1:8080"],
+            &[TOKEN, ("FACEIT_API_KEY", "k-2")],
+        )
+        .expect("разбор");
+        assert_eq!(a.cfg.faceit_key, "k-2");
+        let shown = format!("{a:?}");
+        assert!(!shown.contains("k-2"), "ключ в Debug: {shown}");
+
+        // Без переменной ключ пуст, и это не ошибка запуска.
+        let a = parse(&["--server", "http://127.0.0.1:8080"], &[TOKEN]).expect("разбор");
+        assert!(a.cfg.faceit_key.is_empty());
+
+        // Флага командной строки нет, и значение в тексте ошибки не повторяется.
+        let e = parse(
+            &["--server", "http://127.0.0.1:8080", "--faceit-key", "k-3"],
+            &[TOKEN],
+        )
+        .unwrap_err();
+        assert!(e.contains("неизвестный параметр"), "{e}");
+        assert!(!e.contains("k-3"), "{e}");
+        assert!(USAGE_RUNNER.contains("FACEIT_API_KEY"));
     }
 
     #[test]

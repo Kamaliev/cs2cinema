@@ -369,3 +369,27 @@ impl Executor for PipelineExecutor {
         notes
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journal_text_hides_the_key_and_addresses() {
+        let t = scrub_error(
+            "io: reset https://cdn.example/d.dem.zst?token=abc ключ k-1\nвторая строка",
+            "k-1",
+        );
+        assert!(!t.contains("k-1") && !t.contains("cdn.example") && !t.contains("token=abc"), "{t}");
+        assert!(t.contains("***") && t.contains("<адрес>"), "{t}");
+        assert!(!t.contains('\n'));
+    }
+
+    #[test]
+    fn phrases_are_fixed_per_error_class() {
+        assert!(fetch_phrase("у матча нет демки (x)").contains("нет демки"));
+        assert!(fetch_phrase("FACEIT отказал в доступе (y)").contains("отказал в доступе"));
+        assert!(fetch_phrase("FACEIT: не найдено (матч)").contains("не найден"));
+        assert!(fetch_phrase("что угодно https://a/b").starts_with("не удалось скачать"));
+    }
+}

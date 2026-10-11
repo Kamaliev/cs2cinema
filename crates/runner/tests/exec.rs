@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -172,19 +172,160 @@ fn environment_failure_after_a_good_preflight_returns_the_job_to_the_queue() {
     assert_eq!(host.launches(), 0, "чужой CS2 — игра не запускалась");
 }
 
-#[test]
-fn faceit_link_without_a_demo_file_fails_with_unsupported_source() {
-    let dir = TestDir::new("exec-faceit");
-    let host = FakeHost::new(Scenario::happy(1));
-    let exec = executor(&host, &dir);
-    let mut t = task("");
-    t.faceit = Some("https://www.faceit.com/ru/cs2/room/1-abc".to_owned());
+const FACEIT_LINK: &str = "https://www.faceit.com/ru/cs2/room/1-0f9a1b2c-3d4e-5f60-7182-93a4b5c6d7e8";
+const FACEIT_ID: &str = "1-0f9a1b2c-3d4e-5f60-7182-93a4b5c6d7e8";
 
-    let e = exec
-        .run(&t, &Quiet)
-        .expect_err("ссылка без файла не берётся");
+/// Исполнитель с ключом FACEIT раннера и подменённым скачиванием: вызовы `(match_id, ключ)` копятся в `calls`.
+fn faceit_executor(
+    host: &FakeHost,
+    dir: &TestDir,
+    key: &str,
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+    fetch: impl Fn(&Path) -> Result<PathBuf, String> + Send + Sync + 'static,
+) -> PipelineExecutor {
+    let cfg = JobConfig {
+        faceit_key: key.to_owned(),
+        ..healthy_config(dir)
+    };
+    PipelineExecutor::new(Arc::new(host.clone()), cfg, settings()).with_fetch_fn(
+        move |id, key, folder| {
+            calls.lock().unwrap().push((id.to_owned(), key.to_owned()));
+            fetch(folder)
+        },
+    )
+}
+
+/// Задача FACEIT: демка должна оказаться в `<dir>/remote/srv7.dem`.
+fn faceit_task(dir: &TestDir, link: &str) -> Task {
+    let mut t = task(dir.path.join("remote/srv7.dem").to_str().unwrap());
+    t.faceit = Some(link.to_owned());
+    t
+}
+
+#[test]
+fn faceit_link_is_downloaded_by_match_id_with_the_runner_key() {
+    let dir = TestDir::new("exec-faceit");
+    let host = FakeHost::new(Scenario::happy(1).program("cs2-cli", &[OK_REPLY], exit0()));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let seen_source = Arc::new(Mutex::new(None));
+    let source = seen_source.clone();
+    let exec = faceit_executor(&host, &dir, "k-1", calls.clone(), |folder| {
+        std::fs::create_dir_all(folder).unwrap();
+        let path = folder.join("1-abc.dem.zst");
+        std::fs::write(&path, fake_demo(4096)).unwrap();
+        Ok(path)
+    })
+    .with_job_fn(move |_, spec, _| {
+        *source.lock().unwrap() = Some(format!("{:?}", spec.source));
+        Err(RunError::from("стоп после проверки источника"))
+    });
+    let t = faceit_task(&dir, FACEIT_LINK);
+
+    let e = exec.run(&t, &Quiet).expect_err("job_fn остановил задачу");
+    assert_eq!(e.message, "стоп после проверки источника");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![(FACEIT_ID.to_owned(), "k-1".to_owned())],
+        "скачивание по id матча ключом раннера, один раз"
+    );
+    assert_eq!(inspect_runs(&host), 1);
+    let runs = host.runs();
+    let inspect = runs
+        .iter()
+        .find(|(_, program, _)| program.contains("cs2-cli"))
+        .expect("разбор звали");
+    assert!(
+        inspect.2.iter().any(|a| a.contains("srv7.dem")),
+        "разбор идёт по скачанному файлу: {:?}",
+        inspect.2
+    );
+    let source = seen_source.lock().unwrap().clone().unwrap();
+    assert!(
+        source.starts_with("File(") && source.contains("srv7.dem"),
+        "run_job получил файл: {source}"
+    );
+    assert!(t.demo.is_file(), "демка лежит на месте задачи");
+    assert!(
+        !t.demo.with_extension("faceit").exists(),
+        "временная папка убрана"
+    );
+}
+
+#[test]
+fn link_that_fails_the_strict_check_is_unsupported_source() {
+    let dir = TestDir::new("exec-faceit-strict");
+    let host = FakeHost::new(Scenario::happy(1));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let exec = faceit_executor(&host, &dir, "k-1", calls.clone(), |_| {
+        panic!("скачивание не должно вызываться")
+    });
+    let t = faceit_task(&dir, "https://evil.com/x");
+
+    let e = exec.run(&t, &Quiet).expect_err("чужая ссылка не берётся");
     assert_eq!(fail_code(&e), FailCode::UnsupportedSource);
+    assert!(calls.lock().unwrap().is_empty());
     assert_eq!(inspect_runs(&host), 0, "ребёнка не звали");
+}
+
+#[test]
+fn missing_key_is_faceit_fetch_failed() {
+    let dir = TestDir::new("exec-faceit-nokey");
+    let host = FakeHost::new(Scenario::happy(1));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let exec = faceit_executor(&host, &dir, "  ", calls.clone(), |_| {
+        panic!("скачивание не должно вызываться")
+    });
+    let t = faceit_task(&dir, FACEIT_LINK);
+
+    let e = exec.run(&t, &Quiet).expect_err("без ключа не скачать");
+    assert_eq!(fail_code(&e), FailCode::FaceitFetchFailed);
+    assert!(e.message.contains("FACEIT_API_KEY"), "{}", e.message);
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(inspect_runs(&host), 0);
+}
+
+#[test]
+fn fetch_failure_is_faceit_fetch_failed_without_urls() {
+    let cases = [
+        (
+            "у матча нет демки (ещё не доиграли или демка удалена)",
+            "у матча FACEIT нет демки",
+        ),
+        (
+            "FACEIT отказал в доступе (ссылка на скачивание (нужен ключ с доступом к Downloads API)): проверьте FACEIT_API_KEY",
+            "FACEIT отказал в доступе к демке",
+        ),
+        (
+            "io: connection reset https://cdn.example/demo.dem.zst?token=abc k-1",
+            "не удалось скачать демку FACEIT",
+        ),
+    ];
+    for (raw, phrase) in cases {
+        let dir = TestDir::new("exec-faceit-fail");
+        let host = FakeHost::new(Scenario::happy(1).program("cs2-cli", &[OK_REPLY], exit0()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let raw_owned = raw.to_owned();
+        let exec = faceit_executor(&host, &dir, "k-1", calls.clone(), move |folder| {
+            // Сбой посреди скачивания: недокачанный файл остаётся во временной папке.
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("half.part"), b"x").unwrap();
+            Err(raw_owned.clone())
+        });
+        let t = faceit_task(&dir, FACEIT_LINK);
+
+        let e = exec.run(&t, &Quiet).expect_err("скачивание упало");
+        assert_eq!(fail_code(&e), FailCode::FaceitFetchFailed, "{raw}");
+        assert!(e.message.contains(phrase), "{raw}: {}", e.message);
+        for secret in ["https://", "token=", "k-1", "cdn.example"] {
+            assert!(!e.message.contains(secret), "{secret} в {}", e.message);
+        }
+        assert!(
+            !t.demo.with_extension("faceit").exists(),
+            "временная папка убрана"
+        );
+        assert!(!t.demo.exists());
+        assert_eq!(inspect_runs(&host), 0, "разбор не вызывался");
+    }
 }
 
 #[test]

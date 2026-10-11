@@ -196,7 +196,7 @@ impl App {
         };
         // приложение упало посреди задачи: сначала завершаем осиротевшую игру по processes.json, затем убираем из папки игры
         // файлы задачи и помечаем оборванные дубли (D-08, D-15), и только потом задача становится «прервана» (`reset_running`)
-        let reset = crate::launch::recover_after_crash(&store, &*pipeline::host::default_host(), &s.cs2_dir).unwrap_or_default();
+        let reset = crate::jobs::recover_after_crash(&store, &*pipeline::host::default_host(), &s.cs2_dir).unwrap_or_default();
         let mut app = Self {
             draft: s.clone(),
             matches: MatchesState { nickname: s.nickname.clone(), ..Default::default() },
@@ -361,7 +361,7 @@ impl App {
             } else {
                 self.jobs.resumable.remove(&j.id);
             }
-            let logs = crate::launch::old_logs(dir);
+            let logs = old_logs(dir);
             if logs.is_empty() {
                 self.jobs.old_logs.remove(&j.id);
             } else {
@@ -739,5 +739,46 @@ fn cleanup_old() {
                 let _ = std::fs::remove_file(e.path());
             }
         }
+    }
+}
+
+/// Журналы прошлых попыток в папке задачи: `record.log.<номер>` по возрастанию номера (D-11). Текущий `record.log` и
+/// файлы с другими именами не входят — открываются только имена такого вида внутри папки задачи (T-03-20).
+fn old_logs(out_dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<(u64, PathBuf)> = std::fs::read_dir(out_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let digits = name.strip_prefix("record.log.")?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some((digits.parse().ok()?, e.path()))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_logs_are_listed_in_attempt_order() {
+        let root = std::env::temp_dir().join(format!("cs2cinema-oldlogs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let job = root.join("job");
+        std::fs::create_dir_all(&job).unwrap();
+        for n in ["record.log", "record.log.10", "record.log.2", "record.log.1", "record.log.x", "record.log."] {
+            std::fs::write(job.join(n), b"x").unwrap();
+        }
+        let names: Vec<String> = old_logs(&job).iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["record.log.1", "record.log.2", "record.log.10"]);
+        assert!(old_logs(&root.join("no-such-job")).is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

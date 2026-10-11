@@ -4,7 +4,7 @@
 //! делается заново в фоновом потоке — и задачу можно повторить после перезапуска.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -14,6 +14,7 @@ use std::{
 
 use pipeline::{
     Artifact, Progress, RecordFailure, RecordState, RunError, Stage,
+    host::Host,
     job::{self, DemoSource, JobConfig, JobSpec},
     precheck::{Demo, Inputs},
 };
@@ -233,6 +234,22 @@ pub fn job_spec(job: &Job, store: &Store, s: &Settings, attempt: u32) -> JobSpec
 /// Один построитель для задачи и для кнопки в настройках (D-01).
 pub fn precheck_inputs(s: &Settings, demo: Demo, last_good: Option<store::LastGood>) -> Inputs {
     job::precheck_inputs(&job_config(s), demo, last_good.map(|g| (g.cs2_build, g.hlae_version)))
+}
+
+/// Восстановление при запуске приложения после падения (RET-04, D-15). Для каждой задачи, оставшейся «выполняется» или
+/// «отменяется», сначала завершается осиротевшая игра, затем убирается папка игры, и только потом `reset_running` делает
+/// задачу «прервана» («отменена»). Порядок обязателен: живой `cs2.exe` держит копию демки, и уборка без завершения её не удалит.
+/// Каждый шаг пишется в журнал задачи строкой «уборка после перезапуска: …».
+pub fn recover_after_crash(store: &Store, host: &dyn Host, cs2_dir: &str) -> store::Result<store::Reset> {
+    for (id, _, dir) in store.interrupted_jobs().unwrap_or_default() {
+        let Some(dir) = dir else { continue };
+        let mut notes = pipeline::gamedir::kill_orphans(host, &dir);
+        notes.extend(pipeline::gamedir::recover(Path::new(cs2_dir), &dir));
+        for note in notes {
+            let _ = store.append_log(id, &format!("уборка после перезапуска: {note}"));
+        }
+    }
+    store.reset_running()
 }
 
 /// Останавливает ли итог задачи очередь: только осознанная отмена (D-13); сбой и успех — очередь идёт дальше.
@@ -499,5 +516,115 @@ mod tests {
 
     fn reporter_for(store: &Store, id: i64) -> JobReporter {
         JobReporter::new(store.clone(), id, Reporter::detached(), CancelToken::default(), 1)
+    }
+
+    /// Временное дерево: `cs2/game/csgo/cfg`, папка задачи `job` и чужая папка `elsewhere`.
+    fn tree(tag: &str) -> (PathBuf, String, PathBuf) {
+        let root = std::env::temp_dir().join(format!("cs2cinema-recover-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["cs2/game/csgo/cfg", "job", "elsewhere"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let cs2 = root.join("cs2").to_string_lossy().into_owned();
+        let job = root.join("job");
+        (root, cs2, job)
+    }
+
+    fn put(path: &Path) {
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    fn record(job: &Path, files: &[&Path], done: &[u32]) {
+        let rec = pipeline::gamedir::Installed { files: files.iter().map(|p| p.to_path_buf()).collect(), done_takes: done.to_vec() };
+        std::fs::write(job.join(pipeline::gamedir::INSTALLED_FILE), serde_json::to_string_pretty(&rec).unwrap()).unwrap();
+    }
+
+    fn identity(pid: u32) -> pipeline::host::ProcIdentity {
+        pipeline::host::ProcIdentity { pid, created: 1234, image: "cs2.exe".into() }
+    }
+
+    /// Задача «выполняется» в базе с этой папкой; возвращает id.
+    fn running_job_in(store: &Store, job: &Path) -> i64 {
+        let id = store
+            .add_job(&store::NewJob {
+                kind: store::JobKind::Record,
+                source: store::JobSource::Faceit("1-abc".into()),
+                label: "матч".into(),
+                hero_name: "me".into(),
+                hero_steam: 42,
+                map: "de_nuke".into(),
+            })
+            .unwrap();
+        store.start_job(id).unwrap();
+        store.set_out_dir(id, job).unwrap();
+        id
+    }
+
+    #[test]
+    fn startup_kills_the_orphan_before_cleanup_and_marks_the_job_interrupted() {
+        use pipeline::host::{
+            OrphanOutcome,
+            fake::{FakeHost, Scenario},
+        };
+        let (root, cs2, job) = tree("orphan");
+        let demo = root.join("cs2/game/csgo/cs2cinema_m.dem");
+        put(&demo);
+        record(&job, &[&demo], &[]);
+        pipeline::record::processes::save(&job, &[identity(777)]).unwrap();
+        let store = Store::in_memory().unwrap();
+        let id = running_job_in(&store, &job);
+        let fake = FakeHost::new(Scenario::happy(1).orphan(777, OrphanOutcome::Killed));
+
+        let reset = recover_after_crash(&store, &fake, &cs2).unwrap();
+
+        assert_eq!(fake.orphan_kills(), vec![identity(777)]);
+        assert_eq!(reset.interrupted, 1);
+        let j = store.job(id).unwrap().unwrap();
+        assert_eq!(j.status, store::JobStatus::Interrupted);
+        assert!(!job.join(pipeline::record::processes::PROCESSES_FILE).exists(), "processes.json убран");
+        assert!(!demo.exists(), "копия демки убрана");
+        let at = |needle: &str| j.log.lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("нет строки «{needle}» в журнале:\n{}", j.log));
+        assert!(at("завершён осиротевший cs2.exe (PID 777)") < at("убрано из папки игры"), "процесс завершён раньше уборки:\n{}", j.log);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orphan_with_another_creation_time_is_left_alone() {
+        use pipeline::host::{
+            OrphanOutcome,
+            fake::{FakeHost, Scenario},
+        };
+        let (root, cs2, job) = tree("orphan-mismatch");
+        pipeline::record::processes::save(&job, &[identity(777)]).unwrap();
+        let store = Store::in_memory().unwrap();
+        let id = running_job_in(&store, &job);
+        let fake = FakeHost::new(Scenario::happy(1).orphan(777, OrphanOutcome::Mismatch("время создания другое".into())));
+
+        let reset = recover_after_crash(&store, &fake, &cs2).unwrap();
+
+        let j = store.job(id).unwrap().unwrap();
+        assert_eq!((reset.interrupted, j.status), (1, store::JobStatus::Interrupted));
+        assert!(j.log.contains("не трогаю"), "{}", j.log);
+        assert!(!job.join(pipeline::record::processes::PROCESSES_FILE).exists(), "чужой процесс не держит файл");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_processes_json_kills_nothing() {
+        use pipeline::host::fake::{FakeHost, Scenario};
+        let (root, cs2, job) = tree("orphan-garbage");
+        std::fs::write(job.join(pipeline::record::processes::PROCESSES_FILE), "{не json").unwrap();
+        let store = Store::in_memory().unwrap();
+        let id = running_job_in(&store, &job);
+        let fake = FakeHost::new(Scenario::happy(1));
+
+        recover_after_crash(&store, &fake, &cs2).unwrap();
+
+        assert!(fake.orphan_kills().is_empty());
+        let j = store.job(id).unwrap().unwrap();
+        assert!(j.log.contains("processes.json не разобран — процессы не трогаю"), "{}", j.log);
+        assert_eq!(j.status, store::JobStatus::Interrupted);
+        assert!(job.join(pipeline::record::processes::PROCESSES_FILE).exists(), "файл остаётся для разбора вручную");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

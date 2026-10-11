@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 04
 current_phase_name: Очередь без присмотра и приёмка
 status: executing
-stopped_at: Completed 04-09-PLAN.md
-last_updated: "2026-10-11T08:15:47.877Z"
+stopped_at: Completed 04-10-PLAN.md
+last_updated: "2026-10-11T08:27:22.906Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 04 execution started
-state_head: 84efa3e849c9ea70beade7448b345295661cb760
+state_head: 481d034e3d5154cc55282a501919d01ae16d5151
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 36
-  completed_plans: 33
+  completed_plans: 34
   percent: 50
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 04 (Очередь без присмотра и приёмка) — EXECUTING
-Plan: 10 of 12
+Plan: 11 of 12
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 04 execution started
 
@@ -88,6 +88,7 @@ Progress: [█████░░░░░] 50%
 | Phase 04 P07 | 10 min | 2 tasks | 8 files |
 | Phase 04 P08 | 25 min | 2 tasks | 6 files |
 | Phase 04 P09 | 13min | 3 tasks | 4 files |
+| Phase 04 P10 | 35min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -141,6 +142,8 @@ Recent decisions affecting current work:
 - [Phase 04]: 04-07: launch.rs удалён; recover_after_crash в app::jobs, find_cs2/find_hlae в app::settings, no_window в app::ui, old_logs в app::app
 - [Phase 04]: 04-08: очередь в потоке cs2cinema-queue; Cmd только Resume (Wake не нужен), Resume действует и сразу в виде, и по порядку в потоке
 - [Phase 04]: 04-09: политика очереди чистая (QueuePolicy); сбой «запуск» повторяется один раз, два одинаковых сбоя «окружение» (и «запуск» без бюджета) — пауза с объяснением; итог очереди объявляется и при паузе без ждущих задач
+- [Phase 04]: 04-10: ручные действия приёмки выводятся только из журнала (First/Auto) и attempt == 1 + auto_retries; серия B доказывается другим PID в имени партии и постановкой после конца серии A
+- [Phase 04]: 04-10: acceptance check/state/job читают базу только Store::open_read_only; ничего не удаляют и не завершают
 
 ### Pending Todos
 
@@ -169,6 +172,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T08:15:47.738Z
-Stopped at: Completed 04-09-PLAN.md
+Last session: 2026-10-11T08:27:22.769Z
+Stopped at: Completed 04-10-PLAN.md
 Resume file: None

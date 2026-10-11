@@ -124,6 +124,10 @@ pub struct Scenario {
     pub video_size: Option<(u32, u32)>,
     /// Файлы дубля нечитаемы (как недописанные) в течение этого времени после `TAKE_END`.
     pub finalize_lag: Duration,
+    /// Дубли, чей `video.mp4` ffmpeg HLAE ещё дописывает столько времени после `TAKE_END`, хотя
+    /// ffprobe уже читает файл: каждый опрос `video.mp4` в это время дописывает к файлу байты и
+    /// отвечает как по готовому дублю.
+    pub growing: Vec<(u32, Duration)>,
     /// Ответы утилит по подстроке аргумента: (имя программы, подстрока аргумента, stdout, ответ).
     /// Побеждают и ответчик ffprobe, и `programs`.
     pub programs_for: Vec<ProgramFor>,
@@ -175,6 +179,7 @@ impl Scenario {
             no_audio: vec![],
             video_size: None,
             finalize_lag: Duration::ZERO,
+            growing: vec![],
             programs_for: vec![],
             orphans: vec![],
         }
@@ -220,6 +225,12 @@ impl Scenario {
     /// Файл дописывается: `lag` после `TAKE_END` ffprobe ещё не может его прочитать.
     pub fn finalize_lag(mut self, lag: Duration) -> Self {
         self.finalize_lag = lag;
+        self
+    }
+
+    /// `video.mp4` дубля `i` растёт ещё `lasts` после `TAKE_END`, ffprobe при этом читает его успешно.
+    pub fn growing_take(mut self, i: u32, lasts: Duration) -> Self {
+        self.growing.push((i, lasts));
         self
     }
 
@@ -781,6 +792,18 @@ fn ffprobe_reply(st: &HostState, name: &str, args: &[String]) -> Option<(Vec<Str
         } else {
             "Invalid data found when processing input"
         });
+    }
+    // ffmpeg ещё дописывает файл, но ffprobe его уже прочитал: к файлу прибавляется хвост
+    let growing = is_video
+        && sc.growing.iter().any(|(i, lasts)| {
+            *i == idx
+                && st
+                    .take_ends
+                    .iter()
+                    .any(|(j, t)| *j == idx && st.now < *t + *lasts)
+        });
+    if growing && let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+        let _ = std::io::Write::write_all(&mut f, &[0u8; 4096]);
     }
 
     let planned = sc

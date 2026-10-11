@@ -572,6 +572,24 @@ impl<'a> Verifier<'a> {
             &|| p.cancelled() || p.force_cancelled(),
         );
         let now = host.now();
+        // ffprobe прочитал контейнер, который ffmpeg HLAE ещё дописывает: размер после проверки ушёл
+        // вперёд от снятого до неё. Это «ещё пишется», а не «годен» — иначе склейка увидит другой размер.
+        let outcome = match outcome {
+            verify::ProbeOutcome::Valid(f) => {
+                let before = (f.video_bytes, f.audio_bytes);
+                let after = self.sizes(&dir);
+                if after == Some(before) {
+                    verify::ProbeOutcome::Valid(f)
+                } else {
+                    if let Some(s) = after {
+                        self.manifest.mark_recorded(plan.index, s);
+                        self.save(now, j);
+                    }
+                    verify::ProbeOutcome::NotReady(failure::msg_take_growing(before, after))
+                }
+            }
+            other => other,
+        };
         let finalize = req.deadlines.take_finalize;
         let pend = &mut self.pending[pos];
         let changed = current != pend.sizes;

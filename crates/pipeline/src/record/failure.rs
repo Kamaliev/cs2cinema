@@ -291,6 +291,18 @@ pub fn msg_take_not_final(dir: &str, limit: Duration, reason: &str) -> String {
     format!("{dir}: файл не дописан за {} с — {reason}", secs(limit))
 }
 
+/// Размер файлов дубля сдвинулся, пока шла проверка: ffmpeg HLAE ещё пишет. `before` — размеры
+/// `(video.mp4, audio.wav)` до `ffprobe`, `after` — после; `None` — один из файлов пропал.
+pub fn msg_take_growing(before: (u64, u64), after: Option<(u64, u64)>) -> String {
+    match after {
+        Some(a) => format!(
+            "размер менялся во время проверки (ffmpeg HLAE ещё пишет): video.mp4 {} → {} байт, audio.wav {} → {} байт",
+            before.0, a.0, before.1, a.1
+        ),
+        None => "video.mp4 или audio.wav пропал во время проверки".to_owned(),
+    }
+}
+
 /// Пришла метка, но не та, что ждали.
 pub fn msg_misordered(got: &str, expected: &str) -> String {
     format!("пришла метка {got} вместо {expected}")
@@ -586,6 +598,11 @@ mod tests {
         assert_eq!(
             nf,
             "take0000: файл не дописан за 20 с — moov atom not found"
+        );
+        let g = msg_take_growing((18087984, 100), Some((20592482, 100)));
+        assert!(
+            g.contains("video.mp4") && g.contains("18087984") && g.contains("20592482"),
+            "{g}"
         );
     }
 

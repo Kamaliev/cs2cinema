@@ -1186,6 +1186,83 @@ fn take_that_never_finalizes_fails_after_take_finalize() {
     let _ = std::fs::remove_dir_all(&req.out_dir);
 }
 
+/// Сколько раз `ffprobe` опрашивал `video.mp4` дубля `dir`: (момент, число) последнего и общее число.
+fn video_probes(fake: &FakeHost, dir: &str) -> Vec<Duration> {
+    fake.runs()
+        .iter()
+        .filter(|(_, _, args)| {
+            args.last()
+                .is_some_and(|a| a.contains(dir) && a.contains("video.mp4"))
+        })
+        .map(|(at, _, _)| *at)
+        .collect()
+}
+
+#[test]
+fn take_growing_after_a_good_ffprobe_is_validated_only_with_its_final_size() {
+    // ffprobe читает video.mp4 успешно, а ffmpeg HLAE дописывает его ещё 3 с после TAKE_END
+    let (req, clips) = verified("verify-growing", 3);
+    let fake = FakeHost::new(
+        Scenario::happy(3)
+            .clips_dir(clips.clone())
+            .growing_take(0, secs(3)),
+    );
+    let cap = Capture::default();
+    record(&fake, &req, &cap).expect("растущий дубль дожидается окончательного размера");
+
+    let mut m = manifest_of(&req);
+    assert!(m.all_validated(), "{m:?}");
+    let on_disk = std::fs::metadata(clips.join("take0000").join("video.mp4"))
+        .unwrap()
+        .len();
+    assert!(on_disk > 10, "файл действительно вырос: {on_disk}");
+    assert_eq!(m.entry(0).unwrap().video_bytes, Some(on_disk));
+    assert!(
+        m.reconcile(&clips).is_empty(),
+        "склейка не должна видеть расхождения"
+    );
+    let probes = video_probes(&fake, "take0000");
+    let end_0 = fake.take_ends()[0].1;
+    assert!(probes.len() > 1, "проверка повторялась: {probes:?}");
+    assert!(
+        *probes.last().unwrap() >= end_0 + secs(3),
+        "последняя проверка после окончания роста: {probes:?} против {end_0:?}"
+    );
+    let log = read_log(&req);
+    assert!(log.contains("ещё дописывается"), "{log}");
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn take_growing_past_take_finalize_fails_as_not_final() {
+    let (req, clips) = verified("verify-growing-never", 6);
+    let fake = FakeHost::new(
+        Scenario::happy(6)
+            .clips_dir(clips)
+            .growing_take(0, secs(60)),
+    );
+    let f = record(&fake, &req, &Capture::default()).expect_err("файл так и не перестал расти");
+
+    assert_eq!(f.code, FailCode::TakeInvalid);
+    assert_eq!(f.state, RecordState::Take);
+    assert!(f.message.contains("дубль 1 из 6"), "{}", f.message);
+    assert!(f.message.contains("take0000"), "{}", f.message);
+    assert!(f.message.contains("не дописан за 20 с"), "{}", f.message);
+    let end_0 = fake.take_ends()[0].1;
+    let spent = fake.now() - end_0;
+    assert!(
+        spent >= req.deadlines.take_finalize && spent <= req.deadlines.take_finalize + secs(10),
+        "решение не позже take_finalize: {spent:?}"
+    );
+    assert!(
+        fake.take_ends().len() < 6,
+        "запись остановлена, игра не дописала все дубли"
+    );
+    let m = manifest_of(&req);
+    assert_eq!(m.entry(0).unwrap().status, TakeStatus::Invalid);
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
 #[test]
 fn last_take_is_verified_after_the_game_closes() {
     // каждый дубль занимает 7 с, дописывается 6 с: последний не успевает до выхода игры

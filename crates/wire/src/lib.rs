@@ -282,6 +282,23 @@ pub struct ProgressReply {
     pub cancel: CancelMode,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Тело `POST /v1/jobs/{id}/release`: раннер возвращает задачу в очередь.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseRequest {
+    pub epoch: i64,
+    /// Почему возвращает (для журнала сервера).
+    #[serde(default)]
+    pub reason: String,
+    /// `false` — раннер возвращает задачу не по её вине, и выдача не засчитывается. Когда так делать,
+    /// решает раннер фазы 6; по умолчанию выдача засчитывается.
+    #[serde(default = "default_true")]
+    pub counts: bool,
+}
+
 /// Тело любого ответа с ошибкой.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApiError {

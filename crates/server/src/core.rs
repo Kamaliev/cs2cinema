@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use wire::{
-    Assignment, CancelMode, DemoInfo, JobState, Player, ProgressReply, ProgressRequest, codes,
+    Assignment, CancelMode, DemoInfo, JobState, Player, ProgressReply, ProgressRequest,
+    ReleaseRequest, codes,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -338,49 +339,130 @@ impl Core {
         self.db.read(|c| demo_by_job(c, job_id))
     }
 
-    /// Выдача задачи раннеру (SRV-04, D-04): одна транзакция `BEGIN IMMEDIATE`, один `UPDATE … RETURNING`.
-    /// Самая старая задача в `queued` получает эпоху +1, раннера и аренду; два вызова из любых потоков
-    /// и процессов не получат одну задачу дважды. Очередь пуста — `None`.
+    /// Выдача задачи раннеру (SRV-04, D-04). Тонкая обёртка над `claim_report`: пустая очередь — `None`.
     pub fn claim(&self, runner_id: i64) -> std::result::Result<Option<Assignment>, Reject> {
+        Ok(self.claim_report(runner_id)?.assignment)
+    }
+
+    /// Выдача задачи раннеру одной транзакцией `BEGIN IMMEDIATE` (SRV-04, SRV-07, D-04), шаги по порядку:
+    /// 1. истёкшие аренды возвращаются в очередь;
+    /// 2. задача раннера в `assigned` выдаётся повторно без новой эпохи и выдачи (ответ мог потеряться в сети);
+    /// 3. задача раннера в `running` или `uploading` — отказ `already_holding`;
+    /// 4. задачи в очереди, выданные `max_grants` раз, падают с `TOO_MANY_GRANTS` — «ядовитая» демка не крутится по кругу;
+    /// 5. самая старая задача в очереди получает эпоху +1, раннера и аренду одним `UPDATE … RETURNING`.
+    pub fn claim_report(&self, runner_id: i64) -> std::result::Result<Claimed, Reject> {
         let now = self.clock.now_ms();
         let lease_until = now + self.limits.lease_ttl_ms;
+        let max = self.limits.max_grants;
         self.db.write(|tx| {
             expire_leases(tx, now, &self.limits)?;
+
+            let held: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM jobs WHERE runner_id = ?1 AND state IN ('assigned','running','uploading') \
+                     ORDER BY id LIMIT 1",
+                    [runner_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db_err)?;
+            if let Some(id) = held {
+                let job = job_by_id(tx, id)?.ok_or_else(|| format!("задача #{id} исчезла"))?;
+                if job.state != JobState::Assigned {
+                    return Err(Reject::new(
+                        codes::ALREADY_HOLDING,
+                        format!("раннер уже ведёт задачу #{id}: сначала завершите её"),
+                    ));
+                }
+                tx.execute(
+                    "UPDATE jobs SET lease_until = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![id, lease_until, now],
+                )
+                .map_err(db_err)?;
+                let job = job_by_id(tx, id)?.ok_or_else(|| format!("задача #{id} исчезла"))?;
+                return Ok(Claimed {
+                    assignment: Some(assignment_of(tx, &job)?),
+                    failed: Vec::new(),
+                });
+            }
+
+            let poisoned: Vec<(i64, i64)> = {
+                let mut st = tx
+                    .prepare("SELECT id, grants FROM jobs WHERE state = 'queued' AND grants >= ?1 ORDER BY id")
+                    .map_err(db_err)?;
+                let rows = st
+                    .query_map([max], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(db_err)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?
+            };
+            let mut failed = Vec::new();
+            for (id, grants) in poisoned {
+                tx.execute(
+                    "UPDATE jobs SET state = 'failed', fail_code = ?2, fail_class = 'server', fail_state = 'queued', \
+                     fail_message = ?3, fail_hint = ?4, finished_at = ?5, updated_at = ?5, lease_until = NULL, lease_lost = 0 \
+                     WHERE id = ?1 AND state = 'queued'",
+                    params![
+                        id,
+                        wire::fail::TOO_MANY_GRANTS,
+                        format!(
+                            "задачу выдавали раннеру {grants} раз, и ни разу она не дошла до конца — похоже, демка роняет раннер"
+                        ),
+                        "проверьте демку и поставьте задачу заново",
+                        now
+                    ],
+                )
+                .map_err(db_err)?;
+                failed.push(id);
+            }
+
+            // Номер сообщения раннера считается заново в каждой эпохе: `last_seq`, этап и дубль сбрасываются.
             let id: Option<i64> = tx
                 .query_row(
                     "UPDATE jobs SET state = 'assigned', epoch = epoch + 1, grants = grants + 1, runner_id = ?1, \
-                     lease_until = ?2, lease_lost = 0, updated_at = ?3 \
-                     WHERE id = (SELECT id FROM jobs WHERE state = 'queued' ORDER BY id LIMIT 1) RETURNING id",
-                    params![runner_id, lease_until, now],
+                     lease_until = ?2, lease_lost = 0, last_seq = 0, phase = '', take_n = NULL, take_m = NULL, updated_at = ?3 \
+                     WHERE id = (SELECT id FROM jobs WHERE state = 'queued' AND grants < ?4 ORDER BY id LIMIT 1) RETURNING id",
+                    params![runner_id, lease_until, now, max],
                     |r| r.get(0),
                 )
                 .optional()
                 .map_err(db_err)?;
             let Some(id) = id else {
-                return Ok(None);
+                return Ok(Claimed {
+                    assignment: None,
+                    failed,
+                });
             };
             let job = job_by_id(tx, id)?
                 .ok_or_else(|| format!("задача #{id} исчезла сразу после выдачи"))?;
-            let demo = demo_by_job(tx, id)?
-                .ok_or_else(|| format!("у задачи #{id} в очереди нет демки"))?;
-            Ok(Some(Assignment {
-                job_id: id,
-                epoch: job.epoch,
-                lease_until_ms: lease_until,
-                demo: DemoInfo {
-                    size: demo.size,
-                    sha256: demo.sha256,
-                    orig_name: job.orig_name,
-                },
-                faceit_link: job.faceit_link,
-                player: Player {
-                    steam64: job.player_steam,
-                    name: job.player_name,
-                },
-                requested_by: job.requested_by,
-                options: serde_json::Map::new(),
-            }))
+            Ok(Claimed {
+                assignment: Some(assignment_of(tx, &job)?),
+                failed,
+            })
         })
+    }
+
+    /// Раннер возвращает задачу в очередь (`release`): окружение не готово, раннер уходит и т. п.
+    /// `counts = false` возвращает и одну выдачу. Возврат чужой выдачи — `stale_epoch`.
+    pub fn release(
+        &self,
+        runner_id: i64,
+        job_id: i64,
+        req: &ReleaseRequest,
+    ) -> std::result::Result<(), Reject> {
+        let now = self.clock.now_ms();
+        let ev = Event::Release {
+            runner_id,
+            epoch: req.epoch,
+            counts: req.counts,
+        };
+        self.db.write(|tx| {
+            let before = job_by_id(tx, job_id)?.ok_or_else(not_found)?;
+            let d = rules::decide(&before, &ev, now, &self.limits)?;
+            apply(tx, &before, &d.job, now)?;
+            Ok::<(), Reject>(())
+        })?;
+        self.wake();
+        Ok(())
     }
 
     /// Прогресс раннера (он же heartbeat): продлевает аренду и двигает состояние. Возвращает ответ и признак того,
@@ -449,8 +531,38 @@ impl Core {
     }
 }
 
+/// Выдача для раннера по строке задачи и её демке.
+fn assignment_of(c: &Connection, job: &JobRow) -> Result<Assignment> {
+    let id = job.id;
+    let demo = demo_by_job(c, id)?.ok_or_else(|| format!("у задачи #{id} в очереди нет демки"))?;
+    Ok(Assignment {
+        job_id: id,
+        epoch: job.epoch,
+        lease_until_ms: job.lease_until.unwrap_or_default(),
+        demo: DemoInfo {
+            size: demo.size,
+            sha256: demo.sha256,
+            orig_name: job.orig_name.clone(),
+        },
+        faceit_link: job.faceit_link.clone(),
+        player: Player {
+            steam64: job.player_steam.clone(),
+            name: job.player_name.clone(),
+        },
+        requested_by: job.requested_by.clone(),
+        options: serde_json::Map::new(),
+    })
+}
+
 fn not_found() -> Reject {
     Reject::new(codes::NOT_FOUND, "нет такой задачи")
+}
+
+/// Итог `claim_report`: выдача (если есть) и задачи, упавшие с `TOO_MANY_GRANTS` по дороге.
+#[derive(Debug, Clone)]
+pub struct Claimed {
+    pub assignment: Option<Assignment>,
+    pub failed: Vec<i64>,
 }
 
 /// Что сделал `sweep`: id задач по исходам.

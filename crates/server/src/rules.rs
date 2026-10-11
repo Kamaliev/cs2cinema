@@ -24,6 +24,12 @@ pub enum Event {
     },
     /// Проверка срока аренды (по часам сервера).
     Expire,
+    /// Раннер возвращает задачу в очередь; `counts = false` возвращает и выдачу.
+    Release {
+        runner_id: i64,
+        epoch: i64,
+        counts: bool,
+    },
 }
 
 /// Результат `decide`: новая строка и пометки для вызывающего.
@@ -115,6 +121,31 @@ pub fn decide(job: &JobRow, ev: &Event, now_ms: i64, limits: &Limits) -> Result<
                 reattached: lost,
                 discard_parts: false,
             })
+        }
+        Event::Release {
+            runner_id,
+            epoch,
+            counts,
+        } => {
+            if job.state.is_terminal() {
+                return Err(terminal());
+            }
+            let lost = job.state == JobState::Queued && job.lease_lost;
+            if !(job.state.is_leased() || lost) || !fenced(job, *runner_id, *epoch) {
+                return Err(stale());
+            }
+            let mut j = job.clone();
+            j.state = JobState::Queued;
+            j.runner_id = None;
+            j.lease_until = None;
+            j.lease_lost = false;
+            j.phase = String::new();
+            j.take_n = None;
+            j.take_m = None;
+            if !*counts {
+                j.grants = (j.grants - 1).max(0);
+            }
+            Ok(Decision::of(j))
         }
         Event::Expire => {
             let overdue = job.state.is_leased() && job.lease_until.is_none_or(|l| l < now_ms);

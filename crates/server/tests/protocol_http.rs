@@ -65,9 +65,17 @@ fn submitted_demo_is_claimed_over_http_once() {
     let runner = server::auth::list_runners(srv.running().core().db()).unwrap();
     assert_eq!(job.runner_id, Some(runner[0].id));
 
+    // Тот же раннер повторил запрос, пока задача не подтверждена: ответ мог потеряться, поэтому выдача
+    // повторяется без новой эпохи и без новой выдачи. Другой раннер получает пустую очередь.
     let (status, again) = srv.claim(&token, 0);
+    assert_eq!(status, 200, "повторная выдача той же задачи");
+    let again = again.expect("та же задача");
+    assert_eq!((again.job_id, again.epoch), (id, 1));
+    assert_eq!(srv.job(id).grants, 1);
+    let other = srv.add_runner("other");
+    let (status, none) = srv.claim(&other, 0);
     assert_eq!(status, 204, "очередь пуста");
-    assert!(again.is_none());
+    assert!(none.is_none());
 
     let log = srv.sink.lines().join("\n");
     assert!(
@@ -126,13 +134,14 @@ fn two_processes_on_one_database_hand_out_each_job_once() {
     })
     .unwrap();
     let first = srv.running().core().clone();
-    let runners: Vec<i64> = (0..4)
+    // Раннеров больше, чем задач: каждый берёт не больше одной, повторная выдача своей задачи не в счёт.
+    let runners: Vec<i64> = (0..8)
         .map(|n| {
             let (r, _) = server::auth::add_runner(first.db(), &format!("r{n}"), 1).unwrap();
             r.id
         })
         .collect();
-    let gate = Barrier::new(4);
+    let gate = Barrier::new(8);
     let mut got: Vec<i64> = std::thread::scope(|s| {
         let hs: Vec<_> = runners
             .iter()
@@ -148,7 +157,9 @@ fn two_processes_on_one_database_hand_out_each_job_once() {
                     gate.wait();
                     let mut mine = Vec::new();
                     for _ in 0..10 {
-                        if let Some(a) = core.claim(*rid).unwrap() {
+                        if let Some(a) = core.claim(*rid).unwrap()
+                            && !mine.contains(&a.job_id)
+                        {
                             mine.push(a.job_id);
                         }
                     }

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response};
-use wire::{ApiError, ClaimRequest, ProgressRequest, codes};
+use wire::{ApiError, ClaimRequest, ProgressRequest, ReleaseRequest, codes};
 
 /// Самое большое JSON-тело запроса: 64 КиБ.
 pub const MAX_JSON: usize = 64 * 1024;
@@ -120,6 +120,7 @@ fn job_action(ctx: &Ctx, rq: &mut Request, path: &str, trace: &mut Trace) -> Res
         .ok_or_else(not_found)?;
     match action {
         "progress" => progress(ctx, rq, job_id, trace),
+        "release" => release(ctx, rq, job_id, trace),
         _ => Err(not_found()),
     }
 }
@@ -139,6 +140,25 @@ fn progress(ctx: &Ctx, rq: &mut Request, job_id: i64, trace: &mut Trace) -> Resu
     Reply::json(200, &reply)
 }
 
+/// `POST /v1/jobs/{id}/release`: раннер возвращает задачу в очередь.
+fn release(ctx: &Ctx, rq: &mut Request, job_id: i64, trace: &mut Trace) -> Result<Reply, Reject> {
+    let runner = authenticate(ctx, rq)?;
+    trace.runner = Some(runner.name.clone());
+    let req: ReleaseRequest = read_json(rq, MAX_JSON)?;
+    ctx.core.release(runner.id, job_id, &req)?;
+    let reason = ctx.core.redactor().clean(&req.reason, 200);
+    ctx.log.info(&format!(
+        "раннер {} вернул задачу #{job_id}: {}",
+        runner.name,
+        if reason.is_empty() {
+            "без причины"
+        } else {
+            &reason
+        }
+    ));
+    Ok(Reply::no_content())
+}
+
 /// `POST /v1/runner/claim?wait=N`: раннер просит задачу; сервер ждёт её до `min(N, longpoll_secs)` секунд.
 fn claim(ctx: &Ctx, rq: &mut Request, trace: &mut Trace) -> Result<Reply, Reject> {
     let runner = authenticate(ctx, rq)?;
@@ -151,7 +171,12 @@ fn claim(ctx: &Ctx, rq: &mut Request, trace: &mut Trace) -> Result<Reply, Reject
     loop {
         // Поколение читается до проверки очереди: пробуждение между проверкой и ожиданием не теряется.
         let seen = ctx.core.work_generation();
-        if let Some(a) = ctx.core.claim(runner.id)? {
+        let got = ctx.core.claim_report(runner.id)?;
+        for id in &got.failed {
+            ctx.log
+                .warn(&format!("задача #{id}: превышено число выдач"));
+        }
+        if let Some(a) = got.assignment {
             return Reply::json(200, &a);
         }
         let now = Instant::now();

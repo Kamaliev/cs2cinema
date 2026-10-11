@@ -7,7 +7,7 @@ mod common;
 use common::{TestOptions, TestServer, fake_demo};
 use server::clock::ManualClock;
 use std::time::Duration;
-use wire::{CancelMode, JobState, Phase, ProgressReply, ProgressRequest, Take};
+use wire::{CancelMode, JobState, Phase, ProgressReply, ProgressRequest, ReleaseRequest, Take};
 
 const T0: i64 = 1_800_000_000_000;
 
@@ -143,4 +143,93 @@ fn an_old_seq_extends_the_lease_but_changes_nothing_else() {
         Some(T0 + 20_000 + 45_000),
         "аренда продлена"
     );
+}
+
+#[test]
+fn stale_epoch_progress_is_refused_over_http() {
+    let srv = clocked();
+    let clock = srv.clock();
+    let id = srv.submit(&fake_demo(4096), "s1mple");
+    let old = srv.add_runner("old");
+    let new = srv.add_runner("new");
+    srv.claim(&old, 0);
+    assert_eq!(srv.progress(&old, id, &req(1, 1, Phase::Record)).0, 200);
+
+    clock.advance(Duration::from_secs(46));
+    srv.sweep();
+    let (status, got) = srv.claim(&new, 0);
+    assert_eq!(status, 200);
+    assert_eq!(got.unwrap().epoch, 2, "новая выдача — новая эпоха");
+
+    let (status, body) = srv.progress(&old, id, &req(1, 2, Phase::Record));
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("stale_epoch"), "{body}");
+    assert_eq!(srv.job(id).last_seq, 0, "старый раннер ничего не записал");
+    assert_eq!(srv.progress(&new, id, &req(2, 1, Phase::Record)).0, 200);
+}
+
+#[test]
+fn poison_demo_fails_after_max_grants_over_http() {
+    let srv = clocked();
+    let clock = srv.clock();
+    let poison = srv.submit(&fake_demo(4096), "poison");
+    let token = srv.add_runner("a");
+    for round in 1..=3 {
+        let (status, got) = srv.claim(&token, 0);
+        assert_eq!(status, 200, "выдача {round}");
+        assert_eq!(got.unwrap().epoch, round);
+        clock.advance(Duration::from_secs(46));
+        srv.sweep();
+    }
+    let (status, got) = srv.claim(&token, 0);
+    assert_eq!(status, 204, "четвёртой выдачи нет");
+    assert!(got.is_none());
+    let job = srv.job(poison);
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.fail_code.as_deref(), Some("TOO_MANY_GRANTS"));
+    let log = srv.sink.lines().join("\n");
+    assert!(log.contains("превышено число выдач"), "{log}");
+}
+
+#[test]
+fn release_over_http_requeues_the_job() {
+    let srv = clocked();
+    let id = srv.submit(&fake_demo(4096), "s1mple");
+    let token = srv.add_runner("a");
+    srv.claim(&token, 0);
+
+    let bad = ReleaseRequest {
+        epoch: 5,
+        reason: String::new(),
+        counts: true,
+    };
+    let (status, body) = srv.release(&token, id, &bad);
+    assert_eq!(status, 409, "{body}");
+
+    let ok = ReleaseRequest {
+        epoch: 1,
+        reason: "окружение не готово".to_owned(),
+        counts: true,
+    };
+    let (status, body) = srv.release(&token, id, &ok);
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(srv.job(id).state, JobState::Queued);
+    let (status, got) = srv.claim(&token, 0);
+    assert_eq!(status, 200);
+    assert_eq!(got.unwrap().epoch, 2);
+    let log = srv.sink.lines().join("\n");
+    assert!(
+        log.contains("вернул задачу") && log.contains("окружение не готово"),
+        "{log}"
+    );
+
+    // Задача, которой нет, и кривой id.
+    let (status, _) = srv.release(&token, 999, &ok);
+    assert_eq!(status, 404);
+    let r = srv.send(
+        "/v1/jobs/abc/release",
+        Some(&format!("Bearer {token}")),
+        Some("{}"),
+    );
+    assert_eq!(r.status, 404);
 }

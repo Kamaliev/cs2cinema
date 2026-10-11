@@ -444,9 +444,16 @@ fn serve_binary_answers_claims_and_survives_a_restart() {
     assert_eq!(r.json()["epoch"], 1);
     srv.kill();
 
-    // После перезапуска тот же токен проходит (не 401), а задача осталась выданной: очередь пуста.
+    // После перезапуска тот же токен проходит (не 401), а задача осталась выданной: тому же раннеру она
+    // отдаётся повторно с прежней эпохой (ответ мог потеряться), очередь для остальных пуста.
+    let (_, out, _) = run(&["runner", "add", "other", "--data-dir", &data]);
+    let other = token_from(&out);
     let srv = Serve::start(&data);
     let r = srv.claim(&token);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["job_id"], 1);
+    assert_eq!(r.json()["epoch"], 1, "повторная выдача без новой эпохи");
+    let r = srv.claim(&other);
     assert_eq!(r.status, 204, "{}", r.body);
     srv.kill();
 }

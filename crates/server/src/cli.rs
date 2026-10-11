@@ -47,6 +47,11 @@ cs2-server — сервер очереди монтажа
   CS2_SERVER_LONGPOLL_SECS, CS2_SERVER_MAX_GRANTS, CS2_SERVER_STARTUP_GRACE_SECS,
   CS2_SERVER_MAX_DEMO_MIB, CS2_SERVER_MAX_RESULT_MIB, TELEGRAM_BOT_TOKEN
   (или CS2_SERVER_TELEGRAM_BOT_TOKEN), STATE_DIRECTORY (папка данных по умолчанию).
+Бот (включается адресом bot_api_url; остальное — ключи файла настроек того же имени):
+  CS2_SERVER_BOT_API_URL, CS2_SERVER_BOT_API_FILES_ROOT, CS2_SERVER_BOT_API_FILES_ROOT_LOCAL,
+  CS2_SERVER_BOT_API_RESULTS_PREFIX, CS2_SERVER_BOT_SEND_AS (video | document),
+  CS2_SERVER_BOT_USER_MAX_ACTIVE, CS2_SERVER_BOT_ADMIN_MAX_ACTIVE, CS2_SERVER_BOT_QUEUE_MAX_ACTIVE,
+  CS2_SERVER_BOT_STATUS_EDIT_SECS, CS2_SERVER_BOT_TRANSFER_TIMEOUT_MINS.
 ";
 
 #[derive(Default)]
@@ -190,6 +195,32 @@ fn show_config(loaded: &config::Loaded) {
         Some(t) => println!("telegram_bot_token = {t}"),
         None => println!("telegram_bot_token = не задан"),
     }
+    let path = |p: &Option<PathBuf>| match p {
+        Some(p) => p.display().to_string(),
+        None => "не задан".to_owned(),
+    };
+    println!(
+        "bot_api_url = {}",
+        c.bot_api_url.as_deref().unwrap_or("не задан")
+    );
+    println!("bot_api_files_root = {}", path(&c.bot_api_files_root));
+    println!(
+        "bot_api_files_root_local = {}",
+        path(&c.bot_api_files_root_local)
+    );
+    println!(
+        "bot_api_results_prefix = {}",
+        path(&c.bot_api_results_prefix)
+    );
+    println!("bot_send_as = {}", c.bot_send_as.as_str());
+    println!("bot_user_max_active = {}", c.bot_user_max_active);
+    println!("bot_admin_max_active = {}", c.bot_admin_max_active);
+    println!("bot_queue_max_active = {}", c.bot_queue_max_active);
+    println!("bot_status_edit_secs = {}", c.bot_status_edit_secs);
+    println!(
+        "bot_transfer_timeout_mins = {}",
+        c.bot_transfer_timeout_mins
+    );
 }
 
 fn execute(

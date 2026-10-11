@@ -686,4 +686,212 @@ mod tests {
         let quiet = load(&Flags::default(), &env_of(&[])).unwrap();
         assert!(quiet.warnings.is_empty());
     }
+
+    /// Абсолютный путь на любой платформе.
+    fn abs_root() -> String {
+        std::env::temp_dir()
+            .join("bot-api-files")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// JSON настроек бота; пути экранируются самим serde_json.
+    fn bot_json(extra: serde_json::Value) -> String {
+        let mut v = serde_json::json!({
+            "bot_api_url": "http://127.0.0.1:8081",
+            "bot_api_files_root": abs_root(),
+        });
+        for (k, val) in extra.as_object().cloned().unwrap_or_default() {
+            v[k] = val;
+        }
+        v.to_string()
+    }
+
+    #[test]
+    fn bot_keys_load_from_file_and_env() {
+        let body = bot_json(serde_json::json!({
+            "bot_user_max_active": 3,
+            "bot_send_as": "document",
+            "bot_status_edit_secs": 20,
+            "bot_transfer_timeout_mins": 30,
+        }));
+        let got = load_with(
+            Some(&body),
+            "bot-keys",
+            &[("TELEGRAM_BOT_TOKEN", SENTINEL_TOKEN)],
+            Flags::default(),
+        )
+        .unwrap();
+        let c = &got.config;
+        assert_eq!(c.bot_api_url.as_deref(), Some("http://127.0.0.1:8081"));
+        assert_eq!(c.bot_user_max_active, 3);
+        assert_eq!(c.bot_admin_max_active, 5, "умолчание D-03");
+        assert_eq!(c.bot_queue_max_active, 10, "умолчание D-03");
+        let s = c.bot_settings();
+        assert_eq!(s.send_as, SendAs::Document);
+        assert_eq!(s.user_max_active, 3);
+        assert_eq!(s.admin_max_active, 5);
+        assert_eq!(s.queue_max_active, 10);
+        assert_eq!(s.status_edit_ms, 20_000);
+        assert_eq!(s.files_root, PathBuf::from(abs_root()));
+        assert_eq!(
+            s.files_root_local,
+            PathBuf::from(abs_root()),
+            "по умолчанию вид с сервера совпадает с видом bot-api"
+        );
+        assert!(
+            s.results_prefix
+                .ends_with(PathBuf::from("blobs").join("results")),
+            "{:?}",
+            s.results_prefix
+        );
+        assert!(s.results_prefix.is_absolute() || s.results_prefix.has_root());
+        assert_eq!(
+            c.http_timeouts().transfer,
+            std::time::Duration::from_secs(30 * 60)
+        );
+
+        // Окружение сильнее файла.
+        let got = load_with(
+            Some(&body),
+            "bot-keys-env",
+            &[
+                ("TELEGRAM_BOT_TOKEN", SENTINEL_TOKEN),
+                ("CS2_SERVER_BOT_USER_MAX_ACTIVE", "4"),
+                ("CS2_SERVER_BOT_SEND_AS", "video"),
+                ("CS2_SERVER_BOT_API_URL", "http://localhost:9000"),
+            ],
+            Flags::default(),
+        )
+        .unwrap();
+        assert_eq!(got.config.bot_user_max_active, 4);
+        assert_eq!(got.config.bot_send_as, SendAs::Video);
+        assert_eq!(
+            got.config.bot_api_url.as_deref(),
+            Some("http://localhost:9000")
+        );
+
+        // Неизвестный ключ — ошибка с номером строки и без значения.
+        let e = load_with(
+            Some("{\n\"bot_foo\": \"SENTINEL-VALUE-12345\"\n}"),
+            "bot-unknown",
+            &[],
+            Flags::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            e.contains("строка") && !e.contains("SENTINEL-VALUE-12345"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn bot_url_must_be_local_http() {
+        let token = [("TELEGRAM_BOT_TOKEN", SENTINEL_TOKEN)];
+        for bad in [
+            "https://api.telegram.org",
+            "http://secret-host.example:80",
+            "http://10.0.0.5:8081",
+        ] {
+            let body = bot_json(serde_json::json!({ "bot_api_url": bad }));
+            let e = load_with(Some(&body), "bot-url", &token, Flags::default())
+                .err()
+                .unwrap_or_else(|| panic!("{bad} должен быть отвергнут"));
+            assert!(
+                e.contains("bot_api_url")
+                    && e.contains(
+                        "адрес telegram-bot-api должен быть локальным http://127.0.0.1:ПОРТ"
+                    )
+                    && !e.contains(bad),
+                "{e}"
+            );
+        }
+        let body = bot_json(serde_json::json!({}));
+        let got = load_with(Some(&body), "bot-url-ok", &token, Flags::default()).unwrap();
+        assert!(got.warnings.is_empty(), "{:?}", got.warnings);
+    }
+
+    #[test]
+    fn bot_url_without_token_or_root_is_an_error() {
+        let token = [("TELEGRAM_BOT_TOKEN", SENTINEL_TOKEN)];
+        // Адрес без токена.
+        let body = bot_json(serde_json::json!({}));
+        let e = load_with(Some(&body), "bot-no-token", &[], Flags::default())
+            .err()
+            .unwrap();
+        assert!(e.contains("токен"), "{e}");
+        // Без корня файлов.
+        let e = load_with(
+            Some(r#"{"bot_api_url": "http://127.0.0.1:8081"}"#),
+            "bot-no-root",
+            &token,
+            Flags::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains("bot_api_files_root"), "{e}");
+        // Относительный корень.
+        let body = bot_json(serde_json::json!({ "bot_api_files_root": "relative/dir" }));
+        let e = load_with(Some(&body), "bot-rel-root", &token, Flags::default())
+            .err()
+            .unwrap();
+        assert!(e.contains("bot_api_files_root"), "{e}");
+        // Прочие ключи называются по имени.
+        for (key, value, name) in [
+            ("bot_send_as", serde_json::json!("photo"), "bot_send_as"),
+            (
+                "bot_status_edit_secs",
+                serde_json::json!(1),
+                "bot_status_edit_secs",
+            ),
+            (
+                "bot_transfer_timeout_mins",
+                serde_json::json!(0),
+                "bot_transfer_timeout_mins",
+            ),
+            (
+                "bot_user_max_active",
+                serde_json::json!(0),
+                "bot_user_max_active",
+            ),
+            (
+                "bot_admin_max_active",
+                serde_json::json!(0),
+                "bot_admin_max_active",
+            ),
+            (
+                "bot_queue_max_active",
+                serde_json::json!(0),
+                "bot_queue_max_active",
+            ),
+        ] {
+            let body = bot_json(serde_json::json!({ key: value }));
+            let e = load_with(Some(&body), "bot-bad-key", &token, Flags::default())
+                .err()
+                .unwrap_or_else(|| panic!("{key} должен быть отвергнут"));
+            assert!(e.contains(name), "{e}");
+        }
+    }
+
+    #[test]
+    fn token_without_bot_url_warns() {
+        let got = load(
+            &Flags::default(),
+            &env_of(&[("TELEGRAM_BOT_TOKEN", SENTINEL_TOKEN)]),
+        )
+        .unwrap();
+        assert!(
+            got.warnings
+                .iter()
+                .any(|w| w.contains("бот не запущен: не задан bot_api_url")),
+            "{:?}",
+            got.warnings
+        );
+        assert!(
+            got.warnings.iter().all(|w| !w.contains(SENTINEL_TOKEN)),
+            "{:?}",
+            got.warnings
+        );
+    }
 }

@@ -20,6 +20,16 @@ const ENV_KEYS: &[&str] = &[
     "CS2_SERVER_STARTUP_GRACE_SECS",
     "CS2_SERVER_MAX_DEMO_MIB",
     "CS2_SERVER_MAX_RESULT_MIB",
+    "CS2_SERVER_BOT_API_URL",
+    "CS2_SERVER_BOT_API_FILES_ROOT",
+    "CS2_SERVER_BOT_API_FILES_ROOT_LOCAL",
+    "CS2_SERVER_BOT_API_RESULTS_PREFIX",
+    "CS2_SERVER_BOT_SEND_AS",
+    "CS2_SERVER_BOT_USER_MAX_ACTIVE",
+    "CS2_SERVER_BOT_ADMIN_MAX_ACTIVE",
+    "CS2_SERVER_BOT_QUEUE_MAX_ACTIVE",
+    "CS2_SERVER_BOT_STATUS_EDIT_SECS",
+    "CS2_SERVER_BOT_TRANSFER_TIMEOUT_MINS",
     "CS2_SERVER_TELEGRAM_BOT_TOKEN",
     "TELEGRAM_BOT_TOKEN",
     "STATE_DIRECTORY",
@@ -362,6 +372,44 @@ fn example_config_is_accepted() {
         out.contains("lease_ttl_secs = 45") && out.contains("telegram_bot_token = не задан"),
         "{out}"
     );
+    assert!(
+        out.contains("bot_api_url = не задан") && out.contains("bot_send_as = video"),
+        "{out}"
+    );
+}
+
+#[test]
+fn config_show_prints_bot_keys_without_the_token() {
+    let d = test_dir("show-bot");
+    let file = d.join("cfg.json");
+    let root = d.join("bot-api-files");
+    let body = serde_json::json!({
+        "bot_api_url": "http://127.0.0.1:8081",
+        "bot_api_files_root": root.to_string_lossy(),
+    });
+    std::fs::write(&file, body.to_string()).unwrap();
+    let out = bin()
+        .args(["--config", file.to_str().unwrap(), "config", "show"])
+        .env("TELEGRAM_BOT_TOKEN", SENTINEL_TOKEN)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    for line in [
+        "bot_api_url = http://127.0.0.1:8081",
+        "bot_user_max_active = 2",
+        "bot_admin_max_active = 5",
+        "bot_queue_max_active = 10",
+        "bot_send_as = video",
+        "bot_status_edit_secs = 10",
+        "bot_transfer_timeout_mins = 60",
+        "telegram_bot_token = ***",
+    ] {
+        assert!(stdout.contains(line), "нет строки «{line}»: {stdout}");
+    }
+    assert!(!stdout.contains(SENTINEL_TOKEN) && !stderr.contains(SENTINEL_TOKEN));
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// Запущенный `cs2-server serve`: адрес берётся из первой строки stdout; при выходе из теста процесс убивается.

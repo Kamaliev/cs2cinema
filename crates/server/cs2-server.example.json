@@ -9,5 +9,15 @@
   "startup_grace_secs": 90,
   "max_demo_mib": 2000,
   "max_result_mib": 2000,
-  "telegram_bot_token": null
+  "telegram_bot_token": null,
+  "bot_api_url": null,
+  "bot_api_files_root": "/var/lib/telegram-bot-api",
+  "bot_api_files_root_local": null,
+  "bot_api_results_prefix": null,
+  "bot_send_as": "video",
+  "bot_user_max_active": 2,
+  "bot_admin_max_active": 5,
+  "bot_queue_max_active": 10,
+  "bot_status_edit_secs": 10,
+  "bot_transfer_timeout_mins": 60
 }

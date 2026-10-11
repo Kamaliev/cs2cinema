@@ -65,6 +65,9 @@ pub fn run_bounded(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for name in crate::SECRET_ENV {
+        c.env_remove(name);
+    }
     if let Some(cwd) = &cmd.cwd {
         c.current_dir(cwd);
     }
@@ -227,6 +230,24 @@ mod tests {
         let out = run_bounded(&cmd, &|| false, &mut |l| lines.push(l.to_owned())).unwrap();
         assert_eq!(out.code, Some(0));
         assert_eq!(lines, vec!["one".to_owned(), "two".to_owned()]);
+    }
+
+    /// Токен раннера не доходит до дочернего процесса (WR-07).
+    #[test]
+    fn bounded_run_does_not_pass_the_runner_token_to_the_child() {
+        // SAFETY: имя переменной используется только этим тестом.
+        unsafe { std::env::set_var("CS2_RUNNER_TOKEN", "secret-for-test") };
+        let cmd = spec(
+            (
+                "cmd",
+                &["/C", "if defined CS2_RUNNER_TOKEN (echo SET) else (echo UNSET)"],
+            ),
+            ("sh", &["-c", "[ -n \"${CS2_RUNNER_TOKEN+x}\" ] && echo SET || echo UNSET"]),
+            Duration::from_secs(10),
+        );
+        let mut lines = Vec::new();
+        run_bounded(&cmd, &|| false, &mut |l| lines.push(l.to_owned())).unwrap();
+        assert_eq!(lines, vec!["UNSET".to_owned()]);
     }
 
     /// Потомок утилиты держит её pipe открытыми: вызов всё равно возвращается после DRAIN_LIMIT.

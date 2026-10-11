@@ -282,6 +282,9 @@ fn game_cmdline(spec: &LaunchSpec, port: u16) -> String {
 /// Команда запуска HLAE: единственное место, где собирается строка запуска.
 fn hlae_command(spec: &LaunchSpec, hlae: &Path, hook: &Path, cs2_exe: &Path, port: u16) -> Command {
     let mut cmd = Command::new(hlae);
+    for name in crate::SECRET_ENV {
+        cmd.env_remove(name);
+    }
     cmd.current_dir(&spec.hlae_dir)
         .args(["-customLoader", "-noGui", "-autoStart", "-noConfig"])
         .arg("-hookDllPath")

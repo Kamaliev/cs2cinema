@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 04
 current_phase_name: Очередь без присмотра и приёмка
 status: executing
-stopped_at: Completed 04-10-PLAN.md
-last_updated: "2026-10-11T08:27:22.906Z"
+stopped_at: Completed 04-11-PLAN.md (учения D1-D6 не проводились)
+last_updated: "2026-10-11T08:42:55.905Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 04 execution started
-state_head: 481d034e3d5154cc55282a501919d01ae16d5151
+state_head: 7a5b6a66811edefa895d19581ef0b62ff583ce48
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 36
-  completed_plans: 34
+  completed_plans: 35
   percent: 50
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 04 (Очередь без присмотра и приёмка) — EXECUTING
-Plan: 11 of 12
+Plan: 12 of 12
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 04 execution started
 
@@ -89,6 +89,7 @@ Progress: [█████░░░░░] 50%
 | Phase 04 P08 | 25 min | 2 tasks | 6 files |
 | Phase 04 P09 | 13min | 3 tasks | 4 files |
 | Phase 04 P10 | 35min | 3 tasks | 9 files |
+| Phase 04 P11 | n/a | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -144,6 +145,7 @@ Recent decisions affecting current work:
 - [Phase 04]: 04-09: политика очереди чистая (QueuePolicy); сбой «запуск» повторяется один раз, два одинаковых сбоя «окружение» (и «запуск» без бюджета) — пауза с объяснением; итог очереди объявляется и при паузе без ждущих задач
 - [Phase 04]: 04-10: ручные действия приёмки выводятся только из журнала (First/Auto) и attempt == 1 + auto_retries; серия B доказывается другим PID в имени партии и постановкой после конца серии A
 - [Phase 04]: 04-10: acceptance check/state/job читают базу только Store::open_read_only; ничего не удаляют и не завершают
+- [Phase 04]: 04-11: учения D1-D6 не проводились, приняты по указанию автора без улик; ACC-03 остаётся Pending, A1/A3/кириллица в трее не проверены
 
 ### Pending Todos
 
@@ -172,6 +174,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T08:27:22.769Z
-Stopped at: Completed 04-10-PLAN.md
+Last session: 2026-10-11T08:42:55.754Z
+Stopped at: Completed 04-11-PLAN.md (учения D1-D6 не проводились)
 Resume file: None

@@ -11,6 +11,7 @@
 pub mod console_log;
 pub mod job;
 pub mod netcon;
+pub mod notify;
 pub mod process;
 pub mod system;
 pub mod watch;
@@ -331,6 +332,10 @@ fn identity_of(proc: &OwnedProc, created: u64) -> Option<ProcIdentity> {
 impl Host for WinHost {
     fn kill_orphan(&self, id: &ProcIdentity) -> OrphanOutcome {
         process::kill_if_same(id, &ORPHAN_IMAGES)
+    }
+
+    fn notify(&self, title: &str, text: &str) -> bool {
+        notify::balloon(title, text)
     }
 
     fn launch(&self, spec: &LaunchSpec) -> Result<Box<dyn Session>, HostError> {

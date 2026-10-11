@@ -341,6 +341,45 @@ pub trait Host: Send + Sync {
         let _ = path;
         None
     }
+
+    /// Уведомление в трее; не блокирует — показ и уборка значка идут на своём потоке; `false` —
+    /// не показано (нет платформы или Windows отказал). Текст сюда приходит как есть: хост
+    /// сам чистит его через [`notify_text`] (OBS-04).
+    fn notify(&self, title: &str, text: &str) -> bool {
+        let _ = (title, text);
+        false
+    }
+}
+
+/// Предел заголовка уведомления Windows в единицах UTF-16 (`szInfoTitle` — 64 с нулём).
+pub const NOTIFY_TITLE_MAX: usize = 63;
+/// Предел текста уведомления Windows в единицах UTF-16 (`szInfo` — 256 с нулём).
+pub const NOTIFY_TEXT_MAX: usize = 255;
+
+/// Готовит строку для уведомления: убирает управляющие символы и, если строка длиннее
+/// `max_units` единиц UTF-16, обрезает по границе символа и дописывает «…» так, чтобы итог
+/// уложился в предел. Один код для настоящего хоста и фейка (T-04-06).
+pub fn notify_text(s: &str, max_units: usize) -> String {
+    let clean: String = s.chars().filter(|c| !c.is_control()).collect();
+    if clean.encode_utf16().count() <= max_units {
+        return clean;
+    }
+    const ELLIPSIS: char = '…';
+    let budget = max_units.saturating_sub(ELLIPSIS.len_utf16());
+    let mut out = String::new();
+    let mut used = 0;
+    for c in clean.chars() {
+        let n = c.len_utf16();
+        if used + n > budget {
+            break;
+        }
+        out.push(c);
+        used += n;
+    }
+    if max_units >= ELLIPSIS.len_utf16() {
+        out.push(ELLIPSIS);
+    }
+    out
 }
 
 /// Годится ли строка для консоли игры: не пустая и без `\r`, `\n`, `\0`.
@@ -379,6 +418,34 @@ mod tests {
         assert_eq!(Source::ConsoleLog.label(), "console.log");
         assert_eq!(Source::HlaeStdout.label(), "hlae-stdout");
         assert_eq!(Source::HlaeStderr.label(), "hlae-stderr");
+    }
+
+    #[test]
+    fn notify_text_strips_control_chars_and_fits_the_limit() {
+        assert_eq!(notify_text("a\u{7}b\nc", NOTIFY_TEXT_MAX), "abc");
+        assert_eq!(
+            notify_text("2 готово / 1 упало", NOTIFY_TEXT_MAX),
+            "2 готово / 1 упало"
+        );
+        let long = "я".repeat(400);
+        let cut = notify_text(&long, NOTIFY_TEXT_MAX);
+        assert!(cut.encode_utf16().count() <= NOTIFY_TEXT_MAX);
+        assert!(cut.ends_with('…'));
+        // эмодзи занимает две единицы UTF-16: на границе его нельзя резать пополам
+        let emoji = "😀".repeat(100);
+        let cut = notify_text(&emoji, 10);
+        assert!(cut.encode_utf16().count() <= 10, "{cut}");
+        assert!(cut.ends_with('…'));
+        assert!(cut.chars().filter(|&c| c == '😀').count() == 4, "{cut}");
+        assert_eq!(
+            notify_text(&"x".repeat(NOTIFY_TITLE_MAX), NOTIFY_TITLE_MAX).len(),
+            NOTIFY_TITLE_MAX
+        );
+    }
+
+    #[test]
+    fn unsupported_host_does_not_notify() {
+        assert!(!UnsupportedHost.notify("CS2 Cinema", "текст"));
     }
 
     #[test]

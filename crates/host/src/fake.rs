@@ -16,8 +16,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::{
-    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, OrphanOutcome, PrevGame,
-    ProcIdentity, ProcInfo, Session, SessionEvent, Source, WindowInfo, console_line_ok,
+    CmdOutput, CmdSpec, Host, HostError, LaunchSpec, Liveness, NOTIFY_TEXT_MAX, NOTIFY_TITLE_MAX,
+    OrphanOutcome, PrevGame, ProcIdentity, ProcInfo, Session, SessionEvent, Source, WindowInfo,
+    console_line_ok, notify_text,
 };
 
 /// PID «игры» в событии `GameAppeared`.
@@ -427,6 +428,8 @@ struct HostState {
     launch_size: Option<(u32, u32)>,
     /// Идентичности, с которыми вызывали `Host::kill_orphan`.
     orphan_kills: Vec<ProcIdentity>,
+    /// Уведомления, показанные через `Host::notify`: (заголовок, текст) после очистки.
+    notifications: Vec<(String, String)>,
 }
 
 /// Страховка от зациклившегося сценария: виртуальные часы не должны уходить за `MAX_VIRTUAL`.
@@ -463,6 +466,7 @@ impl FakeHost {
                 take_ends: vec![],
                 launch_size: None,
                 orphan_kills: vec![],
+                notifications: vec![],
             })),
         }
     }
@@ -480,6 +484,12 @@ impl FakeHost {
     /// Идентичности, с которыми вызывали `Host::kill_orphan`, по порядку.
     pub fn orphan_kills(&self) -> Vec<ProcIdentity> {
         lock(&self.state).orphan_kills.clone()
+    }
+
+    /// Уведомления, показанные через `Host::notify`, по порядку: (заголовок, текст) в том виде,
+    /// в каком их увидел бы пользователь (после `notify_text`).
+    pub fn notifications(&self) -> Vec<(String, String)> {
+        lock(&self.state).notifications.clone()
     }
 
     /// Команды, принятые консолью (отклонённые и отправленные до открытия порта не считаются).
@@ -635,6 +645,14 @@ impl Host for FakeHost {
 
     fn free_space(&self, _path: &Path) -> Result<u64, HostError> {
         lock(&self.state).scenario.free_space.clone()
+    }
+
+    fn notify(&self, title: &str, text: &str) -> bool {
+        lock(&self.state).notifications.push((
+            notify_text(title, NOTIFY_TITLE_MAX),
+            notify_text(text, NOTIFY_TEXT_MAX),
+        ));
+        true
     }
 
     fn file_version(&self, _path: &Path) -> Option<String> {
@@ -1707,6 +1725,20 @@ mod tests {
             Err(HostError::Io("диск".into()))
         );
         assert_eq!(host.file_version(Path::new("HLAE.exe")), None);
+    }
+
+    #[test]
+    fn fake_records_notifications_in_order() {
+        let host = FakeHost::new(Scenario::happy(1));
+        assert!(host.notify("CS2 Cinema", "2 готово / 1 упало"));
+        assert!(host.notify("CS2 Cinema", "строка\nс\u{7}переводом"));
+        assert_eq!(
+            host.notifications(),
+            vec![
+                ("CS2 Cinema".to_string(), "2 готово / 1 упало".to_string()),
+                ("CS2 Cinema".to_string(), "строкаспереводом".to_string()),
+            ]
+        );
     }
 
     #[test]

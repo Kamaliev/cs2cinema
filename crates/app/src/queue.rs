@@ -258,6 +258,12 @@ mod tests {
         panic!("задача #{id} не стала {status:?} за 5 с: {:?}\n{}", j.status, j.log);
     }
 
+    /// Пока очередь на паузе, вторая задача остаётся в очереди не меньше пяти тактов.
+    fn stays_queued(store: &Store, id: i64) {
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(store.job(id).unwrap().unwrap().status, JobStatus::Queued, "на паузе очередь задач не берёт");
+    }
+
     #[test]
     fn a_failed_job_does_not_stop_the_queue() {
         let store = Store::in_memory().unwrap();
@@ -311,5 +317,53 @@ mod tests {
             let j = store.job(id).unwrap().unwrap();
             assert_eq!(j.fail_code.as_deref(), Some("RETRY_NO_DATA"), "{}", j.log);
         }
+    }
+
+    #[test]
+    fn cancel_pauses_the_queue_until_resume() {
+        let store = Store::in_memory().unwrap();
+        let (a, b) = (add(&store, "первая"), add(&store, "вторая"));
+        let cancelled: Behavior = Box::new(|| Err(RunError::from(pipeline::CANCELLED)));
+        let (runner, _) = stub(vec![("первая", cancelled), ("вторая", ok())]);
+        let q = start(store.clone(), runner, Reporter::detached(), None, cfg());
+
+        wait_for(&store, a, JobStatus::Cancelled);
+        stays_queued(&store, b);
+        assert_eq!(q.view().paused, Some(PauseReason::Cancelled));
+        q.resume();
+        wait_for(&store, b, JobStatus::Done);
+        assert_eq!(q.view().paused, None);
+    }
+
+    #[test]
+    fn interrupted_start_waits_for_resume() {
+        let store = Store::in_memory().unwrap();
+        let a = add(&store, "первая");
+        let (runner, started) = stub(vec![("первая", ok())]);
+        let q = start(store.clone(), runner, Reporter::detached(), Some(PauseReason::Interrupted), cfg());
+
+        stays_queued(&store, a);
+        assert!(started.lock().unwrap().is_empty());
+        assert_eq!(q.view().paused, Some(PauseReason::Interrupted));
+        q.resume();
+        wait_for(&store, a, JobStatus::Done);
+    }
+
+    #[test]
+    fn resume_clears_any_pause() {
+        let store = Store::in_memory().unwrap();
+        let a = add(&store, "первая");
+        let cancelled: Behavior = Box::new(|| Err(RunError::from(pipeline::CANCELLED)));
+        let (runner, _) = stub(vec![("первая", cancelled)]);
+        let q = start(store.clone(), runner, Reporter::detached(), None, cfg());
+
+        wait_for(&store, a, JobStatus::Cancelled);
+        let begin = Instant::now();
+        while q.view().paused.is_none() && begin.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(q.view().paused, Some(PauseReason::Cancelled));
+        q.resume();
+        assert_eq!(q.view().paused, None, "«Продолжить», новая задача и «Повторить» снимают паузу сразу");
     }
 }

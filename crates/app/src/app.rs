@@ -530,6 +530,10 @@ impl App {
                             self.status.busy = false;
                             self.status.stage = None;
                             self.status.push(&format!("задача #{id} отменена"));
+                            // осознанная отмена останавливает очередь, сбой и успех — нет (D-13)
+                            if self.queue.view().paused == Some(PauseReason::Cancelled) {
+                                self.status.push("очередь на паузе после отмены — нажмите «Продолжить»");
+                            }
                         }
                         Err(e) => self.status.finish(Err(format!("задача #{id}: {e}"))),
                     }

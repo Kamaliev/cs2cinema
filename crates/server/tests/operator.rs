@@ -512,3 +512,55 @@ fn job_cancel_is_immediate_for_a_queued_job_and_a_flag_for_a_leased_one() {
     assert!(err.contains("нет задачи #999"), "{err}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn job_show_prints_stage_take_and_result() {
+    use wire::{Phase, ProgressRequest, Take};
+
+    let srv = common::TestServer::start();
+    let data = srv.dir.path.join("data");
+    let data = data.to_str().unwrap();
+    let id = srv.submit(&common::fake_demo(4096), "s1mple");
+
+    // Задача в очереди: ни этапа, ни дубля, ни результата.
+    let (code, out, err) = run(&["job", "show", &id.to_string(), "--data-dir", data]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        !out.contains("этап:") && !out.contains("дубль:") && !out.contains("результат:"),
+        "{out}"
+    );
+
+    // Раннер взял задачу и пишет дубль 2 из 3.
+    let token = srv.add_runner("a");
+    let (status, got) = srv.claim(&token, 0);
+    assert_eq!(status, 200);
+    let epoch = got.expect("задача должна быть выдана").epoch;
+    let progress = ProgressRequest {
+        epoch,
+        seq: 1,
+        phase: Phase::Record,
+        take: Some(Take { n: 2, m: 3 }),
+        status: String::new(),
+    };
+    assert_eq!(srv.progress(&token, id, &progress).0, 200);
+    let (code, out, err) = run(&["job", "show", &id.to_string(), "--data-dir", data]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("этап: record"), "{out}");
+    assert!(out.contains("дубль: 2 из 3"), "{out}");
+    assert!(out.contains("running"), "{out}");
+
+    // Результат загружен и принят: размер и хеш в выводе, состояние `done`.
+    let bytes = common::result_bytes(2 * 1024 * 1024);
+    let sha = common::sha256_hex(&bytes);
+    let (status, _, body) = srv.put_chunk(&token, id, epoch, 0, &bytes);
+    assert_eq!(status, 204, "{body}");
+    let (status, body) = srv.finish_done(&token, id, epoch, bytes.len() as u64, &sha);
+    assert_eq!(status, 200, "{body}");
+    let (code, out, err) = run(&["job", "show", &id.to_string(), "--data-dir", data]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("состояние: готово (done)"), "{out}");
+    assert!(
+        out.contains(&format!("результат: 2.0 МиБ, sha256 {sha}")),
+        "{out}"
+    );
+}

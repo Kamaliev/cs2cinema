@@ -279,7 +279,8 @@ fn execute(
                 .job(id)?
                 .ok_or_else(|| CliError::Run(format!("задачи #{id} нет")))?;
             let demo = core.demo_file(id)?;
-            print_job(&job, demo.as_ref());
+            let result = core.result_file(id)?;
+            print_job(&job, demo.as_ref(), result.as_ref());
             Ok(())
         }
         ["job", "cancel", id] => {
@@ -375,7 +376,7 @@ fn execute(
     }
 }
 
-fn print_job(j: &JobRow, demo: Option<&FileRow>) {
+fn print_job(j: &JobRow, demo: Option<&FileRow>, result: Option<&FileRow>) {
     println!("задача #{}", j.id);
     println!("состояние: {} ({})", j.state.title(), j.state.as_str());
     println!("игрок: {}", j.player_name);
@@ -390,12 +391,26 @@ fn print_job(j: &JobRow, demo: Option<&FileRow>) {
         println!("закончена: {}", utc(t));
     }
     println!("эпоха: {}, выдач: {}", j.epoch, j.grants);
+    // Ход задачи у раннера: на живом прогоне по этим строкам видно, где она сейчас.
+    if !j.phase.is_empty() {
+        println!("этап: {}", j.phase);
+    }
+    if let (Some(n), Some(m)) = (j.take_n, j.take_m) {
+        println!("дубль: {n} из {m}");
+    }
     if j.cancel_requested != wire::CancelMode::NotRequested {
         println!("отмена запрошена: {}", j.cancel_requested.as_str());
     }
     if let Some(d) = demo {
         println!("демка: {:.1} МиБ", d.size as f64 / (1024.0 * 1024.0));
         println!("sha256: {}", d.sha256);
+    }
+    if let Some(r) = result {
+        println!(
+            "результат: {:.1} МиБ, sha256 {}",
+            r.size as f64 / (1024.0 * 1024.0),
+            r.sha256
+        );
     }
     for (k, v) in [
         ("код сбоя", &j.fail_code),

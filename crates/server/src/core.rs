@@ -343,6 +343,11 @@ impl Core {
         self.db.read(|c| demo_by_job(c, job_id))
     }
 
+    /// Принятый результат задачи (строка `files` с `kind = 'result'`, не удалённая): размер и SHA-256.
+    pub fn result_file(&self, job_id: i64) -> Result<Option<FileRow>> {
+        self.db.read(|c| result_by_job(c, job_id))
+    }
+
     /// Выдача задачи раннеру (SRV-04, D-04). Тонкая обёртка над `claim_report`: пустая очередь — `None`.
     pub fn claim(&self, runner_id: i64) -> std::result::Result<Option<Assignment>, Reject> {
         Ok(self.claim_report(runner_id)?.assignment)

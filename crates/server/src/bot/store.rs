@@ -3,6 +3,7 @@
 //! Правила: мьютекс базы не держат во время вызовов `Tg` и копирования файлов; функции с `tx` зовут только
 //! внутри `Db::write` и только SQL на переданной транзакции (мьютекс не реентерабелен).
 
+use super::ingest::ACTIVE_STATES as ACTIVE;
 use crate::Result;
 use crate::db::{Db, db_err};
 use rusqlite::{OptionalExtension, Row, Transaction, params};
@@ -239,6 +240,164 @@ pub fn tg_jobs(db: &Db) -> Result<Vec<TgJob>> {
             .map_err(db_err)?;
         let rows = st.query_map([], tg_job_from_row).map_err(db_err)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+    })
+}
+
+/// Строки `tg_jobs`, которым может понадобиться сообщение статуса: чат не заглушён, а задача либо не окончена,
+/// либо отменена и об отмене ещё не сказано.
+pub fn status_candidates(db: &Db) -> Result<Vec<TgJob>> {
+    db.read(|c| {
+        let mut st = c
+            .prepare(&format!(
+                "SELECT {TG_JOB_COLUMNS} FROM tg_jobs
+                 WHERE muted = 0 AND (
+                     job_id IN (SELECT id FROM jobs WHERE state IN {ACTIVE})
+                     OR (final_reported_ms IS NULL AND job_id IN (SELECT id FROM jobs WHERE state = 'cancelled')))
+                 ORDER BY job_id"
+            ))
+            .map_err(db_err)?;
+        let rows = st.query_map([], tg_job_from_row).map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+    })
+}
+
+/// Запоминает текст сообщения статуса и время, раньше которого его не правят.
+pub fn note_status(db: &Db, job_id: i64, text: &str, next_edit_ms: i64, now_ms: i64) -> Result<()> {
+    db.write(|tx| {
+        tx.execute(
+            "UPDATE tg_jobs SET status_text = ?2, next_edit_ms = ?3, updated_at = ?4 WHERE job_id = ?1",
+            params![job_id, text, next_edit_ms, now_ms],
+        )
+        .map(|_| ())
+        .map_err(db_err)
+    })
+}
+
+/// Откладывает следующую правку (ответ 429 или неясный сбой), текст не трогает.
+pub fn defer_edit(db: &Db, job_id: i64, next_edit_ms: i64, now_ms: i64) -> Result<()> {
+    db.write(|tx| {
+        tx.execute(
+            "UPDATE tg_jobs SET next_edit_ms = ?2, updated_at = ?3 WHERE job_id = ?1",
+            params![job_id, next_edit_ms, now_ms],
+        )
+        .map(|_| ())
+        .map_err(db_err)
+    })
+}
+
+/// Новое сообщение статуса вместо потерянного (или так и не отправленного): номер, текст и срок следующей правки.
+pub fn set_status_message(
+    db: &Db,
+    job_id: i64,
+    message_id: i64,
+    text: &str,
+    next_edit_ms: i64,
+    now_ms: i64,
+) -> Result<()> {
+    db.write(|tx| {
+        tx.execute(
+            "UPDATE tg_jobs SET status_message_id = ?2, status_text = ?3, next_edit_ms = ?4, updated_at = ?5
+             WHERE job_id = ?1",
+            params![job_id, message_id, text, next_edit_ms, now_ms],
+        )
+        .map(|_| ())
+        .map_err(db_err)
+    })
+}
+
+/// Telegram ответил `403`: чат заглушается целиком (все его строки), правки и отчёты в него прекращаются.
+pub fn mute_chat(db: &Db, chat_id: i64, now_ms: i64) -> Result<()> {
+    db.write(|tx| {
+        tx.execute(
+            "UPDATE tg_jobs SET muted = 1, updated_at = ?2 WHERE chat_id = ?1",
+            params![chat_id, now_ms],
+        )
+        .map(|_| ())
+        .map_err(db_err)
+    })
+}
+
+/// Занимает право сказать «задача отменена»: `true` только первому, кто успел (отметка `final_reported_ms`).
+pub fn claim_final(db: &Db, job_id: i64, now_ms: i64) -> Result<bool> {
+    db.write(|tx| {
+        let n = tx
+            .execute(
+                "UPDATE tg_jobs SET final_reported_ms = ?2, updated_at = ?2
+                 WHERE job_id = ?1 AND final_reported_ms IS NULL",
+                params![job_id, now_ms],
+            )
+            .map_err(db_err)?;
+        Ok(n == 1)
+    })
+}
+
+/// Снимает отметку, если сообщение об отмене точно не ушло: тик повторит его позже.
+pub fn unclaim_final(db: &Db, job_id: i64) -> Result<()> {
+    db.write(|tx| {
+        tx.execute(
+            "UPDATE tg_jobs SET final_reported_ms = NULL WHERE job_id = ?1",
+            [job_id],
+        )
+        .map(|_| ())
+        .map_err(db_err)
+    })
+}
+
+/// Новая строка `tg_jobs` для задачи, поставленной командой (`/retry`): сообщение статуса уже отправлено.
+pub struct NewTgJob<'a> {
+    pub job_id: i64,
+    pub chat_id: i64,
+    pub user_id: i64,
+    pub status_message_id: Option<i64>,
+    pub status_text: &'a str,
+    pub next_edit_ms: i64,
+}
+
+pub fn insert_tg_job(db: &Db, n: &NewTgJob<'_>, now_ms: i64) -> Result<()> {
+    db.write(|tx| {
+        tx.execute(
+            "INSERT INTO tg_jobs(job_id, chat_id, user_id, status_message_id, status_text, next_edit_ms, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                n.job_id,
+                n.chat_id,
+                n.user_id,
+                n.status_message_id,
+                n.status_text,
+                n.next_edit_ms,
+                now_ms
+            ],
+        )
+        .map(|_| ())
+        .map_err(db_err)
+    })
+}
+
+/// Номера задач пользователя в заданных состояниях (`states` — готовый список SQL вида `('failed','cancelled')`,
+/// только из констант кода), от свежих к старым, не больше `limit`.
+pub fn user_job_ids(db: &Db, user_id: i64, states: &str, limit: i64) -> Result<Vec<i64>> {
+    db.read(|c| {
+        let mut st = c
+            .prepare(&format!(
+                "SELECT id FROM jobs WHERE user_id = ?1 AND state IN {states} ORDER BY id DESC LIMIT ?2"
+            ))
+            .map_err(db_err)?;
+        let rows = st
+            .query_map(params![user_id, limit], |r| r.get::<_, i64>(0))
+            .map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+    })
+}
+
+/// Сколько задач сейчас у раннера (выданы, ведутся или загружают результат).
+pub fn working_count(db: &Db) -> Result<i64> {
+    db.read(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE state IN ('assigned','running','uploading')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_err)
     })
 }
 

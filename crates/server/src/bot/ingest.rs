@@ -9,7 +9,7 @@
 //! скачанные строки `tg_inbox`; повтор узнаётся по `file_unique_id` до `getFile` и по SHA-256 после копирования;
 //! путь из `getFile` принимается только внутри корня файлов bot-api как обычный файл заявленного размера.
 
-use super::{Bot, BotSettings, store};
+use super::{Bot, BotSettings, notify, store};
 use crate::Result;
 use crate::core::{DedupKey, JobRow, Submit, player_key};
 use crate::db::db_err;
@@ -22,7 +22,7 @@ use wire::JobState;
 const MIB: u64 = 1024 * 1024;
 
 /// Состояния «задача ещё не закончена» (как в ядре).
-const ACTIVE_STATES: &str = "('receiving','queued','assigned','running','uploading')";
+pub(super) const ACTIVE_STATES: &str = "('receiving','queued','assigned','running','uploading')";
 /// Состояния, в которых задача считается дублем: активные и готовая.
 const DEDUP_STATES: &str = "('receiving','queued','assigned','running','uploading','done')";
 
@@ -401,7 +401,7 @@ fn ahead_of_row(bot: &Bot, row_id: i64) -> i64 {
 }
 
 /// «(перед вами K)» или «(очередь пуста)».
-fn ahead_phrase(ahead: i64) -> String {
+pub(super) fn ahead_phrase(ahead: i64) -> String {
     if ahead > 0 {
         format!("перед вами {ahead}")
     } else {
@@ -538,13 +538,8 @@ fn queue_row(bot: &Bot, row: &store::InboxRow, job_id: i64) -> Result<bool> {
     };
     bot.log()
         .info(&format!("бот: {what} из чата принята как задача #{job_id}"));
-    let ahead = bot.core().jobs_ahead(job_id).unwrap_or(0);
-    let text = format!(
-        "Задача #{job_id} в очереди (игрок {}), {}.",
-        row.player,
-        ahead_phrase(ahead)
-    );
-    status(bot, row, &text);
+    // Текст строит тот же код, что правит статус позже, и эта правка учитывается в частоте (D-04).
+    notify::push_now(bot, job_id);
     Ok(true)
 }
 

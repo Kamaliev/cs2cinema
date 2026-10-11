@@ -258,10 +258,10 @@ pub fn respond_error(rq: Request, rej: &Reject) {
     if let Some(h) = header("Content-Type", "application/json") {
         r = r.with_header(h);
     }
-    if let Some(off) = rej.offset {
-        if let Some(h) = header(wire::headers::UPLOAD_OFFSET, &off.to_string()) {
-            r = r.with_header(h);
-        }
+    if let Some(off) = rej.offset
+        && let Some(h) = header(wire::headers::UPLOAD_OFFSET, &off.to_string())
+    {
+        r = r.with_header(h);
     }
     let _ = rq.respond(r);
 }

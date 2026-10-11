@@ -1,5 +1,7 @@
 //! Тесты бинарника `cs2-server`: команды оператора в отдельных процессах.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -360,4 +362,91 @@ fn example_config_is_accepted() {
         out.contains("lease_ttl_secs = 45") && out.contains("telegram_bot_token = не задан"),
         "{out}"
     );
+}
+
+/// Запущенный `cs2-server serve`: адрес берётся из первой строки stdout; при выходе из теста процесс убивается.
+struct Serve {
+    child: std::process::Child,
+    base: String,
+    _stdout: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl Serve {
+    fn start(data: &str) -> Serve {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let mut child = bin()
+            .args(["serve", "--bind", "127.0.0.1:0", "--data-dir", data])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut first = String::new();
+        stdout.read_line(&mut first).unwrap();
+        let addr = first
+            .split("http://")
+            .nth(1)
+            .unwrap_or_else(|| panic!("в первой строке нет адреса: {first:?}"))
+            .trim()
+            .to_owned();
+        Serve {
+            child,
+            base: format!("http://{addr}"),
+            _stdout: stdout,
+        }
+    }
+
+    fn claim(&self, token: &str) -> common::Resp {
+        common::send(
+            &format!("{}{}?wait=0", self.base, wire::paths::CLAIM),
+            Some(&format!("Bearer {token}")),
+            Some(r#"{"status":"idle"}"#),
+        )
+    }
+
+    fn kill(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Serve {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn serve_binary_answers_claims_and_survives_a_restart() {
+    let d = test_dir("serve");
+    let data = data_arg(&d);
+    let demo = d.join("match.dem");
+    fake_demo(&demo, 1024 * 1024);
+    let (_, out, _) = run(&["runner", "add", "main", "--data-dir", &data]);
+    let token = token_from(&out);
+    let (code, _, err) = run(&[
+        "submit",
+        demo.to_str().unwrap(),
+        "--player",
+        "s1mple",
+        "--data-dir",
+        &data,
+    ]);
+    assert_eq!(code, 0, "{err}");
+
+    // submit из другого процесса поставил задачу раньше, чем запущен serve; claim её видит.
+    let srv = Serve::start(&data);
+    let r = srv.claim(&token);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["job_id"], 1);
+    assert_eq!(r.json()["epoch"], 1);
+    srv.kill();
+
+    // После перезапуска тот же токен проходит (не 401), а задача осталась выданной: очередь пуста.
+    let srv = Serve::start(&data);
+    let r = srv.claim(&token);
+    assert_eq!(r.status, 204, "{}", r.body);
+    srv.kill();
 }

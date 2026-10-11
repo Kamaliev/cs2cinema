@@ -40,3 +40,12 @@ fn retry_without_a_folder_prints_usage() {
     assert!(stderr.contains("укажите папку задачи"), "{stderr}");
     assert!(stderr.contains("cs2-cli retry <папка задачи>"), "{stderr}");
 }
+
+#[test]
+fn record_without_player_prints_usage() {
+    let out = cli(&["record".as_ref(), "match.dem".as_ref()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--player"), "{stderr}");
+    assert!(stderr.contains("cs2-cli record <ссылка FACEIT"), "{stderr}");
+}

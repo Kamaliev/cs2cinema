@@ -1,13 +1,14 @@
 //! Самоограничение памяти: тест перезапускает собственный бинарь, и дочерний процесс ограничивает
-//! себя 256 МиБ. Родитель проверяет код выхода и время жизни ребёнка.
+//! себя 256 МиБ. Родитель проверяет код выхода, вывод и время жизни ребёнка.
 #![cfg(windows)]
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const LIMIT: u64 = 256 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
 
-/// Режим ребёнка из переменной окружения: `alloc:N` — выделить N МиБ.
+/// Режим ребёнка из переменной окружения: `alloc:N` — выделить N МиБ, `spawn` — породить процесс.
 fn child_mode() -> Option<String> {
     std::env::var("CS2C_SELF_LIMIT_CHILD").ok()
 }
@@ -29,10 +30,17 @@ fn allocate(mib: usize) -> Vec<Vec<u8>> {
 #[test]
 fn child_entry() {
     let Some(mode) = child_mode() else { return };
-    let _limit = host::limit_self_memory(LIMIT).expect("самоограничение");
+    host::quiet_crash_dialogs();
+    let limit = host::limit_self_memory(LIMIT).expect("самоограничение");
     if let Some(n) = mode.strip_prefix("alloc:") {
         let held = allocate(n.parse().expect("число МиБ"));
+        println!("peak={}", limit.peak_bytes().unwrap_or(0));
         drop(held);
+    } else if mode == "spawn" {
+        match Command::new("cmd").args(["/C", "exit 0"]).status() {
+            Err(_) => println!("spawn refused"),
+            Ok(s) => println!("spawn allowed: {s}"),
+        }
     }
 }
 
@@ -83,4 +91,23 @@ fn allocation_over_the_limit_kills_the_child_quickly() {
         took < Duration::from_secs(10),
         "умирал слишком долго: {took:?}"
     );
+}
+
+#[test]
+fn peak_memory_is_reported_after_allocation() {
+    let (code, out, _) = run_child("alloc:100");
+    assert_eq!(code, Some(0), "{out}");
+    let peak: u64 = out
+        .lines()
+        .find_map(|l| l.strip_prefix("peak="))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("в выводе нет peak=: {out}"));
+    assert!(peak >= 100 * MIB, "пик {peak} меньше 100 МиБ");
+}
+
+#[test]
+fn limited_process_cannot_spawn_children() {
+    let (code, out, _) = run_child("spawn");
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("spawn refused"), "порождение не отвергнуто: {out}");
 }

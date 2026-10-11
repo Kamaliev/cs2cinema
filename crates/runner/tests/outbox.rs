@@ -196,6 +196,9 @@ fn second_sha256_mismatch_drops_the_result_from_the_outbox() {
     let mut held = finished_state(&stand, &a, &result_bytes(MIB));
     let result_path = held.result.as_ref().unwrap().path.clone();
     held.result.as_mut().unwrap().sha256 = "0".repeat(64);
+    // Первый отказ сервера уже был (раннер перезапустили): перед первой загрузкой раннер сверяет файл сам и закрыл бы
+    // задачу `RESULT_INVALID`, а второй отказ сервера обязан убрать результат из outbox.
+    held.sha_retries = 1;
     write_state(&stand, Some(held));
 
     let exec = ScriptedExecutor::new(stand.runner_dir(), vec![Scenario::Result(MIB)]);

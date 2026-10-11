@@ -9,12 +9,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use pipeline::assemble::verify_result;
 use pipeline::host::Host;
 use pipeline::inspect::{InspectArgs, InspectLimits, preflight};
 use pipeline::job::{DemoSource, JobConfig, JobSpec, Outcome, run_job};
-use pipeline::record::failure::msg_unsupported_source;
+use pipeline::record::failure::{msg_result_invalid, msg_unsupported_source};
 use pipeline::record::log::one_line;
-use pipeline::{FailCode, Progress, RecordFailure, RecordState, RunError};
+use pipeline::{CANCELLED, FailCode, Progress, RecordFailure, RecordState, RunError};
+
+/// Сколько ждать ffprobe при проверке готового ролика.
+const VERIFY_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Задача раннера: всё, что исполнителю нужно знать о выданной сервером работе. Пути строит сам раннер из
 /// номера задачи; имя файла и параметры от пользователя сюда не попадают.
@@ -116,6 +120,40 @@ impl PipelineExecutor {
         Ok(())
     }
 
+    /// Проверка готового ролика до загрузки (RUN-06): негодный не уходит на сервер и остаётся у раннера уликой.
+    fn verify(&self, outcome: Outcome, p: &dyn Progress) -> Result<Outcome, RunError> {
+        let started = self.host.now();
+        let checked = verify_result(
+            &*self.host,
+            &self.cfg.ffprobe,
+            &outcome.result,
+            VERIFY_DEADLINE,
+            &|| p.cancelled(),
+        );
+        match checked {
+            Ok(facts) => {
+                p.log(&format!(
+                    "ролик проверен: H.264, {}x{}, {:.1} с, faststart",
+                    facts.width, facts.height, facts.duration
+                ));
+                Ok(outcome)
+            }
+            Err(reason) if reason == CANCELLED => Err(RunError::from(CANCELLED)),
+            Err(reason) => {
+                let f = RecordFailure::new(
+                    FailCode::ResultInvalid,
+                    RecordState::Done,
+                    msg_result_invalid(&reason),
+                    self.host.now().saturating_sub(started),
+                );
+                Err(RunError {
+                    message: f.message.clone(),
+                    fail: Some(f),
+                })
+            }
+        }
+    }
+
     /// Один вызов `run_job` под защитой от паники.
     fn call_job(&self, task: &Task, resume: bool, p: &dyn Progress) -> Result<Outcome, RunError> {
         let spec = JobSpec {
@@ -179,7 +217,7 @@ impl Executor for PipelineExecutor {
         if !task.resume {
             self.inspect_demo(task, p)?;
         }
-        match self.call_job(task, task.resume, p) {
+        let outcome = match self.call_job(task, task.resume, p) {
             Err(e) if task.resume && is_retry_no_data(&e) => {
                 p.log(&format!(
                     "продолжить нельзя ({}) — начинаю задачу заново",
@@ -189,7 +227,8 @@ impl Executor for PipelineExecutor {
                 self.call_job(task, false, p)
             }
             other => other,
-        }
+        }?;
+        self.verify(outcome, p)
     }
 
     /// Порядок обязателен (Pitfall 5): живая игра держит копию демки, и уборка без её завершения не удалит файлы.

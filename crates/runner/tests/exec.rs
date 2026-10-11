@@ -10,11 +10,14 @@ use std::time::Duration;
 
 use common::{Stand, TestDir, fake_demo};
 use pipeline::host::fake::{FakeHost, Scenario};
-use pipeline::host::{CmdOutput, ProcInfo};
+use pipeline::host::{CmdOutput, ProcIdentity, ProcInfo};
 use pipeline::inspect::InspectLimits;
-use pipeline::job::JobConfig;
+use pipeline::job::{JobConfig, Outcome};
 use pipeline::{FailCode, Progress, Quiet, RunError};
-use runner::{Executor, InspectSettings, PipelineExecutor, Runner, Task, Tick};
+use runner::{
+    Executor, HeldJob, InspectSettings, Link, PipelineExecutor, ResultFile, Runner, RunnerState,
+    Stage, Task, Tick, Token, sha256_file,
+};
 use wire::JobState;
 
 const MIB: usize = 1024 * 1024;
@@ -252,5 +255,231 @@ fn log_lines_of_the_executor_are_reported_to_progress() {
     assert!(
         text.contains("пик памяти разбора 1 МиБ"),
         "пик нужен для калибровки лимитов: {text}"
+    );
+}
+
+/// Ответ ffprobe для годного ролика: H.264, yuv420p, звук, mp4, длительность.
+const GOOD_PROBE: &str = r#"{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","width":1280,"height":720},{"codec_type":"audio","codec_name":"aac"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"5.000000"}}"#;
+
+/// Бокс MP4 верхнего уровня: размер, тип, полезная нагрузка.
+fn mp4_box(kind: &[u8; 4], payload: usize) -> Vec<u8> {
+    let mut b = ((8 + payload) as u32).to_be_bytes().to_vec();
+    b.extend_from_slice(kind);
+    b.extend(std::iter::repeat_n(0xAB, payload));
+    b
+}
+
+/// Файл MP4 из боксов в заданном порядке.
+fn mp4(order: &[&[u8; 4]]) -> Vec<u8> {
+    order.iter().flat_map(|k| mp4_box(k, 64)).collect()
+}
+
+/// Исполнитель, который «записал» ролик с заданными боксами в `out/srv{id}/highlights.mp4`.
+fn exec_writing(
+    host: &FakeHost,
+    dir: &TestDir,
+    runner_dir: PathBuf,
+    bytes: Vec<u8>,
+) -> PipelineExecutor {
+    executor(host, dir).with_job_fn(move |_, spec, _| {
+        let out_dir = runner_dir.join("out").join(format!("srv{}", spec.job_id));
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let result = out_dir.join("highlights.mp4");
+        std::fs::write(&result, &bytes).unwrap();
+        Ok(Outcome {
+            out_dir,
+            result,
+            shots: 1,
+            secs: 5.0,
+        })
+    })
+}
+
+fn probing_host() -> FakeHost {
+    FakeHost::new(
+        Scenario::happy(1)
+            .program("cs2-cli", &[OK_REPLY], exit0())
+            .program("ffprobe", &[GOOD_PROBE], exit0()),
+    )
+}
+
+/// Папка принятых результатов задачи на сервере пуста или не создана.
+fn nothing_uploaded(stand: &Stand, id: i64) -> bool {
+    std::fs::read_dir(stand.results_dir(id)).map_or(true, |mut d| d.next().is_none())
+}
+
+#[test]
+fn invalid_result_is_not_uploaded_and_fails_with_result_invalid() {
+    let stand = Stand::start();
+    let id = stand.submit(&fake_demo(MIB), "s1mple");
+    let dir = TestDir::new("exec-invalid");
+    let host = probing_host();
+    // moov после mdat: ролик не начнёт играть в Telegram до полной загрузки.
+    let exec = Arc::new(exec_writing(
+        &host,
+        &dir,
+        stand.runner_dir(),
+        mp4(&[b"ftyp", b"mdat", b"moov"]),
+    ));
+    let mut runner = Runner::new(stand.runner_config(), exec).unwrap();
+
+    assert_eq!(
+        runner.tick().unwrap(),
+        Tick::Settled {
+            job_id: id,
+            state: JobState::Failed
+        }
+    );
+    let job = stand.job(id);
+    assert_eq!(job.fail_code.as_deref(), Some("RESULT_INVALID"));
+    assert!(
+        nothing_uploaded(&stand, id),
+        "негодный ролик не должен быть загружен"
+    );
+    let kept = stand
+        .runner_dir()
+        .join("out")
+        .join(format!("srv{id}"))
+        .join("highlights.mp4");
+    assert!(kept.is_file(), "файл остаётся у раннера уликой");
+    let log = std::fs::read_to_string(stand.runner_dir().join("runner.log")).unwrap();
+    assert!(log.contains("faststart"), "{log}");
+}
+
+#[test]
+fn valid_result_is_uploaded_and_the_job_is_done() {
+    let stand = Stand::start();
+    let id = stand.submit(&fake_demo(MIB), "s1mple");
+    let dir = TestDir::new("exec-valid");
+    let host = probing_host();
+    let exec = Arc::new(exec_writing(
+        &host,
+        &dir,
+        stand.runner_dir(),
+        mp4(&[b"ftyp", b"moov", b"mdat"]),
+    ));
+    let mut runner = Runner::new(stand.runner_config(), exec).unwrap();
+
+    assert_eq!(
+        runner.tick().unwrap(),
+        Tick::Settled {
+            job_id: id,
+            state: JobState::Done
+        }
+    );
+    assert_eq!(stand.job(id).state, JobState::Done);
+    let log = std::fs::read_to_string(stand.runner_dir().join("runner.log")).unwrap();
+    assert!(log.contains("ролик проверен: H.264, 1280x720"), "{log}");
+}
+
+#[test]
+fn demo_over_the_limit_is_refused_before_download() {
+    let stand = Stand::start();
+    let id = stand.submit(&fake_demo(MIB), "s1mple");
+    let dir = TestDir::new("exec-big");
+    let host = probing_host();
+    let exec = Arc::new(executor(&host, &dir));
+    let mut cfg = stand.runner_config();
+    cfg.max_demo_bytes = (MIB / 2) as u64;
+    let mut runner = Runner::new(cfg, exec).unwrap();
+
+    assert_eq!(
+        runner.tick().unwrap(),
+        Tick::Settled {
+            job_id: id,
+            state: JobState::Failed
+        }
+    );
+    assert_eq!(stand.job(id).fail_code.as_deref(), Some("DEMO_TOO_LARGE"));
+    let remote = stand.runner_dir().join("remote");
+    assert!(!remote.join(format!("srv{id}.dem")).exists());
+    assert!(!remote.join(format!("srv{id}.dem.part")).exists());
+    assert!(host.runs().is_empty(), "{:?}", host.runs());
+}
+
+#[test]
+fn result_changed_after_verification_is_not_uploaded() {
+    let stand = Stand::start();
+    let id = stand.submit(&fake_demo(MIB), "s1mple");
+
+    // «Убитый» раннер: задача выдана по-настоящему, ролик проверен и записан в состояние, но уйти не успел.
+    let link = Link::new(&stand.base, Token::new(stand.token.clone())).unwrap();
+    let a = link.claim(0).unwrap().expect("задача должна быть выдана");
+    assert_eq!(a.job_id, id);
+    let remote = stand.runner_dir().join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    let out_dir = stand.runner_dir().join("out").join(format!("srv{id}"));
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let result = out_dir.join("highlights.mp4");
+    std::fs::write(&result, mp4(&[b"ftyp", b"moov", b"mdat"])).unwrap();
+    let (size, sha256) = sha256_file(&result).unwrap();
+    let mut held = HeldJob::claimed(&a, remote.join(format!("srv{id}.dem")));
+    held.stage = Stage::Finished;
+    held.attempt = 1;
+    held.out_dir = Some(out_dir);
+    held.result = Some(ResultFile {
+        path: result.clone(),
+        size,
+        sha256,
+    });
+    RunnerState {
+        job: Some(held),
+        ..Default::default()
+    }
+    .save(&stand.runner_dir())
+    .unwrap();
+    // Файл изменили уже после проверки, размер тот же.
+    std::fs::write(&result, mp4(&[b"ftyp", b"mdat", b"moov"])).unwrap();
+
+    let host = probing_host();
+    let dir = TestDir::new("exec-changed");
+    let mut runner = Runner::new(stand.runner_config(), Arc::new(executor(&host, &dir))).unwrap();
+    assert_eq!(
+        runner.tick().unwrap(),
+        Tick::Settled {
+            job_id: id,
+            state: JobState::Failed
+        }
+    );
+    let job = stand.job(id);
+    assert_eq!(job.fail_code.as_deref(), Some("RESULT_INVALID"));
+    let log = std::fs::read_to_string(stand.runner_dir().join("runner.log")).unwrap();
+    assert!(
+        log.contains("файл результата изменился после проверки"),
+        "{log}"
+    );
+    assert!(result.is_file(), "улика остаётся у раннера");
+    assert!(
+        nothing_uploaded(&stand, id),
+        "изменённый ролик не должен быть загружен"
+    );
+}
+
+#[test]
+fn recover_kills_own_orphans_before_cleaning_the_game_dir() {
+    let dir = TestDir::new("exec-recover");
+    let host = FakeHost::new(Scenario::happy(1));
+    let exec = executor(&host, &dir);
+
+    // Пустая папка: ни процессов, ни файлов — пустой журнал, без паники.
+    let empty = dir.path.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert!(exec.recover(&empty).is_empty());
+    assert!(host.orphan_kills().is_empty());
+
+    // Папка задачи с `processes.json` своей игры: процесс завершается по полной идентичности.
+    let job = dir.path.join("job");
+    std::fs::create_dir_all(&job).unwrap();
+    let game = ProcIdentity {
+        pid: 4242,
+        created: 1234,
+        image: "cs2.exe".to_owned(),
+    };
+    pipeline::record::processes::save(&job, std::slice::from_ref(&game)).unwrap();
+    let notes = exec.recover(&job);
+    assert_eq!(host.orphan_kills(), vec![game]);
+    assert!(
+        notes.iter().any(|n| n.contains("4242")),
+        "строка для журнала: {notes:?}"
     );
 }

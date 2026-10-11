@@ -164,6 +164,7 @@ impl Stand {
             debounce: Duration::from_secs(2),
             force_after: runner::FORCE_AFTER,
             release_cooldown: Duration::ZERO,
+            max_demo_bytes: runner::MAX_DEMO_BYTES,
         }
     }
 }

@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use pipeline::record::failure;
 use pipeline::record::log::one_line;
+use pipeline::{FailCode, RecordFailure, RecordState, RunError};
 use wire::{
     Assignment, DirectiveAction, Failure, FinishRequest, HelloRequest, Holding, JobState, Outcome,
     Phase, ReleaseRequest, fail,
@@ -39,6 +41,8 @@ use transfer::{Verdict, judge};
 /// Сколько раннер ждёт после `release` перед следующим `claim`: кратковременная неисправность (игра ещё
 /// закрывается) успевает пройти.
 pub const RELEASE_COOLDOWN: Duration = Duration::from_secs(15);
+/// Потолок размера демки по умолчанию: 2000 МиБ, как у дочернего разбора (`InspectLimits`).
+pub const MAX_DEMO_BYTES: u64 = 2000 << 20;
 /// Как часто раннер на паузе напоминает серверу о себе.
 const PAUSE_HELLO_EVERY: Duration = Duration::from_secs(30);
 
@@ -66,6 +70,8 @@ pub struct Config {
     pub force_after: Duration,
     /// Сколько ждать после `release` перед следующим `claim` (по умолчанию `RELEASE_COOLDOWN`, в тестах ноль).
     pub release_cooldown: Duration,
+    /// Демка больше этого размера (по выдаче) не скачивается: задача закрывается `DEMO_TOO_LARGE`.
+    pub max_demo_bytes: u64,
 }
 
 impl std::fmt::Debug for Config {
@@ -81,6 +87,7 @@ impl std::fmt::Debug for Config {
             .field("debounce", &self.debounce)
             .field("force_after", &self.force_after)
             .field("release_cooldown", &self.release_cooldown)
+            .field("max_demo_bytes", &self.max_demo_bytes)
             .finish()
     }
 }
@@ -160,6 +167,41 @@ fn link_error(e: LinkError) -> String {
         LinkError::Status { status: 401, .. } => tee::TOKEN_REJECTED.to_owned(),
         e => e.to_string(),
     }
+}
+
+/// Нужно ли качать демку с сервера: у ссылки FACEIT без файла (`demo.size == 0`) качать нечего.
+fn needs_download(held: &HeldJob) -> bool {
+    !(held.faceit.is_some() && held.demo_size == 0)
+}
+
+/// Задача для исполнителя из удерживаемой: без файла демки путь пустой, а ссылка FACEIT остаётся в `faceit`.
+fn task_of(held: &HeldJob, attempt: u32, resumed_dir: Option<PathBuf>) -> Task {
+    Task {
+        job_id: held.server_job_id,
+        attempt,
+        demo: if needs_download(held) {
+            held.demo_path.clone()
+        } else {
+            PathBuf::new()
+        },
+        faceit: held.faceit.clone(),
+        hero_steam: held.hero_steam,
+        hero_name: held.hero_name.clone(),
+        resume: resumed_dir.is_some(),
+        out_dir: resumed_dir,
+    }
+}
+
+/// Итог для сервера со своим кодом, подсказкой и классом, как у сбоя исполнителя.
+fn typed_failure(code: FailCode, state: RecordState, message: String) -> Failure {
+    let f = RecordFailure::new(code, state, message.clone(), Duration::ZERO);
+    policy::failure_of(
+        &RunError {
+            message,
+            fail: Some(f),
+        },
+        0,
+    )
 }
 
 /// Ручка остановки раннера из другого потока (поток консоли, Ctrl+C). Остановка не отмена: задача остаётся в
@@ -627,9 +669,48 @@ impl Runner {
         self.persist()
     }
 
+    /// Закрывает удерживаемую задачу сбоем: итог пишется в outbox и уходит серверу этапом `Reporting`. Контентный
+    /// сбой обрывает серию неисправностей. Файлы задачи не удаляются: негодный результат остаётся уликой.
+    fn fail_job(&mut self, failure: Failure) -> Result<(), String> {
+        self.pause.after(&Disposition::Fail(failure.clone()));
+        let held = self.held();
+        held.pending = Some(Outcome::Failed(failure));
+        held.stage = Stage::Reporting;
+        self.persist()
+    }
+
     /// Скачивает демку; не сошлась по SHA-256 — итог задачи `BAD_DEMO`.
     fn fetch(&mut self) -> Result<Option<Tick>, String> {
         let job = self.state.job.clone().expect("задача удерживается");
+        // Ссылка FACEIT без файла: качать нечего, отказ даст исполнитель (`UNSUPPORTED_SOURCE`).
+        if !needs_download(&job) {
+            self.log.line(&format!(
+                "задача #{}: демки на сервере нет, скачивание пропущено",
+                job.server_job_id
+            ));
+            self.held().stage = Stage::Fetched;
+            self.persist()?;
+            return Ok(None);
+        }
+        // Огромная демка не скачивается вовсе: диск раннера не зависит от чужого файла (T-06-29).
+        if job.demo_size > self.cfg.max_demo_bytes {
+            let reason = format!(
+                "{} МиБ при потолке {} МиБ",
+                job.demo_size.div_ceil(1 << 20),
+                self.cfg.max_demo_bytes >> 20
+            );
+            let failure = typed_failure(
+                FailCode::DemoTooLarge,
+                RecordState::Precheck,
+                failure::msg_demo_too_large(&reason),
+            );
+            self.log.line(&format!(
+                "задача #{}: {}",
+                job.server_job_id, failure.message
+            ));
+            self.fail_job(failure)?;
+            return Ok(None);
+        }
         let end = {
             let log = |m: &str| self.log.line(m);
             let stop = self.stopper();
@@ -667,7 +748,7 @@ impl Runner {
     /// Запускает исполнитель и записывает его итог в outbox. `Some` — задача на этом тике закончена.
     fn execute(&mut self, started: Instant) -> Result<Option<Tick>, String> {
         // Демки на месте нет (диск почистили): сначала скачать заново.
-        if !self.held().demo_path.is_file() {
+        if needs_download(self.held()) && !self.held().demo_path.is_file() {
             let id = self.held().server_job_id;
             self.log
                 .line(&format!("задача #{id}: файла демки нет, скачиваю заново"));
@@ -696,16 +777,7 @@ impl Runner {
         };
         self.persist()?;
         let held = self.state.job.clone().expect("задача удерживается");
-        let task = Task {
-            job_id: held.server_job_id,
-            attempt,
-            demo: held.demo_path.clone(),
-            faceit: held.faceit.clone(),
-            hero_steam: held.hero_steam,
-            hero_name: held.hero_name.clone(),
-            resume: resumed_dir.is_some(),
-            out_dir: resumed_dir,
-        };
+        let task = task_of(&held, attempt, resumed_dir);
         let progress = RunnerProgress {
             log: self.log.clone(),
         };
@@ -828,6 +900,26 @@ impl Runner {
     /// Загружает результат со смещения сервера и закрывает задачу `Done`. `None` — отмена на сервере прервала
     /// загрузку, дальше нужно сообщить итог `Cancelled`.
     fn upload(&mut self) -> Result<Option<Tick>, String> {
+        // Файл мог измениться после проверки: на сервер уходит только тот, что проверен (T-06-28). Сверка идёт
+        // перед первой загрузкой; после отказа сервера по SHA-256 (`sha_retries > 0`) решает сам сервер.
+        let first_upload = self.held().sha_retries == 0;
+        if first_upload && let Some(result) = self.held().result.clone() {
+            let same = matches!(
+                sha256_file(&result.path),
+                Ok((size, sha256)) if size == result.size && sha256 == result.sha256
+            );
+            if !same {
+                let failure = typed_failure(
+                    FailCode::ResultInvalid,
+                    RecordState::Done,
+                    failure::msg_result_invalid("файл результата изменился после проверки"),
+                );
+                let id = self.held().server_job_id;
+                self.log.line(&format!("задача #{id}: {}", failure.message));
+                self.fail_job(failure)?;
+                return Ok(None);
+            }
+        }
         let mut held = self.state.job.take().expect("задача удерживается");
         let id = held.server_job_id;
         let end = {
@@ -966,5 +1058,52 @@ impl Runner {
                 Verdict::Retry => Err(format!("задача #{id}: finish: {e}")),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assignment(faceit: Option<&str>, size: u64) -> Assignment {
+        Assignment {
+            job_id: 5,
+            epoch: 1,
+            lease_until_ms: 0,
+            demo: wire::DemoInfo {
+                size,
+                ..Default::default()
+            },
+            faceit_link: faceit.map(str::to_owned),
+            player: wire::Player {
+                steam64: None,
+                name: "s1mple".to_owned(),
+            },
+            requested_by: String::new(),
+            options: Default::default(),
+        }
+    }
+
+    #[test]
+    fn faceit_link_without_a_demo_file_is_not_downloaded() {
+        let link = "https://www.faceit.com/ru/cs2/room/1-abc";
+        let held = HeldJob::claimed(&assignment(Some(link), 0), PathBuf::from("remote/srv5.dem"));
+        assert!(!needs_download(&held));
+        let task = task_of(&held, 1, None);
+        assert_eq!(task.faceit.as_deref(), Some(link));
+        assert!(task.demo.as_os_str().is_empty(), "{:?}", task.demo);
+
+        // Ссылка вместе с файлом демки и обычная задача без ссылки качаются как раньше.
+        let with_file = HeldJob::claimed(
+            &assignment(Some(link), 10),
+            PathBuf::from("remote/srv5.dem"),
+        );
+        assert!(needs_download(&with_file));
+        assert_eq!(
+            task_of(&with_file, 1, None).demo,
+            PathBuf::from("remote/srv5.dem")
+        );
+        let plain = HeldJob::claimed(&assignment(None, 0), PathBuf::from("remote/srv5.dem"));
+        assert!(needs_download(&plain));
     }
 }

@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 06
 current_phase_name: Раннер, защита входа и первый живой прогон
 status: executing
-stopped_at: Completed 06-04-PLAN.md
-last_updated: "2026-10-11T15:42:38.901Z"
+stopped_at: Completed 06-05-PLAN.md
+last_updated: "2026-10-11T15:53:07.081Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 06 execution started
-state_head: 074295b40d2ca424e5b2259a2448c57c2bdf624d
+state_head: 662d692ef940cc16ad6495cb05dc7e16628057e6
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 16
-  completed_plans: 9
+  completed_plans: 10
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 06 (Раннер, защита входа и первый живой прогон) — EXECUTING
-Plan: 5 of 11
+Plan: 6 of 11
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 06 execution started
 
@@ -101,6 +101,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 06 P02 | 40min | 2 tasks | 6 files |
 | Phase 06 P03 | 15min | 2 tasks | 5 files |
 | Phase 06 P04 | 15min | 2 tasks | 5 files |
+| Phase 06 P05 | 25min | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -175,6 +176,8 @@ Recent decisions affecting current work:
 - [Phase 06]: 06-02: текст из демки очищается в Match::build и не пишется в cfg вовсе; подписи drawtext читаются из cap_NNN.txt
 - [Phase 06]: 06-03: стартовые лимиты чтения демки — файл 2000 МиБ, распакованная 3 ГиБ; команда демки до 128 МиБ после snappy; read_demo/decompress не менялись
 - [Phase 06]: 06-04: самоограничение памяти через самоприсвоение Job Object без KILL_ON_JOB_CLOSE; лимит задаёт вызывающий
+- [Phase 06]: 06-05: job_id раннера = номер задачи на сервере; демка всегда remote/srv{id}.dem, orig_name в путях не участвует
+- [Phase 06]: 06-05: JOB_ERROR и BAD_DEMO в runner пока локальные константы, 06-09 заменит на wire::fail
 
 ### Pending Todos
 
@@ -204,6 +207,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T15:42:38.792Z
-Stopped at: Completed 06-04-PLAN.md
+Last session: 2026-10-11T15:53:06.978Z
+Stopped at: Completed 06-05-PLAN.md
 Resume file: None

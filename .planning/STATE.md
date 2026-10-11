@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 07
 current_phase_name: Telegram-бот и доставка
 status: executing
-stopped_at: Completed 07-07-PLAN.md
-last_updated: "2026-10-11T20:50:57.849Z"
+stopped_at: Completed 07-08-PLAN.md
+last_updated: "2026-10-11T21:02:46.474Z"
 last_activity: 2026-10-12
 last_activity_desc: Phase 07 execution started
-state_head: 2af79e03db343e30dccc648416f4704d6305da67
+state_head: 48cbd9cb8118be7942571008665d1d905010c10f
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 27
-  completed_plans: 24
+  completed_plans: 25
   percent: 40
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 07 (Telegram-бот и доставка) — EXECUTING
-Plan: 8 of 11
+Plan: 9 of 11
 Status: Ready to execute
 Last activity: 2026-10-12 — Phase 07 execution started
 
@@ -117,6 +117,7 @@ Progress: [████░░░░░░] 40%
 | Phase 07 P06 | 40min | 3 tasks | 3 files |
 | Phase 07 P10 | ~40min | 3 tasks | 9 files |
 | Phase 07 P07 | 75min | 3 tasks | 10 files |
+| Phase 07 P08 | 35min | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -222,6 +223,7 @@ Recent decisions affecting current work:
 - [Phase 07]: 07-10: бот включает только bot_api_url (или внедрённый Tg в serve_with_bot); остановка бота ограничена 3 с, потоки не join-ятся при висящем вызове Telegram
 - [Phase 07]: 07-07: голый id матча тоже считается попыткой ссылки и получает объяснение с примером; Task.demo всегда remote/srv{id}.dem, FACEIT-демку кладёт исполнитель
 - [Phase 07]: 07-07: наружу из раннера идут фиксированные фразы FACEIT_FETCH_FAILED; ключ FACEIT только из FACEIT_API_KEY у раннера
+- [Phase 07]: 07-08: заглушённый чат (403) глушит все строки tg_jobs чата; первое сообщение статуса после постановки идёт через notify::push_now и считается в частоте правок; /retry только владельцу, несуществующий номер отвечает как чужой
 
 ### Pending Todos
 
@@ -251,6 +253,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T20:50:57.727Z
-Stopped at: Completed 07-07-PLAN.md
+Last session: 2026-10-11T21:02:46.353Z
+Stopped at: Completed 07-08-PLAN.md
 Resume file: None

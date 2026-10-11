@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 07
 current_phase_name: Telegram-бот и доставка
 status: executing
-stopped_at: Completed 07-05-PLAN.md
-last_updated: "2026-10-11T20:19:59.388Z"
+stopped_at: Completed 07-06-PLAN.md
+last_updated: "2026-10-11T20:29:37.703Z"
 last_activity: 2026-10-12
 last_activity_desc: Phase 07 execution started
-state_head: 0759cf9a97262b05fdc0cf36bb8727b45f3a3c33
+state_head: 261a59aeea17a0c49d7bcda464c354dded3e7a5c
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 27
-  completed_plans: 21
+  completed_plans: 22
   percent: 40
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 07 (Telegram-бот и доставка) — EXECUTING
-Plan: 6 of 11
+Plan: 7 of 11
 Status: Ready to execute
 Last activity: 2026-10-12 — Phase 07 execution started
 
@@ -114,6 +114,7 @@ Progress: [████░░░░░░] 40%
 | Phase 07 P03 | 25min | 3 tasks | 5 files |
 | Phase 07 P04 | 25min | 3 tasks | 4 files |
 | Phase 07 P05 | 25min | 2 tasks | 7 files |
+| Phase 07 P06 | 40min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -214,6 +215,8 @@ Recent decisions affecting current work:
 - [Phase 07]: 07-04: valid_player (1-64 символа, без управляющих и bidi) общий для /player и имени в /adduser; ник сбрасывает прежний player_steam
 - [Phase 07]: 07-05: HttpTg принимает только http:// loopback с портом, прокси из окружения и перенаправления отключены; sent=false только пока соединения не было
 - [Phase 07]: 07-05: Redactor маскирует токен бота и в форме цифры~секрет (рабочая папка telegram-bot-api)
+- [Phase 07]: 07-06: восстановление после падения между Core::submit и queued привязывает строку к неприкреплённой задаче до getFile
+- [Phase 07]: 07-06: повтор сообщения (потерянное смещение) не получает ответа про дубль
 
 ### Pending Todos
 
@@ -243,6 +246,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T20:19:59.263Z
-Stopped at: Completed 07-05-PLAN.md
+Last session: 2026-10-11T20:29:37.580Z
+Stopped at: Completed 07-06-PLAN.md
 Resume file: None

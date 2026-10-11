@@ -258,6 +258,35 @@ impl Core {
         })
     }
 
+    /// Ставит в очередь матч FACEIT по ссылке: задача сразу `queued`, без файла (демку скачивает раннер).
+    /// Ссылка проверяется строгим разбором `wire::faceit`; в базу идёт только канонический вид из id (D-01),
+    /// сервер сам по ней никуда не ходит.
+    pub fn submit_faceit(&self, link: &str, s: &Submit) -> Result<i64> {
+        let Some(match_id) = wire::faceit::room_match_id(link) else {
+            return Err("ссылка не похожа на комнату матча FACEIT".to_owned());
+        };
+        let now = self.clock.now_ms();
+        let player = self.redactor.clean(s.player.trim(), 64);
+        if player.is_empty() {
+            return Err("не указан игрок".to_owned());
+        }
+        let steam = is_steam64(&player).then(|| player.clone());
+        let by = self.redactor.clean(&s.requested_by, 64);
+        let canonical = wire::faceit::canonical_url(&match_id);
+        let orig = format!("faceit-{match_id}");
+        let id = self.db.write(|tx| {
+            tx.execute(
+                "INSERT INTO jobs(user_id, requested_by, state, source_kind, orig_name, faceit_link, player_steam, player_name, created_at, updated_at)
+                 VALUES (?1, ?2, 'queued', 'faceit', ?3, ?4, ?5, ?6, ?7, ?7)",
+                params![s.user_id, by, orig, canonical, steam, player, now],
+            )
+            .map_err(db_err)?;
+            Ok::<i64, String>(tx.last_insert_rowid())
+        })?;
+        self.wake();
+        Ok(id)
+    }
+
     /// Копирует демку в хранилище (вне мьютекса базы), затем одной транзакцией ставит `queued` и пишет строку файла.
     /// Сбой копирования переводит задачу в `failed` с кодом `RECEIVE_FAILED`.
     pub fn finish_receive(&self, job_id: i64, src: &Path) -> Result<Ingested> {
@@ -950,16 +979,25 @@ impl Core {
 /// Выдача для раннера по строке задачи и её демке.
 fn assignment_of(c: &Connection, job: &JobRow) -> Result<Assignment> {
     let id = job.id;
-    let demo = demo_by_job(c, id)?.ok_or_else(|| format!("у задачи #{id} в очереди нет демки"))?;
+    let demo = match demo_by_job(c, id)? {
+        Some(d) => DemoInfo {
+            size: d.size,
+            sha256: d.sha256,
+            orig_name: job.orig_name.clone(),
+        },
+        // Матч FACEIT: файла на сервере нет, раннер скачивает демку сам по `faceit_link`.
+        None if job.source_kind == "faceit" => DemoInfo {
+            size: 0,
+            sha256: String::new(),
+            orig_name: job.orig_name.clone(),
+        },
+        None => return Err(format!("у задачи #{id} в очереди нет демки")),
+    };
     Ok(Assignment {
         job_id: id,
         epoch: job.epoch,
         lease_until_ms: job.lease_until.unwrap_or_default(),
-        demo: DemoInfo {
-            size: demo.size,
-            sha256: demo.sha256,
-            orig_name: job.orig_name.clone(),
-        },
+        demo,
         faceit_link: job.faceit_link.clone(),
         player: Player {
             steam64: job.player_steam.clone(),

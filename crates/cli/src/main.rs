@@ -3,6 +3,7 @@ use std::{env, error::Error, path::PathBuf, process::ExitCode};
 use director::{NoPositions, Order, PositionSource};
 
 mod acceptance;
+mod inspect;
 mod record;
 
 use record::ConsoleProgress;
@@ -128,6 +129,7 @@ fn parse_args() -> Result<Args, String> {
 fn main() -> ExitCode {
     match env::args().nth(1).as_deref() {
         Some("assemble") => return assemble_cmd(),
+        Some("inspect") => return inspect::inspect_cmd(),
         Some("record") => return record::record_cmd(),
         Some("retry") => return record::retry_cmd(),
         Some("acceptance") => {

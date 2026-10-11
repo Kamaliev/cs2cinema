@@ -7,6 +7,7 @@ pub use host;
 pub mod acceptance;
 pub mod assemble;
 pub mod gamedir;
+pub mod inspect;
 pub mod job;
 pub mod manifest;
 pub mod precheck;
@@ -134,7 +135,20 @@ pub enum Source {
     Faceit { link: String, key: String, demo_index: usize, dir: PathBuf },
 }
 
+/// Разбор для вызывающих, которым достаточно текста ошибки (окно): потолки по умолчанию, сбой — строкой.
 pub fn analyze(src: &Source, p: &dyn Progress) -> Result<Analysis> {
+    analyze_with(src, &demo::DemoLimits::default(), p).map_err(|e| e.message)
+}
+
+/// Типизированный сбой разбора демки: до папки задачи и запуска игры, класс «прочее».
+fn bad_demo(reason: &str) -> RunError {
+    precheck_failure(FailCode::BadDemo, record::failure::msg_bad_demo(reason))
+}
+
+/// Скачивает (при необходимости) и разбирает демку с потолками `limits`. Бомба и файл сверх лимита —
+/// `DEMO_TOO_LARGE`; мусор, обрезанная, испорченная и пустая демка — `BAD_DEMO`; ошибки скачивания FACEIT
+/// остаются строковыми.
+pub fn analyze_with(src: &Source, limits: &demo::DemoLimits, p: &dyn Progress) -> std::result::Result<Analysis, RunError> {
     let (demo_path, label) = match src {
         Source::File(p) => {
             let label = p.file_stem().and_then(|s| s.to_str()).unwrap_or("match");
@@ -159,11 +173,14 @@ pub fn analyze(src: &Source, p: &dyn Progress) -> Result<Analysis> {
     check(p)?;
     p.stage(Stage::Parse);
     p.log("разбираю демку…");
-    let data = demo::read_demo(&demo_path).map_err(|e| format!("{}: {e}", demo_path.display()))?;
-    let parsed = demo::parse(&data).map_err(|e| e.to_string())?;
+    let data = demo::read_demo_limited(&demo_path, limits).map_err(|e| match e {
+        demo::DemoError::TooLarge { .. } => precheck_failure(FailCode::DemoTooLarge, record::failure::msg_demo_too_large(&e.to_string())),
+        demo::DemoError::Bad(_) => bad_demo(&e.to_string()),
+    })?;
+    let parsed = demo::parse(&data).map_err(|e| bad_demo(&e.to_string()))?;
     let m = Match::from_parsed(&parsed);
     if m.kills.is_empty() {
-        return Err("убийств не найдено: демка пустая или не распознана".into());
+        return Err(bad_demo("убийств не найдено: демка пустая или не распознана"));
     }
     let found = highlights::find(&m, &highlights::Config::default());
     Ok(Analysis { label, demo_path, m, found, data, track: None })

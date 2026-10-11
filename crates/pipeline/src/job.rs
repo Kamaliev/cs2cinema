@@ -511,7 +511,7 @@ pub fn run_job(host: &dyn Host, spec: &JobSpec, p: &dyn Progress) -> Result<Outc
             dir: cfg.out_root.join("demos"),
         },
     };
-    let mut a = crate::analyze(&src, p)?;
+    let mut a = crate::analyze_with(&src, &demo::DemoLimits::default(), p)?;
     if let DemoSource::Faceit(id) = &spec.source {
         p.artifact(&Artifact::Demo {
             match_id: id.clone(),

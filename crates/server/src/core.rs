@@ -194,7 +194,7 @@ fn job_from_row(r: &Row<'_>) -> rusqlite::Result<JobRow> {
 }
 
 /// Ник вида Steam64 (17 цифр, начинается с 7656) — это steamid, иначе обычное имя.
-fn is_steam64(s: &str) -> bool {
+pub fn is_steam64(s: &str) -> bool {
     s.len() == 17 && s.starts_with("7656") && s.bytes().all(|b| b.is_ascii_digit())
 }
 

@@ -129,9 +129,176 @@ pub fn find_user_by_id(db: &Db, id: i64) -> Result<Option<User>> {
     })
 }
 
+fn check_name(name: &str) -> Result<()> {
+    if !(1..=64).contains(&name.chars().count()) || name.chars().any(char::is_control) {
+        return Err("имя пользователя: от 1 до 64 символов без управляющих".to_owned());
+    }
+    Ok(())
+}
+
+/// Добавляет друга по Telegram-ID с ролью `member`. Убранного с этим ID возвращает в список (имя прежнее) —
+/// тогда второй элемент ответа `true`. Активный с этим ID или занятое имя — ошибка. Админов отсюда не создают.
+pub fn add_member_by_tg(db: &Db, tg_id: i64, name: &str, now_ms: i64) -> Result<(User, bool)> {
+    check_name(name)?;
+    db.write(|tx| {
+        let existing: Option<User> = tx
+            .query_row(
+                &format!("SELECT {USER_COLUMNS} FROM users WHERE tg_id = ?1"),
+                [tg_id],
+                user_from_row,
+            )
+            .optional()
+            .map_err(db_err)?;
+        if let Some(mut u) = existing {
+            if u.is_active() {
+                return Err(format!("Telegram-ID {tg_id} уже в списке"));
+            }
+            tx.execute("UPDATE users SET removed_at = NULL WHERE id = ?1", [u.id])
+                .map_err(db_err)?;
+            u.removed_at = None;
+            return Ok((u, true));
+        }
+        let taken: Option<i64> = tx
+            .query_row("SELECT id FROM users WHERE name = ?1", [name], |r| r.get(0))
+            .optional()
+            .map_err(db_err)?;
+        if taken.is_some() {
+            return Err(format!("имя «{name}» уже занято"));
+        }
+        tx.execute(
+            "INSERT INTO users(name, tg_id, role, created_at) VALUES (?1, ?2, 'member', ?3)",
+            params![name, tg_id, now_ms],
+        )
+        .map_err(db_err)?;
+        Ok((
+            User {
+                id: tx.last_insert_rowid(),
+                name: name.to_owned(),
+                tg_id: Some(tg_id),
+                role: "member".to_owned(),
+                created_at: now_ms,
+                player_steam: None,
+                player_name: None,
+                removed_at: None,
+            },
+            false,
+        ))
+    })
+}
+
+/// Мягко убирает друга из белого списка (`removed_at`): строка остаётся ради истории задач. Админа убрать
+/// нельзя, неизвестного и уже убранного — ошибка.
+pub fn remove_user(db: &Db, tg_id: i64, now_ms: i64) -> Result<User> {
+    db.write(|tx| {
+        let found: Option<User> = tx
+            .query_row(
+                &format!("SELECT {USER_COLUMNS} FROM users WHERE tg_id = ?1"),
+                [tg_id],
+                user_from_row,
+            )
+            .optional()
+            .map_err(db_err)?;
+        let Some(mut u) = found else {
+            return Err(format!("Telegram-ID {tg_id} нет в списке"));
+        };
+        if u.role == "admin" {
+            return Err("админа убирает оператор на сервере".to_owned());
+        }
+        if !u.is_active() {
+            return Err(format!("{} ({tg_id}) уже убран", u.name));
+        }
+        tx.execute(
+            "UPDATE users SET removed_at = ?1 WHERE id = ?2",
+            params![now_ms, u.id],
+        )
+        .map_err(db_err)?;
+        u.removed_at = Some(now_ms);
+        Ok(u)
+    })
+}
+
+/// Запоминает игрока пользователя по умолчанию: SteamID64 (если это он) и ник. Прежнее значение заменяется целиком.
+pub fn set_player(db: &Db, user_id: i64, steam: Option<&str>, name: &str) -> Result<()> {
+    db.write(|tx| {
+        let n = tx
+            .execute(
+                "UPDATE users SET player_steam = ?1, player_name = ?2 WHERE id = ?3",
+                params![steam, name, user_id],
+            )
+            .map_err(db_err)?;
+        if n == 0 {
+            return Err("пользователь не найден".to_owned());
+        }
+        Ok(())
+    })
+}
+
+/// Сколько задач пользователя ещё не закончено (приём, очередь, выдана, запись, выгрузка).
+pub fn active_jobs_of(db: &Db, user_id: i64) -> Result<i64> {
+    db.read(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE user_id = ?1
+               AND state IN ('receiving','queued','assigned','running','uploading')",
+            [user_id],
+            |r| r.get(0),
+        )
+        .map_err(db_err)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_user_is_found_but_inactive_and_can_be_restored() {
+        let db = Db::in_memory().unwrap();
+        let (u, restored) = add_member_by_tg(&db, 222, "петя", 10).unwrap();
+        assert!(!restored);
+        assert_eq!(u.role, "member");
+        assert!(
+            add_member_by_tg(&db, 222, "другой", 11)
+                .unwrap_err()
+                .contains("уже в списке")
+        );
+        let gone = remove_user(&db, 222, 20).unwrap();
+        assert_eq!(gone.removed_at, Some(20));
+        let found = find_user_by_tg(&db, 222).unwrap().unwrap();
+        assert!(!found.is_active(), "убранный найден, но не активен");
+        assert!(list_users(&db).unwrap().iter().any(|x| x.id == u.id));
+        assert!(remove_user(&db, 222, 21).unwrap_err().contains("уже убран"));
+        let (back, restored) = add_member_by_tg(&db, 222, "иначе", 30).unwrap();
+        assert!(restored);
+        assert_eq!(back.name, "петя", "имя прежнее");
+        assert!(find_user_by_tg(&db, 222).unwrap().unwrap().is_active());
+        assert!(
+            remove_user(&db, 999, 40).is_err(),
+            "неизвестного убрать нельзя"
+        );
+        add_user(&db, "ada", Some(1), true, 1).unwrap();
+        assert!(
+            remove_user(&db, 1, 50).unwrap_err().contains("оператор"),
+            "админа через чат не убрать"
+        );
+        assert!(
+            add_member_by_tg(&db, 7, "петя", 60)
+                .unwrap_err()
+                .contains("занято")
+        );
+    }
+
+    #[test]
+    fn player_is_replaced_as_a_whole_and_active_jobs_are_zero_without_jobs() {
+        let db = Db::in_memory().unwrap();
+        let (u, _) = add_member_by_tg(&db, 5, "вася", 1).unwrap();
+        set_player(&db, u.id, Some("76561198034202275"), "76561198034202275").unwrap();
+        set_player(&db, u.id, None, "ZywOo").unwrap();
+        let u = find_user_by_id(&db, u.id).unwrap().unwrap();
+        assert_eq!(u.player_steam, None);
+        assert_eq!(u.player_name.as_deref(), Some("ZywOo"));
+        assert!(set_player(&db, 999, None, "x").is_err());
+        assert_eq!(active_jobs_of(&db, u.id).unwrap(), 0);
+    }
 
     #[test]
     fn users_are_added_listed_and_found() {

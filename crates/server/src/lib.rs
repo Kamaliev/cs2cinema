@@ -7,6 +7,7 @@
 pub mod api;
 pub mod auth;
 pub mod blobs;
+pub mod bot;
 pub mod cli;
 pub mod clock;
 pub mod config;
@@ -16,6 +17,7 @@ pub mod http;
 pub mod log;
 pub mod rules;
 pub mod secret;
+pub mod tg;
 pub mod users;
 
 pub type Result<T> = std::result::Result<T, String>;

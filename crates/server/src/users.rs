@@ -11,6 +11,19 @@ pub struct User {
     pub tg_id: Option<i64>,
     pub role: String,
     pub created_at: i64,
+    /// Сохранённый игрок по умолчанию: SteamID64.
+    pub player_steam: Option<String>,
+    /// Сохранённый игрок по умолчанию: ник.
+    pub player_name: Option<String>,
+    /// Когда друга убрали из белого списка; строка остаётся ради истории задач.
+    pub removed_at: Option<i64>,
+}
+
+impl User {
+    /// Друг в белом списке: его ещё не убирали.
+    pub fn is_active(&self) -> bool {
+        self.removed_at.is_none()
+    }
 }
 
 fn user_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
@@ -20,10 +33,14 @@ fn user_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         tg_id: r.get(2)?,
         role: r.get(3)?,
         created_at: r.get(4)?,
+        player_steam: r.get(5)?,
+        player_name: r.get(6)?,
+        removed_at: r.get(7)?,
     })
 }
 
-const USER_COLUMNS: &str = "id, name, tg_id, role, created_at";
+const USER_COLUMNS: &str =
+    "id, name, tg_id, role, created_at, player_steam, player_name, removed_at";
 
 pub fn add_user(db: &Db, name: &str, tg_id: Option<i64>, admin: bool, now_ms: i64) -> Result<User> {
     if !(1..=64).contains(&name.chars().count()) || name.chars().any(char::is_control) {
@@ -58,6 +75,9 @@ pub fn add_user(db: &Db, name: &str, tg_id: Option<i64>, admin: bool, now_ms: i6
             tg_id,
             role: role.to_owned(),
             created_at: now_ms,
+            player_steam: None,
+            player_name: None,
+            removed_at: None,
         })
     })
 }
@@ -77,6 +97,31 @@ pub fn find_user(db: &Db, name: &str) -> Result<Option<User>> {
         c.query_row(
             &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
             [name],
+            user_from_row,
+        )
+        .optional()
+        .map_err(db_err)
+    })
+}
+
+/// Пользователь по Telegram-id (в том числе убранный: `is_active()` решает, пускать ли его).
+pub fn find_user_by_tg(db: &Db, tg_id: i64) -> Result<Option<User>> {
+    db.read(|c| {
+        c.query_row(
+            &format!("SELECT {USER_COLUMNS} FROM users WHERE tg_id = ?1"),
+            [tg_id],
+            user_from_row,
+        )
+        .optional()
+        .map_err(db_err)
+    })
+}
+
+pub fn find_user_by_id(db: &Db, id: i64) -> Result<Option<User>> {
+    db.read(|c| {
+        c.query_row(
+            &format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?1"),
+            [id],
             user_from_row,
         )
         .optional()

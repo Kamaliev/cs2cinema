@@ -18,7 +18,7 @@ pub fn db_err(e: rusqlite::Error) -> String {
     format!("база данных: {e}")
 }
 
-// Версии схемы: 1 — пользователи, раннеры, задачи и файлы.
+// Версии схемы: 1 — пользователи, раннеры, задачи и файлы; 2 — таблицы Telegram-бота.
 // Новая версия — только новым шагом в конце списка и только добавлением колонок или таблиц.
 // Элемент k поднимает схему до версии k+1; шаг идёт в одной транзакции со своим `user_version`.
 const MIGRATIONS: &[&str] = &["
@@ -84,6 +84,61 @@ CREATE TABLE files (
 );
 CREATE INDEX jobs_state_id ON jobs(state, id);
 CREATE INDEX files_job ON files(job_id);
+", "
+CREATE TABLE tg_kv (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE tg_inbox (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id           INTEGER NOT NULL,
+    message_id        INTEGER NOT NULL,
+    user_id           INTEGER NOT NULL REFERENCES users(id),
+    kind              TEXT NOT NULL CHECK(kind IN ('document','faceit')),
+    file_id           TEXT,
+    file_unique_id    TEXT,
+    file_size         INTEGER,
+    file_name         TEXT NOT NULL DEFAULT '',
+    faceit_link       TEXT,
+    player            TEXT NOT NULL,
+    state             TEXT NOT NULL CHECK(state IN ('pending','downloading','queued','rejected')),
+    job_id            INTEGER REFERENCES jobs(id),
+    reason            TEXT,
+    status_message_id INTEGER,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    UNIQUE(chat_id, message_id)
+);
+CREATE INDEX tg_inbox_state ON tg_inbox(state, id);
+CREATE TABLE tg_jobs (
+    job_id              INTEGER PRIMARY KEY REFERENCES jobs(id),
+    chat_id             INTEGER NOT NULL,
+    user_id             INTEGER NOT NULL REFERENCES users(id),
+    status_message_id   INTEGER,
+    status_text         TEXT NOT NULL DEFAULT '',
+    next_edit_ms        INTEGER NOT NULL DEFAULT 0,
+    muted               INTEGER NOT NULL DEFAULT 0,
+    final_reported_ms   INTEGER,
+    admin_reported_ms   INTEGER,
+    delivery            TEXT NOT NULL DEFAULT 'none' CHECK(delivery IN ('none','pending','sending','sent','uncertain','failed')),
+    delivery_attempts   INTEGER NOT NULL DEFAULT 0,
+    next_try_ms         INTEGER NOT NULL DEFAULT 0,
+    result_message_id   INTEGER,
+    result_file_id      TEXT,
+    delivery_error      TEXT,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+CREATE INDEX tg_jobs_delivery ON tg_jobs(delivery, job_id);
+CREATE TABLE tg_files (
+    file_unique_id TEXT PRIMARY KEY,
+    size           INTEGER NOT NULL,
+    sha256         TEXT NOT NULL,
+    job_id         INTEGER NOT NULL REFERENCES jobs(id),
+    created_at     INTEGER NOT NULL
+);
+ALTER TABLE users ADD COLUMN removed_at INTEGER;
+CREATE INDEX files_sha256 ON files(sha256);
 "];
 
 /// Версия схемы, которую создаёт и ожидает эта сборка (число шагов `MIGRATIONS`).
@@ -189,7 +244,9 @@ mod tests {
     fn fresh_database_migrates_to_the_current_version() {
         let db = Db::in_memory().unwrap();
         assert_eq!(user_version(&db), schema_version() as i64);
-        for table in ["users", "runners", "jobs", "files"] {
+        for table in [
+            "users", "runners", "jobs", "files", "tg_kv", "tg_inbox", "tg_jobs", "tg_files",
+        ] {
             let n: i64 = db
                 .read(|c| {
                     c.query_row(
@@ -202,6 +259,17 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "таблица {table}");
         }
+        let removed_at: i64 = db
+            .read(|c| {
+                c.query_row(
+                    "SELECT count(*) FROM pragma_table_info('users') WHERE name = 'removed_at'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)
+            })
+            .unwrap();
+        assert_eq!(removed_at, 1, "колонка users.removed_at");
     }
 
     #[test]

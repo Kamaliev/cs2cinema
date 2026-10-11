@@ -592,3 +592,154 @@ pub fn read_reply(s: &mut std::net::TcpStream, head_request: bool) -> RawReply {
         body,
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Стенд бота Telegram (07-02): настоящий сервер на ручных часах, FakeTelegram и Bot поверх ядра
+// ---------------------------------------------------------------------------------------------------------
+
+use server::bot::store::TgJob;
+use server::bot::{Bot, BotSettings};
+use server::tg::fake::FakeTelegram;
+
+/// Начальное время стенда бота, unix-мс.
+pub const BOT_T0: i64 = 1_800_000_000_000;
+
+pub struct BotStand {
+    pub server: TestServer,
+    pub tg: FakeTelegram,
+    pub bot: Bot,
+    pub tg_dir: TestDir,
+    runner: std::sync::Mutex<Option<String>>,
+}
+
+impl BotStand {
+    pub fn start() -> Self {
+        let server = TestServer::start_with(TestOptions {
+            clock: Some(ManualClock::new(BOT_T0)),
+            ..Default::default()
+        });
+        let tg_dir = TestDir::new("tg");
+        let tg = FakeTelegram::new(tg_dir.path.clone());
+        let data_dir = server.dir.path.join("data");
+        let bot = Bot::new(
+            server.running().core().clone(),
+            Arc::new(tg.clone()),
+            server.running().log().clone(),
+            BotSettings::new(&data_dir, tg.files_dir()),
+        );
+        Self {
+            server,
+            tg,
+            bot,
+            tg_dir,
+            runner: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn clock(&self) -> ManualClock {
+        self.server.clock()
+    }
+
+    /// Друг в белом списке: id строки `users`.
+    pub fn add_friend(&self, tg_id: i64, name: &str) -> i64 {
+        let core = self.server.running().core();
+        server::users::add_user(core.db(), name, Some(tg_id), false, core.clock().now_ms())
+            .unwrap()
+            .id
+    }
+
+    pub fn add_admin(&self, tg_id: i64, name: &str) -> i64 {
+        let core = self.server.running().core();
+        server::users::add_user(core.db(), name, Some(tg_id), true, core.clock().now_ms())
+            .unwrap()
+            .id
+    }
+
+    /// Кладёт `fake_demo` на диск фейка и толкает обновление «друг прислал файл»; пустая подпись — без подписи.
+    /// Возвращает `file_id`.
+    pub fn send_demo(&self, from: i64, caption: &str) -> String {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let file_id = format!("file-{n}");
+        let unique = format!("uniq-{n}");
+        let bytes = fake_demo(4096);
+        self.tg.put_document(&file_id, &unique, &bytes);
+        let caption = (!caption.is_empty()).then_some(caption);
+        let upd = self.tg.document_update(
+            from,
+            from,
+            &file_id,
+            &unique,
+            "match.dem",
+            bytes.len() as u64,
+            caption,
+        );
+        self.tg.push_update(upd);
+        file_id
+    }
+
+    pub fn step(&self) -> server::bot::StepReport {
+        self.bot.step().expect("шаг бота")
+    }
+
+    /// Токен единственного фейкового раннера стенда (создаётся при первом обращении).
+    pub fn runner_token(&self) -> String {
+        let mut slot = self.runner.lock().unwrap();
+        slot.get_or_insert_with(|| self.server.add_runner("bot-runner"))
+            .clone()
+    }
+
+    /// Раннер берёт задачу `job_id`: эпоха выдачи и первый прогресс `record`.
+    fn claim_and_record(&self, job_id: i64, token: &str) -> i64 {
+        let (status, got) = self.server.claim(token, 0);
+        assert_eq!(status, 200, "раннер должен получить задачу");
+        let a = got.unwrap();
+        assert_eq!(a.job_id, job_id, "выдана не та задача");
+        let req = ProgressRequest {
+            epoch: a.epoch,
+            seq: 1,
+            phase: wire::Phase::Record,
+            take: None,
+            status: String::new(),
+        };
+        assert_eq!(self.server.progress(token, job_id, &req).0, 200);
+        a.epoch
+    }
+
+    /// Фейковый раннер доводит задачу до `done`: claim, прогресс, кусок результата, finish. Возвращает размер.
+    pub fn finish_done(&self, job_id: i64, token: &str) -> u64 {
+        let epoch = self.claim_and_record(job_id, token);
+        let data = result_bytes(64 * 1024);
+        let (status, _, body) = self.server.put_chunk(token, job_id, epoch, 0, &data);
+        assert_eq!(status, 204, "{body}");
+        let (status, body) =
+            self.server
+                .finish_done(token, job_id, epoch, data.len() as u64, &sha256_hex(&data));
+        assert_eq!(status, 200, "{body}");
+        data.len() as u64
+    }
+
+    /// Фейковый раннер завершает задачу сбоем с кодом `code`.
+    pub fn finish_failed(&self, job_id: i64, token: &str, code: &str) {
+        let epoch = self.claim_and_record(job_id, token);
+        let req = FinishRequest {
+            epoch,
+            outcome: wire::Outcome::Failed(wire::Failure {
+                code: code.to_owned(),
+                class: "other".to_owned(),
+                state: "recording".to_owned(),
+                hint: String::new(),
+                message: "сбой для теста".to_owned(),
+                tail: String::new(),
+                elapsed_ms: 1000,
+            }),
+        };
+        let (status, body) = self.server.finish(token, job_id, &req);
+        assert_eq!(status, 200, "{body}");
+    }
+
+    pub fn tg_job(&self, job_id: i64) -> TgJob {
+        server::bot::store::tg_job(self.server.running().core().db(), job_id)
+            .unwrap()
+            .expect("строка tg_jobs")
+    }
+}

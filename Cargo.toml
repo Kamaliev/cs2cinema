@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor"]
 
 members = [
     "crates/demo",
@@ -19,3 +20,6 @@ members = [
     "crates/server",
     "crates/runner",
 ]
+
+[patch.crates-io]
+tiny_http = { path = "vendor/tiny_http" }

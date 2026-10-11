@@ -7,6 +7,10 @@
 //!    до `as_reader`, а 503 уходит из отдельного короткого потока и никогда не из диспетчера: сброс тела блокирует.
 //! 3. Обрыв тела клиентом выглядит как чистый EOF. Поэтому обработчики загрузки сверяют число принятых байтов
 //!    с `Content-Length` (это делают обработчики PUT, не этот слой).
+//! 4. Огромный `Content-Length` (CR-01): дочитывание остатка в `Drop` оригинального `tiny_http` выделяло буфер размером
+//!    с объявленную длину и роняло процесс. Поэтому диспетчер отвергает тело больше `MAX_BODY` ответом 413 до обработчика
+//!    и до проверки токена, а само дочитывание ограничено пропатченной копией крейта (`vendor/tiny_http/VENDORED.md`).
+//!    Медленные клиенты по-прежнему остаются за прокси (WR-03, фаза 9).
 //!
 //! Слой ничего не знает о маршрутах: обработчик приходит замыканием.
 
@@ -24,6 +28,10 @@ use wire::ApiError;
 
 /// Сколько `stop` ждёт, пока обработчики закончат текущие запросы.
 const STOP_GRACE: Duration = Duration::from_secs(3);
+
+/// Потолок тела запроса (CR-01): самое большое законное тело — кусок результата `wire::CHUNK_SIZE`, JSON-ручки меньше.
+/// Всё, что больше, получает 413 в диспетчере — до обработчика, до проверки токена и до любого выделения памяти.
+const MAX_BODY: usize = wire::CHUNK_SIZE as usize + 64 * 1024;
 
 pub type Handler = Arc<dyn Fn(Request) + Send + Sync>;
 
@@ -127,6 +135,11 @@ pub fn start_with_flag(
                     }
                     match server.recv_timeout(Duration::from_millis(500)) {
                         Ok(Some(rq)) => {
+                            if rq.body_length().is_some_and(|n| n > MAX_BODY) {
+                                // Отдельный поток: ответ и дочитывание в `Drop` блокируют, диспетчер ждать не может.
+                                std::thread::spawn(move || too_large(rq));
+                                continue;
+                            }
                             if busy.fetch_add(1, Ordering::SeqCst) >= workers {
                                 busy.fetch_sub(1, Ordering::SeqCst);
                                 std::thread::spawn(move || overloaded(rq));
@@ -170,6 +183,22 @@ fn overloaded(rq: Request) {
         if let Ok(h) = Header::from_bytes(k.as_bytes(), v.as_bytes()) {
             resp = resp.with_header(h);
         }
+    }
+    let _ = rq.respond(resp);
+}
+
+/// Ответ 413: тело больше `MAX_BODY`. Тело не читается, а дочитывается в `Drop` (не больше 1 МиБ) — поэтому отдельный поток.
+/// Заголовок `Connection: close` `tiny_http` в ответе игнорирует (закрытием соединения управляет он сам).
+fn too_large(rq: Request) {
+    let body = serde_json::to_string(&ApiError {
+        error: wire::codes::TOO_LARGE.to_owned(),
+        message: "тело запроса больше допустимого".to_owned(),
+        offset: None,
+    })
+    .unwrap_or_default();
+    let mut resp = Response::from_string(body).with_status_code(413);
+    if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
+        resp = resp.with_header(h);
     }
     let _ = rq.respond(resp);
 }

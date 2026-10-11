@@ -346,3 +346,68 @@ fn stop_returns_while_a_long_poll_is_waiting() {
         assert_eq!(status, 204);
     }
 }
+
+/// Заголовки сырого `POST claim` без токена с объявленной длиной `len`.
+fn raw_claim_head(len: &str) -> String {
+    format!(
+        "POST {} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {len}\r\n\r\n",
+        wire::paths::CLAIM
+    )
+}
+
+#[test]
+fn huge_content_length_without_a_token_does_not_kill_the_server() {
+    use std::io::Write;
+    let srv = TestServer::start();
+    let token = srv.add_runner("main");
+
+    let mut conn = common::raw_request(srv.addr());
+    conn.write_all(raw_claim_head("1000000000000000").as_bytes())
+        .unwrap();
+    conn.write_all(b"0123456789abcdef").unwrap();
+    let r = common::read_reply(&mut conn, false);
+    assert_eq!(r.status(), 413, "{}", r.status_line);
+    let json: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(json["error"], "too_large");
+    drop(conn);
+
+    let started = Instant::now();
+    assert_eq!(srv.claim(&token, 0).0, 204, "сервер должен отвечать дальше");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn oversized_body_on_any_path_is_413_before_the_handler() {
+    use std::io::Write;
+    let srv = TestServer::start();
+    let token = srv.add_runner("main");
+
+    // Неизвестный путь: 413, а не 404 — тело отвергается до обработчика.
+    let mut conn = common::raw_request(srv.addr());
+    conn.write_all(
+        b"POST /nope HTTP/1.1\r\nHost: test\r\nContent-Length: 1000000000000000\r\n\r\n",
+    )
+    .unwrap();
+    let r = common::read_reply(&mut conn, false);
+    assert_eq!(r.status(), 413, "{}", r.status_line);
+    drop(conn);
+
+    // Кусок результата на байт больше потолка — тоже 413, с верным токеном и эпохой.
+    let id = srv.submit(&fake_demo(4096), "s1mple");
+    let (status, got) = srv.claim(&token, 0);
+    assert_eq!((status, got.unwrap().job_id), (200, id));
+    let too_big = wire::CHUNK_SIZE as usize + 64 * 1024 + 1;
+    let mut conn = common::raw_request(srv.addr());
+    conn.write_all(
+        common::raw_put_head(&token, id, 1, 0, &format!("Content-Length: {too_big}\r\n"))
+            .as_bytes(),
+    )
+    .unwrap();
+    let r = common::read_reply(&mut conn, false);
+    assert_eq!(r.status(), 413, "{}", r.status_line);
+    drop(conn);
+
+    // Задача уже у первого раннера, поэтому живость проверяет второй: свободной работы нет, но сервер отвечает.
+    let other = srv.add_runner("second");
+    assert_eq!(srv.claim(&other, 0).0, 204);
+}

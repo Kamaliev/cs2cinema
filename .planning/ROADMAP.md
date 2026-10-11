@@ -75,12 +75,12 @@ Plans:
   4. Враждебные входы проверены тестами: ник или имя карты с переводом строки, `;`, кавычками и управляющими символами не меняют грамматику `highlights.cfg` и не попадают в cfg, а `drawtext` читает подпись из файла. Обрезанная демка, демка с испорченными битами, zstd-бомба и файл сверх лимита заканчиваются кодами `BAD_DEMO` или `DEMO_TOO_LARGE`; разбор идёт в дочернем процессе с лимитом памяти, и раннер после этого продолжает брать задачи.
   5. Неоднозначный ник даёт `PLAYER_AMBIGUOUS` со списком до 10 очищенных кандидатов, отсутствующий — `PLAYER_NOT_FOUND`, демка без подходящих моментов — `NO_HIGHLIGHTS`; всё это ещё до запуска CS2. `crates/cli/tests/pipeline.rs` и `cargo test --workspace` остаются зелёными.
 
-**Plans**: 1/11 plans executed
+**Plans**: 2/11 plans executed
 
 Plans:
 **Wave 1**
 - [x] 06-01-PLAN.md — строгий выбор игрока (`resolve_player`, `job::hero_for`) и новые коды `PLAYER_*`, `NO_HIGHLIGHTS`, `BAD_DEMO`, `DEMO_TOO_LARGE`, `RESULT_INVALID`, `UNSUPPORTED_SOURCE`; строки кодов и `Phase::Precheck` в `wire` (SEC-03, RUN-05)
-- [ ] 06-02-PLAN.md — очистка ников и карты в `Match::build`, cfg без текста из демки, `drawtext` из файлов; `+faststart` и `verify_result` (ffprobe + порядок боксов MP4) (SEC-01, RUN-06)
+- [x] 06-02-PLAN.md — очистка ников и карты в `Match::build`, cfg без текста из демки, `drawtext` из файлов; `+faststart` и `verify_result` (ffprobe + порядок боксов MP4) (SEC-01, RUN-06)
 - [ ] 06-03-PLAN.md — `read_demo_limited` (потолки файла и распаковки), потолок snappy-команды, мутационный тест парсера, `demo::synth` (SEC-02)
 - [ ] 06-04-PLAN.md — `host::limit_self_memory`: самоограничение памяти процесса Job Object'ом, запрет дочерних процессов, пик памяти, без аварийного диалога (SEC-02)
 - [ ] 06-05-PLAN.md — крейт `runner`: клиент протокола и сквозной путь claim → демка → исполнитель → результат → done; итоги исполнителя, токен вне журнала (RUN-01)
@@ -158,7 +158,7 @@ Phases execute in numeric order: 5 → 6 → 7 → 8 → 9 (фаза 7 може�
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 5. Ядро сервера и протокол | 5/5 | In Progress | - |
-| 6. Раннер, защита входа и первый живой прогон | 1/11 | In Progress | - |
+| 6. Раннер, защита входа и первый живой прогон | 2/11 | In Progress | - |
 | 7. Telegram-бот и доставка | 0/TBD | Not started | - |
 | 8. Режим раннера в приложении | 0/TBD | Not started | - |
 | 9. Уборка, развёртывание и учения | 0/TBD | Not started | - |

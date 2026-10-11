@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 06
 current_phase_name: Раннер, защита входа и первый живой прогон
 status: executing
-stopped_at: Completed 06-01-PLAN.md
-last_updated: "2026-10-11T15:21:27.232Z"
+stopped_at: Completed 06-02-PLAN.md
+last_updated: "2026-10-11T15:30:34.491Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 06 execution started
-state_head: bfbf8c6bf2db330619e17b68c1b5bc791e04ab32
+state_head: cc5ae504b663cd363e6b16bb3f673947efbde6d8
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 16
-  completed_plans: 6
+  completed_plans: 7
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 06 (Раннер, защита входа и первый живой прогон) — EXECUTING
-Plan: 2 of 11
+Plan: 3 of 11
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 06 execution started
 
@@ -98,6 +98,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 05 P04 | 80m | 3 tasks | 12 files |
 | Phase 05 P05 | 1h30m | 3 tasks | 9 files |
 | Phase 06 P01 | 25 min | 2 tasks | 4 files |
+| Phase 06 P02 | 40min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -169,6 +170,7 @@ Recent decisions affecting current work:
 - [Phase 05]: 05-05: Chunk ставит phase=upload, Touch делегирует в Reattach; Reject несёт заголовки; highlights.mp4 удаляется, если вторая транзакция finish done отказала
 - [Phase 06]: Слияние двойников SteamID применяется на каждом ярусе resolve_player; find_player остаётся обёрткой resolve_player(..).ok()
 - [Phase 06]: JOB_ERROR — только строка в wire::fail, в FailCode его нет; Phase::Precheck добавлен аддитивно (ALL = 10)
+- [Phase 06]: 06-02: текст из демки очищается в Match::build и не пишется в cfg вовсе; подписи drawtext читаются из cap_NNN.txt
 
 ### Pending Todos
 
@@ -198,6 +200,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T15:21:27.124Z
-Stopped at: Completed 06-01-PLAN.md
+Last session: 2026-10-11T15:30:34.371Z
+Stopped at: Completed 06-02-PLAN.md
 Resume file: None

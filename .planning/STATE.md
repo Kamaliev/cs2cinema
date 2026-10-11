@@ -1,18 +1,18 @@
 ---
 gsd_state_version: "1.0"
-current_phase: 1
-current_phase_name: Новый путь записи с понятными сбоями
-status: planning
-stopped_at: Phase 03 complete, ready to plan Phase 1
-last_updated: "2026-10-10T20:41:05.881Z"
+current_phase: 04
+current_phase_name: Очередь без присмотра и приёмка
+status: executing
+stopped_at: Completed 04-01-PLAN.md
+last_updated: "2026-10-11T06:55:44.718Z"
 last_activity: 2026-10-11
-last_activity_desc: Phase 03 complete, transitioned to Phase 1
-state_head: 77f81bb2af0acfea2bbd3e9b9e630e123ad4648b
+last_activity_desc: Phase 04 execution started
+state_head: 34649a0f87212d7f008e3e4042fd49605ffaf764
 progress:
   total_phases: 4
   completed_phases: 2
-  total_plans: 24
-  completed_plans: 24
+  total_plans: 36
+  completed_plans: 25
   percent: 50
 ---
 
@@ -23,14 +23,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-10)
 
 **Core value:** Задача на монтаж из очереди доходит до готового `highlights.mp4` без ручного вмешательства, а если это невозможно — останавливается быстро и объясняет, что именно пошло не так.
-**Current focus:** Phase 03 — Проверенные дубли, повтор и восстановление
+**Current focus:** Phase 04 — Очередь без присмотра и приёмка
 
 ## Current Position
 
-Phase: 1 — Новый путь записи с понятными сбоями
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-10-11 — Phase 03 complete, transitioned to Phase 1
+Phase: 04 (Очередь без присмотра и приёмка) — EXECUTING
+Plan: 2 of 12
+Status: Ready to execute
+Last activity: 2026-10-11 — Phase 04 execution started
 
 Progress: [█████░░░░░] 50%
 
@@ -79,6 +79,7 @@ Progress: [█████░░░░░] 50%
 | Phase 03 P05 | 20min | 2 tasks | 1 files |
 | Phase 03 P06 | 40min | 3 tasks | 1 files |
 | Phase 03 P07 | 35min | 2 tasks | 3 files |
+| Phase 04 P01 | 25min | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -123,6 +124,7 @@ Recent decisions affecting current work:
 - [Phase 03]: 03-03: звук проверяется в audio.wav, разрешение и видео в video.mp4; допуск длительности ±10% но не меньше ±0.5 с; NotReady отличается от Invalid по тексту stderr ffprobe
 - [Phase 03]: 03-04: проверки дублей идут по одной за шаг цикла драйвера; после закрытия игры оставшиеся дубли проверяются по разу без повторов
 - [Phase 03]: 03-06: повтор с невалидным дублем записывает все дубли заново, прежний clips уходит в clips_old_<ts> (D-07, запасной вариант)
+- [Phase 04]: 04-01: cs2-cli assemble принимает папку задачи (record.json + clips/manifest.json); старая склейка renderer::assemble и флаги --plan/--clips удалены (DC-1); RunError переехала в pipeline
 
 ### Pending Todos
 
@@ -145,6 +147,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-10T20:35:18.852Z
-Stopped at: Phase 03 complete, ready to plan Phase 1
+Last session: 2026-10-11T06:55:44.595Z
+Stopped at: Completed 04-01-PLAN.md
 Resume file: None

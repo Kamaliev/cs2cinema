@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 07
 current_phase_name: Telegram-бот и доставка
 status: executing
-stopped_at: Completed 07-10-PLAN.md
-last_updated: "2026-10-11T20:39:58.302Z"
+stopped_at: Completed 07-07-PLAN.md
+last_updated: "2026-10-11T20:50:57.849Z"
 last_activity: 2026-10-12
 last_activity_desc: Phase 07 execution started
-state_head: cf2523ce81e3c648b43eea3ef4f3cfb0fc4f7c82
+state_head: 2af79e03db343e30dccc648416f4704d6305da67
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 27
-  completed_plans: 23
+  completed_plans: 24
   percent: 40
 ---
 
@@ -116,6 +116,7 @@ Progress: [████░░░░░░] 40%
 | Phase 07 P05 | 25min | 2 tasks | 7 files |
 | Phase 07 P06 | 40min | 3 tasks | 3 files |
 | Phase 07 P10 | ~40min | 3 tasks | 9 files |
+| Phase 07 P07 | 75min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -219,6 +220,8 @@ Recent decisions affecting current work:
 - [Phase 07]: 07-06: восстановление после падения между Core::submit и queued привязывает строку к неприкреплённой задаче до getFile
 - [Phase 07]: 07-06: повтор сообщения (потерянное смещение) не получает ответа про дубль
 - [Phase 07]: 07-10: бот включает только bot_api_url (или внедрённый Tg в serve_with_bot); остановка бота ограничена 3 с, потоки не join-ятся при висящем вызове Telegram
+- [Phase 07]: 07-07: голый id матча тоже считается попыткой ссылки и получает объяснение с примером; Task.demo всегда remote/srv{id}.dem, FACEIT-демку кладёт исполнитель
+- [Phase 07]: 07-07: наружу из раннера идут фиксированные фразы FACEIT_FETCH_FAILED; ключ FACEIT только из FACEIT_API_KEY у раннера
 
 ### Pending Todos
 
@@ -248,6 +251,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T20:39:58.181Z
-Stopped at: Completed 07-10-PLAN.md
+Last session: 2026-10-11T20:50:57.727Z
+Stopped at: Completed 07-07-PLAN.md
 Resume file: None

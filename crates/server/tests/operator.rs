@@ -457,3 +457,58 @@ fn serve_binary_answers_claims_and_survives_a_restart() {
     assert_eq!(r.status, 204, "{}", r.body);
     srv.kill();
 }
+
+#[test]
+fn job_cancel_is_immediate_for_a_queued_job_and_a_flag_for_a_leased_one() {
+    let d = test_dir("cancel");
+    let data = d.join("data");
+    let args = |extra: &[&str]| -> Vec<String> {
+        let mut v: Vec<String> = extra.iter().map(|s| (*s).to_owned()).collect();
+        v.extend(["--data-dir".to_owned(), data.to_str().unwrap().to_owned()]);
+        v
+    };
+    let run_args = |extra: &[&str]| {
+        let a = args(extra);
+        run(&a.iter().map(String::as_str).collect::<Vec<_>>())
+    };
+    for n in 0..2 {
+        let demo = d.join(format!("m{n}.dem"));
+        fake_demo(&demo, 2048);
+        let (code, _, err) = run_args(&["submit", demo.to_str().unwrap(), "--player", "s1mple"]);
+        assert_eq!(code, 0, "{err}");
+    }
+
+    // Вторая задача в очереди — отмена сразу, повторная — отказ.
+    let (code, out, err) = run_args(&["job", "cancel", "2"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("задача #2: отменена"), "{out}");
+    let (code, _, err) = run_args(&["job", "cancel", "2"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("задача уже завершена"), "{err}");
+
+    // Первую выдаём раннеру тем же ядром, что и сервер.
+    {
+        use server::core::{Core, CoreOptions, Limits};
+        let core = Core::open(CoreOptions {
+            data_dir: data.clone(),
+            limits: Limits::default(),
+            clock: std::sync::Arc::new(server::clock::SystemClock),
+            redactor: server::secret::Redactor::default(),
+        })
+        .unwrap();
+        let (runner, _) = server::auth::add_runner(core.db(), "r", core.clock().now_ms()).unwrap();
+        assert_eq!(core.claim(runner.id).unwrap().unwrap().job_id, 1);
+    }
+    let (code, out, err) = run_args(&["job", "cancel", "1"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("отмена запрошена (мягко)"), "{out}");
+    let (_, out, _) = run_args(&["job", "show", "1"]);
+    assert!(out.contains("отмена запрошена: soft"), "{out}");
+    let (code, out, err) = run_args(&["job", "cancel", "1"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("отмена запрошена (сразу)"), "{out}");
+    let (code, _, err) = run_args(&["job", "cancel", "999"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("нет задачи #999"), "{err}");
+    let _ = std::fs::remove_dir_all(&d);
+}

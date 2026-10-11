@@ -26,6 +26,7 @@ cs2-server — сервер очереди монтажа
   submit {демка} --player {ник|steamid} [--user {имя}]   поставить демку в очередь
   job list                                               список задач
   job show {id}                                          подробности задачи
+  job cancel {id} [--force]                              отменить задачу (выданной раннеру — флагом; повторно или с --force — сразу)
   runner add {имя}                                       выдать раннеру токен (показывается один раз)
   runner list                                            раннеры и отпечатки их токенов
   runner revoke {имя}                                    отозвать токен раннера
@@ -57,6 +58,7 @@ struct Args {
     user: Option<String>,
     tg: Option<i64>,
     admin: bool,
+    force: bool,
     bind: Option<String>,
     threads: Option<usize>,
 }
@@ -96,6 +98,7 @@ fn parse_args(args: Vec<String>) -> std::result::Result<Args, CliError> {
                 )
             }
             "--admin" => out.admin = true,
+            "--force" => out.force = true,
             "--bind" => out.bind = Some(value("--bind")?),
             "--threads" => {
                 out.threads = Some(
@@ -279,6 +282,25 @@ fn execute(
             print_job(&job, demo.as_ref());
             Ok(())
         }
+        ["job", "cancel", id] => {
+            let id: i64 = id
+                .parse()
+                .map_err(|_| CliError::Usage("job cancel: нужен числовой id".to_owned()))?;
+            let core = open_core(&a, env, redactor)?;
+            let state = core.cancel(id, a.force)?;
+            if state == wire::JobState::Cancelled {
+                println!("задача #{id}: отменена");
+            } else {
+                let mode = match core.job(id)?.map(|j| j.cancel_requested) {
+                    Some(wire::CancelMode::Force) => "сразу",
+                    _ => "мягко",
+                };
+                println!(
+                    "задача #{id}: отмена запрошена ({mode}) — раннер узнает при следующем прогрессе"
+                );
+            }
+            Ok(())
+        }
         ["runner", "add", name] => {
             let core = open_core(&a, env, redactor)?;
             let (runner, token) = auth::add_runner(core.db(), name, core.clock().now_ms())?;
@@ -368,6 +390,9 @@ fn print_job(j: &JobRow, demo: Option<&FileRow>) {
         println!("закончена: {}", utc(t));
     }
     println!("эпоха: {}, выдач: {}", j.epoch, j.grants);
+    if j.cancel_requested != wire::CancelMode::NotRequested {
+        println!("отмена запрошена: {}", j.cancel_requested.as_str());
+    }
     if let Some(d) = demo {
         println!("демка: {:.1} МиБ", d.size as f64 / (1024.0 * 1024.0));
         println!("sha256: {}", d.sha256);

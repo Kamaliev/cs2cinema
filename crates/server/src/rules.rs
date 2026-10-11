@@ -65,6 +65,12 @@ pub enum Event {
         epoch: i64,
         kind: FinishKind,
     },
+    /// Оператор отменяет задачу: в приёме и в очереди сразу, у выданной ставится флаг (`force` — жёсткий).
+    Cancel { force: bool },
+    /// Демка принята и записана: `receiving` → `queued`.
+    Received,
+    /// Приём демки не удался: `receiving` → `failed` с кодом `RECEIVE_FAILED`.
+    ReceiveFailed { message: String },
 }
 
 /// Результат `decide`: новая строка и пометки для вызывающего.
@@ -101,6 +107,24 @@ fn stale() -> Reject {
 
 fn terminal() -> Reject {
     Reject::new(codes::JOB_TERMINAL, "задача уже завершена")
+}
+
+/// Приём демки не удался: `failed` с кодом `RECEIVE_FAILED`.
+fn receive_failed(job: &JobRow, message: &str, now_ms: i64) -> JobRow {
+    let mut j = job.clone();
+    j.state = JobState::Failed;
+    j.fail_code = Some(wire::fail::RECEIVE_FAILED.to_owned());
+    j.fail_message = Some(message.to_owned());
+    j.finished_at = Some(now_ms);
+    j
+}
+
+/// Событие приёма на задаче не в приёме — ошибка вызывающего кода, а не раннера.
+fn not_receiving(job: &JobRow) -> Reject {
+    Reject::new(
+        codes::INTERNAL,
+        format!("задача #{} не в состоянии приёма", job.id),
+    )
 }
 
 /// Состояние после возврата аренды по этапу.
@@ -265,18 +289,60 @@ pub fn decide(job: &JobRow, ev: &Event, now_ms: i64, limits: &Limits) -> Result<
             Ok(Decision::of(j))
         }
         Event::ReceiveStale => {
-            let mut j = job.clone();
             if job.state == JobState::Receiving && job.updated_at < now_ms - RECEIVING_STALE_MS {
-                j.state = JobState::Failed;
-                j.fail_code = Some(wire::fail::RECEIVE_FAILED.to_owned());
-                j.fail_message = Some(
-                    "приём демки прервался (сервер или submit остановлены) — отправьте демку заново"
-                        .to_owned(),
-                );
-                j.finished_at = Some(now_ms);
+                return Ok(Decision::of(receive_failed(
+                    job,
+                    "приём демки прервался (сервер или submit остановлены) — отправьте демку заново",
+                    now_ms,
+                )));
             }
+            Ok(Decision::of(job.clone()))
+        }
+        Event::Received => {
+            if job.state != JobState::Receiving {
+                return Err(not_receiving(job));
+            }
+            let mut j = job.clone();
+            j.state = JobState::Queued;
             Ok(Decision::of(j))
         }
+        Event::ReceiveFailed { message } => {
+            if job.state != JobState::Receiving {
+                return Err(not_receiving(job));
+            }
+            Ok(Decision::of(receive_failed(job, message, now_ms)))
+        }
+        Event::Cancel { force } => match job.state {
+            JobState::Done | JobState::Failed | JobState::Cancelled => Err(terminal()),
+            JobState::Receiving | JobState::Queued => {
+                // Раннер не работает (или потерял аренду): отменяем сразу, раннер узнает по `job_terminal`/`abandon`.
+                let mut j = job.clone();
+                j.state = JobState::Cancelled;
+                j.finished_at = Some(now_ms);
+                j.lease_until = None;
+                j.lease_lost = false;
+                Ok(Decision {
+                    job: j,
+                    reattached: false,
+                    discard_parts: true,
+                })
+            }
+            JobState::Assigned | JobState::Running | JobState::Uploading => {
+                // Выдана раннеру: ставится флаг, раннер увидит его в ответе на прогресс и в `hello`.
+                // Повторная отмена (или `--force`) ужесточает флаг до жёсткого.
+                let mut j = job.clone();
+                j.cancel_requested = if *force || job.cancel_requested != CancelMode::NotRequested {
+                    CancelMode::Force
+                } else {
+                    CancelMode::Soft
+                };
+                Ok(Decision::of(j))
+            }
+            JobState::Unknown => Err(Reject::new(
+                codes::INTERNAL,
+                "у задачи неизвестное состояние",
+            )),
+        },
         Event::Expire => {
             let overdue = job.state.is_leased() && job.lease_until.is_none_or(|l| l <= now_ms);
             if !overdue {

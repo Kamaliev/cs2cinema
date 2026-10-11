@@ -8,8 +8,8 @@ use common::{TestOptions, TestServer, fake_demo};
 use server::clock::ManualClock;
 use std::time::Duration;
 use wire::{
-    CancelMode, DirectiveAction, HelloReply, HelloRequest, Holding, JobState, Phase, ProgressReply,
-    ProgressRequest, ReleaseRequest, Take,
+    CancelMode, DirectiveAction, Failure, FinishReply, FinishRequest, HelloReply, HelloRequest,
+    Holding, JobState, Outcome, Phase, ProgressReply, ProgressRequest, ReleaseRequest, Take,
 };
 
 const T0: i64 = 1_800_000_000_000;
@@ -405,4 +405,161 @@ fn revoked_runner_is_refused_and_its_job_goes_to_another_runner() {
     assert_eq!(status, 200);
     assert_eq!(got.unwrap().epoch, 2, "новая выдача — новая эпоха");
     assert_eq!(srv.job(id).grants, 2);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Итог задачи и отмена (05-04, SRV-03)
+// ---------------------------------------------------------------------------------------------------------
+
+fn failed_body(epoch: i64) -> FinishRequest {
+    FinishRequest {
+        epoch,
+        outcome: Outcome::Failed(Failure {
+            code: "HLAE_ERROR".to_owned(),
+            message: "boom".to_owned(),
+            ..Default::default()
+        }),
+    }
+}
+
+fn running_job(srv: &TestServer, token: &str) -> i64 {
+    let id = srv.submit(&fake_demo(4096), "s1mple");
+    let (status, got) = srv.claim(token, 0);
+    assert_eq!(status, 200);
+    assert_eq!(got.unwrap().job_id, id);
+    let (st, body) = srv.progress(token, id, &req(1, 1, Phase::Record));
+    assert_eq!(st, 200, "{body}");
+    id
+}
+
+#[test]
+fn cancel_reaches_the_runner_in_the_progress_reply() {
+    let srv = clocked();
+    let token = srv.add_runner("a");
+    let id = running_job(&srv, &token);
+    let core = srv.running().core();
+
+    core.cancel(id, false).unwrap();
+    let (st, body) = srv.progress(&token, id, &req(1, 2, Phase::Record));
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(reply(&body).cancel, CancelMode::Soft);
+    assert_eq!(srv.job(id).state, JobState::Running, "состояние то же");
+
+    core.cancel(id, false).unwrap();
+    let (_, body) = srv.progress(&token, id, &req(1, 3, Phase::Record));
+    assert_eq!(reply(&body).cancel, CancelMode::Force);
+
+    // Раннер остановился и сообщает отмену.
+    let cancelled = FinishRequest {
+        epoch: 1,
+        outcome: Outcome::Cancelled,
+    };
+    let (st, body) = srv.finish(&token, id, &cancelled);
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<FinishReply>(&body).unwrap().state,
+        JobState::Cancelled
+    );
+    assert_eq!(srv.job(id).state, JobState::Cancelled);
+
+    let (st, body) = srv.progress(&token, id, &req(1, 4, Phase::Record));
+    assert_eq!(st, 409, "{body}");
+    assert!(body.contains("job_terminal"), "{body}");
+}
+
+#[test]
+fn hello_tells_the_runner_to_cancel() {
+    let srv = clocked();
+    let token = srv.add_runner("a");
+    let id = running_job(&srv, &token);
+    srv.running().core().cancel(id, false).unwrap();
+
+    let hello = HelloRequest {
+        protocol: wire::PROTOCOL_VERSION,
+        name: "a".to_owned(),
+        app_version: "0.1.0".to_owned(),
+        status: "busy".to_owned(),
+        holding: vec![Holding {
+            job_id: id,
+            epoch: 1,
+        }],
+    };
+    let (st, body) = srv.hello(&token, &hello);
+    assert_eq!(st, 200, "{body}");
+    let got: HelloReply = serde_json::from_str(&body).unwrap();
+    assert_eq!(got.directives.len(), 1);
+    assert_eq!(got.directives[0].action, DirectiveAction::Cancel);
+}
+
+#[test]
+fn stale_runner_cannot_finish() {
+    let srv = clocked();
+    let clock = srv.clock();
+    let a = srv.add_runner("a");
+    let b = srv.add_runner("b");
+    let id = running_job(&srv, &a);
+
+    clock.advance(Duration::from_secs(46));
+    srv.sweep();
+    let (status, got) = srv.claim(&b, 0);
+    assert_eq!(status, 200);
+    assert_eq!(got.unwrap().epoch, 2);
+
+    // Старый раннер с эпохой 1 и с чужой эпохой 2 отсекается; задача не тронута.
+    let before = srv.job(id);
+    for epoch in [1, 2] {
+        let (st, body) = srv.finish(&a, id, &failed_body(epoch));
+        assert_eq!(st, 409, "{body}");
+        assert!(body.contains("stale_epoch"), "{body}");
+    }
+    assert_eq!(srv.job(id), before);
+    let (st, body) = srv.finish(&b, id, &failed_body(1));
+    assert_eq!(st, 409, "эпоха первой выдачи у нового раннера: {body}");
+    let (st, body) = srv.finish(&b, id, &failed_body(2));
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(srv.job(id).state, JobState::Failed);
+}
+
+#[test]
+fn finish_validates_the_outcome_and_cleans_the_failure_fields() {
+    let srv = clocked();
+    let token = srv.add_runner("a");
+    let id = running_job(&srv, &token);
+    let bearer = format!("Bearer {token}");
+    let path = wire::paths::job(id, "finish");
+
+    // Итог от более новой стороны протокола не принимается.
+    let r = srv.send(
+        &path,
+        Some(&bearer),
+        Some(r#"{"epoch":1,"outcome":{"kind":"something_new"}}"#),
+    );
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.body.contains("неизвестный итог задачи"), "{}", r.body);
+    assert_eq!(srv.job(id).state, JobState::Running);
+
+    // Без токена, чужая задача, мусорный JSON.
+    assert_eq!(srv.send(&path, None, Some("{}")).status, 401);
+    let r = srv.send(
+        &wire::paths::job(999, "finish"),
+        Some(&bearer),
+        Some(r#"{"epoch":1,"outcome":{"kind":"cancelled"}}"#),
+    );
+    assert_eq!(r.status, 404);
+    assert_eq!(srv.send(&path, Some(&bearer), Some("не json")).status, 400);
+
+    // Код не из [A-Z0-9_] сохраняется как UNKNOWN, длинное сообщение обрезается, управляющие символы уходят.
+    let long = "я".repeat(3000);
+    let body = serde_json::json!({
+        "epoch": 1,
+        "outcome": {"kind": "failed", "code": "hlae error!", "message": format!("a\u{7}b{long}"), "tail": "x\u{1b}y"}
+    });
+    let r = srv.send(&path, Some(&bearer), Some(&body.to_string()));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let job = srv.job(id);
+    assert_eq!(job.fail_code.as_deref(), Some("UNKNOWN"));
+    let message = job.fail_message.unwrap();
+    assert_eq!(message.chars().count(), 2000);
+    assert!(message.starts_with("ab"), "управляющий символ удалён");
+    assert_eq!(job.fail_tail.as_deref(), Some("xy"));
 }

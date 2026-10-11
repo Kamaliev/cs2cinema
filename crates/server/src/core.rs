@@ -264,21 +264,17 @@ impl Core {
             Ok(got) => {
                 let now = self.clock.now_ms();
                 self.db.write(|tx| {
-                    let n = tx
-                        .execute(
-                            "UPDATE jobs SET state = 'queued', updated_at = ?2 WHERE id = ?1 AND state = 'receiving'",
-                            params![job_id, now],
-                        )
-                        .map_err(db_err)?;
-                    if n != 1 {
-                        return Err(format!("задача #{job_id} не в состоянии приёма"));
-                    }
+                    let before = job_by_id(tx, job_id)?
+                        .ok_or_else(|| format!("нет задачи #{job_id}"))?;
+                    let d = rules::decide(&before, &Event::Received, now, &self.limits)
+                        .map_err(|r| r.message)?;
+                    apply(tx, &before, &d.job, now)?;
                     tx.execute(
                         "INSERT INTO files(job_id, kind, rel_path, size, sha256, created_at) VALUES (?1, 'demo', ?2, ?3, ?4, ?5)",
                         params![job_id, demo_rel(job_id), got.size as i64, got.sha256, now],
                     )
                     .map_err(db_err)?;
-                    Ok(())
+                    Ok::<(), String>(())
                 })?;
                 self.wake();
                 Ok(got)
@@ -288,14 +284,17 @@ impl Core {
                 let msg = self
                     .redactor
                     .clean(&format!("не удалось принять демку: {e}"), 2000);
+                let ev = Event::ReceiveFailed {
+                    message: msg.clone(),
+                };
                 self.db.write(|tx| {
-                    tx.execute(
-                        "UPDATE jobs SET state = 'failed', fail_code = ?2, fail_message = ?3, updated_at = ?4, finished_at = ?4
-                         WHERE id = ?1 AND state = 'receiving'",
-                        params![job_id, wire::fail::RECEIVE_FAILED, msg, now],
-                    )
-                    .map(|_| ())
-                    .map_err(db_err)
+                    // Задача уже не в приёме (например, её отменили): оставляем как есть.
+                    if let Some(before) = job_by_id(tx, job_id)?
+                        && let Ok(d) = rules::decide(&before, &ev, now, &self.limits)
+                    {
+                        apply(tx, &before, &d.job, now)?;
+                    }
+                    Ok::<(), String>(())
                 })?;
                 Err(msg)
             }
@@ -433,6 +432,14 @@ impl Core {
                     failed,
                 });
             };
+            // Раннер просит новую задачу — значит, он свободен: прежняя задача с потерянной арендой ему больше не
+            // принадлежит, иначе поздний прогресс или `hello` вернули бы её, и раннер вёл бы две задачи сразу.
+            tx.execute(
+                "UPDATE jobs SET runner_id = NULL, lease_lost = 0, updated_at = ?3 \
+                 WHERE runner_id = ?1 AND state = 'queued' AND lease_lost = 1 AND id != ?2",
+                params![runner_id, id, now],
+            )
+            .map_err(db_err)?;
             let job = job_by_id(tx, id)?
                 .ok_or_else(|| format!("задача #{id} исчезла сразу после выдачи"))?;
             Ok(Claimed {
@@ -502,7 +509,7 @@ impl Core {
     pub fn recover(&self) -> Result<Recovered> {
         let now = self.clock.now_ms();
         let grace_until = now + self.limits.startup_grace_ms;
-        self.db.write(|tx| {
+        let mut out = self.db.write(|tx| {
             let receive_failed = fail_stale_receiving(tx, now, &self.limits)?;
             let ids: Vec<i64> = {
                 let mut st = tx
@@ -526,8 +533,25 @@ impl Core {
             Ok::<Recovered, String>(Recovered {
                 receive_failed,
                 grace_extended,
+                parts_discarded: 0,
             })
-        })
+        })?;
+        // Куски результата окончательных задач без живой выдачи больше никому не нужны (Pitfall 7).
+        let finished: Vec<i64> = self.db.read(|c| {
+            let mut st = c
+                .prepare(
+                    "SELECT id FROM jobs WHERE state IN ('done','failed','cancelled') ORDER BY id",
+                )
+                .map_err(db_err)?;
+            let rows = st.query_map([], |r| r.get(0)).map_err(db_err)?;
+            rows.collect::<rusqlite::Result<Vec<i64>>>().map_err(db_err)
+        })?;
+        for id in finished {
+            if self.blobs.results_dir(id).is_dir() {
+                out.parts_discarded += self.blobs.discard_parts(id).unwrap_or(0);
+            }
+        }
+        Ok(out)
     }
 
     /// Раннер возвращает задачу в очередь (`release`): окружение не готово, раннер уходит и т. п.
@@ -552,6 +576,25 @@ impl Core {
         })?;
         self.wake();
         Ok(())
+    }
+
+    /// Отмена задачи оператором (`job cancel`, SRV-03). Задача в `receiving` и `queued` отменяется сразу; выданной
+    /// ставится флаг (мягкий, повторный вызов или `force` — жёсткий), который раннер увидит в ответе на прогресс и
+    /// в `hello`; окончательная задача — отказ «задача уже завершена». Возвращает состояние после отмены.
+    pub fn cancel(&self, job_id: i64, force: bool) -> Result<JobState> {
+        let now = self.clock.now_ms();
+        let (state, discard) = self.db.write(|tx| {
+            let before = job_by_id(tx, job_id)?.ok_or_else(|| format!("нет задачи #{job_id}"))?;
+            let d = rules::decide(&before, &Event::Cancel { force }, now, &self.limits)
+                .map_err(|r| r.message)?;
+            apply(tx, &before, &d.job, now)?;
+            Ok::<_, String>((d.job.state, d.discard_parts))
+        })?;
+        if discard {
+            // Нечего удалять или не удалось — на отмену не влияет: остатки уберёт `recover`.
+            let _ = self.blobs.discard_parts(job_id);
+        }
+        Ok(state)
     }
 
     /// Очищает текст сбоя раннера до записи в базу (SEC-04, T-05-19): секреты маскируются, управляющие символы
@@ -668,6 +711,9 @@ impl Core {
             out.receive_failed = fail_stale_receiving(tx, now, &self.limits)?;
             Ok::<Sweep, String>(out)
         })?;
+        for id in &out.cancelled {
+            let _ = self.blobs.discard_parts(*id);
+        }
         if !out.requeued.is_empty() {
             self.wake();
         }
@@ -733,6 +779,8 @@ fn not_found() -> Reject {
 pub struct Recovered {
     pub receive_failed: Vec<i64>,
     pub grace_extended: usize,
+    /// Сколько недозагруженных кусков `*.part` окончательных задач удалено.
+    pub parts_discarded: usize,
 }
 
 /// Итог `claim_report`: выдача (если есть) и задачи, упавшие с `TOO_MANY_GRANTS` по дороге.

@@ -75,24 +75,31 @@ Plans:
   4. Враждебные входы проверены тестами: ник или имя карты с переводом строки, `;`, кавычками и управляющими символами не меняют грамматику `highlights.cfg` и не попадают в cfg, а `drawtext` читает подпись из файла. Обрезанная демка, демка с испорченными битами, zstd-бомба и файл сверх лимита заканчиваются кодами `BAD_DEMO` или `DEMO_TOO_LARGE`; разбор идёт в дочернем процессе с лимитом памяти, и раннер после этого продолжает брать задачи.
   5. Неоднозначный ник даёт `PLAYER_AMBIGUOUS` со списком до 10 очищенных кандидатов, отсутствующий — `PLAYER_NOT_FOUND`, демка без подходящих моментов — `NO_HIGHLIGHTS`; всё это ещё до запуска CS2. `crates/cli/tests/pipeline.rs` и `cargo test --workspace` остаются зелёными.
 
-**Plans**: 8 plans
+**Plans**: 11 plans
 
 Plans:
 **Wave 1**
 - [ ] 06-01-PLAN.md — строгий выбор игрока (`resolve_player`, `job::hero_for`) и новые коды `PLAYER_*`, `NO_HIGHLIGHTS`, `BAD_DEMO`, `DEMO_TOO_LARGE`, `RESULT_INVALID`, `UNSUPPORTED_SOURCE`; строки кодов и `Phase::Precheck` в `wire` (SEC-03, RUN-05)
 - [ ] 06-02-PLAN.md — очистка ников и карты в `Match::build`, cfg без текста из демки, `drawtext` из файлов; `+faststart` и `verify_result` (ffprobe + порядок боксов MP4) (SEC-01, RUN-06)
-- [ ] 06-03-PLAN.md — `read_demo_limited` (потолки файла и распаковки), потолок snappy-команды, мутационный тест парсера, `demo::synth`, `host::limit_self_memory` (SEC-02)
-- [ ] 06-04-PLAN.md — крейт `runner`: клиент протокола, сквозной путь claim → демка → исполнитель → результат → done, outbox `runner_state.json` с докачкой после перезапуска (RUN-01, RUN-02)
+- [ ] 06-03-PLAN.md — `read_demo_limited` (потолки файла и распаковки), потолок snappy-команды, мутационный тест парсера, `demo::synth` (SEC-02)
+- [ ] 06-04-PLAN.md — `host::limit_self_memory`: самоограничение памяти процесса Job Object'ом, запрет дочерних процессов, пик памяти, без аварийного диалога (SEC-02)
+- [ ] 06-05-PLAN.md — крейт `runner`: клиент протокола и сквозной путь claim → демка → исполнитель → результат → done; итоги исполнителя, токен вне журнала (RUN-01)
 
 **Wave 2** *(blocked on Wave 1 completion)*
-- [ ] 06-05-PLAN.md — дочерний разбор `cs2-cli inspect` с самоограничением памяти и `pipeline::inspect::preflight`; типизированный `analyze_with` (SEC-02, SEC-03, RUN-05)
-- [ ] 06-06-PLAN.md — пульс и отмена (`Tee`, `Uplink`), политика итогов (`release` для «окружения», пауза после двух одинаковых сбоев), этап и дубль в `cs2-server job show` (RUN-03, RUN-04, RUN-02)
+- [ ] 06-06-PLAN.md — outbox `runner_state.json`: докачка после перезапуска, `hello` с удерживаемой задачей, чистка outbox при окончательном отказе сервера (RUN-02)
+- [ ] 06-07-PLAN.md — дочерний разбор `cs2-cli inspect` с самоограничением памяти и `pipeline::inspect::preflight`; типизированный `analyze_with` (SEC-02, SEC-03, RUN-05)
 
 **Wave 3** *(blocked on Wave 2 completion)*
-- [ ] 06-07-PLAN.md — `PipelineExecutor` (предпроверка, `run_job` под `catch_unwind`, `verify_result`, уборка после падения) и подкоманда `cs2-cli runner` (RUN-01, RUN-05, RUN-06, SEC-02)
+- [ ] 06-08-PLAN.md — пульс и отмена (`Tee`, `Uplink`): этап и дубль на сервере, эскалация мягкой отмены в жёсткую через 10 с, остановка без закрытия задачи (RUN-03, RUN-02)
 
-**Wave 4** *(blocked on Wave 3 completion; с участием автора)*
-- [ ] 06-08-PLAN.md — первый живой прогон настоящей демки через сервер, раннер и CS2/HLAE и учения (отмена, обрывы, чужой CS2, мусорная демка, неоднозначный ник), калибровка лимитов и дедлайнов
+**Wave 4** *(blocked on Wave 3 completion)*
+- [ ] 06-09-PLAN.md — политика итогов: `release` для «окружения» с засчитанной выдачей (D-02), пауза после двух одинаковых сбоев, `TOO_MANY_GRANTS` сервера; этап, дубль и результат в `cs2-server job show` (RUN-04, RUN-03)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+- [ ] 06-10-PLAN.md — `PipelineExecutor` (предпроверка, `run_job` под `catch_unwind`, `verify_result`, уборка после падения) и подкоманда `cs2-cli runner` (RUN-01, RUN-05, RUN-06, SEC-02)
+
+**Wave 6** *(blocked on Wave 5 completion; с участием автора)*
+- [ ] 06-11-PLAN.md — первый живой прогон настоящей демки через сервер, раннер и CS2/HLAE и учения (отмена, обрывы, чужой CS2, мусорная демка, неоднозначный ник), калибровка лимитов и дедлайнов
 **Notes**: нужен короткий спайк по изоляции разбора: дочерний `cs2-cli` в Job Object с лимитом памяти на Windows. Раннер не должен быть службой Windows: CS2 нужна интерактивная сессия. Пока SEC-01, SEC-02 и SEC-03 не закрыты, сервер не принимает демки и ники не от автора; поэтому фаза 7 зависит от этой фазы. Значения дедлайнов записи из v1.0 подстраиваются по замерам живого прогона.
 
 ### Phase 7: Telegram-бот и доставка
@@ -150,7 +157,7 @@ Phases execute in numeric order: 5 → 6 → 7 → 8 → 9 (фаза 7 може�
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 5. Ядро сервера и протокол | 5/5 | In Progress | - |
-| 6. Раннер, защита входа и первый живой прогон | 0/8 | Planned | - |
+| 6. Раннер, защита входа и первый живой прогон | 0/11 | Planned | - |
 | 7. Telegram-бот и доставка | 0/TBD | Not started | - |
 | 8. Режим раннера в приложении | 0/TBD | Not started | - |
 | 9. Уборка, развёртывание и учения | 0/TBD | Not started | - |

@@ -5,9 +5,9 @@
 //! а дочитывание pipe после выхода ограничено 2 с: потомок, унаследовавший pipe, не удерживает вызов.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 
 use crate::{CmdOutput, CmdSpec, HostError};
@@ -18,6 +18,11 @@ const STEP: Duration = Duration::from_millis(100);
 const DRAIN_LIMIT: Duration = Duration::from_secs(2);
 /// Сколько последних строк stderr сохраняется для причины сбоя.
 const STDERR_TAIL: usize = 20;
+/// Потолок длины одной строки pipe, байт: остаток длиннее выбрасывается. Дочерний процесс (например, разбор
+/// недоверенной демки) не должен раздуть память родителя строкой без перевода строки.
+const LINE_MAX: usize = 1 << 20;
+/// Сколько непрочитанных строк ждёт в канале: дальше читающий поток ждёт, а не копит память.
+const QUEUE_MAX: usize = 4096;
 /// Флаг создания процесса `CREATE_NO_WINDOW`: утилита не открывает окно консоли.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -28,14 +33,39 @@ enum Msg {
     Err(String),
 }
 
+/// Читает одну строку не длиннее `LINE_MAX` байт в `buf` (он очищается); хвост длиннее потолка до перевода
+/// строки отбрасывается. `Ok(0)` - конец потока.
+fn read_line_capped(r: &mut impl BufRead, buf: &mut Vec<u8>) -> io::Result<usize> {
+    buf.clear();
+    let n = r.by_ref().take(LINE_MAX as u64).read_until(b'\n', buf)?;
+    if n == LINE_MAX && buf.last() != Some(&b'\n') {
+        loop {
+            let chunk = r.fill_buf()?;
+            if chunk.is_empty() {
+                break;
+            }
+            match chunk.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    r.consume(i + 1);
+                    break;
+                }
+                None => {
+                    let len = chunk.len();
+                    r.consume(len);
+                }
+            }
+        }
+    }
+    Ok(n)
+}
+
 /// Читает pipe построчно до EOF; байты не обязаны быть UTF-8, перевод строки отрезается.
-fn spawn_reader(pipe: impl Read + Send + 'static, tx: Sender<Msg>, wrap: fn(String) -> Msg) {
+fn spawn_reader(pipe: impl Read + Send + 'static, tx: SyncSender<Msg>, wrap: fn(String) -> Msg) {
     std::thread::spawn(move || {
         let mut r = BufReader::new(pipe);
         let mut buf = Vec::new();
-        while r.read_until(b'\n', &mut buf).is_ok_and(|n| n > 0) {
+        while read_line_capped(&mut r, &mut buf).is_ok_and(|n| n > 0) {
             let line = String::from_utf8_lossy(&buf).trim_end().to_owned();
-            buf.clear();
             if !line.is_empty() && tx.send(wrap(line)).is_err() {
                 break;
             }
@@ -80,7 +110,7 @@ pub fn run_bounded(
         .spawn()
         .map_err(|e| HostError::Spawn(format!("{}: {e}", cmd.program.display())))?;
 
-    let (tx, rx) = mpsc::channel::<Msg>();
+    let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE_MAX);
     if let Some(out) = child.stdout.take() {
         spawn_reader(out, tx.clone(), Msg::Out);
     }
@@ -230,6 +260,20 @@ mod tests {
         let out = run_bounded(&cmd, &|| false, &mut |l| lines.push(l.to_owned())).unwrap();
         assert_eq!(out.code, Some(0));
         assert_eq!(lines, vec!["one".to_owned(), "two".to_owned()]);
+    }
+
+    /// Строка длиннее потолка режется, хвост выбрасывается, следующая строка читается нормально (WR-08).
+    #[test]
+    fn overlong_line_is_capped_and_the_next_line_survives() {
+        let mut data = vec![b'x'; LINE_MAX * 2 + 5];
+        data.extend_from_slice(b"\nnext\n");
+        let mut r = BufReader::new(io::Cursor::new(data));
+        let mut buf = Vec::new();
+        assert_eq!(read_line_capped(&mut r, &mut buf).unwrap(), LINE_MAX);
+        assert_eq!(buf.len(), LINE_MAX);
+        assert_eq!(read_line_capped(&mut r, &mut buf).unwrap(), 5);
+        assert_eq!(buf, b"next\n");
+        assert_eq!(read_line_capped(&mut r, &mut buf).unwrap(), 0);
     }
 
     /// Токен раннера не доходит до дочернего процесса (WR-07).

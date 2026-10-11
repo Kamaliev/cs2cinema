@@ -5,13 +5,16 @@
 //! в настройках лежит токен бота (SEC-04).
 
 use crate::Result;
+use crate::bot::{BotSettings, SendAs};
 use crate::core::Limits;
 use crate::secret::{Redactor, Secret};
+use crate::tg::http::{HttpTimeouts, check_base_url};
 use serde::Deserialize;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 /// Файл настроек больше этого размера не читается.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -30,6 +33,20 @@ pub struct Config {
     pub max_result_mib: u64,
     /// Токен Telegram-бота (понадобится в фазе 7); `Debug` у `Secret` печатает `***`.
     pub telegram_bot_token: Option<Secret>,
+    /// Адрес локального `telegram-bot-api` (`http://127.0.0.1:порт`); нет — бот не запускается.
+    pub bot_api_url: Option<String>,
+    /// Корень файлов `telegram-bot-api`, как его возвращает `getFile` (обязателен при включённом боте).
+    pub bot_api_files_root: Option<PathBuf>,
+    /// Тот же корень на стороне сервера; нет — равен `bot_api_files_root`.
+    pub bot_api_files_root_local: Option<PathBuf>,
+    /// Папка результатов сервера в глазах `telegram-bot-api`; нет — `data_dir/blobs/results`.
+    pub bot_api_results_prefix: Option<PathBuf>,
+    pub bot_send_as: SendAs,
+    pub bot_user_max_active: u32,
+    pub bot_admin_max_active: u32,
+    pub bot_queue_max_active: u32,
+    pub bot_status_edit_secs: u64,
+    pub bot_transfer_timeout_mins: u64,
 }
 
 impl Default for Config {
@@ -48,11 +65,51 @@ impl Default for Config {
             max_demo_mib: 2000,
             max_result_mib: 2000,
             telegram_bot_token: None,
+            bot_api_url: None,
+            bot_api_files_root: None,
+            bot_api_files_root_local: None,
+            bot_api_results_prefix: None,
+            // Решение спайка 07-11: по умолчанию видео, документом — если сжатие мешает.
+            bot_send_as: SendAs::Video,
+            // D-03: лимиты активных задач.
+            bot_user_max_active: 2,
+            bot_admin_max_active: 5,
+            bot_queue_max_active: 10,
+            bot_status_edit_secs: 10,
+            bot_transfer_timeout_mins: 60,
         }
     }
 }
 
 impl Config {
+    /// Настройки бота из ключей (или умолчаний). Корень файлов обязателен только при включённом боте,
+    /// это проверяют `validate` и `serve_with_bot`; здесь пустой путь.
+    pub fn bot_settings(&self) -> BotSettings {
+        let root = self.bot_api_files_root.clone().unwrap_or_default();
+        let mut s = BotSettings::new(&self.data_dir, root.clone());
+        s.files_root_local = self
+            .bot_api_files_root_local
+            .clone()
+            .unwrap_or_else(|| root.clone());
+        if let Some(p) = &self.bot_api_results_prefix {
+            s.results_prefix = p.clone();
+        }
+        s.send_as = self.bot_send_as;
+        s.status_edit_ms = self.bot_status_edit_secs as i64 * 1000;
+        s.user_max_active = self.bot_user_max_active as i64;
+        s.admin_max_active = self.bot_admin_max_active as i64;
+        s.queue_max_active = self.bot_queue_max_active as i64;
+        s
+    }
+
+    /// Сроки вызовов Bot API: передача файла — `bot_transfer_timeout_mins`, остальное — умолчания клиента.
+    pub fn http_timeouts(&self) -> HttpTimeouts {
+        HttpTimeouts {
+            transfer: Duration::from_secs(self.bot_transfer_timeout_mins * 60),
+            ..HttpTimeouts::default()
+        }
+    }
+
     pub fn limits(&self) -> Limits {
         const MIB: u64 = 1024 * 1024;
         Limits {
@@ -103,6 +160,20 @@ struct FileConfig {
     max_demo_mib: Option<u64>,
     max_result_mib: Option<u64>,
     telegram_bot_token: Option<String>,
+    bot_api_url: Option<String>,
+    bot_api_files_root: Option<PathBuf>,
+    bot_api_files_root_local: Option<PathBuf>,
+    bot_api_results_prefix: Option<PathBuf>,
+    bot_send_as: Option<String>,
+    bot_user_max_active: Option<u32>,
+    bot_admin_max_active: Option<u32>,
+    bot_queue_max_active: Option<u32>,
+    bot_status_edit_secs: Option<u64>,
+    bot_transfer_timeout_mins: Option<u64>,
+}
+
+fn parse_send_as(v: &str) -> Result<SendAs> {
+    SendAs::parse(v.trim()).ok_or_else(|| "bot_send_as: нужно video или document".to_owned())
 }
 
 fn read_file(path: &std::path::Path) -> Result<FileConfig> {
@@ -197,6 +268,42 @@ pub fn load(flags: &Flags, env: &dyn Fn(&str) -> Option<String>) -> Result<Loade
             c.max_result_mib = v;
         }
         file_token = f.telegram_bot_token.filter(|v| !v.is_empty());
+        if let Some(v) = f.bot_api_url.filter(|v| !v.is_empty()) {
+            c.bot_api_url = Some(v);
+        }
+        if let Some(v) = f.bot_api_files_root.filter(|v| !v.as_os_str().is_empty()) {
+            c.bot_api_files_root = Some(v);
+        }
+        if let Some(v) = f
+            .bot_api_files_root_local
+            .filter(|v| !v.as_os_str().is_empty())
+        {
+            c.bot_api_files_root_local = Some(v);
+        }
+        if let Some(v) = f
+            .bot_api_results_prefix
+            .filter(|v| !v.as_os_str().is_empty())
+        {
+            c.bot_api_results_prefix = Some(v);
+        }
+        if let Some(v) = f.bot_send_as {
+            c.bot_send_as = parse_send_as(&v)?;
+        }
+        if let Some(v) = f.bot_user_max_active {
+            c.bot_user_max_active = v;
+        }
+        if let Some(v) = f.bot_admin_max_active {
+            c.bot_admin_max_active = v;
+        }
+        if let Some(v) = f.bot_queue_max_active {
+            c.bot_queue_max_active = v;
+        }
+        if let Some(v) = f.bot_status_edit_secs {
+            c.bot_status_edit_secs = v;
+        }
+        if let Some(v) = f.bot_transfer_timeout_mins {
+            c.bot_transfer_timeout_mins = v;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -242,6 +349,38 @@ pub fn load(flags: &Flags, env: &dyn Fn(&str) -> Option<String>) -> Result<Loade
     if let Some(v) = env_num(env, "CS2_SERVER_MAX_RESULT_MIB")? {
         c.max_result_mib = v;
     }
+    if let Some(v) = env("CS2_SERVER_BOT_API_URL").filter(|v| !v.is_empty()) {
+        c.bot_api_url = Some(v);
+    }
+    if let Some(v) = env("CS2_SERVER_BOT_API_FILES_ROOT").filter(|v| !v.is_empty()) {
+        c.bot_api_files_root = Some(PathBuf::from(v));
+    }
+    if let Some(v) = env("CS2_SERVER_BOT_API_FILES_ROOT_LOCAL").filter(|v| !v.is_empty()) {
+        c.bot_api_files_root_local = Some(PathBuf::from(v));
+    }
+    if let Some(v) = env("CS2_SERVER_BOT_API_RESULTS_PREFIX").filter(|v| !v.is_empty()) {
+        c.bot_api_results_prefix = Some(PathBuf::from(v));
+    }
+    if let Some(v) = env("CS2_SERVER_BOT_SEND_AS").filter(|v| !v.is_empty()) {
+        c.bot_send_as = parse_send_as(&v).map_err(|_| {
+            "переменная CS2_SERVER_BOT_SEND_AS: нужно video или document".to_owned()
+        })?;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_BOT_USER_MAX_ACTIVE")? {
+        c.bot_user_max_active = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_BOT_ADMIN_MAX_ACTIVE")? {
+        c.bot_admin_max_active = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_BOT_QUEUE_MAX_ACTIVE")? {
+        c.bot_queue_max_active = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_BOT_STATUS_EDIT_SECS")? {
+        c.bot_status_edit_secs = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_BOT_TRANSFER_TIMEOUT_MINS")? {
+        c.bot_transfer_timeout_mins = v;
+    }
     let env_token = env("CS2_SERVER_TELEGRAM_BOT_TOKEN")
         .filter(|v| !v.is_empty())
         .or_else(|| env("TELEGRAM_BOT_TOKEN").filter(|v| !v.is_empty()));
@@ -266,6 +405,9 @@ pub fn load(flags: &Flags, env: &dyn Fn(&str) -> Option<String>) -> Result<Loade
                 c.bind
             ));
         }
+    }
+    if c.telegram_bot_token.is_some() && c.bot_api_url.is_none() {
+        warnings.push("бот не запущен: не задан bot_api_url".to_owned());
     }
     Ok(Loaded {
         config: c,
@@ -300,7 +442,57 @@ pub fn validate(c: &Config) -> Result<()> {
     if !(1..=4096).contains(&c.max_result_mib) {
         return Err("max_result_mib: нужно число от 1 до 4096".to_owned());
     }
+    if let Some(url) = &c.bot_api_url {
+        check_base_url(url).map_err(|why| {
+            format!(
+                "bot_api_url: адрес telegram-bot-api должен быть локальным http://127.0.0.1:ПОРТ ({why})"
+            )
+        })?;
+        if c.telegram_bot_token.is_none() {
+            return Err(
+                "bot_api_url задан, а токена бота нет: задайте TELEGRAM_BOT_TOKEN или telegram_bot_token"
+                    .to_owned(),
+            );
+        }
+        match &c.bot_api_files_root {
+            None => {
+                return Err("bot_api_files_root: при включённом боте нужен абсолютный путь к файлам telegram-bot-api".to_owned());
+            }
+            Some(p) if !is_abs(p) => {
+                return Err("bot_api_files_root: нужен абсолютный путь".to_owned());
+            }
+            Some(_) => {}
+        }
+        for (name, p) in [
+            ("bot_api_files_root_local", &c.bot_api_files_root_local),
+            ("bot_api_results_prefix", &c.bot_api_results_prefix),
+        ] {
+            if p.as_ref().is_some_and(|p| !is_abs(p)) {
+                return Err(format!("{name}: нужен абсолютный путь"));
+            }
+        }
+    }
+    for (name, v) in [
+        ("bot_user_max_active", c.bot_user_max_active),
+        ("bot_admin_max_active", c.bot_admin_max_active),
+        ("bot_queue_max_active", c.bot_queue_max_active),
+    ] {
+        if !(1..=1000).contains(&v) {
+            return Err(format!("{name}: нужно число от 1 до 1000"));
+        }
+    }
+    if !(3..=600).contains(&c.bot_status_edit_secs) {
+        return Err("bot_status_edit_secs: нужно число от 3 до 600".to_owned());
+    }
+    if !(1..=240).contains(&c.bot_transfer_timeout_mins) {
+        return Err("bot_transfer_timeout_mins: нужно число от 1 до 240".to_owned());
+    }
     Ok(())
+}
+
+/// Абсолютный путь: на Windows принимается и вид «/var/lib/…» (корень bot-api может жить в другой системе).
+fn is_abs(p: &std::path::Path) -> bool {
+    p.is_absolute() || p.has_root()
 }
 
 #[cfg(test)]

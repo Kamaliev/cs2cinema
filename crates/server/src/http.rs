@@ -203,7 +203,7 @@ fn too_large(rq: Request) {
     let _ = rq.respond(resp);
 }
 
-fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = p.downcast_ref::<&str>() {
         (*s).to_owned()
     } else if let Some(s) = p.downcast_ref::<String>() {

@@ -32,12 +32,13 @@ pub fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Запущенный сервер: адрес, ядро и журнал; `stop` останавливает HTTP.
+/// Запущенный сервер: адрес, ядро и журнал; `stop` останавливает бота и HTTP.
 pub struct Running {
     http: http::HttpServer,
     core: core::Core,
     log: log::Log,
     sweeper: Option<std::thread::JoinHandle<()>>,
+    bot: Option<bot::BotHandle>,
 }
 
 impl Running {
@@ -53,8 +54,17 @@ impl Running {
         &self.log
     }
 
-    /// Ставит флаг остановки, будит long-poll и ждёт обработчики не дольше трёх секунд.
+    /// Бот, если он запущен (`serve_with_bot` с клиентом Telegram).
+    pub fn bot(&self) -> Option<&bot::Bot> {
+        self.bot.as_ref().map(bot::BotHandle::bot)
+    }
+
+    /// Останавливает бота (ждёт потоки не дольше трёх секунд), ставит флаг остановки, будит long-poll
+    /// и ждёт обработчики не дольше трёх секунд.
     pub fn stop(mut self) {
+        if let Some(b) = self.bot.take() {
+            b.stop();
+        }
         self.http
             .shutdown_flag()
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -67,10 +77,37 @@ impl Running {
 }
 
 /// Открывает ядро в папке данных, занимает адрес из настроек и запускает HTTP.
+/// Бот запускается, если заданы `bot_api_url` и токен (клиент — `HttpTg` на локальный `telegram-bot-api`).
 pub fn serve(
     cfg: &config::Config,
     clock: std::sync::Arc<dyn clock::Clock>,
     sink: std::sync::Arc<dyn log::LogSink>,
+) -> Result<Running> {
+    let tg: Option<std::sync::Arc<dyn tg::Tg>> = match (&cfg.bot_api_url, &cfg.telegram_bot_token) {
+        (Some(url), Some(token)) => Some(std::sync::Arc::new(tg::http::HttpTg::new(
+            url,
+            token,
+            cfg.redactor(),
+            cfg.http_timeouts(),
+        )?)),
+        (Some(_), None) => {
+            return Err(
+                "бот не запустился: задан bot_api_url, а токена бота нет (TELEGRAM_BOT_TOKEN)"
+                    .to_owned(),
+            );
+        }
+        _ => None,
+    };
+    serve_with_bot(cfg, clock, sink, tg)
+}
+
+/// То же, что `serve`, но клиент Telegram внедряется: с `Some` бот запускается (в тестах — `FakeTelegram`),
+/// с `None` сервер работает без бота.
+pub fn serve_with_bot(
+    cfg: &config::Config,
+    clock: std::sync::Arc<dyn clock::Clock>,
+    sink: std::sync::Arc<dyn log::LogSink>,
+    tg: Option<std::sync::Arc<dyn tg::Tg>>,
 ) -> Result<Running> {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -81,7 +118,7 @@ pub fn serve(
         clock,
         redactor: redactor.clone(),
     })?;
-    let log = log::Log::new(sink, redactor);
+    let log = log::Log::new(sink, redactor.clone());
     // Восстановление до открытия порта: раннеры ещё не могли вернуться и увидеть полузавершённое состояние.
     let rec = core.recover()?;
     log.info(&format!(
@@ -89,6 +126,22 @@ pub fn serve(
         rec.receive_failed.len(),
         rec.grace_extended
     ));
+    // Бот проверяется до порта: недоступный bot-api не должен оставлять сервер наполовину запущенным.
+    let bot = match tg {
+        Some(tg) => {
+            if cfg.bot_api_files_root.is_none() {
+                return Err("бот не запустился: не задан bot_api_files_root".to_owned());
+            }
+            let bot = bot::Bot::new(core.clone(), tg, log.clone(), cfg.bot_settings());
+            let me = bot.startup().map_err(|e| {
+                redactor.redact(&format!(
+                    "бот не запустился: локальный telegram-bot-api не отвечает (getMe) — проверьте bot_api_url и что telegram-bot-api запущен с --local ({e})"
+                ))
+            })?;
+            Some((bot, me))
+        }
+        None => None,
+    };
     let listener = std::net::TcpListener::bind(&cfg.bind)
         .map_err(|e| format!("не удалось занять адрес {}: {e}", cfg.bind))?;
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -106,12 +159,18 @@ pub fn serve(
         http.addr(),
         cfg.data_dir.display()
     ));
+    let bot = bot.map(|(bot, me)| {
+        let name = me.username.unwrap_or_else(|| "без имени".to_owned());
+        log.info(&format!("бот @{name} запущен через локальный Bot API"));
+        bot::spawn(bot, shutdown_flag.clone())
+    });
     let sweeper = spawn_sweeper(core.clone(), log.clone(), shutdown_flag);
     Ok(Running {
         http,
         core,
         log,
         sweeper: Some(sweeper),
+        bot,
     })
 }
 

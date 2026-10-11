@@ -43,6 +43,12 @@ pub struct TestOptions {
     pub clock: Option<ManualClock>,
     /// Токен бота Telegram в настройках стенда (для проверок SEC-04).
     pub bot_token: Option<String>,
+    /// Подставной Telegram: с ним стенд запускает бота через `serve_with_bot`.
+    pub tg: Option<FakeTelegram>,
+    /// Адрес поддельного или настоящего bot-api: с ним стенд запускает бота через `serve`.
+    pub bot_api_url: Option<String>,
+    /// Корень файлов bot-api для `bot_api_url` (по умолчанию — папка внутри стенда).
+    pub bot_api_files_root: Option<PathBuf>,
 }
 
 impl Default for TestOptions {
@@ -52,7 +58,24 @@ impl Default for TestOptions {
             longpoll_secs: 2,
             clock: None,
             bot_token: None,
+            tg: None,
+            bot_api_url: None,
+            bot_api_files_root: None,
         }
+    }
+}
+
+/// Ждёт, пока `cond` станет истинным, не дольше `secs` секунд; `true` — дождались.
+pub fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+    let until = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if cond() {
+            return true;
+        }
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -81,6 +104,7 @@ pub struct TestServer {
     pub base: String,
     pub sink: Arc<MemorySink>,
     clock: Option<ManualClock>,
+    tg: Option<FakeTelegram>,
 }
 
 impl TestServer {
@@ -89,30 +113,58 @@ impl TestServer {
     }
 
     pub fn start_with(opts: TestOptions) -> Self {
+        Self::try_start_with(opts).expect("сервер должен запуститься")
+    }
+
+    /// То же, но ошибку запуска отдаёт тесту (вместе с папкой стенда: порт и данные остаются проверяемыми).
+    pub fn try_start_with(opts: TestOptions) -> Result<Self, String> {
         let dir = TestDir::new("proto");
-        let cfg = Config {
+        let mut cfg = Config {
             bind: "127.0.0.1:0".to_owned(),
             data_dir: dir.path.join("data"),
             threads: opts.threads,
             longpoll_secs: opts.longpoll_secs,
             telegram_bot_token: opts.bot_token.map(Secret::new),
+            bot_api_url: opts.bot_api_url,
+            bot_api_files_root: opts.bot_api_files_root,
             ..Default::default()
         };
+        if let Some(tg) = &opts.tg {
+            cfg.bot_api_files_root = Some(tg.files_dir());
+        } else if cfg.bot_api_url.is_some() && cfg.bot_api_files_root.is_none() {
+            let root = dir.path.join("bot-api-files");
+            std::fs::create_dir_all(&root).unwrap();
+            cfg.bot_api_files_root = Some(root);
+        }
         let manual = opts.clock.clone();
         let clock: Arc<dyn Clock> = match opts.clock {
             Some(c) => Arc::new(c),
             None => Arc::new(SystemClock),
         };
         let sink = Arc::new(MemorySink::default());
-        let running = server::serve(&cfg, clock, sink.clone()).expect("сервер должен запуститься");
+        let running = match &opts.tg {
+            Some(tg) => server::serve_with_bot(
+                &cfg,
+                clock,
+                sink.clone(),
+                Some(Arc::new(tg.clone()) as Arc<dyn server::tg::Tg>),
+            )?,
+            None => server::serve(&cfg, clock, sink.clone())?,
+        };
         let base = format!("http://{}", running.addr());
-        Self {
+        Ok(Self {
             dir,
             running: Some(running),
             base,
             sink,
             clock: manual,
-        }
+            tg: opts.tg,
+        })
+    }
+
+    /// Подставной Telegram стенда; паника, если стенд запущен без него.
+    pub fn tg(&self) -> FakeTelegram {
+        self.tg.clone().expect("стенд запущен без FakeTelegram")
     }
 
     /// Ручные часы стенда; паника, если стенд запущен на настоящих.

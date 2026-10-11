@@ -16,16 +16,46 @@ pub mod store;
 use crate::Result;
 use crate::core::Core;
 use crate::log::Log;
-use crate::tg::{Me, Tg};
+use crate::tg::{Me, Tg, TgError};
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Чем отправлять готовый ролик.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendAs {
     Video,
     Document,
+}
+
+impl SendAs {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SendAs::Video => "video",
+            SendAs::Document => "document",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<SendAs> {
+        match s {
+            "video" => Some(SendAs::Video),
+            "document" => Some(SendAs::Document),
+            _ => None,
+        }
+    }
+}
+
+/// Итог одного опроса `getUpdates`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollOutcome {
+    /// Разобрано обновлений.
+    Updates(usize),
+    /// `409`: обновления забирает ещё кто-то (второй экземпляр бота или вебхук).
+    Conflict,
+    Failed(String),
 }
 
 /// Настройки бота с умолчаниями фазы.
@@ -189,16 +219,43 @@ impl Bot {
 
     /// Один опрос `getUpdates`; смещение и принятое сообщение пишутся одной транзакцией.
     pub fn poll_once(&self, timeout_secs: u64) -> Result<usize> {
-        let offset = store::offset(self.core.db())?;
-        let updates = self
-            .tg
-            .get_updates(offset, timeout_secs)
-            .map_err(|e| e.to_string())?;
+        match self.poll_tick(timeout_secs) {
+            PollOutcome::Updates(n) => Ok(n),
+            PollOutcome::Conflict => Err(
+                "Telegram ответил ошибкой 409: обновления забирает другой экземпляр бота"
+                    .to_owned(),
+            ),
+            PollOutcome::Failed(e) => Err(e),
+        }
+    }
+
+    /// Тот же опрос, но с различением `409` (второй экземпляр бота) от прочих сбоев.
+    pub fn poll_tick(&self, timeout_secs: u64) -> PollOutcome {
+        self.poll_inner(timeout_secs, None)
+    }
+
+    /// Опрос потока: если за время ожидания пришла остановка, обновления не разбираются и смещение не
+    /// двигается — Telegram отдаст их снова при следующем запуске.
+    fn poll_inner(&self, timeout_secs: u64, stop: Option<&AtomicBool>) -> PollOutcome {
+        let offset = match store::offset(self.core.db()) {
+            Ok(o) => o,
+            Err(e) => return PollOutcome::Failed(e),
+        };
+        let updates = match self.tg.get_updates(offset, timeout_secs) {
+            Ok(u) => u,
+            Err(TgError::Api { code: 409, .. }) => return PollOutcome::Conflict,
+            Err(e) => return PollOutcome::Failed(e.to_string()),
+        };
+        if stop.is_some_and(|s| s.load(Ordering::SeqCst)) {
+            return PollOutcome::Updates(0);
+        }
         let n = updates.len();
         for u in updates {
-            dispatch::handle_update(self, u)?;
+            if let Err(e) = dispatch::handle_update(self, u) {
+                return PollOutcome::Failed(e);
+            }
         }
-        Ok(n)
+        PollOutcome::Updates(n)
     }
 
     /// Принимает одно ожидающее входящее: `getFile`, `Core::submit`. `false` — ждать нечего.
@@ -229,5 +286,239 @@ impl Bot {
             r.delivered += 1;
         }
         Ok(r)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Потоки бота (план 07-10)
+// ---------------------------------------------------------------------------------------------------------
+
+/// Сколько `BotHandle::stop` ждёт завершения потоков: висящий `getFile` или `sendVideo` не держит процесс.
+const STOP_GRACE: Duration = Duration::from_secs(3);
+/// Пауза потока приёма при пустой очереди.
+const INGEST_IDLE: Duration = Duration::from_millis(500);
+/// Период тика уведомлений.
+const NOTIFY_EVERY: Duration = Duration::from_secs(2);
+/// Пауза потока доставки при пустой очереди.
+const DELIVER_IDLE: Duration = Duration::from_secs(1);
+/// Пауза после сбоя шага.
+const ERROR_PAUSE: Duration = Duration::from_secs(2);
+/// Пауза после `409`: второй экземпляр бота не отпустит обновления быстро.
+const CONFLICT_PAUSE: Duration = Duration::from_secs(60);
+/// Шаг сна с проверкой флага остановки.
+const SLEEP_STEP: Duration = Duration::from_millis(200);
+
+/// Что поток делает после шага.
+enum Pace {
+    /// Сразу следующий шаг.
+    Again,
+    Pause(Duration),
+}
+
+/// Запущенные потоки бота: `bot-poll`, `bot-ingest`, `bot-notify`, `bot-deliver`.
+pub struct BotHandle {
+    bot: Bot,
+    stop: Arc<AtomicBool>,
+    alive: Arc<AtomicUsize>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl BotHandle {
+    pub fn bot(&self) -> &Bot {
+        &self.bot
+    }
+
+    /// Ставит общий флаг остановки и ждёт потоки не дольше трёх секунд. Поток, застрявший в вызове Telegram,
+    /// не `join`-ится: он завершится сам, когда вызов вернётся, а процесс из-за него не зависает.
+    pub fn stop(self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let until = Instant::now() + STOP_GRACE;
+        while self.alive.load(Ordering::SeqCst) > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for t in self.threads {
+            if t.is_finished() {
+                let _ = t.join();
+            }
+        }
+    }
+}
+
+/// Уменьшает счётчик живых потоков при выходе, в том числе при панике.
+struct AliveGuard(Arc<AtomicUsize>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Спит `d` шагами по 200 мс; `false` — пришла остановка.
+fn sleep_checked(d: Duration, stop: &AtomicBool) -> bool {
+    let until = Instant::now() + d;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= until {
+            return true;
+        }
+        std::thread::sleep(SLEEP_STEP.min(until - now));
+    }
+}
+
+/// Поток, который крутит `step` до остановки; паника шага пишется в журнал, поток продолжает работу.
+fn spawn_loop(
+    name: &str,
+    alive: &Arc<AtomicUsize>,
+    stop: &Arc<AtomicBool>,
+    log: &Log,
+    mut step: impl FnMut() -> Pace + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let (stop, log, label) = (stop.clone(), log.clone(), name.to_owned());
+    alive.fetch_add(1, Ordering::SeqCst);
+    let guard = AliveGuard(alive.clone());
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let _guard = guard;
+            while !stop.load(Ordering::SeqCst) {
+                let pace = match std::panic::catch_unwind(AssertUnwindSafe(&mut step)) {
+                    Ok(p) => p,
+                    Err(p) => {
+                        let text = crate::http::panic_text(&*p);
+                        log.warn(&format!("бот ({label}): шаг упал: {text}"));
+                        Pace::Pause(ERROR_PAUSE)
+                    }
+                };
+                if let Pace::Pause(d) = pace {
+                    if !sleep_checked(d, &stop) {
+                        return;
+                    }
+                }
+            }
+        })
+}
+
+/// Не засоряет журнал одинаковыми сбоями: пишет первый и каждый тридцатый повтор.
+struct Throttle {
+    last: Option<String>,
+    repeats: u32,
+}
+
+impl Throttle {
+    fn new() -> Self {
+        Self {
+            last: None,
+            repeats: 0,
+        }
+    }
+
+    fn warn(&mut self, log: &Log, what: &str, err: &str) {
+        if self.last.as_deref() == Some(err) {
+            self.repeats += 1;
+            if self.repeats % 30 != 0 {
+                return;
+            }
+        } else {
+            self.last = Some(err.to_owned());
+            self.repeats = 0;
+        }
+        log.warn(&format!("бот: {what}: {err}"));
+    }
+
+    fn ok(&mut self) {
+        self.last = None;
+        self.repeats = 0;
+    }
+}
+
+/// Запускает потоки бота. `stop` — общий с HTTP флаг остановки. Поток, который не удалось запустить,
+/// пишется в журнал; остальные работают.
+pub fn spawn(bot: Bot, stop: Arc<AtomicBool>) -> BotHandle {
+    let alive = Arc::new(AtomicUsize::new(0));
+    let log = bot.log().clone();
+    let mut threads = Vec::new();
+    let mut push = |r: std::io::Result<std::thread::JoinHandle<()>>| match r {
+        Ok(h) => threads.push(h),
+        Err(e) => log.warn(&format!("бот: не удалось запустить поток: {e}")),
+    };
+
+    let poll_timeout = bot.settings().poll_timeout_secs;
+    push(spawn_loop("bot-poll", &alive, &stop, &log, {
+        let (bot, stop, log) = (bot.clone(), stop.clone(), log.clone());
+        let (mut throttle, mut conflict_warned) = (Throttle::new(), false);
+        move || match bot.poll_inner(poll_timeout, Some(stop.as_ref())) {
+            PollOutcome::Updates(_) => {
+                throttle.ok();
+                conflict_warned = false;
+                Pace::Again
+            }
+            PollOutcome::Conflict => {
+                if !conflict_warned {
+                    conflict_warned = true;
+                    log.warn(
+                        "бот: второй экземпляр бота забирает обновления (409) — опрос приостановлен на минуту",
+                    );
+                }
+                Pace::Pause(CONFLICT_PAUSE)
+            }
+            PollOutcome::Failed(e) => {
+                throttle.warn(&log, "опрос Telegram не удался", &e);
+                Pace::Pause(ERROR_PAUSE)
+            }
+        }
+    }));
+
+    push(spawn_loop("bot-ingest", &alive, &stop, &log, {
+        let (bot, log) = (bot.clone(), log.clone());
+        let mut throttle = Throttle::new();
+        move || match bot.ingest_once() {
+            Ok(true) => {
+                throttle.ok();
+                Pace::Again
+            }
+            Ok(false) => Pace::Pause(INGEST_IDLE),
+            Err(e) => {
+                throttle.warn(&log, "приём демки не удался", &e);
+                Pace::Pause(ERROR_PAUSE)
+            }
+        }
+    }));
+
+    push(spawn_loop("bot-notify", &alive, &stop, &log, {
+        let (bot, log) = (bot.clone(), log.clone());
+        let mut throttle = Throttle::new();
+        move || {
+            match bot.notify_once() {
+                Ok(_) => throttle.ok(),
+                Err(e) => throttle.warn(&log, "тик уведомлений не удался", &e),
+            }
+            Pace::Pause(NOTIFY_EVERY)
+        }
+    }));
+
+    push(spawn_loop("bot-deliver", &alive, &stop, &log, {
+        let (bot, log) = (bot.clone(), log.clone());
+        let mut throttle = Throttle::new();
+        move || match bot.deliver_once() {
+            Ok(true) => {
+                throttle.ok();
+                Pace::Again
+            }
+            Ok(false) => Pace::Pause(DELIVER_IDLE),
+            Err(e) => {
+                throttle.warn(&log, "доставка ролика не удалась", &e);
+                Pace::Pause(ERROR_PAUSE)
+            }
+        }
+    }));
+
+    BotHandle {
+        bot,
+        stop,
+        alive,
+        threads,
     }
 }

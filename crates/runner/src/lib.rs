@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use pipeline::record::failure::classify;
 use pipeline::record::log::one_line;
+use pipeline::{FailCode, RunError};
 use sha2::{Digest, Sha256};
 use wire::{Assignment, CHUNK_SIZE, Failure, FinishRequest, HelloRequest, JobState, Outcome};
 
@@ -128,6 +130,40 @@ impl Write for HashingFile<'_> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush()
     }
+}
+
+/// Итог для сервера по ошибке исполнителя: отмена — `Cancelled`, сбой записи — `Failed` со своим кодом, классом и
+/// состоянием автомата, ошибка без описания — `JOB_ERROR`. Весь текст проходит `one_line`.
+fn outcome_of(e: &RunError, elapsed_ms: u64) -> Outcome {
+    let cancelled = e.message == pipeline::CANCELLED
+        || e.fail
+            .as_ref()
+            .is_some_and(|f| f.code == FailCode::Cancelled);
+    if cancelled {
+        return Outcome::Cancelled;
+    }
+    Outcome::Failed(match &e.fail {
+        Some(f) => Failure {
+            code: f.code.as_str().to_owned(),
+            class: classify(f.code, f.state).title().to_owned(),
+            state: f.state.code().to_owned(),
+            hint: one_line(&f.hint),
+            message: one_line(&f.message),
+            tail: f
+                .console_tail
+                .iter()
+                .map(|line| one_line(line))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            elapsed_ms,
+        },
+        None => Failure {
+            code: JOB_ERROR.to_owned(),
+            message: one_line(&e.message),
+            elapsed_ms,
+            ..Default::default()
+        },
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -290,13 +326,8 @@ impl Runner {
             Err(e) => {
                 self.log
                     .line(&format!("задача #{id} не удалась: {}", e.message));
-                let failure = Failure {
-                    code: JOB_ERROR.to_owned(),
-                    message: one_line(&e.message),
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                    ..Default::default()
-                };
-                self.finish(id, epoch, Outcome::Failed(failure))
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                self.finish(id, epoch, outcome_of(&e, elapsed_ms))
             }
         }
     }

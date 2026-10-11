@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response};
-use wire::{ApiError, ClaimRequest, codes};
+use wire::{ApiError, ClaimRequest, ProgressRequest, codes};
 
 /// Самое большое JSON-тело запроса: 64 КиБ.
 pub const MAX_JSON: usize = 64 * 1024;
@@ -103,8 +103,40 @@ fn route(
 ) -> Result<Reply, Reject> {
     match (method, path) {
         (Method::Post, wire::paths::CLAIM) => claim(ctx, rq, trace),
+        (Method::Post, p) if p.starts_with("/v1/jobs/") => job_action(ctx, rq, p, trace),
         _ => Err(Reject::new(codes::NOT_FOUND, "нет такого адреса")),
     }
+}
+
+/// `POST /v1/jobs/{id}/{действие}`: id — целое больше нуля, иначе 404; токен проверяется до чтения тела.
+fn job_action(ctx: &Ctx, rq: &mut Request, path: &str, trace: &mut Trace) -> Result<Reply, Reject> {
+    let not_found = || Reject::new(codes::NOT_FOUND, "нет такого адреса");
+    let rest = path.strip_prefix("/v1/jobs/").ok_or_else(not_found)?;
+    let (id, action) = rest.split_once('/').ok_or_else(not_found)?;
+    let job_id = id
+        .parse::<i64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(not_found)?;
+    match action {
+        "progress" => progress(ctx, rq, job_id, trace),
+        _ => Err(not_found()),
+    }
+}
+
+/// `POST /v1/jobs/{id}/progress`: прогресс раннера, он же heartbeat.
+fn progress(ctx: &Ctx, rq: &mut Request, job_id: i64, trace: &mut Trace) -> Result<Reply, Reject> {
+    let runner = authenticate(ctx, rq)?;
+    trace.runner = Some(runner.name.clone());
+    let req: ProgressRequest = read_json(rq, MAX_JSON)?;
+    let (reply, reattached) = ctx.core.progress(runner.id, job_id, &req)?;
+    if reattached {
+        ctx.log.info(&format!(
+            "раннер {} вернул себе задачу #{job_id} (эпоха {})",
+            runner.name, req.epoch
+        ));
+    }
+    Reply::json(200, &reply)
 }
 
 /// `POST /v1/runner/claim?wait=N`: раннер просит задачу; сервер ждёт её до `min(N, longpoll_secs)` секунд.

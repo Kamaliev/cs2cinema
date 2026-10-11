@@ -14,6 +14,7 @@ pub mod core;
 pub mod db;
 pub mod http;
 pub mod log;
+pub mod rules;
 pub mod secret;
 pub mod users;
 
@@ -34,6 +35,7 @@ pub struct Running {
     http: http::HttpServer,
     core: core::Core,
     log: log::Log,
+    sweeper: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Running {
@@ -50,11 +52,14 @@ impl Running {
     }
 
     /// Ставит флаг остановки, будит long-poll и ждёт обработчики не дольше трёх секунд.
-    pub fn stop(self) {
+    pub fn stop(mut self) {
         self.http
             .shutdown_flag()
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.core.wake();
+        if let Some(h) = self.sweeper.take() {
+            let _ = h.join();
+        }
         self.http.stop();
     }
 }
@@ -84,6 +89,7 @@ pub fn serve(
         shutdown: shutdown.clone(),
     };
     let handler: http::Handler = Arc::new(move |rq| api::handle(&ctx, rq));
+    let shutdown_flag = shutdown.clone();
     let http = http::start_with_flag(listener, cfg.threads, log.clone(), handler, shutdown)?;
     log.info(&format!(
         "cs2-server {} слушает http://{}, данные {}",
@@ -91,5 +97,48 @@ pub fn serve(
         http.addr(),
         cfg.data_dir.display()
     ));
-    Ok(Running { http, core, log })
+    let sweeper = spawn_sweeper(core.clone(), log.clone(), shutdown_flag);
+    Ok(Running {
+        http,
+        core,
+        log,
+        sweeper: Some(sweeper),
+    })
+}
+
+/// Поток, раз в 5 секунд возвращающий в очередь задачи с истёкшей арендой; выходит по флагу остановки.
+fn spawn_sweeper(
+    core: core::Core,
+    log: log::Log,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    std::thread::spawn(move || {
+        'outer: loop {
+            // Шаги по 200 мс: остановка не ждёт целых 5 секунд.
+            for _ in 0..25 {
+                if stop.load(Ordering::SeqCst) {
+                    break 'outer;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            match core.sweep() {
+                Ok(s) => {
+                    for id in &s.requeued {
+                        log.info(&format!(
+                            "аренда задачи #{id} истекла — задача снова в очереди"
+                        ));
+                    }
+                    for id in &s.cancelled {
+                        log.info(&format!("аренда задачи #{id} истекла — задача отменена"));
+                    }
+                    for id in &s.receive_failed {
+                        log.info(&format!("приём демки задачи #{id} завис — задача упала"));
+                    }
+                }
+                Err(e) => log.warn(&format!("sweep: {e}")),
+            }
+        }
+    })
 }

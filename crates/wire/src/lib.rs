@@ -198,6 +198,90 @@ pub struct Assignment {
     pub options: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Этап работы раннера. `fetch` — скачивание демки с сервера, `upload` — загрузка результата, остальные —
+/// этапы `pipeline::Stage`, раннер (фаза 6) переводит их в эти имена сам. Незнакомое имя читается как `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Fetch,
+    Download,
+    Parse,
+    Positions,
+    Geometry,
+    Plan,
+    Record,
+    Assemble,
+    Upload,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Phase {
+    /// Все известные этапы.
+    pub const ALL: [Phase; 9] = [
+        Phase::Fetch,
+        Phase::Download,
+        Phase::Parse,
+        Phase::Positions,
+        Phase::Geometry,
+        Phase::Plan,
+        Phase::Record,
+        Phase::Assemble,
+        Phase::Upload,
+    ];
+
+    /// Строка для базы и JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Phase::Fetch => "fetch",
+            Phase::Download => "download",
+            Phase::Parse => "parse",
+            Phase::Positions => "positions",
+            Phase::Geometry => "geometry",
+            Phase::Plan => "plan",
+            Phase::Record => "record",
+            Phase::Assemble => "assemble",
+            Phase::Upload => "upload",
+            Phase::Unknown => "unknown",
+        }
+    }
+
+    /// Обратное к `as_str` для девяти известных этапов; прочее (в том числе пустая строка) — `None`.
+    pub fn parse(s: &str) -> Option<Phase> {
+        Phase::ALL.into_iter().find(|p| p.as_str() == s)
+    }
+}
+
+/// Номер дубля записи: `n` из `m`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Take {
+    pub n: u32,
+    pub m: u32,
+}
+
+/// Тело `POST /v1/jobs/{id}/progress`. Прогресс — он же heartbeat: раннер шлёт его раз в `heartbeat_secs`,
+/// отдельной ручки heartbeat нет. Каждый запрос продлевает аренду, если эпоха текущая.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgressRequest {
+    /// Эпоха выдачи из `Assignment`.
+    pub epoch: i64,
+    /// Номер сообщения раннера: растёт; не больше последнего принятого — дубль или опоздавший.
+    pub seq: u64,
+    pub phase: Phase,
+    #[serde(default)]
+    pub take: Option<Take>,
+    /// Короткий текст состояния для людей.
+    #[serde(default)]
+    pub status: String,
+}
+
+/// Ответ на прогресс: новый конец аренды и запрошенная отмена (`none`, если отмены нет).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgressReply {
+    pub lease_until_ms: i64,
+    pub cancel: CancelMode,
+}
+
 /// Тело любого ответа с ошибкой.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApiError {
@@ -267,6 +351,33 @@ mod tests {
             ClaimRequest::default()
         );
         assert_eq!(paths::job(5, "heartbeat"), "/v1/jobs/5/heartbeat");
+    }
+
+    #[test]
+    fn progress_request_without_take_and_status_parses() {
+        let p: ProgressRequest =
+            serde_json::from_str(r#"{"epoch":2,"seq":5,"phase":"record"}"#).unwrap();
+        assert_eq!((p.epoch, p.seq, p.phase), (2, 5, Phase::Record));
+        assert!(p.take.is_none() && p.status.is_empty());
+        let p: ProgressRequest = serde_json::from_str(
+            r#"{"epoch":1,"seq":1,"phase":"teleport","take":{"n":1,"m":3},"status":"запись"}"#,
+        )
+        .unwrap();
+        assert_eq!(p.phase, Phase::Unknown, "незнакомый этап не роняет разбор");
+        assert_eq!(p.take, Some(Take { n: 1, m: 3 }));
+        for ph in Phase::ALL {
+            assert_eq!(Phase::parse(ph.as_str()), Some(ph));
+            assert_eq!(
+                serde_json::to_string(&ph).unwrap(),
+                format!("\"{}\"", ph.as_str())
+            );
+        }
+        let r = serde_json::to_string(&ProgressReply {
+            lease_until_ms: 9,
+            cancel: CancelMode::NotRequested,
+        })
+        .unwrap();
+        assert_eq!(r, r#"{"lease_until_ms":9,"cancel":"none"}"#);
     }
 
     #[test]

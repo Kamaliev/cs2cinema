@@ -6,12 +6,15 @@ use crate::Result;
 use crate::blobs::{Blobs, Ingested, demo_rel, sniff_demo};
 use crate::clock::Clock;
 use crate::db::{Db, db_err};
+use crate::rules::{self, Event};
 use crate::secret::Redactor;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
-use wire::{Assignment, CancelMode, DemoInfo, JobState, Player};
+use wire::{
+    Assignment, CancelMode, DemoInfo, JobState, Player, ProgressReply, ProgressRequest, codes,
+};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -342,6 +345,7 @@ impl Core {
         let now = self.clock.now_ms();
         let lease_until = now + self.limits.lease_ttl_ms;
         self.db.write(|tx| {
+            expire_leases(tx, now, &self.limits)?;
             let id: Option<i64> = tx
                 .query_row(
                     "UPDATE jobs SET state = 'assigned', epoch = epoch + 1, grants = grants + 1, runner_id = ?1, \
@@ -379,6 +383,45 @@ impl Core {
         })
     }
 
+    /// Прогресс раннера (он же heartbeat): продлевает аренду и двигает состояние. Возвращает ответ и признак того,
+    /// что раннер вернул себе задачу с потерянной арендой (вызывающий пишет это в журнал).
+    pub fn progress(
+        &self,
+        runner_id: i64,
+        job_id: i64,
+        req: &ProgressRequest,
+    ) -> std::result::Result<(ProgressReply, bool), Reject> {
+        let now = self.clock.now_ms();
+        let ev = Event::Progress {
+            runner_id,
+            epoch: req.epoch,
+            seq: req.seq,
+            phase: req.phase,
+            take: req.take,
+        };
+        self.db.write(|tx| {
+            let before = job_by_id(tx, job_id)?.ok_or_else(not_found)?;
+            let d = rules::decide(&before, &ev, now, &self.limits)?;
+            apply(tx, &before, &d.job, now)?;
+            let reply = ProgressReply {
+                lease_until_ms: d.job.lease_until.unwrap_or(now),
+                cancel: d.job.cancel_requested,
+            };
+            Ok((reply, d.reattached))
+        })
+    }
+
+    /// Возвращает в очередь задачи с истёкшей арендой (или отменяет, если отмена была запрошена).
+    /// Зовётся потоком `sweep` раз в 5 с и лениво из `claim`.
+    pub fn sweep(&self) -> Result<Sweep> {
+        let now = self.clock.now_ms();
+        let out = self.db.write(|tx| expire_leases(tx, now, &self.limits))?;
+        if !out.requeued.is_empty() {
+            self.wake();
+        }
+        Ok(out)
+    }
+
     /// Будит всех, кто ждёт работу в long-poll: в очередь встала задача.
     pub fn wake(&self) {
         let (lock, cv) = &*self.wake;
@@ -404,6 +447,84 @@ impl Core {
     pub fn wait_for_work(&self, timeout: Duration) {
         self.wait_for_work_since(self.work_generation(), timeout);
     }
+}
+
+fn not_found() -> Reject {
+    Reject::new(codes::NOT_FOUND, "нет такой задачи")
+}
+
+/// Что сделал `sweep`: id задач по исходам.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sweep {
+    /// Аренда истекла, задача снова в очереди.
+    pub requeued: Vec<i64>,
+    /// Аренда истекла у задачи с запрошенной отменой — она отменена.
+    pub cancelled: Vec<i64>,
+    /// Приём демки завис дольше предела — задача упала.
+    pub receive_failed: Vec<i64>,
+}
+
+/// Записывает изменённую строку задачи: все изменяемые колонки разом, `updated_at = now`.
+fn apply(tx: &rusqlite::Transaction<'_>, before: &JobRow, after: &JobRow, now: i64) -> Result<()> {
+    if before == after {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE jobs SET state = ?2, cancel_requested = ?3, epoch = ?4, grants = ?5, runner_id = ?6, lease_until = ?7,          lease_lost = ?8, last_seq = ?9, phase = ?10, take_n = ?11, take_m = ?12, fail_code = ?13, fail_class = ?14,          fail_state = ?15, fail_hint = ?16, fail_message = ?17, fail_tail = ?18, fail_elapsed_ms = ?19,          finished_at = ?20, updated_at = ?21 WHERE id = ?1",
+        params![
+            after.id,
+            after.state.as_str(),
+            after.cancel_requested.as_str(),
+            after.epoch,
+            after.grants,
+            after.runner_id,
+            after.lease_until,
+            after.lease_lost as i64,
+            after.last_seq,
+            after.phase,
+            after.take_n,
+            after.take_m,
+            after.fail_code,
+            after.fail_class,
+            after.fail_state,
+            after.fail_hint,
+            after.fail_message,
+            after.fail_tail,
+            after.fail_elapsed_ms,
+            after.finished_at,
+            now,
+        ],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Истекшие аренды через `rules::decide(Expire)`. Общая для `sweep` и ленивого истечения в начале `claim`.
+fn expire_leases(tx: &rusqlite::Transaction<'_>, now: i64, limits: &Limits) -> Result<Sweep> {
+    let ids: Vec<i64> = {
+        let mut st = tx
+            .prepare(
+                "SELECT id FROM jobs WHERE state IN ('assigned','running','uploading')                  AND (lease_until IS NULL OR lease_until < ?1) ORDER BY id",
+            )
+            .map_err(db_err)?;
+        let rows = st.query_map([now], |r| r.get(0)).map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<i64>>>()
+            .map_err(db_err)?
+    };
+    let mut out = Sweep::default();
+    for id in ids {
+        let Some(before) = job_by_id(tx, id)? else {
+            continue;
+        };
+        let d = rules::decide(&before, &Event::Expire, now, limits).map_err(|r| r.message)?;
+        apply(tx, &before, &d.job, now)?;
+        match d.job.state {
+            JobState::Queued => out.requeued.push(id),
+            JobState::Cancelled => out.cancelled.push(id),
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 fn demo_by_job(c: &Connection, job_id: i64) -> Result<Option<FileRow>> {

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use wire::Assignment;
+use wire::{Assignment, ProgressRequest};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -74,6 +74,7 @@ pub struct TestServer {
     running: Option<Running>,
     pub base: String,
     pub sink: Arc<MemorySink>,
+    clock: Option<ManualClock>,
 }
 
 impl TestServer {
@@ -90,6 +91,7 @@ impl TestServer {
             longpoll_secs: opts.longpoll_secs,
             ..Default::default()
         };
+        let manual = opts.clock.clone();
         let clock: Arc<dyn Clock> = match opts.clock {
             Some(c) => Arc::new(c),
             None => Arc::new(SystemClock),
@@ -102,7 +104,13 @@ impl TestServer {
             running: Some(running),
             base,
             sink,
+            clock: manual,
         }
+    }
+
+    /// Ручные часы стенда; паника, если стенд запущен на настоящих.
+    pub fn clock(&self) -> ManualClock {
+        self.clock.clone().expect("стенд запущен без ручных часов")
     }
 
     pub fn running(&self) -> &Running {
@@ -160,6 +168,23 @@ impl TestServer {
         );
         let a = (r.status == 200).then(|| serde_json::from_str(&r.body).unwrap());
         (r.status, a)
+    }
+}
+
+impl TestServer {
+    /// `POST /v1/jobs/{id}/progress`: статус и тело ответа.
+    pub fn progress(&self, token: &str, job_id: i64, req: &ProgressRequest) -> (u16, String) {
+        let r = self.send(
+            &wire::paths::job(job_id, "progress"),
+            Some(&format!("Bearer {token}")),
+            Some(&serde_json::to_string(req).unwrap()),
+        );
+        (r.status, r.body)
+    }
+
+    /// Один проход `sweep` в ядре (как сделал бы фоновый поток).
+    pub fn sweep(&self) -> server::core::Sweep {
+        self.running().core().sweep().unwrap()
     }
 }
 

@@ -34,6 +34,9 @@ cs2-cli acceptance — машинная приёмка очереди (база 
 
 Использование:
   cs2-cli acceptance check [--db <файл>] [--batch <имя> | --last] [--expect-restart-from <партия A>] [--set <файл>]
+  cs2-cli acceptance state [--db <файл>] [--cs2 <папка>]
+  cs2-cli acceptance job <номер задачи> [--db <файл>]
+  cs2-cli acceptance set
 
 check: подтверждает партию, поставленную кнопкой «Поставить приёмочный набор»: в партии ровно матчи набора,
   5 разных карт, все задачи «готово», каждый highlights.mp4 прошёл ffprobe (видео и звук, длительность в допуске
@@ -43,7 +46,14 @@ check: подтверждает партию, поставленную кноп�
   --db <файл>                      база приложения         (по умолчанию %LOCALAPPDATA%\\cs2cinema\\cs2cinema.db)
   --batch <имя> | --last           какая партия            (по умолчанию --last: самая новая)
   --expect-restart-from <партия A> серия B шла в другом запуске приложения, начатом после конца серии A
-  --set <файл>                     набор вместо встроенного (или переменная CS2CINEMA_ACCEPTANCE)";
+  --set <файл>                     набор вместо встроенного (или переменная CS2CINEMA_ACCEPTANCE)
+
+state: чисто ли после учения — нет задач «выполняется»/«отменяется», нет cs2.exe и HLAE.exe, в папке игры нет наших демок
+  и скриптов, в папках задач нет installed.json; печатает последние задачи с кодами сбоев. Только чтение.
+  --cs2 <папка>   папка CS2 (иначе $CS2_DIR, иначе cs2_dir из settings.json)
+  Код выхода: 0 — чисто, 1 — не чисто, 2 — ошибка аргументов или базы.
+job: строка задачи (статус, этап, код сбоя, сообщение, подсказка, попытки, партия, папка, результат) и журнал целиком.
+set: источник и id набора; код 0 только если в нём ровно 5 матчей.";
 
 /// Имя файла базы приложения в папке данных.
 const DB_FILE: &str = "cs2cinema.db";
@@ -630,11 +640,14 @@ fn real_env(k: &str) -> Option<String> {
     env::var(k).ok()
 }
 
-/// `cs2-cli acceptance <check|…>`.
-pub fn acceptance_cmd() -> ExitCode {
-    let args: Vec<String> = env::args().skip(2).collect();
-    match args.first().map(String::as_str) {
-        Some("check") => check_cmd(&args[1..]),
+/// Аргументы после `acceptance <подкоманда>`.
+fn sub_args() -> Vec<String> {
+    env::args().skip(3).collect()
+}
+
+/// `cs2-cli acceptance` без подкоманды, с `--help` или с неизвестной подкомандой.
+pub fn usage_cmd(unknown: Option<&str>) -> ExitCode {
+    match unknown {
         Some("-h" | "--help") => {
             println!("{USAGE_ACCEPTANCE}");
             ExitCode::SUCCESS
@@ -650,8 +663,8 @@ pub fn acceptance_cmd() -> ExitCode {
 }
 
 /// `cs2-cli acceptance check …`.
-pub fn check_cmd(args: &[String]) -> ExitCode {
-    let a = match parse_check(args) {
+pub fn check_cmd() -> ExitCode {
+    let a = match parse_check(&sub_args()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("ошибка: {e}\n\n{USAGE_ACCEPTANCE}");
@@ -696,6 +709,350 @@ pub fn check_cmd(args: &[String]) -> ExitCode {
         }
     }
     ExitCode::from(code as u8)
+}
+
+/// Сколько наших файлов из папки игры `state` перечисляет по именам.
+const MAX_LISTED_FILES: usize = 10;
+/// Сколько последних задач печатает `state`.
+const RECENT_JOBS: usize = 10;
+
+/// Снятое состояние после учения: задачи, процессы, папка игры и остатки в папках задач.
+pub struct StateInput {
+    pub jobs: Vec<Job>,
+    pub processes: Result<Vec<ProcInfo>, String>,
+    /// Папка установки CS2; `None` — неизвестна.
+    pub cs2_dir: Option<PathBuf>,
+    /// Наши файлы в папке игры: `cs2cinema_*.dem` в `game/csgo` и скрипты записи в `game/csgo/cfg`.
+    pub game_files: Vec<PathBuf>,
+    /// Задачи, в папках которых остался `installed.json`.
+    pub leftovers: Vec<(i64, PathBuf)>,
+}
+
+/// Время по-местному «ЧЧ:ММ:СС» из секунд Unix.
+fn clock(unix: i64) -> String {
+    chrono::DateTime::from_timestamp(unix, 0).map_or_else(
+        || "?".to_owned(),
+        |t| {
+            t.with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string()
+        },
+    )
+}
+
+/// Отчёт о чистоте состояния: `(чисто, строки вывода)`. Чистая: ничего не читает и не меняет.
+/// Строки — последние задачи с кодами сбоев, затем нарушения и итог «СОСТОЯНИЕ ЧИСТО» / «СОСТОЯНИЕ НЕ ЧИСТО:».
+pub fn state_report(input: &StateInput) -> (bool, Vec<String>) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut recent: Vec<&Job> = input.jobs.iter().collect();
+    recent.sort_by_key(|j| std::cmp::Reverse(j.id));
+    lines.push(format!("Последние задачи (до {RECENT_JOBS}):"));
+    if recent.is_empty() {
+        lines.push("  задач нет".to_owned());
+    }
+    for j in recent.iter().take(RECENT_JOBS) {
+        lines.push(format!(
+            "  #{} · {} · {} · {} · попытка {} · авто-повторов {} · обновлена {}",
+            j.id,
+            j.status.title(),
+            j.fail_code.as_deref().unwrap_or("—"),
+            j.fail_state
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("—"),
+            j.attempt,
+            j.auto_retries,
+            clock(j.updated_at),
+        ));
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    for j in &input.jobs {
+        if matches!(j.status, JobStatus::Running | JobStatus::Cancelling) {
+            problems.push(format!("задача #{} «{}»", j.id, j.status.title()));
+        }
+    }
+    match &input.processes {
+        Err(e) => problems.push(format!("снимок процессов недоступен: {e}")),
+        Ok(list) => {
+            for p in list {
+                if pipeline::host::ORPHAN_IMAGES
+                    .iter()
+                    .any(|img| p.exe_name.eq_ignore_ascii_case(img))
+                {
+                    problems.push(format!("запущен {} (PID {})", p.exe_name, p.pid));
+                }
+            }
+        }
+    }
+    if input.cs2_dir.is_none() {
+        problems.push(
+            "папка CS2 неизвестна — проверка папки игры пропущена (укажите --cs2, CS2_DIR или cs2_dir в settings.json)"
+                .to_owned(),
+        );
+    }
+    // у автора в папке игры бывают сотни остатков старых версий: печатаем начало списка и счёт
+    if input.game_files.len() > MAX_LISTED_FILES {
+        problems.push(format!(
+            "в папке игры наших файлов: {} (показаны первые {MAX_LISTED_FILES})",
+            input.game_files.len()
+        ));
+    }
+    for f in input.game_files.iter().take(MAX_LISTED_FILES) {
+        let dir = f
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let name = f
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        problems.push(format!("в {dir} лежит {name}"));
+    }
+    for (id, dir) in &input.leftovers {
+        problems.push(format!(
+            "в папке задачи #{id} ({}) остался {}",
+            dir.display(),
+            pipeline::gamedir::INSTALLED_FILE
+        ));
+    }
+
+    if problems.is_empty() {
+        lines.push("СОСТОЯНИЕ ЧИСТО".to_owned());
+        (true, lines)
+    } else {
+        lines.push("СОСТОЯНИЕ НЕ ЧИСТО:".to_owned());
+        lines.extend(problems.into_iter().map(|p| format!("  - {p}")));
+        (false, lines)
+    }
+}
+
+/// Файлы с таким признаком имени из каталога `dir` (только чтение каталога).
+fn files_in(dir: &Path, wanted: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| wanted(&e.file_name().to_string_lossy()))
+        .map(|e| e.path())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Наши файлы в папке игры: копии демок и скрипты записи.
+pub fn game_files(cs2_dir: &Path) -> Vec<PathBuf> {
+    let csgo = cs2_dir.join("game").join("csgo");
+    let mut out = files_in(&csgo, |n| {
+        n.starts_with("cs2cinema_") && n.ends_with(".dem")
+    });
+    out.extend(files_in(
+        &csgo.join("cfg"),
+        pipeline::gamedir::is_script_name,
+    ));
+    out
+}
+
+/// Поле `cs2_dir` из настроек приложения — единственное, что `state` берёт из `settings.json`.
+fn settings_cs2_dir(data: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(data.join("settings.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let dir = v.get("cs2_dir")?.as_str()?.trim().to_owned();
+    (!dir.is_empty()).then(|| PathBuf::from(dir))
+}
+
+/// Аргументы `state`: `--db`, `--cs2`.
+fn parse_state(args: &[String]) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+    let (mut db, mut cs2) = (None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = |name: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{name} требует значение"))
+        };
+        match a.as_str() {
+            "--db" => db = Some(value("--db")?.into()),
+            "--cs2" => cs2 = Some(value("--cs2")?.into()),
+            s if s.starts_with("--") => return Err(format!("неизвестный параметр {s}")),
+            s => return Err(format!("лишний аргумент {s}")),
+        }
+    }
+    Ok((db, cs2))
+}
+
+/// `cs2-cli acceptance state [--db <файл>] [--cs2 <папка>]`: чистое ли состояние после учения.
+pub fn state_cmd() -> ExitCode {
+    let (db, cs2) = match parse_state(&sub_args()) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("ошибка: {e}\n\n{USAGE_ACCEPTANCE}");
+            return ExitCode::from(2);
+        }
+    };
+    let data = data_dir(&real_env);
+    let db = db.unwrap_or_else(|| data.join(DB_FILE));
+    let jobs = match Store::open_read_only(&db).and_then(|s| s.jobs()) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("ошибка: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let cs2_dir = cs2
+        .or_else(|| {
+            real_env("CS2_DIR")
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| settings_cs2_dir(&data));
+    let leftovers = jobs
+        .iter()
+        .filter_map(|j| {
+            let dir = j.out_dir.as_ref()?;
+            dir.join(pipeline::gamedir::INSTALLED_FILE)
+                .exists()
+                .then(|| (j.id, dir.clone()))
+        })
+        .collect();
+    let input = StateInput {
+        game_files: cs2_dir.as_deref().map(game_files).unwrap_or_default(),
+        processes: pipeline::host::default_host()
+            .processes()
+            .map_err(|e| e.to_string()),
+        cs2_dir,
+        jobs,
+        leftovers,
+    };
+    let (clean, lines) = state_report(&input);
+    for l in lines {
+        println!("{l}");
+    }
+    ExitCode::from(if clean { 0 } else { 1 })
+}
+
+/// Строка задачи и журнал целиком — улика учения.
+pub fn job_text(j: &Job) -> String {
+    let dash = |v: Option<&str>| v.filter(|s| !s.is_empty()).unwrap_or("—").to_owned();
+    let mut s = String::new();
+    s.push_str(&format!(
+        "#{} · {} · {} · {}\n",
+        j.id,
+        j.kind.title(),
+        j.status.title(),
+        source_id(j)
+    ));
+    s.push_str(&format!(
+        "этап: {} · код сбоя: {} · состояние сбоя: {}\n",
+        dash(Some(&j.stage)),
+        dash(j.fail_code.as_deref()),
+        dash(j.fail_state.as_deref())
+    ));
+    s.push_str(&format!("сообщение: {}\n", dash(j.error.as_deref())));
+    s.push_str(&format!("подсказка: {}\n", dash(j.fail_hint.as_deref())));
+    s.push_str(&format!(
+        "попытка: {} · авто-повторов: {} · партия: {}\n",
+        j.attempt,
+        j.auto_retries,
+        dash(j.batch.as_deref())
+    ));
+    s.push_str(&format!(
+        "папка: {} · результат: {}\n",
+        j.out_dir
+            .as_ref()
+            .map_or("—".to_owned(), |p| p.display().to_string()),
+        j.result
+            .as_ref()
+            .map_or("—".to_owned(), |p| p.display().to_string())
+    ));
+    s.push_str(&format!("обновлена: {}\n", clock(j.updated_at)));
+    s.push_str("--- журнал ---\n");
+    s.push_str(j.log.trim_end());
+    s
+}
+
+/// `cs2-cli acceptance job <id> [--db <файл>]`: строка задачи и её журнал.
+pub fn job_cmd() -> ExitCode {
+    let args = sub_args();
+    let mut id: Option<i64> = None;
+    let mut db: Option<PathBuf> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--db" => match it.next() {
+                Some(v) => db = Some(v.into()),
+                None => {
+                    eprintln!("ошибка: --db требует значение");
+                    return ExitCode::from(2);
+                }
+            },
+            s if s.starts_with("--") => {
+                eprintln!("ошибка: неизвестный параметр {s}\n\n{USAGE_ACCEPTANCE}");
+                return ExitCode::from(2);
+            }
+            s if id.is_none() => match s.parse() {
+                Ok(n) => id = Some(n),
+                Err(_) => {
+                    eprintln!("ошибка: номер задачи — число, а не «{s}»");
+                    return ExitCode::from(2);
+                }
+            },
+            s => {
+                eprintln!("ошибка: лишний аргумент {s}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(id) = id else {
+        eprintln!("ошибка: укажите номер задачи\n\n{USAGE_ACCEPTANCE}");
+        return ExitCode::from(2);
+    };
+    let db = db.unwrap_or_else(|| data_dir(&real_env).join(DB_FILE));
+    match Store::open_read_only(&db).and_then(|s| s.job(id)) {
+        Ok(Some(j)) => {
+            println!("{}", job_text(&j));
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!("ошибка: задачи #{id} в базе нет");
+            ExitCode::from(2)
+        }
+        Err(e) => {
+            eprintln!("ошибка: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `cs2-cli acceptance set`: источник и id набора; код 0 только при ровно пяти матчах.
+pub fn set_cmd() -> ExitCode {
+    if let Some(extra) = sub_args().first() {
+        eprintln!("ошибка: лишний аргумент {extra}\n\n{USAGE_ACCEPTANCE}");
+        return ExitCode::from(2);
+    }
+    match set_file::load_set(&real_env) {
+        Err(e) => {
+            eprintln!("ошибка: {e}");
+            ExitCode::from(2)
+        }
+        Ok((set, source)) => {
+            println!("Источник набора: {source}");
+            for (i, id) in set.iter().enumerate() {
+                println!("  {}. {id}", i + 1);
+            }
+            match set_file::require_full(&set) {
+                Ok(()) => {
+                    println!("Набор полный: {} матчей", set.len());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    println!("Набор не полный: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1124,6 +1481,226 @@ mod tests {
         let p = write_report(&dir, &r).unwrap();
         assert_eq!(p.parent().unwrap(), dir, "отчёт не выходит из папки");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn clean_state() -> StateInput {
+        StateInput {
+            jobs: (0..3).map(job).collect(),
+            processes: Ok(vec![ProcInfo {
+                pid: 9,
+                exe_name: "steam.exe".into(),
+            }]),
+            cs2_dir: Some(PathBuf::from("C:/cs2")),
+            game_files: Vec::new(),
+            leftovers: Vec::new(),
+        }
+    }
+
+    fn violation(input: &StateInput, needle: &str) {
+        let (clean, lines) = state_report(input);
+        assert!(!clean, "должно быть не чисто: {needle}");
+        assert!(
+            lines.iter().any(|l| l.contains(needle)),
+            "нет «{needle}» в {lines:#?}"
+        );
+        assert!(lines.iter().any(|l| l == "СОСТОЯНИЕ НЕ ЧИСТО:"));
+        assert!(!lines.iter().any(|l| l == "СОСТОЯНИЕ ЧИСТО"));
+    }
+
+    #[test]
+    fn a_clean_state_ends_with_the_verdict_and_lists_recent_jobs_first() {
+        let (clean, lines) = state_report(&clean_state());
+        assert!(clean, "{lines:#?}");
+        assert_eq!(lines.last().map(String::as_str), Some("СОСТОЯНИЕ ЧИСТО"));
+        let first = lines.iter().position(|l| l.starts_with("  #")).unwrap();
+        assert!(
+            lines[first]
+                .starts_with("  #3 · готово · — · — · попытка 1 · авто-повторов 0 · обновлена "),
+            "{}",
+            lines[first]
+        );
+        assert!(lines[first].len() > "  #3 · готово".len() + 20);
+    }
+
+    #[test]
+    fn recent_jobs_are_limited_to_ten_with_codes() {
+        let mut input = clean_state();
+        input.jobs = (0..5)
+            .map(job)
+            .cycle()
+            .take(12)
+            .enumerate()
+            .map(|(k, mut j)| {
+                j.id = k as i64 + 1;
+                j
+            })
+            .collect();
+        input.jobs[11].status = JobStatus::Failed;
+        input.jobs[11].fail_code = Some("CONSOLE_NOT_OPEN".into());
+        input.jobs[11].fail_state = Some("console".into());
+        let (clean, lines) = state_report(&input);
+        assert!(clean);
+        let rows: Vec<&String> = lines.iter().filter(|l| l.starts_with("  #")).collect();
+        assert_eq!(rows.len(), RECENT_JOBS);
+        assert!(
+            rows[0].starts_with("  #12 · ошибка · CONSOLE_NOT_OPEN · console · попытка 1"),
+            "{}",
+            rows[0]
+        );
+        assert!(rows[9].starts_with("  #3 "), "{}", rows[9]);
+    }
+
+    #[test]
+    fn every_dirty_thing_is_a_violation_with_its_own_line() {
+        let mut i = clean_state();
+        i.jobs[1].status = JobStatus::Running;
+        violation(&i, "задача #2 «выполняется»");
+        let mut i = clean_state();
+        i.jobs[0].status = JobStatus::Cancelling;
+        violation(&i, "задача #1 «отменяется»");
+        let mut i = clean_state();
+        i.processes = Ok(vec![ProcInfo {
+            pid: 31,
+            exe_name: "cs2.exe".into(),
+        }]);
+        violation(&i, "запущен cs2.exe (PID 31)");
+        let mut i = clean_state();
+        i.processes = Ok(vec![ProcInfo {
+            pid: 32,
+            exe_name: "HLAE.exe".into(),
+        }]);
+        violation(&i, "запущен HLAE.exe (PID 32)");
+        let mut i = clean_state();
+        i.processes = Err("нет доступа".into());
+        violation(&i, "снимок процессов недоступен: нет доступа");
+        let mut i = clean_state();
+        i.game_files = vec![PathBuf::from("C:/cs2/game/csgo/cs2cinema_x.dem")];
+        violation(&i, "лежит cs2cinema_x.dem");
+        let mut i = clean_state();
+        i.game_files = vec![
+            PathBuf::from("C:/cs2/game/csgo/cfg/cs2c_01.cfg"),
+            PathBuf::from("C:/cs2/game/csgo/cfg/highlights.cfg"),
+        ];
+        let (_, lines) = state_report(&i);
+        assert!(
+            lines.iter().any(|l| l.contains("лежит cs2c_01.cfg"))
+                && lines.iter().any(|l| l.contains("лежит highlights.cfg"))
+        );
+        let mut i = clean_state();
+        i.leftovers = vec![(2, PathBuf::from("out/job2"))];
+        violation(&i, "в папке задачи #2");
+        violation(&i, "installed.json");
+    }
+
+    #[test]
+    fn a_long_list_of_game_files_is_counted_and_cut() {
+        let mut i = clean_state();
+        i.game_files = (0..40)
+            .map(|k| PathBuf::from(format!("C:/cs2/game/csgo/cfg/cs2c_{k:02}.cfg")))
+            .collect();
+        violation(&i, "в папке игры наших файлов: 40 (показаны первые 10)");
+        let (_, lines) = state_report(&i);
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("лежит")).count(),
+            MAX_LISTED_FILES
+        );
+    }
+
+    #[test]
+    fn an_unknown_cs2_folder_is_not_clean() {
+        let mut i = clean_state();
+        i.cs2_dir = None;
+        violation(&i, "папка CS2 неизвестна — проверка папки игры пропущена");
+    }
+
+    #[test]
+    fn game_files_finds_only_our_demos_and_scripts_and_never_touches_them() {
+        let root = std::env::temp_dir().join(format!("cs2cinema-acc-game-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let csgo = root.join("game/csgo");
+        std::fs::create_dir_all(csgo.join("cfg")).unwrap();
+        for f in [
+            "cs2cinema_m.dem",
+            "other.dem",
+            "cfg/cs2c_01.cfg",
+            "cfg/cs2c_01_2.xml",
+            "cfg/highlights.cfg",
+            "cfg/autoexec.cfg",
+        ] {
+            std::fs::write(csgo.join(f), "x").unwrap();
+        }
+        let names: Vec<String> = game_files(&root)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "cs2cinema_m.dem",
+                "cs2c_01.cfg",
+                "cs2c_01_2.xml",
+                "highlights.cfg"
+            ]
+        );
+        assert!(csgo.join("cfg/cs2c_01.cfg").exists(), "ничего не удалено");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(game_files(&root).is_empty(), "нет папки — нет файлов");
+    }
+
+    #[test]
+    fn cs2_dir_comes_from_settings_json_only_when_it_is_set() {
+        let dir =
+            std::env::temp_dir().join(format!("cs2cinema-acc-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(settings_cs2_dir(&dir), None);
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"cs2_dir":"D:/cs2","faceit_key":"секрет"}"#,
+        )
+        .unwrap();
+        assert_eq!(settings_cs2_dir(&dir), Some(PathBuf::from("D:/cs2")));
+        std::fs::write(dir.join("settings.json"), r#"{"cs2_dir":"  "}"#).unwrap();
+        assert_eq!(settings_cs2_dir(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn job_text_shows_the_row_and_the_whole_journal() {
+        let mut j = job(2);
+        j.status = JobStatus::Failed;
+        j.fail_code = Some("GAME_EXITED".into());
+        j.fail_state = Some("take".into());
+        j.error = Some("игра закрылась".into());
+        j.fail_hint = Some("запустите заново".into());
+        j.log = format!(
+            "{}\nстрока журнала\nитог попытки 1: сбой GAME_EXITED",
+            journal::separator(1, "2026-01-01 10:00:00", StartKind::First)
+        );
+        let t = job_text(&j);
+        for needle in [
+            "#3 · ролик · ошибка · 1-00000000-0000-0000-0000-000000000003",
+            "код сбоя: GAME_EXITED · состояние сбоя: take",
+            "сообщение: игра закрылась",
+            "подсказка: запустите заново",
+            "попытка: 1 · авто-повторов: 0 · партия: acc-1700000000-100",
+            "--- журнал ---",
+            "строка журнала",
+            "итог попытки 1: сбой GAME_EXITED",
+        ] {
+            assert!(t.contains(needle), "нет «{needle}» в\n{t}");
+        }
+    }
+
+    #[test]
+    fn state_and_job_args_reject_garbage() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_state(&s(&["--db", "a.db", "--cs2", "C:/cs2"])).unwrap(),
+            (Some("a.db".into()), Some("C:/cs2".into()))
+        );
+        assert!(parse_state(&s(&["--nope"])).is_err());
+        assert!(parse_state(&s(&["x"])).is_err());
+        assert!(parse_state(&s(&["--cs2"])).is_err());
     }
 
     /// Файл базы во временной папке; убирается вместе с `-wal`/`-shm`.

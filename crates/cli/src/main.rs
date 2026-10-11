@@ -40,7 +40,9 @@ cs2-cli — хайлайт-ролик из матча FACEIT
 
 Приёмка (база приложения только на чтение):
   cs2-cli acceptance check [--db <файл>] [--batch <имя> | --last] [--expect-restart-from <партия A>]
-  — машинная проверка серии из пяти матчей; код выхода 0 только если приёмка пройдена (подробно: cs2-cli acceptance --help)
+  cs2-cli acceptance state | job <номер задачи> | set
+  — машинная проверка серии из пяти матчей (код выхода 0 только если приёмка пройдена), чистоты после учений, улики задачи и набора
+  (подробно: cs2-cli acceptance --help)
 
 Ключ FACEIT берётся из переменной FACEIT_API_KEY.";
 
@@ -128,7 +130,15 @@ fn main() -> ExitCode {
         Some("assemble") => return assemble_cmd(),
         Some("record") => return record::record_cmd(),
         Some("retry") => return record::retry_cmd(),
-        Some("acceptance") => return acceptance::acceptance_cmd(),
+        Some("acceptance") => {
+            return match env::args().nth(2).as_deref() {
+                Some("check") => acceptance::check_cmd(),
+                Some("state") => acceptance::state_cmd(),
+                Some("job") => acceptance::job_cmd(),
+                Some("set") => acceptance::set_cmd(),
+                other => acceptance::usage_cmd(other),
+            };
+        }
         _ => {}
     }
     let args = match parse_args() {

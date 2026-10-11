@@ -19,6 +19,7 @@ geometry = { path = "../geometry" }
 pipeline = { path = "../pipeline" }
 store = { path = "../store" }
 serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 prost = "0.14.4"

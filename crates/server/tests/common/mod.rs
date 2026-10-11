@@ -61,6 +61,8 @@ pub struct Resp {
     pub status: u16,
     pub body: String,
     pub retry_after: Option<String>,
+    /// Все заголовки ответа: имя и значение.
+    pub headers: Vec<(String, String)>,
 }
 
 impl Resp {
@@ -282,11 +284,17 @@ pub fn send(url: &str, authorization: Option<&str>, body: Option<&str>) -> Resp 
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
+        .collect();
     let body = resp.body_mut().read_to_string().unwrap_or_default();
     Resp {
         status,
         body,
         retry_after,
+        headers,
     }
 }
 

@@ -1,5 +1,17 @@
 //! Защита секретов (SEC-04). Все секреты процесса живут только в `Secret`;
-//! любой текст, уходящий из процесса — журнал, колонки базы, ответы API, ошибки CLI, — проходит `Redactor`.
+//! любой текст, уходящий из процесса, проходит `Redactor`.
+//!
+//! `Redactor` маскирует по значению и по форме:
+//! - точные значения известных секретов (токен бота Telegram из настроек) — `***`;
+//! - токены раннера `cs2r_` + hex от 16 символов — `cs2r_***`, даже если сервер их уже не знает (отозванный или чужой);
+//! - заголовок `Bearer {значение}` (регистр не важен, значение от 8 символов) — `Bearer ***`;
+//! - токен бота Telegram по форме: от 5 цифр, `:`, от 30 символов `[A-Za-z0-9_-]` — `***` (в том числе внутри
+//!   адреса Bot API `bot{цифры}:{секрет}`).
+//!
+//! `Redactor` стоит на всех выходах сервера: журнал (`Log` маскирует каждую строку и текст паники), база (`Core` пропускает
+//! через `clean` каждый текст раннера и оператора до записи: сбои, причины возврата, имя и статус раннера, имя файла
+//! демки), ответы API (только фиксированные русские тексты и очищенные данные, значения запроса в ответ не попадают)
+//! и строки «ошибка:» командной строки.
 
 use std::fmt;
 use std::sync::Arc;
@@ -61,7 +73,9 @@ impl Redactor {
         for secret in self.exact.iter() {
             out = out.replace(secret.as_str(), "***");
         }
-        mask_tokens(&out)
+        let out = mask_tokens(&out);
+        let out = mask_bearer(&out);
+        mask_bot_tokens(&out)
     }
 
     /// `redact`, затем удаление управляющих символов (кроме `\n` и `\t`) и обрезка до `max_chars`.
@@ -78,6 +92,68 @@ impl Redactor {
         out.push('…');
         out
     }
+}
+
+/// Самое короткое значение после `Bearer`, которое считается токеном.
+const MIN_BEARER_LEN: usize = 8;
+/// Токен бота Telegram: `{id}:{секрет}`, не меньше 5 цифр и не меньше 30 символов секрета.
+const MIN_BOT_ID_DIGITS: usize = 5;
+const MIN_BOT_SECRET_LEN: usize = 30;
+
+/// `Bearer {значение}` без учёта регистра слова: значение от `MIN_BEARER_LEN` символов заменяется на `***`.
+fn mask_bearer(s: &str) -> String {
+    // Приведение только ASCII не меняет длину в байтах, поэтому смещения совпадают со строкой `s`.
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(rel) = lower[search..].find("bearer ") {
+        let value_at = search + rel + "bearer ".len();
+        let value = s[value_at..]
+            .chars()
+            .take_while(|c| !c.is_whitespace())
+            .collect::<String>();
+        if value.chars().count() >= MIN_BEARER_LEN {
+            out.push_str(&s[copied..value_at]);
+            out.push_str("***");
+            copied = value_at + value.len();
+            search = copied;
+        } else {
+            search = value_at;
+        }
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
+/// Токен бота Telegram по форме; покрывает и `bot{цифры}:{секрет}` в адресах Bot API.
+fn mask_bot_tokens(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let secret_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(rel) = s[search..].find(':') {
+        let colon = search + rel;
+        let mut start = colon;
+        while start > copied && bytes[start - 1].is_ascii_digit() {
+            start -= 1;
+        }
+        let mut end = colon + 1;
+        while end < bytes.len() && secret_byte(bytes[end]) {
+            end += 1;
+        }
+        if colon - start >= MIN_BOT_ID_DIGITS && end - (colon + 1) >= MIN_BOT_SECRET_LEN {
+            out.push_str(&s[copied..start]);
+            out.push_str("***");
+            copied = end;
+            search = end;
+        } else {
+            search = colon + 1;
+        }
+    }
+    out.push_str(&s[copied..]);
+    out
 }
 
 fn mask_tokens(s: &str) -> String {
@@ -119,6 +195,71 @@ mod tests {
         // Короткие секреты не маскируются.
         let short = Secret::new("abc".to_owned());
         assert_eq!(Redactor::new(&[&short]).redact("abc"), "abc");
+    }
+
+    const BOT: &str = "123456789:AAEsentinelSENTINELsentinelSENTINEL01";
+
+    #[test]
+    fn bearer_and_telegram_bot_tokens_are_masked_by_shape() {
+        let r = Redactor::default();
+        assert_eq!(
+            r.redact(&format!("токен бота {BOT} конец")),
+            "токен бота *** конец"
+        );
+        assert_eq!(
+            r.redact(&format!("https://api.telegram.org/bot{BOT}/sendMessage")),
+            "https://api.telegram.org/bot***/sendMessage"
+        );
+        assert_eq!(
+            r.redact("Authorization: Bearer abcdefgh123"),
+            "Authorization: Bearer ***"
+        );
+        assert_eq!(r.redact("bearer abcdefgh123\nдальше"), "bearer ***\nдальше");
+        assert_eq!(r.redact("BEARER Zz9-_.abcdefgh x"), "BEARER *** x");
+        // Токен раннера внутри Bearer маскируется целиком.
+        let token = format!("cs2r_{}", "cd34".repeat(16));
+        assert_eq!(r.redact(&format!("Bearer {token}")), "Bearer ***");
+        // Граница по длине: 5 цифр и 30 символов — ещё токен, 4 цифры или 29 символов — уже нет.
+        let edge = format!("{}:{}", "1".repeat(5), "a".repeat(30));
+        assert_eq!(r.redact(&edge), "***");
+        let short_id = format!("{}:{}", "1".repeat(4), "a".repeat(30));
+        assert_eq!(r.redact(&short_id), short_id);
+        let short_secret = format!("{}:{}", "1".repeat(5), "a".repeat(29));
+        assert_eq!(r.redact(&short_secret), short_secret);
+    }
+
+    #[test]
+    fn ordinary_text_times_and_hashes_survive_redaction() {
+        let r = Redactor::default();
+        let sha = "ab".repeat(32);
+        for text in [
+            "12:00:01",
+            "2026-10-11T15:04:05Z INFO обычная строка",
+            "время 09:30, порт 127.0.0.1:8080, ключ: значение",
+            "Bearer short",
+            "носитель bearer без значения",
+            &sha,
+            &format!("sha256 {sha}"),
+            "задача #7: failed (HLAE_ERROR), раннер main",
+        ] {
+            assert_eq!(r.redact(text), text, "{text}");
+        }
+    }
+
+    #[test]
+    fn redaction_is_idempotent() {
+        let secret = Secret::new("SECRET-VALUE-123".to_owned());
+        let r = Redactor::new(&[&secret]);
+        let token = format!("cs2r_{}", "ab12".repeat(16));
+        let text = format!("x SECRET-VALUE-123 {token} Bearer {token} bot{BOT}/y {BOT}");
+        let once = r.redact(&text);
+        assert!(
+            !once.contains("SECRET-VALUE")
+                && !once.contains(&token)
+                && !once.contains("AAEsentinel")
+        );
+        assert_eq!(r.redact(&once), once);
+        assert_eq!(r.clean(&once, 10_000), once);
     }
 
     #[test]

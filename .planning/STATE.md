@@ -4,10 +4,10 @@ current_phase: 04
 current_phase_name: Очередь без присмотра и приёмка
 status: executing
 stopped_at: Completed 04-04-PLAN.md
-last_updated: "2026-10-11T07:27:18.613Z"
+last_updated: "2026-10-11T07:41:17.144Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 04 execution started
-state_head: 6d5d499c62b81a8cd4ca02771054792af00f2594
+state_head: e1be156bd9233d4c92f83e548a332f2f74d4f35d
 progress:
   total_phases: 4
   completed_phases: 2
@@ -142,6 +142,12 @@ None yet.
 - Phase 2: последовательность вызовов Job Object + IOCP в `windows-sys` 0.61 ещё не опробована; семантика `StateFlags` в `appmanifest_730.acf` не проверена
 - Phase 4: значения дедлайнов (консоль ~90 с, простой дубля ~60 с) и допуск `ffprobe` нужно подстроить на реальном прогоне
 - 01-05: реальные спайки S1-S4 требуют закрыть запущенный CS2 (PID 48660 на момент 01-01); стенд crates/host/examples/spikes.rs отказывается стартовать при чужом cs2.exe
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 261011-hb5 | Фикс проверки стабильности дубля: пересверка размера после ffprobe и сверка validated-дублей с диском после закрытия игры | 2026-10-11 | e1be156 | [261011-hb5-fiks-proverki-stabilnosti-dublya-perepro](./quick/261011-hb5-fiks-proverki-stabilnosti-dublya-perepro/) |
 
 ## Deferred Items
 

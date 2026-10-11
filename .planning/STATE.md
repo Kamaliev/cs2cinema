@@ -2,19 +2,19 @@
 gsd_state_version: "1.0"
 milestone: v1.1
 milestone_name: Сервер и Telegram-бот
-current_phase: 7
+current_phase: 07
 current_phase_name: Telegram-бот и доставка
-status: planning
-stopped_at: Phase 05 complete, ready to plan Phase 7
-last_updated: "2026-10-11T18:40:17.341Z"
-last_activity: 2026-10-11
-last_activity_desc: Phase 05 complete, transitioned to Phase 7
-state_head: 53543a585b9e74cafe5e799b9868805fc3bac358
+status: executing
+stopped_at: Completed 07-01-PLAN.md
+last_updated: "2026-10-11T19:47:23.752Z"
+last_activity: 2026-10-12
+last_activity_desc: Phase 07 execution started
+state_head: 800a122400901b7a240b4b7a195b08a8eabad1f7
 progress:
   total_phases: 5
   completed_phases: 2
-  total_plans: 16
-  completed_plans: 16
+  total_plans: 27
+  completed_plans: 17
   percent: 40
 ---
 
@@ -25,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-11)
 
 **Core value:** Задача на монтаж доходит до готового `highlights.mp4` без ручного вмешательства, а если это невозможно — останавливается быстро и объясняет, что именно пошло не так. Для v1.1 то же верно от демки, отправленной боту, до ролика в чате.
-**Current focus:** Phase 06 — Раннер, защита входа и первый живой прогон
+**Current focus:** Phase 07 — Telegram-бот и доставка
 
 ## Current Position
 
-Phase: 7 — Telegram-бот и доставка
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-10-11 — Phase 05 complete, transitioned to Phase 7
+Phase: 07 (Telegram-бот и доставка) — EXECUTING
+Plan: 2 of 11
+Status: Ready to execute
+Last activity: 2026-10-12 — Phase 07 execution started
 
 Progress: [████░░░░░░] 40%
 
@@ -109,6 +109,7 @@ Progress: [████░░░░░░] 40%
 | Phase 06 P08 | 70min | 2 tasks | 7 files |
 | Phase 06 P09 | 60 min | 3 tasks | 9 files |
 | Phase 06 P10 | 75min | 3 tasks | 10 files |
+| Phase 07 P01 | 35min | 2 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -200,6 +201,8 @@ Recent decisions affecting current work:
 - [Phase 06]: 06-10: сверка SHA-256 результата перед загрузкой только при sha_retries == 0; после отказа сервера решает сервер
 - [Phase 06]: 06-10: Runner::run возвращает Result — Err при отклонённом токене и несовпадении протокола (код выхода cs2-cli runner 1)
 - [Phase 06]: 06-10: токен раннера только печатные ASCII-знаки (не-ASCII в Authorization давал вечные повторы)
+- [Phase 07]: 07-01: копия tiny_http 0.12.0 в vendor/ с ограниченным дочитыванием тела (CR-01); MAX_BODY = CHUNK_SIZE + 64 КиБ
+- [Phase 07]: 07-01: Event::Release отменённой задачи даёт Cancelled (WR-01); Connection: close в ответе tiny_http игнорируется
 
 ### Pending Todos
 
@@ -229,6 +232,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T17:05:13.947Z
-Stopped at: Phase 05 complete, ready to plan Phase 7
+Last session: 2026-10-11T19:47:23.668Z
+Stopped at: Completed 07-01-PLAN.md
 Resume file: None

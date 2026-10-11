@@ -8,8 +8,12 @@ use std::time::Duration;
 
 /// Признак разделителя попыток: по нему `stage_summary` находит начало последней попытки.
 const SEPARATOR_MARK: &str = "──── попытка ";
+/// Конец разделителя после способа запуска.
+const SEPARATOR_END: &str = " ────";
 /// Начало строки с длительностью этапа.
 const STAGE_MARK: &str = "⏱ этап ";
+/// Начало строки итога попытки.
+const OUTCOME_MARK: &str = "итог попытки ";
 
 /// Как запущена попытка.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,14 +24,20 @@ pub enum StartKind {
     Retry,
     /// «Заново»: с самого начала.
     Redo,
+    /// Очередь сама повторила сбой класса «запуск» после уборки и паузы (DIF-04).
+    Auto,
 }
 
 impl StartKind {
+    /// Все способы запуска: по ним `attempts` узнаёт разделитель, который записал `separator`.
+    pub const ALL: [StartKind; 4] = [StartKind::First, StartKind::Retry, StartKind::Redo, StartKind::Auto];
+
     pub fn title(self) -> &'static str {
         match self {
             StartKind::First => "первый запуск",
             StartKind::Retry => "Повторить",
             StartKind::Redo => "Заново",
+            StartKind::Auto => "авто-повтор",
         }
     }
 }
@@ -61,7 +71,33 @@ pub fn stage_line(stage: &str, d: Duration) -> String {
 
 /// Итог попытки в конце её журнала.
 pub fn outcome_line(attempt: u32, outcome: &str) -> String {
-    format!("итог попытки {attempt}: {outcome}")
+    format!("{OUTCOME_MARK}{attempt}: {outcome}")
+}
+
+/// Номера и способы запуска всех попыток по разделителям журнала. Строка может начинаться временем и меткой `[… #N]`.
+/// Строка с неизвестным способом запуска пропускается: проверка приёмки сравнивает число разделителей с `job.attempt`.
+pub fn attempts(log: &str) -> Vec<(u32, StartKind)> {
+    log.lines()
+        .filter_map(|l| {
+            let rest = &l[l.find(SEPARATOR_MARK)? + SEPARATOR_MARK.len()..];
+            let (n, rest) = rest.split_once(" · ")?;
+            let (_when, kind) = rest.split_once(" · ")?;
+            let kind = kind.trim_end().strip_suffix(SEPARATOR_END)?;
+            let kind = StartKind::ALL.into_iter().find(|k| k.title() == kind)?;
+            Some((n.trim().parse().ok()?, kind))
+        })
+        .collect()
+}
+
+/// Номера попыток и текст их итога по строкам `outcome_line`.
+pub fn outcomes(log: &str) -> Vec<(u32, String)> {
+    log.lines()
+        .filter_map(|l| {
+            let rest = &l[l.find(OUTCOME_MARK)? + OUTCOME_MARK.len()..];
+            let (n, text) = rest.split_once(": ")?;
+            Some((n.trim().parse().ok()?, text.trim().to_owned()))
+        })
+        .collect()
 }
 
 /// Этапы и их длительности последней попытки по журналу. Строка может начинаться временем и меткой `[… #N]`.
@@ -121,5 +157,32 @@ mod tests {
         assert!(log.contains("──── попытка 2 · 2026-10-11 10:30 · Повторить ────"));
         assert_eq!(separator(3, "д", StartKind::Redo), "──── попытка 3 · д · Заново ────");
         assert!(stage_summary("").is_empty());
+    }
+
+    #[test]
+    fn attempts_reads_back_every_separator_kind() {
+        for kind in StartKind::ALL {
+            let log = format!("12:00:01  [Запись #2] {}\n", separator(7, "2026-10-11 10:00", kind));
+            assert_eq!(attempts(&log), vec![(7, kind)], "{}", kind.title());
+            let bare = format!("{}\n", separator(3, "д", kind));
+            assert_eq!(attempts(&bare), vec![(3, kind)]);
+        }
+        let log = format!(
+            "12:00:01  {} старт\n{}\n{}\n{}\n{}\n──── попытка 9 · д · неизвестный ────\n",
+            prefix("Запись", 1),
+            separator(1, "д", StartKind::First),
+            stage_line("Запись", Duration::from_secs(5)),
+            outcome_line(1, "сбой CONSOLE_NOT_OPEN"),
+            separator(2, "д", StartKind::Auto),
+        );
+        assert_eq!(attempts(&log), vec![(1, StartKind::First), (2, StartKind::Auto)], "этапы, итоги и неизвестный способ не дают записей");
+        assert!(attempts("").is_empty());
+    }
+
+    #[test]
+    fn outcomes_read_back_what_outcome_line_wrote() {
+        let log = format!("{}\n12:00:01  {}\n{}\n", outcome_line(1, "сбой CONSOLE_NOT_OPEN"), outcome_line(2, "готово: ролик"), stage_line("Запись", Duration::from_secs(1)));
+        assert_eq!(outcomes(&log), vec![(1, "сбой CONSOLE_NOT_OPEN".to_owned()), (2, "готово: ролик".to_owned())]);
+        assert!(outcomes("").is_empty());
     }
 }

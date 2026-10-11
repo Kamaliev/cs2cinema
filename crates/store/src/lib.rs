@@ -155,6 +155,10 @@ pub struct Job {
     pub attempt: u32,
     /// Следующий запуск — «Повторить»: с записи по `record.json`, без скачивания и плана.
     pub resume: bool,
+    /// Сколько раз задача поставлена в очередь авто-повтором после последнего ручного запуска (DIF-04).
+    pub auto_retries: u32,
+    /// Партия приёмочного прогона (ACC-01); пусто — задача поставлена не приёмкой.
+    pub batch: Option<String>,
 }
 
 /// Сборка CS2 и версия HLAE последней удачной записи (D-04, DIF-01): с ней предпроверка сравнивает текущую сборку CS2.
@@ -256,7 +260,8 @@ CREATE TABLE IF NOT EXISTS demos (
 // Версии схемы: 1 — сбой записи (fail_*, D-05);
 // 2 — прошедшее время сбоя и состояние записи для карточки (D-06);
 // 3 — отчёт предпроверки (`jobs.precheck`, JSON) и пара «сборка CS2 / версия HLAE» последней удачной записи (`last_good`, D-04);
-// 4 — номер попытки (`attempt`, D-10) и флаг «повтор с записи» (`resume`, RET-02).
+// 4 — номер попытки (`attempt`, D-10) и флаг «повтор с записи» (`resume`, RET-02);
+// 5 — счётчик авто-повторов (`auto_retries`, DIF-04) и партия приёмки (`batch`, ACC-01).
 // Новая версия — только новым шагом в конце списка и только добавлением колонок или таблиц.
 // Элемент k поднимает схему до версии k+1; шаг идёт в одной транзакции со своим `user_version`.
 const MIGRATIONS: &[&str] = &[
@@ -275,7 +280,14 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE jobs ADD COLUMN precheck TEXT;",
     "ALTER TABLE jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE jobs ADD COLUMN resume INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE jobs ADD COLUMN auto_retries INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE jobs ADD COLUMN batch TEXT;",
 ];
+
+/// Версия схемы, которую создаёт и ожидает эта сборка (число шагов `MIGRATIONS`).
+pub fn schema_version() -> usize {
+    MIGRATIONS.len()
+}
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -358,6 +370,8 @@ impl Store {
             precheck: r.get("precheck")?,
             attempt: r.get::<_, i64>("attempt")?.max(0) as u32,
             resume: r.get::<_, i64>("resume")? != 0,
+            auto_retries: r.get::<_, i64>("auto_retries")?.max(0) as u32,
+            batch: r.get("batch")?,
         })
     }
 
@@ -514,10 +528,22 @@ impl Store {
         self.requeue_with(id, true)
     }
 
+    /// Авто-повтор (DIF-04): очередь сама ставит задачу «с записи» и считает это в `auto_retries`.
+    /// Ручные «Повторить» и «Заново» обнуляют счётчик, поэтому бюджет авто-повтора — один на серию ручных запусков.
+    pub fn requeue_auto(&self, id: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE jobs SET status = 'queued', stage = '', error = NULL, fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', precheck = NULL, resume = 1, auto_retries = auto_retries + 1, updated_at = ?2 WHERE id = ?1",
+                params![id, now()],
+            )?;
+            Ok(())
+        })
+    }
+
     fn requeue_with(&self, id: i64, resume: bool) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "UPDATE jobs SET status = 'queued', stage = '', error = NULL, fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', precheck = NULL, resume = ?3, updated_at = ?2 WHERE id = ?1",
+                "UPDATE jobs SET status = 'queued', stage = '', error = NULL, fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', precheck = NULL, resume = ?3, auto_retries = 0, updated_at = ?2 WHERE id = ?1",
                 params![id, now(), resume as i64],
             )?;
             Ok(())
@@ -766,10 +792,10 @@ mod tests {
         let j = s.jobs().unwrap().pop().unwrap();
         assert_eq!(j.error.as_deref(), Some("старая ошибка"));
         assert_eq!((j.fail_code, j.fail_state, j.fail_hint, j.fail_tail), (None, None, None, None));
-        assert_eq!(user_version(&s), 4);
+        assert_eq!(user_version(&s), schema_version() as i64);
         drop(s);
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 4, "повторное открытие ничего не меняет");
+        assert_eq!(user_version(&s), schema_version() as i64, "повторное открытие ничего не меняет");
         assert_eq!(s.jobs().unwrap().len(), 1);
     }
 
@@ -784,13 +810,13 @@ mod tests {
             insert_old_job(&c);
         }
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 4);
+        assert_eq!(user_version(&s), schema_version() as i64);
         let j = s.jobs().unwrap().pop().unwrap();
         assert_eq!(j.error.as_deref(), Some("старая ошибка"));
         assert_eq!((j.phase.as_str(), j.fail_elapsed_ms), ("", None));
         drop(s);
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 4, "повторное открытие ничего не меняет");
+        assert_eq!(user_version(&s), schema_version() as i64, "повторное открытие ничего не меняет");
         assert_eq!(s.jobs().unwrap().len(), 1);
     }
 
@@ -808,7 +834,7 @@ mod tests {
         }
         let report = r#"{"ok":false,"items":["нет ffmpeg"]}"#;
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 4);
+        assert_eq!(user_version(&s), schema_version() as i64);
         let j = s.jobs().unwrap().pop().unwrap();
         assert_eq!(j.error.as_deref(), Some("старая ошибка"));
         assert_eq!(j.precheck, None);
@@ -827,7 +853,7 @@ mod tests {
         drop(s);
 
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 4, "повторное открытие ничего не меняет");
+        assert_eq!(user_version(&s), schema_version() as i64, "повторное открытие ничего не меняет");
         assert_eq!(s.jobs().unwrap().len(), 1);
         assert_eq!(s.jobs().unwrap()[0].precheck.as_deref(), Some(report));
         assert_eq!(s.last_good().unwrap().unwrap().cs2_build, "25900000");
@@ -846,15 +872,81 @@ mod tests {
             insert_old_job(&c);
         }
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 4);
+        assert_eq!(user_version(&s), schema_version() as i64);
         let j = s.jobs().unwrap().pop().unwrap();
         assert_eq!(j.error.as_deref(), Some("старая ошибка"));
         assert_eq!((j.attempt, j.resume), (0, false));
         assert_eq!(s.start_job(j.id).unwrap(), 1);
         drop(s);
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 4, "повторное открытие ничего не меняет");
+        assert_eq!(user_version(&s), schema_version() as i64, "повторное открытие ничего не меняет");
         assert_eq!(s.jobs().unwrap()[0].attempt, 1);
+    }
+
+    #[test]
+    fn version_four_database_gains_auto_retries_and_batch() {
+        let db = TempDb::new("v4");
+        {
+            let c = Connection::open(&db.0).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            for sql in &MIGRATIONS[..4] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.execute_batch("PRAGMA user_version = 4").unwrap();
+            insert_old_job(&c);
+        }
+        let s = Store::open(&db.0).unwrap();
+        assert_eq!(user_version(&s), 5);
+        let j = s.jobs().unwrap().pop().unwrap();
+        assert_eq!(j.error.as_deref(), Some("старая ошибка"));
+        assert_eq!((j.auto_retries, j.batch), (0, None));
+        drop(s);
+        let s = Store::open(&db.0).unwrap();
+        assert_eq!(user_version(&s), 5, "повторное открытие ничего не меняет");
+        assert_eq!(s.jobs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn requeue_auto_counts_and_a_manual_requeue_resets() {
+        let s = Store::in_memory().unwrap();
+        let a = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.start_job(a).unwrap();
+        s.finish_job(a, Err("упала")).unwrap();
+        s.requeue_auto(a).unwrap();
+        let j = s.job(a).unwrap().unwrap();
+        assert_eq!((j.status, j.resume, j.auto_retries, j.fail_code), (JobStatus::Queued, true, 1, None));
+
+        s.start_job(a).unwrap();
+        s.finish_job(a, Err("упала снова")).unwrap();
+        s.requeue_resume(a).unwrap();
+        let j = s.job(a).unwrap().unwrap();
+        assert_eq!((j.resume, j.auto_retries), (true, 0), "ручное «Повторить» возвращает бюджет");
+
+        s.requeue_auto(a).unwrap();
+        assert_eq!(s.job(a).unwrap().unwrap().auto_retries, 1);
+        s.requeue(a).unwrap();
+        let j = s.job(a).unwrap().unwrap();
+        assert_eq!((j.resume, j.auto_retries), (false, 0), "«Заново» тоже обнуляет счётчик");
+    }
+
+    #[test]
+    fn auto_retry_attempt_is_visible_in_the_journal() {
+        use crate::journal::{self, StartKind};
+        let s = Store::in_memory().unwrap();
+        let a = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.start_job(a).unwrap();
+        s.append_log(a, &journal::separator(1, "2026-10-11 10:00", StartKind::First)).unwrap();
+        s.append_log(a, &journal::outcome_line(1, "сбой CONSOLE_NOT_OPEN")).unwrap();
+        s.finish_job(a, Err("консоль не открылась")).unwrap();
+        s.requeue_auto(a).unwrap();
+        let j = s.job(a).unwrap().unwrap();
+        assert!(j.resume && j.auto_retries > 0, "исполнитель очереди выбирает Auto по этим двум полям");
+        s.start_job(a).unwrap();
+        s.append_log(a, &journal::separator(2, "2026-10-11 10:05", StartKind::Auto)).unwrap();
+        let job = s.job(a).unwrap().unwrap();
+        assert_eq!(job.attempt, 2);
+        assert_eq!(journal::attempts(&job.log), vec![(1, StartKind::First), (2, StartKind::Auto)]);
+        assert_eq!(journal::outcomes(&job.log), vec![(1, "сбой CONSOLE_NOT_OPEN".to_owned())]);
     }
 
     #[test]

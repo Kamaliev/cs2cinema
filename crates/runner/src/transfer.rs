@@ -1,14 +1,13 @@
 //! Передача файлов раннера: докачка демки и загрузка результата со смещения, которое назвал сервер.
 //!
 //! Файлы читаются и пишутся кусками, целиком в память не грузятся. Временные ошибки (сеть, 5xx, `overloaded`)
-//! повторяются с паузой 1, 2, 4 … 30 с без конца, пока не поднят флаг остановки; окончательные отказы сервера
+//! повторяются с паузой 1, 2, 4 … 30 с без конца, пока функция остановки не скажет прервать (`StopFn`); окончательные отказы сервера
 //! (`stale_epoch`, `job_terminal`, повторный `sha256_mismatch`) возвращаются как `Dropped`, решать их судьбу
 //! будет вызывающий (результат удаляется из outbox с записью причины).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -20,13 +19,31 @@ use wire::{CHUNK_SIZE, FinishRequest, JobState, Outcome};
 use crate::link::{Link, LinkError};
 use crate::state::HeldJob;
 
+/// Почему передачу пора прервать. Порядок важности: потеря задачи, отмена сервера, локальная остановка.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopWhy {
+    /// Остановка раннера (не отмена): задача остаётся для продолжения.
+    Local,
+    /// Отмена на сервере: передача прерывается, задача закрывается `finish(Cancelled)`.
+    Cancelled,
+    /// Задача потеряна (`stale_epoch`, `job_terminal`, токен отозван): сброс без `finish`.
+    Lost,
+}
+
+/// Функция остановки передачи: спрашивается между кусками и во время пауз.
+pub type StopFn<'a> = &'a dyn Fn() -> Option<StopWhy>;
+
 /// Чем кончилась передача.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransferEnd<T = ()> {
     /// Передача завершена; для загрузки результата внутри состояние задачи после `finish`.
     Done(T),
-    /// Остановлено флагом или лимитом кусков; всё уже записанное остаётся для продолжения.
+    /// Остановлено локально или лимитом кусков; всё уже записанное остаётся для продолжения.
     Stopped,
+    /// Отмена на сервере прервала передачу между кусками.
+    Cancelled,
+    /// Задача потеряна, пока шла передача.
+    Lost,
     /// Окончательный отказ: причина для журнала. Для демки так отмечена демка, которая не сошлась по SHA-256.
     Dropped(String),
 }
@@ -75,16 +92,25 @@ impl Write for HashingFile<'_> {
     }
 }
 
-/// Пауза с проверкой флага каждые 200 мс; `false` — подняли флаг остановки.
-fn nap(secs: u64, stop: &AtomicBool) -> bool {
+/// Окончание передачи по причине остановки.
+fn ended<T>(why: StopWhy) -> TransferEnd<T> {
+    match why {
+        StopWhy::Local => TransferEnd::Stopped,
+        StopWhy::Cancelled => TransferEnd::Cancelled,
+        StopWhy::Lost => TransferEnd::Lost,
+    }
+}
+
+/// Пауза с проверкой остановки каждые 200 мс; `Some` — передачу пора прервать.
+fn nap(secs: u64, stop: StopFn) -> Option<StopWhy> {
     let until = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < until {
-        if stop.load(Ordering::SeqCst) {
-            return false;
+        if let Some(why) = stop() {
+            return Some(why);
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    !stop.load(Ordering::SeqCst)
+    stop()
 }
 
 /// Пауза между повторами: 1, 2, 4 … 30 с.
@@ -137,7 +163,7 @@ pub(crate) fn judge(e: &LinkError) -> Verdict {
 pub fn download_demo(
     link: &Link,
     held: &HeldJob,
-    stop: &AtomicBool,
+    stop: StopFn,
     log: &dyn Fn(&str),
 ) -> Result<TransferEnd, String> {
     let (job_id, epoch) = (held.server_job_id, held.epoch);
@@ -182,9 +208,9 @@ pub fn download_demo(
             log(&format!("задача #{job_id}: скачиваю демку, {size} байт"));
         }
         while have < size {
-            if stop.load(Ordering::SeqCst) {
+            if let Some(why) = stop() {
                 let _ = file.flush();
-                return Ok(TransferEnd::Stopped);
+                return Ok(ended(why));
             }
             let mut sink = HashingFile {
                 file: &mut file,
@@ -230,7 +256,7 @@ pub fn upload_result(
     link: &Link,
     held: &mut HeldJob,
     save: &mut dyn FnMut(&HeldJob),
-    stop: &AtomicBool,
+    stop: StopFn,
     chunk_limit: Option<u32>,
     log: &dyn Fn(&str),
 ) -> TransferEnd<JobState> {
@@ -264,8 +290,8 @@ pub fn upload_result(
     let mut chunks = 0u32;
     let mut chunk = vec![0u8; CHUNK_SIZE as usize];
     'attempt: loop {
-        if stop.load(Ordering::SeqCst) {
-            return TransferEnd::Stopped;
+        if let Some(why) = stop() {
+            return ended(why);
         }
         let mut offset = match link.result_head(id, epoch) {
             Ok(o) => o,
@@ -276,8 +302,8 @@ pub fn upload_result(
                     log(&format!(
                         "задача #{id}: HEAD результата: {e}; повтор через {pause} с"
                     ));
-                    if !nap(pause, stop) {
-                        return TransferEnd::Stopped;
+                    if let Some(why) = nap(pause, stop) {
+                        return ended(why);
                     }
                     continue 'attempt;
                 }
@@ -293,8 +319,8 @@ pub fn upload_result(
         ));
 
         while offset < size {
-            if stop.load(Ordering::SeqCst) {
-                return TransferEnd::Stopped;
+            if let Some(why) = stop() {
+                return ended(why);
             }
             let len = (size - offset).min(CHUNK_SIZE) as usize;
             if let Err(e) = file
@@ -339,8 +365,8 @@ pub fn upload_result(
                     log(&format!(
                         "задача #{id}: сервер ещё принимает прошлый кусок; повтор через {pause} с"
                     ));
-                    if !nap(pause, stop) {
-                        return TransferEnd::Stopped;
+                    if let Some(why) = nap(pause, stop) {
+                        return ended(why);
                     }
                 }
                 Err(e) => match judge(&e) {
@@ -350,8 +376,8 @@ pub fn upload_result(
                         log(&format!(
                             "задача #{id}: загрузка результата: {e}; повтор через {pause} с"
                         ));
-                        if !nap(pause, stop) {
-                            return TransferEnd::Stopped;
+                        if let Some(why) = nap(pause, stop) {
+                            return ended(why);
                         }
                         // Смещение могло сдвинуться, пока шёл оборванный запрос: спрашиваем сервер заново.
                         continue 'attempt;
@@ -391,8 +417,8 @@ pub fn upload_result(
                     log(&format!(
                         "задача #{id}: finish: {e}; повтор через {pause} с"
                     ));
-                    if !nap(pause, stop) {
-                        return TransferEnd::Stopped;
+                    if let Some(why) = nap(pause, stop) {
+                        return ended(why);
                     }
                     continue 'attempt;
                 }

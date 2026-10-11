@@ -3,16 +3,17 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pipeline::job::Outcome;
+use pipeline::record::Event;
 use pipeline::{FailCode, Progress, RecordFailure, RecordState, RunError};
 use runner::{Config, Executor, Task, Token};
-use server::clock::SystemClock;
+use server::clock::{Clock, ManualClock, SystemClock};
 use server::config::Config as ServerConfig;
-use server::core::{JobRow, Submit};
+use server::core::{Core, JobRow, Submit};
 use server::log::MemorySink;
 use server::{Running, auth};
 
@@ -45,10 +46,22 @@ pub struct Stand {
     running: Option<Running>,
     pub base: String,
     pub token: String,
+    /// Ручные часы сервера, если стенд запущен с ними.
+    pub clock: Option<ManualClock>,
 }
 
 impl Stand {
     pub fn start() -> Stand {
+        Stand::start_with(Arc::new(SystemClock), None)
+    }
+
+    /// Стенд с ручными часами сервера: аренды истекают, когда скажет тест.
+    pub fn start_manual() -> Stand {
+        let clock = ManualClock::new(SystemClock.now_ms());
+        Stand::start_with(Arc::new(clock.clone()), Some(clock))
+    }
+
+    fn start_with(clock: Arc<dyn Clock>, manual: Option<ManualClock>) -> Stand {
         let dir = TestDir::new("flow");
         let cfg = ServerConfig {
             bind: "127.0.0.1:0".to_owned(),
@@ -57,7 +70,7 @@ impl Stand {
             longpoll_secs: 1,
             ..Default::default()
         };
-        let running = server::serve(&cfg, Arc::new(SystemClock), Arc::new(MemorySink::default()))
+        let running = server::serve(&cfg, clock, Arc::new(MemorySink::default()))
             .expect("сервер должен запуститься");
         let base = format!("http://{}", running.addr());
         let core = running.core();
@@ -67,7 +80,31 @@ impl Stand {
             running: Some(running),
             base,
             token,
+            clock: manual,
         }
+    }
+
+    /// Копия ядра сервера: заглушка исполнителя может отменять задачу сама.
+    pub fn core(&self) -> Core {
+        self.running().core().clone()
+    }
+
+    /// Выдаёт ещё один токен раннера.
+    pub fn second_token(&self) -> String {
+        let core = self.running().core();
+        auth::add_runner(core.db(), "second", core.clock().now_ms())
+            .unwrap()
+            .1
+    }
+
+    /// Двигает ручные часы сервера.
+    pub fn advance(&self, d: Duration) {
+        self.clock.as_ref().expect("нужен start_manual").advance(d);
+    }
+
+    /// Возвращает в очередь задачи с истёкшей арендой.
+    pub fn sweep(&self) {
+        self.running().core().sweep().unwrap();
     }
 
     fn running(&self) -> &Running {
@@ -123,6 +160,9 @@ impl Stand {
             name: "tester".to_owned(),
             poll_secs: Some(0),
             upload_chunk_limit: None,
+            heartbeat: None,
+            debounce: Duration::from_secs(2),
+            force_after: runner::FORCE_AFTER,
         }
     }
 }
@@ -256,4 +296,180 @@ pub fn result_bytes(size: usize) -> Vec<u8> {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     server::hex(&Sha256::digest(bytes))
+}
+
+/// Ждёт, пока условие не станет истинным; `false` — не дождались за `secs` секунд.
+pub fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+    let until = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < until {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    cond()
+}
+
+fn cancelled_error() -> RunError {
+    RunError {
+        message: pipeline::CANCELLED.to_owned(),
+        fail: None,
+    }
+}
+
+/// Исполнитель-заглушка: ставит этап `record` и «дубль 2 из 3», ждёт отмены (не дольше 10 с) и сообщает, когда
+/// увидел мягкую и жёсткую отмену.
+pub struct WaitForCancel {
+    /// Пауза до этапа `record`: сервер успевает показать `precheck`.
+    pub delay: Duration,
+    pub calls: AtomicUsize,
+    pub cancel_seen: Mutex<Option<Instant>>,
+    pub force_seen: Mutex<Option<Instant>>,
+}
+
+impl WaitForCancel {
+    pub fn new(delay: Duration) -> Arc<WaitForCancel> {
+        Arc::new(WaitForCancel {
+            delay,
+            calls: AtomicUsize::new(0),
+            cancel_seen: Mutex::new(None),
+            force_seen: Mutex::new(None),
+        })
+    }
+}
+
+impl Executor for WaitForCancel {
+    fn run(&self, _task: &Task, p: &dyn Progress) -> Result<Outcome, RunError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        p.stage(pipeline::Stage::Record);
+        p.event(&Event::State {
+            state: RecordState::Take,
+            take: Some((2, 3)),
+        });
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until {
+            if p.force_cancelled() {
+                self.force_seen
+                    .lock()
+                    .unwrap()
+                    .get_or_insert(Instant::now());
+            }
+            if p.cancelled() {
+                self.cancel_seen
+                    .lock()
+                    .unwrap()
+                    .get_or_insert(Instant::now());
+                return Err(cancelled_error());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(RunError {
+            message: "заглушка не дождалась отмены".to_owned(),
+            fail: None,
+        })
+    }
+}
+
+/// Исполнитель-заглушка, который не замечает мягкой отмены: ждёт только жёсткой.
+pub struct IgnoreSoftCancel {
+    pub soft_seen: Mutex<Option<Instant>>,
+    pub force_seen: Mutex<Option<Instant>>,
+}
+
+impl IgnoreSoftCancel {
+    pub fn new() -> Arc<IgnoreSoftCancel> {
+        Arc::new(IgnoreSoftCancel {
+            soft_seen: Mutex::new(None),
+            force_seen: Mutex::new(None),
+        })
+    }
+}
+
+impl Executor for IgnoreSoftCancel {
+    fn run(&self, _task: &Task, p: &dyn Progress) -> Result<Outcome, RunError> {
+        p.stage(pipeline::Stage::Record);
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until {
+            if p.cancelled() {
+                self.soft_seen.lock().unwrap().get_or_insert(Instant::now());
+            }
+            if p.force_cancelled() {
+                *self.force_seen.lock().unwrap() = Some(Instant::now());
+                return Err(cancelled_error());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(RunError {
+            message: "заглушка не дождалась жёсткой отмены".to_owned(),
+            fail: None,
+        })
+    }
+}
+
+/// Исполнитель-заглушка, у которого флаг остановки раннера поднимается посреди работы.
+pub struct StopMidway {
+    pub flag: Mutex<Option<Arc<AtomicBool>>>,
+    pub calls: AtomicUsize,
+    pub force_seen: AtomicBool,
+}
+
+impl StopMidway {
+    pub fn new() -> Arc<StopMidway> {
+        Arc::new(StopMidway {
+            flag: Mutex::new(None),
+            calls: AtomicUsize::new(0),
+            force_seen: AtomicBool::new(false),
+        })
+    }
+}
+
+impl Executor for StopMidway {
+    fn run(&self, _task: &Task, p: &dyn Progress) -> Result<Outcome, RunError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        p.stage(pipeline::Stage::Record);
+        let flag = self.flag.lock().unwrap().clone().expect("флаг не задан");
+        flag.store(true, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until && !p.cancelled() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.force_seen.store(p.force_cancelled(), Ordering::SeqCst);
+        Err(cancelled_error())
+    }
+}
+
+/// Исполнитель-заглушка: отдаёт готовый результат, но перед этим отменяет задачу на сервере и ждёт, пока раннер
+/// узнает об отмене, — загрузка начинается уже при отмене.
+pub struct FinishThenCancel {
+    dir: PathBuf,
+    core: Core,
+    size: usize,
+}
+
+impl FinishThenCancel {
+    pub fn new(dir: PathBuf, core: Core, size: usize) -> Arc<FinishThenCancel> {
+        Arc::new(FinishThenCancel { dir, core, size })
+    }
+}
+
+impl Executor for FinishThenCancel {
+    fn run(&self, task: &Task, p: &dyn Progress) -> Result<Outcome, RunError> {
+        p.stage(pipeline::Stage::Assemble);
+        let out_dir = self.dir.join("out").join(format!("srv{}", task.job_id));
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let result = out_dir.join("highlights.mp4");
+        std::fs::write(&result, result_bytes(self.size)).unwrap();
+        self.core.cancel(task.job_id, false).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until && !p.cancelled() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(Outcome {
+            out_dir,
+            result,
+            shots: 1,
+            secs: 1.0,
+        })
+    }
 }

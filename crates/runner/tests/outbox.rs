@@ -400,7 +400,6 @@ mod scripted_http {
 fn upload_follows_the_server_offset_and_waits_when_busy() {
     use scripted_http::{Reply, start};
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     let json = ("Content-Type", "application/json");
@@ -452,11 +451,11 @@ fn upload_follows_the_server_offset_and_waits_when_busy() {
     });
 
     let link = Link::new(&base, Token::new("secret-token")).unwrap();
-    let stop = AtomicBool::new(false);
     let lines = Mutex::new(Vec::<String>::new());
-    let end = runner::transfer::upload_result(&link, &mut held, &mut |_| {}, &stop, None, &|m| {
-        lines.lock().unwrap().push(m.to_owned())
-    });
+    let end =
+        runner::transfer::upload_result(&link, &mut held, &mut |_| {}, &|| None, None, &|m| {
+            lines.lock().unwrap().push(m.to_owned())
+        });
     handle.join().unwrap();
 
     assert_eq!(

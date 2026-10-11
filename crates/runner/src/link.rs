@@ -118,7 +118,8 @@ impl std::fmt::Display for LinkError {
     }
 }
 
-/// Соединение раннера с сервером.
+/// Соединение раннера с сервером. Копия делит агент `ureq`; поток пульса держит свою.
+#[derive(Clone)]
 pub struct Link {
     base: String,
     token: Token,

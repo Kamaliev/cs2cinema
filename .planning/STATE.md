@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 04
 current_phase_name: Очередь без присмотра и приёмка
 status: executing
-stopped_at: Completed 04-02-PLAN.md
-last_updated: "2026-10-11T06:59:31.396Z"
+stopped_at: Completed 04-03-PLAN.md
+last_updated: "2026-10-11T07:13:47.903Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 04 execution started
-state_head: b6fc09a702fe2bd1a4d253fdd98ad0002ce0d006
+state_head: 6c48abe329c035409fbb9b0a971354d04f2b0b0b
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 36
-  completed_plans: 26
+  completed_plans: 27
   percent: 50
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 04 (Очередь без присмотра и приёмка) — EXECUTING
-Plan: 3 of 12
+Plan: 4 of 12
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 04 execution started
 
@@ -81,6 +81,7 @@ Progress: [█████░░░░░] 50%
 | Phase 03 P07 | 35min | 2 tasks | 3 files |
 | Phase 04 P01 | 25min | 2 tasks | 9 files |
 | Phase 04 P02 | 15min | 2 tasks | 3 files |
+| Phase 04 P03 | 25min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -127,6 +128,7 @@ Recent decisions affecting current work:
 - [Phase 03]: 03-06: повтор с невалидным дублем записывает все дубли заново, прежний clips уходит в clips_old_<ts> (D-07, запасной вариант)
 - [Phase 04]: 04-01: cs2-cli assemble принимает папку задачи (record.json + clips/manifest.json); старая склейка renderer::assemble и флаги --plan/--clips удалены (DC-1); RunError переехала в pipeline
 - [Phase 04]: 04-02: бюджет авто-повтора — колонка auto_retries, обнуляется ручным Повторить/Заново; партия приёмки — batch + set_batch; GAME_EXITED до Take — класс «запуск»
+- [Phase 04]: 04-03: Host::notify через Shell_NotifyIconW на отдельном потоке (DC-6); A1 и A3 спайка не проверены, кириллица не подтверждена, A2 подтверждено; 04-08 не опирается на A1, D6 в 04-11 проверяет A1/A3
 
 ### Pending Todos
 
@@ -149,6 +151,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T06:59:31.235Z
-Stopped at: Completed 04-02-PLAN.md
+Last session: 2026-10-11T07:13:47.686Z
+Stopped at: Completed 04-03-PLAN.md
 Resume file: None

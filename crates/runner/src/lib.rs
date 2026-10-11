@@ -1039,7 +1039,11 @@ impl Runner {
                     self.drop_job(&format!("сервер не принял release — {why}"))?;
                     Ok(Tick::Dropped { job_id: id })
                 }
-                Verdict::Retry => Err(format!("задача #{id}: release: {e}")),
+                // 401 повторами не лечится: ровно `TOKEN_REJECTED`, чтобы `run` остановил раннер.
+                Verdict::Retry => Err(match e {
+                    LinkError::Status { status: 401, .. } => tee::TOKEN_REJECTED.to_owned(),
+                    e => format!("задача #{id}: release: {e}"),
+                }),
             },
         }
     }
@@ -1092,7 +1096,10 @@ impl Runner {
                     self.drop_job(&format!("сервер не принял итог — {reason}"))?;
                     Ok(Tick::Dropped { job_id: id })
                 }
-                Verdict::Retry => Err(format!("задача #{id}: finish: {e}")),
+                Verdict::Retry => Err(match e {
+                    LinkError::Status { status: 401, .. } => tee::TOKEN_REJECTED.to_owned(),
+                    e => format!("задача #{id}: finish: {e}"),
+                }),
             },
         }
     }

@@ -27,8 +27,8 @@ cs2-cli — хайлайт-ролик из матча FACEIT
   --maps <папка>    где лежат меши карт (по умолчанию ./maps или $CS2CINEMA_MAPS)
   --list-cameras    каталог камер и их красочность на тестовой сцене
 
-Склейка записанных клипов (после записи в HLAE):
-  cs2-cli assemble --plan <plan.json> --clips <game\\bin\\win64 или папка clips> [--out highlights.mp4] [--fps 60] [--fade 0.35]
+Склейка проверенных дублей задачи:
+  cs2-cli assemble <папка задачи> — берёт record.json и clips/manifest.json, пишет highlights.mp4 через временный highlights.part.mp4
 
 Ключ FACEIT берётся из переменной FACEIT_API_KEY.";
 
@@ -113,13 +113,7 @@ fn parse_args() -> Result<Args, String> {
 
 fn main() -> ExitCode {
     if env::args().nth(1).as_deref() == Some("assemble") {
-        return match assemble_cmd() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("ошибка: {e}");
-                ExitCode::FAILURE
-            }
-        };
+        return assemble_cmd();
     }
     let args = match parse_args() {
         Ok(a) => a,
@@ -398,33 +392,46 @@ fn list_cameras() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// `cs2-cli assemble`: склеивает клипы, записанные HLAE по плану, в один ролик.
-fn assemble_cmd() -> Result<(), Box<dyn Error>> {
-    let mut plan: Option<PathBuf> = None;
-    let mut clips: Option<PathBuf> = None;
-    let mut out = PathBuf::from("highlights.mp4");
-    let (mut fps, mut fade) = (60u32, 0.35f32);
-    let mut it = env::args().skip(2);
-    while let Some(a) = it.next() {
-        let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} требует значение"));
-        match a.as_str() {
-            "--plan" => plan = Some(value("--plan")?.into()),
-            "--clips" => clips = Some(value("--clips")?.into()),
-            "--out" => out = value("--out")?.into(),
-            "--fps" => fps = value("--fps")?.parse().map_err(|_| "--fps: нужно число")?,
-            "--fade" => fade = value("--fade")?.parse().map_err(|_| "--fade: нужно число")?,
-            other => return Err(format!("неизвестный параметр {other}").into()),
+/// Прогресс в консоли: этапы и строки журнала идут в stderr. Отмены нет: остановка CLI закрывает
+/// дескриптор Job Object, и игра уходит вместе с ним.
+struct ConsoleProgress;
+
+impl pipeline::Progress for ConsoleProgress {
+    fn stage(&self, s: pipeline::Stage) {
+        eprintln!("== {}", s.title());
+    }
+    fn log(&self, msg: &str) {
+        eprintln!("{msg}");
+    }
+}
+
+/// `cs2-cli assemble <папка задачи>`: склеивает проверенные дубли задачи в `highlights.mp4` тем же кодом, что и приложение.
+fn assemble_cmd() -> ExitCode {
+    let mut rest = env::args().skip(2);
+    let (Some(dir), None) = (rest.next(), rest.next()) else {
+        eprintln!("ошибка: укажите папку задачи: cs2-cli assemble <папка задачи>\n\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let dir = PathBuf::from(dir);
+    let rj = match pipeline::manifest::RecordJson::load(&dir) {
+        Ok(rj) => rj,
+        Err(e) => {
+            eprintln!("ошибка: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let deadline = pipeline::Deadlines::default().ffmpeg_for(rj.video_secs);
+    match pipeline::assemble::assemble_stage(&*pipeline::host::default_host(), &dir, &rj.take_plans(), &rj.ffmpeg_args, rj.video_secs, deadline, &ConsoleProgress) {
+        Ok(out) => {
+            println!("Готово: {}", out.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            match e.fail {
+                Some(f) => eprintln!("ошибка: {}: {}\nподсказка: {}", f.code.as_str(), f.message, f.hint),
+                None => eprintln!("ошибка: {}", e.message),
+            }
+            ExitCode::FAILURE
         }
     }
-    let plan = plan.ok_or("укажите --plan <plan.json>")?;
-    let clips = clips.ok_or("укажите --clips <папка game\\bin\\win64 или clips>")?;
-
-    let timeline: director::Timeline = serde_json::from_str(&std::fs::read_to_string(&plan)?)?;
-    eprintln!("шотов в плане: {}; ищу клипы в {}", timeline.shots.len(), clips.display());
-    let report = renderer::assemble::assemble(&clips, timeline.shots.len(), &renderer::assemble::Options { fps, fade_secs: fade, out: out.clone() })?;
-    for (i, c) in report.clips.iter().enumerate() {
-        println!("  шот {}: {:.1} c{}", i + 1, c.secs, c.frames.map(|f| format!(" ({f} кадров)")).unwrap_or_default());
-    }
-    println!("\nГотово: {} ({:.1} c)", out.display(), report.total_secs);
-    Ok(())
 }

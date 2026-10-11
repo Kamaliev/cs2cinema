@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 pub use host;
+pub mod assemble;
 pub mod manifest;
 pub mod precheck;
 pub mod record;
@@ -14,6 +15,25 @@ use director::{Order, PositionSource, Timeline};
 use highlights::Highlight;
 
 pub type Result<T> = std::result::Result<T, String>;
+
+/// Ошибка задачи: текст для строки задачи и, если это сбой записи, его типизированное описание.
+#[derive(Debug)]
+pub struct RunError {
+    pub message: String,
+    pub fail: Option<RecordFailure>,
+}
+
+impl From<String> for RunError {
+    fn from(message: String) -> Self {
+        RunError { message, fail: None }
+    }
+}
+
+impl From<&str> for RunError {
+    fn from(message: &str) -> Self {
+        RunError::from(message.to_owned())
+    }
+}
 
 /// Этапы конвейера — для строки состояния в окне.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

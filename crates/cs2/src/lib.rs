@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 pub mod report;
+pub mod text;
 
 use demo::{
     Parsed,
@@ -127,6 +128,10 @@ impl Match {
             let id = PlayerId(userid);
             known.insert(slot, id);
             known.insert(userid, id);
+            let mut name = text::clean_text(&name, text::NAME_MAX);
+            if name.is_empty() {
+                name = format!("игрок {userid}");
+            }
             list.push(Player { id, slot, name, xuid });
         }
         let resolve = |e: &GameEvent, key: &str| -> Option<PlayerId> {
@@ -134,7 +139,7 @@ impl Match {
         };
 
         let mut m = Match {
-            map,
+            map: text::clean_map(&map),
             tick_rate,
             server_start_tick: 0,
             players: list,
@@ -435,6 +440,19 @@ mod tests {
 
     fn players() -> Vec<(i32, i32, String, u64)> {
         (0..4).map(|i| (i, i, format!("p{i}"), i as u64)).collect()
+    }
+
+    #[test]
+    fn empty_player_name_becomes_player_with_userid() {
+        let m = Match::build("de_mirage".into(), 64.0, vec![(7, 3, "\n\u{7}\u{202E}".into(), 1)], &[]);
+        assert_eq!(m.players[0].name, "игрок 7");
+    }
+
+    #[test]
+    fn build_cleans_hostile_name_and_map() {
+        let m = Match::build("x;exec evil".into(), 64.0, vec![(1, 1, "a\nquit".into(), 1)], &[]);
+        assert_eq!(m.map, "xexecevil");
+        assert_eq!(m.players[0].name, "aquit");
     }
 
     #[test]

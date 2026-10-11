@@ -64,10 +64,10 @@ pub enum Encoder {
 }
 
 impl Encoder {
-    fn args(self) -> &'static str {
+    pub fn args(self) -> &'static str {
         match self {
-            Encoder::X264 => "-c:v libx264 -crf 18 -preset medium -pix_fmt yuv420p -c:a aac -b:a 192k highlights.mp4",
-            Encoder::Nvenc => "-c:v h264_nvenc -preset p5 -tune hq -rc vbr -cq 19 -b:v 0 -pix_fmt yuv420p -c:a aac -b:a 192k highlights.mp4",
+            Encoder::X264 => "-c:v libx264 -crf 18 -preset medium -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart highlights.mp4",
+            Encoder::Nvenc => "-c:v h264_nvenc -preset p5 -tune hq -rc vbr -cq 19 -b:v 0 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart highlights.mp4",
         }
     }
 }
@@ -167,7 +167,7 @@ pub fn render(m: &Match, t: &Timeline, cfg: &Config) -> Output {
     let order = record_order(t);
     let d = &cfg.dialect;
     let mut s = String::new();
-    let _ = writeln!(s, "// Сгенерировано cs2-cli. Карта: {}. Шотов: {}.", t.map, t.shots.len());
+    let _ = writeln!(s, "// Сгенерировано cs2-cli. Шотов: {}.", t.shots.len());
     let _ = writeln!(s, "// CS2 запущена через HLAE, демка открыта (playdemo), затем: exec highlights");
     let _ = writeln!(s, "// Рядом должны лежать cs2c_NN.cfg — по скрипту на шот.");
     let _ = writeln!(s, "// Дубли пишутся в {}/clips (takeNNNN по порядку записи). Перед повторной записью", cfg.out_dir);
@@ -204,7 +204,7 @@ pub fn render(m: &Match, t: &Timeline, cfg: &Config) -> Output {
     for (i, &k) in order.iter().enumerate() {
         let shot = &t.shots[k];
         let mut s = String::new();
-        let _ = writeln!(s, "// Шот {} -> take{i:04}: {} (score {:.0}, {:?})", k + 1, shot.title, shot.score, shot.tier);
+        let _ = writeln!(s, "// Шот {} -> take{i:04} (score {:.0}, {:?})", k + 1, shot.score, shot.tier);
         let _ = writeln!(s, "mirv_cmd clear");
         let _ = writeln!(s, "mirv_streams record fps {}", capture_fps(shot, cfg));
         let _ = writeln!(s, "mirv_campath enabled 0; mirv_campath clear; mirv_fov default");
@@ -246,6 +246,7 @@ pub fn render(m: &Match, t: &Timeline, cfg: &Config) -> Output {
 
     if let Some(a) = assembly(t, cfg, &take_of(&order)) {
         out.files.push(("assemble.ffgraph".into(), a.graph.clone()));
+        out.files.extend(a.captions.iter().cloned());
         out.files.push(("assemble.sh".into(), assemble_script(&a, cfg.encoder)));
         out.files.push(("assemble.bat".into(), assemble_bat(&a, cfg.encoder)));
     }
@@ -461,27 +462,21 @@ struct Assembly {
     inputs: Vec<String>,
     graph: String,
     length: f32,
+    /// Файлы подписей `cap_NNN.txt` (рядом с графом): текст не попадает в сам граф.
+    captions: Vec<(String, String)>,
 }
 
-/// Текст для `drawtext` внутри одинарных кавычек: кавычка и обратный слэш заменяются,
-/// двоеточие (счёт «12:11») экранируется — иначе парсер опций режет по нему.
-fn text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\'' => out.push('’'),
-            '\\' => out.push('/'),
-            ':' => out.push_str("\\:"),
-            c => out.push(c),
+/// Подпись в кадре; без шрифта или текста — ничего. Текст лежит в файле `cap_NNN.txt` рядом с графом
+/// (`textfile=`, `expansion=none`): ни кавычка, ни `:`, ни `%{…}` из демки не доходят до парсера фильтров.
+fn caption(cfg: &Config, caps: &mut Vec<(String, String)>, s: &str, style: &str) -> String {
+    let line: String = s.chars().map(|c| if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') { ' ' } else { c }).collect();
+    let line = line.trim();
+    match (&cfg.font_file, line.is_empty()) {
+        (Some(font), false) => {
+            let name = format!("cap_{:03}.txt", caps.len() + 1);
+            caps.push((name.clone(), line.to_owned()));
+            format!(",drawtext=fontfile='{}':textfile='{name}':expansion=none:{style}", font.replace(':', "\\:"))
         }
-    }
-    out
-}
-
-/// Подпись в кадре; без шрифта или текста — ничего.
-fn caption(cfg: &Config, s: &str, style: &str) -> String {
-    match (&cfg.font_file, s.is_empty()) {
-        (Some(font), false) => format!(",drawtext=fontfile='{}':text='{}':expansion=none:{style}", font.replace(':', "\\:"), text(s)),
         _ => String::new(),
     }
 }
@@ -522,17 +517,18 @@ fn assembly(t: &Timeline, cfg: &Config, take_of: &[usize]) -> Option<Assembly> {
     let mut order: Vec<String> = Vec::new(); // метки [v][a] в порядке показа
     let mut length = 0.0f32;
     let mut cards = 0usize;
-    let mut card = |g: &mut String, order: &mut Vec<String>, length: &mut f32, title: &str, sub: &str, d: f32| {
+    let mut caps: Vec<(String, String)> = Vec::new();
+    let mut card = |g: &mut String, caps: &mut Vec<(String, String)>, order: &mut Vec<String>, length: &mut f32, title: &str, sub: &str, d: f32| {
         let _ = write!(g, "color=c=black:s={w}x{h}:r={}:d={d:.3},format=yuv420p,settb=AVTB", cfg.fps);
-        g.push_str(&caption(cfg, title, CARD_TITLE));
-        g.push_str(&caption(cfg, sub, CARD_SUB));
+        g.push_str(&caption(cfg, caps, title, CARD_TITLE));
+        g.push_str(&caption(cfg, caps, sub, CARD_SUB));
         let _ = writeln!(g, "[c{cards}];\nanullsrc=r=44100:cl=stereo:d={d:.3}[ca{cards}];");
         order.push(format!("[c{cards}][ca{cards}]"));
         *length += d;
         cards += 1;
     };
     if let Some((title, sub)) = &cfg.title {
-        card(&mut g, &mut order, &mut length, title, sub, TITLE_SECS);
+        card(&mut g, &mut caps, &mut order, &mut length, title, sub, TITLE_SECS);
     }
     let n_shots = t.shots.len();
     for (k, shot) in t.shots.iter().enumerate() {
@@ -554,12 +550,12 @@ fn assembly(t: &Timeline, cfg: &Config, take_of: &[usize]) -> Option<Assembly> {
         }
         // плашка раунда — поверх первых секунд шота вместо чёрной заставки
         if let Some((title, sub)) = &shot.card {
-            g.push_str(&caption(cfg, title, &format!("{BADGE_TITLE}:{BADGE_ALPHA}:enable='lt(t,{BADGE_SECS})'")));
-            g.push_str(&caption(cfg, sub, &format!("{BADGE_SUB}:{BADGE_ALPHA}:enable='lt(t,{BADGE_SECS})'")));
+            g.push_str(&caption(cfg, &mut caps, title, &format!("{BADGE_TITLE}:{BADGE_ALPHA}:enable='lt(t,{BADGE_SECS})'")));
+            g.push_str(&caption(cfg, &mut caps, sub, &format!("{BADGE_SUB}:{BADGE_ALPHA}:enable='lt(t,{BADGE_SECS})'")));
         }
         // подпись — не дольше шота: на коротком клипе она не должна обрываться на склейке
         let show = (r.secs - 0.3).clamp(0.8, 3.5);
-        g.push_str(&caption(cfg, &shot.caption, &format!("{CAPTION}:enable='lt(t,{show:.2})'")));
+        g.push_str(&caption(cfg, &mut caps, &shot.caption, &format!("{CAPTION}:enable='lt(t,{show:.2})'")));
         let _ = writeln!(g, "[v{k}];");
         // звук: каждый кусок кривой растягиваем в свою длину, затем подгоняем под видео точно
         let n = r.pieces.len();
@@ -592,14 +588,14 @@ fn assembly(t: &Timeline, cfg: &Config, take_of: &[usize]) -> Option<Assembly> {
         length += r.secs;
     }
     if let Some((title, sub)) = &cfg.outro {
-        card(&mut g, &mut order, &mut length, title, sub, OUTRO_SECS);
+        card(&mut g, &mut caps, &mut order, &mut length, title, sub, OUTRO_SECS);
     }
     let fade = 0.6f32;
     let _ = writeln!(g, "{}concat=n={}:v=1:a=1[vc][ac];", order.concat(), order.len());
     let _ = writeln!(g, "[vc]fade=t=in:st=0:d={fade},fade=t=out:st={:.3}:d={fade}[v];", length - fade);
     let _ = writeln!(g, "[ac]afade=t=in:st=0:d={fade},afade=t=out:st={:.3}:d={fade}[a]", length - fade);
     let inputs = (0..t.shots.len()).flat_map(|i| [clip_path(take_of[i]), audio_path(take_of[i])]).collect();
-    Some(Assembly { inputs, graph: g, length })
+    Some(Assembly { inputs, graph: g, length, captions: caps })
 }
 
 /// Аргументы ffmpeg для склейки (запускать в папке результата, где лежат `clips/` и `assemble.ffgraph`)
@@ -830,11 +826,15 @@ mod tests {
         // шот 1 без замедления — без atempo; по краям — микрофейды от щелчков
         assert!(g.contains("[1:a]aformat=sample_rates=44100:channel_layouts=stereo,atrim=start=0.0000:end=6.2500,asetpts=PTS-STARTPTS,apad"), "{g}");
         assert!(g.contains("afade=t=in:st=0:d=0.03,afade=t=out:st=6.2000:d=0.05[a0]"), "{g}");
-        // подписи и заставки: кавычка и двоеточие в тексте заменены, путь к шрифту экранирован
-        assert!(g.contains(r"drawtext=fontfile='C\:/Windows/Fonts/arialbd.ttf':text='Глазами ace · it’s':expansion=none"), "{g}");
-        assert!(g.contains("text='de_test'") && g.contains("text='20-10-3'"));
+        // подписи и заставки читаются из файлов: текста в самом графе нет, путь к шрифту экранирован
+        assert!(g.contains(r"drawtext=fontfile='C\:/Windows/Fonts/arialbd.ttf':textfile='cap_"), "{g}");
+        assert!(g.contains("expansion=none") && !g.contains("text='"), "{g}");
+        let cap = |s: &str| out.files.iter().any(|(n, b)| n.starts_with("cap_") && n.ends_with(".txt") && b == s);
+        assert!(cap("Глазами ace · it's"), "апостроф и текст как есть: {:?}", out.files.iter().map(|f| &f.0).collect::<Vec<_>>());
+        assert!(cap("de_test") && cap("20-10-3"));
         // плашка раунда — поверх шота, не отдельной заставкой; подпись не дольше шота
-        assert!(g.contains(r"text='Раунд 1 · CT · 7\:4':expansion=none:fontsize=44") && g.contains("enable='lt(t,2.2)'"), "{g}");
+        assert!(cap("Раунд 1 · CT · 7:4"));
+        assert!(g.contains("expansion=none:fontsize=44") && g.contains("enable='lt(t,2.2)'"), "{g}");
         assert!(!g.contains("d=1.400"), "чёрных заставок раундов больше нет: {g}");
         assert!(g.contains("enable='lt(t,3.50)'"), "{g}");
         // между раундами — затемнение: шот 1 (раунд 2) уходит в чёрное, шот 2 (раунд 1) из него выходит
@@ -848,6 +848,82 @@ mod tests {
         assert!(g.contains("[ac]afade=t=in:st=0:d=0.6"), "{g}");
         let bat = out.file("assemble.bat").unwrap();
         assert!(bat.contains(&format!("ожидаемая длина: {total:.1}")), "{bat}");
+    }
+
+    const CFG_PREFIXES: [&str; 10] = [
+        "//", "echo CS2C ", "mirv_", "cl_drawhud ", "r_show_build_info ", "hideconsole", "engine_no_focus_sleep ", "exec cs2c_", "demo_gototick ", "demo_resume",
+    ];
+
+    /// Каждая строка каждого cfg начинается с известного префикса и не содержит текста из демки.
+    fn assert_cfg_grammar(out: &Output) {
+        for (name, body) in out.files.iter().filter(|(n, _)| n.ends_with(".cfg")) {
+            for line in body.lines() {
+                assert!(CFG_PREFIXES.iter().any(|p| line.starts_with(p)), "{name}: неизвестная строка {line:?}");
+                for bad in ["evil", "disconnect", "pid", "quit"] {
+                    assert!(!line.contains(bad), "{name}: {bad} в {line:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_text_never_reaches_a_cfg_line() {
+        let (m, mut t) = setup();
+        t.map = "x;exec evil\n".into();
+        let hostile = "a\nquit\r\n; disconnect \"%{pid}' \\ \u{202E}evil";
+        for s in t.shots.iter_mut() {
+            s.title = hostile.into();
+            s.caption = hostile.into();
+            s.card = Some((hostile.into(), hostile.into()));
+        }
+        let cfg = Config {
+            font_file: Some("C:/Windows/Fonts/arialbd.ttf".into()),
+            title: Some((hostile.into(), hostile.into())),
+            outro: Some((hostile.into(), hostile.into())),
+            ..Config::default()
+        };
+        let out = render(&m, &t, &cfg);
+        assert!(out.files.iter().any(|(n, _)| n.ends_with(".cfg")));
+        assert_cfg_grammar(&out);
+        let g = out.file("assemble.ffgraph").unwrap();
+        assert!(!g.contains("evil") && !g.contains("text='") && !g.contains("disconnect"), "{g}");
+        let caps: Vec<_> = out.files.iter().filter(|(n, _)| n.starts_with("cap_")).collect();
+        assert!(!caps.is_empty());
+        for (name, body) in &caps {
+            assert!(g.contains(&format!("textfile='{name}'")), "{name} не в графе");
+            assert!(!body.chars().any(|c| c.is_control() || c == '\u{2028}'), "{name}: {body:?}");
+        }
+        for (i, (name, _)) in caps.iter().enumerate() {
+            assert_eq!(name, &format!("cap_{:03}.txt", i + 1));
+        }
+    }
+
+    #[test]
+    fn match_build_cleans_names_and_map_before_render() {
+        let m = Match::build("x;exec evil".into(), 64.0, vec![(7, 3, "a\nquit".into(), 1)], &[]);
+        assert_eq!(m.map, "xexecevil");
+        assert!(!m.players[0].name.contains('\n'));
+        let (_, mut t) = setup();
+        t.map = m.map.clone();
+        let who = m.name(m.players[0].id);
+        for s in t.shots.iter_mut() {
+            s.title = format!("{who} · x");
+            s.caption = who.clone();
+        }
+        let out = render(&m, &t, &Config { font_file: Some("f.ttf".into()), ..Config::default() });
+        assert_cfg_grammar(&out);
+        let g = out.file("assemble.ffgraph").unwrap();
+        assert!(!g.contains("aquit") && !g.contains("text='"), "{g}");
+    }
+
+    #[test]
+    fn encoder_args_put_faststart_before_the_output() {
+        for enc in [Encoder::X264, Encoder::Nvenc] {
+            let a: Vec<&str> = enc.args().split_whitespace().collect();
+            let n = a.len();
+            assert_eq!(a[n - 1], "highlights.mp4");
+            assert_eq!(&a[n - 3..n - 1], ["-movflags", "+faststart"], "{a:?}");
+        }
     }
 
     #[test]

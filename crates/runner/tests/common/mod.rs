@@ -94,6 +94,11 @@ impl Stand {
         self.running().core().job(id).unwrap().unwrap()
     }
 
+    /// Отмена оператором, как `cs2-server cancel`.
+    pub fn cancel(&self, id: i64, force: bool) {
+        self.running().core().cancel(id, force).unwrap();
+    }
+
     /// Папка принятого результата задачи на сервере.
     pub fn results_dir(&self, id: i64) -> PathBuf {
         self.dir

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 wire = { path = "../wire" }
 pipeline = { path = "../pipeline" }
+faceit = { path = "../faceit" }
 ureq = { version = "3", features = ["json", "platform-verifier"] }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }

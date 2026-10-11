@@ -45,13 +45,15 @@ pub enum FailCode {
     DemoTooLarge,
     /// Раннер собрал ролик, но он не прошёл проверку перед отправкой на сервер.
     ResultInvalid,
-    /// Источник задачи раннер не умеет брать (ссылка FACEIT вместо файла демки).
+    /// Источник задачи раннер не умеет брать (ссылка в задаче не похожа на комнату матча FACEIT).
     UnsupportedSource,
+    /// Раннер не смог скачать демку FACEIT по ссылке задачи (нет ключа, нет демки у матча, отказ API или сети).
+    FaceitFetchFailed,
 }
 
 impl FailCode {
     /// Все коды по порядку объявления: по этому списку раннер сверяет `wire::fail::KNOWN`.
-    pub const ALL: [FailCode; 21] = [
+    pub const ALL: [FailCode; 22] = [
         FailCode::LauncherFailed,
         FailCode::GameNotStarted,
         FailCode::ConsoleNotOpen,
@@ -73,6 +75,7 @@ impl FailCode {
         FailCode::DemoTooLarge,
         FailCode::ResultInvalid,
         FailCode::UnsupportedSource,
+        FailCode::FaceitFetchFailed,
     ];
 
     /// Код в базе, журнале и карточке.
@@ -99,6 +102,7 @@ impl FailCode {
             FailCode::DemoTooLarge => "DEMO_TOO_LARGE",
             FailCode::ResultInvalid => "RESULT_INVALID",
             FailCode::UnsupportedSource => "UNSUPPORTED_SOURCE",
+            FailCode::FaceitFetchFailed => "FACEIT_FETCH_FAILED",
         }
     }
 
@@ -157,7 +161,10 @@ impl FailCode {
                 "Ролик сохранён у раннера как улика; задачу можно поставить заново."
             }
             FailCode::UnsupportedSource => {
-                "Пришлите файл демки: ссылки FACEIT раннер пока не скачивает."
+                "Пришлите файл демки или ссылку на комнату матча FACEIT."
+            }
+            FailCode::FaceitFetchFailed => {
+                "Проверьте, что матч доигран и демка есть на странице матча; иначе пришлите файл демки."
             }
         }
     }
@@ -398,7 +405,12 @@ pub fn msg_result_invalid(reason: &str) -> String {
 
 /// Источник задачи раннер не берёт.
 pub fn msg_unsupported_source() -> String {
-    "раннер принимает только файл демки, а в задаче ссылка".to_owned()
+    "ссылка в задаче не похожа на комнату матча FACEIT".to_owned()
+}
+
+/// Раннер не смог скачать демку FACEIT; `reason` — фиксированная фраза без адресов и ключа.
+pub fn msg_faceit_fetch_failed(reason: &str) -> String {
+    reason.to_owned()
 }
 
 /// Дубль проверен: длина, размер кадра и длина звука.
@@ -672,6 +684,7 @@ pub fn classify(code: FailCode, state: RecordState) -> FailClass {
         | FailCode::DemoTooLarge
         | FailCode::ResultInvalid
         | FailCode::UnsupportedSource
+        | FailCode::FaceitFetchFailed
         | FailCode::Cancelled => FailClass::Other,
     }
 }
@@ -695,10 +708,10 @@ mod tests {
         assert!(FailCode::PrecheckFailed.hint().contains("Повторить"));
         assert!(FailCode::ForeignGameRunning.hint().contains("не закрывает"));
         assert!(FailCode::PrevGameStuck.hint().contains("30 с"));
-        // полный список: 21 разный код, у каждого непустая строка
+        // полный список: 22 разных кода, у каждого непустая строка
         let names: std::collections::HashSet<_> =
             FailCode::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 22);
         assert!(FailCode::ALL.iter().all(|c| !c.as_str().is_empty()));
         for c in [
             FailCode::PlayerNotFound,
@@ -708,11 +721,13 @@ mod tests {
             FailCode::DemoTooLarge,
             FailCode::ResultInvalid,
             FailCode::UnsupportedSource,
+            FailCode::FaceitFetchFailed,
         ] {
             assert!(!c.hint().is_empty(), "{c}: нет подсказки");
         }
         assert_eq!(FailCode::PlayerAmbiguous.as_str(), "PLAYER_AMBIGUOUS");
         assert_eq!(FailCode::UnsupportedSource.as_str(), "UNSUPPORTED_SOURCE");
+        assert_eq!(FailCode::FaceitFetchFailed.as_str(), "FACEIT_FETCH_FAILED");
         assert!(FailCode::PlayerAmbiguous.hint().contains("SteamID64"));
     }
 
@@ -727,6 +742,7 @@ mod tests {
                 FailCode::DemoTooLarge,
                 FailCode::ResultInvalid,
                 FailCode::UnsupportedSource,
+                FailCode::FaceitFetchFailed,
             ] {
                 assert_eq!(classify(code, state), FailClass::Other, "{code} в {state:?}");
             }

@@ -3,7 +3,7 @@
 //!
 //! `getFile` блокируется до конца скачивания, поэтому вызывается только из `ingest_once`, а не из опроса.
 //! Путь из `getFile` содержит токен бота: он не попадает ни в журнал, ни в чат, ни в `reason`.
-//! Новые виды входа (ссылки FACEIT) добавляют сюда, не трогая `dispatch`.
+//! Ссылки FACEIT (план 07-07) разбираются здесь же: сервер хранит только канонический URL и не ходит по ссылкам.
 //!
 //! Защита приёма (план 07-06): размер и имя проверяются до `getFile`; лимиты D-03 (`admit`) считают и ещё не
 //! скачанные строки `tg_inbox`; повтор узнаётся по `file_unique_id` до `getFile` и по SHA-256 после копирования;
@@ -35,6 +35,8 @@ pub enum IntakeKind {
         file_size: Option<u64>,
         file_name: String,
     },
+    /// Ссылка на комнату матча FACEIT: `link` — канонический вид из id (D-01). Сервер по ней не ходит.
+    Faceit { link: String },
 }
 
 /// Решение «принять» с выбранным игроком (D-02).
@@ -62,7 +64,9 @@ pub enum Accepted {
 
 const NO_PLAYER: &str =
     "Сначала задайте игрока: /player ник или SteamID64 — или напишите ник в подписи к файлу.";
-const HINT: &str = "Пришлите демку CS2 файлом (.dem или .dem.zst). Ник игрока напишите в подписи к файлу. Справка: /help";
+const HINT: &str = "Пришлите демку CS2 файлом (.dem или .dem.zst) или ссылку на комнату матча FACEIT. Ник игрока напишите в подписи к файлу или после ссылки. Справка: /help";
+/// Текст со ссылкой не прошёл строгий шаблон: присланная строка в ответе не повторяется.
+const NOT_FACEIT_LINK: &str = "Это не ссылка на комнату матча FACEIT. Пример: https://www.faceit.com/ru/cs2/room/1-0f9a1b2c-3d4e-5f60-7182-93a4b5c6d7e8";
 const NO_SIZE: &str =
     "Не вижу размера файла — пришлите демку файлом (как документ), а не ссылкой или пересылкой.";
 const BAD_NAME: &str = "Нужен файл .dem или .dem.zst.";
@@ -105,17 +109,78 @@ fn active_tasks(n: i64) -> String {
 
 /// Ответ про повтор: задача в очереди или готовый ролик.
 fn duplicate_text(job: &JobRow, player: &str) -> String {
+    let faceit = job.source_kind == "faceit";
     if job.state == JobState::Done {
         format!(
-            "Ролик по этой демке для игрока {player} уже готов: /resend {}",
+            "Ролик по {} для игрока {player} уже готов: /resend {}",
+            if faceit { "этому матчу" } else { "этой демке" },
             job.id
         )
     } else {
         format!(
-            "Эта демка для игрока {player} уже в очереди: задача #{}",
+            "{} для игрока {player} уже в очереди: задача #{}",
+            if faceit { "Этот матч" } else { "Эта демка" },
             job.id
         )
     }
+}
+
+/// Похоже ли первое слово на попытку прислать ссылку (а не на обычный текст): `faceit`, `http` или голый id матча.
+fn looks_like_link_attempt(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let first = text.split_whitespace().next().unwrap_or("");
+    lower.contains("faceit") || lower.contains("http") || wire::faceit::is_match_id(first)
+}
+
+/// Повтор уже принятого сообщения (смещение потеряно): ответ про дубль не шлём, `accept` пропустит его молча.
+fn is_replay(bot: &Bot, msg: &Message) -> bool {
+    bot.core()
+        .db()
+        .read(|c| {
+            count(
+                c,
+                "SELECT EXISTS(SELECT 1 FROM tg_inbox WHERE chat_id = ?1 AND message_id = ?2)",
+                params![msg.chat.id, msg.message_id],
+            )
+        })
+        .map(|n| n != 0)
+        .unwrap_or(false)
+}
+
+/// Решение по тексту без файла: ссылка на комнату матча FACEIT с ником после неё либо подсказка.
+fn precheck_text(bot: &Bot, user: &User, msg: &Message) -> Precheck {
+    let text = msg.text.as_deref().map(str::trim).unwrap_or("");
+    if !looks_like_link_attempt(text) {
+        return Precheck::Reply(HINT.to_owned());
+    }
+    // Первое слово — ссылка, остаток — ник на эту задачу (как подпись к файлу, D-02).
+    let (link, rest) = match text.split_once(char::is_whitespace) {
+        Some((link, rest)) => (link, rest.trim()),
+        None => (text, ""),
+    };
+    let Some(match_id) = wire::faceit::room_match_id(link) else {
+        return Precheck::Reply(NOT_FACEIT_LINK.to_owned());
+    };
+    let canonical = wire::faceit::canonical_url(&match_id);
+    let caption = (!rest.is_empty()).then_some(rest);
+    let Some(player) = choose_player(bot, user, caption) else {
+        return Precheck::Reply(NO_PLAYER.to_owned());
+    };
+    if !is_replay(bot, msg) {
+        let key = DedupKey::Faceit {
+            link: canonical.clone(),
+            player_key: player_key(&player),
+        };
+        match bot.core().find_duplicate(&key) {
+            Ok(Some(dup)) => return Precheck::Reply(duplicate_text(&dup, &player)),
+            Ok(None) => {}
+            Err(_) => bot.log().warn("бот: не удалось проверить повтор ссылки"),
+        }
+    }
+    Precheck::Accept(Intake {
+        kind: IntakeKind::Faceit { link: canonical },
+        player,
+    })
 }
 
 /// Строка `tg_files` по `file_unique_id`: хеш и задача-источник.
@@ -147,7 +212,7 @@ fn known_file(bot: &Bot, unique: &str) -> Result<Option<KnownFile>> {
 /// Решает, что делать с сообщением друга. Только чтение, ничего не пишет.
 pub fn precheck(bot: &Bot, user: &User, msg: &Message) -> Precheck {
     let Some(doc) = &msg.document else {
-        return Precheck::Reply(HINT.to_owned());
+        return precheck_text(bot, user, msg);
     };
     let Some(player) = choose_player(bot, user, msg.caption.as_deref()) else {
         return Precheck::Reply(NO_PLAYER.to_owned());
@@ -168,18 +233,7 @@ pub fn precheck(bot: &Bot, user: &User, msg: &Message) -> Precheck {
         return Precheck::Reply(BAD_NAME.to_owned());
     }
     // Повтор уже принятого сообщения (смещение потеряно): ответ про дубль не шлём, `accept` пропустит его молча.
-    let replay = bot
-        .core()
-        .db()
-        .read(|c| {
-            count(
-                c,
-                "SELECT EXISTS(SELECT 1 FROM tg_inbox WHERE chat_id = ?1 AND message_id = ?2)",
-                params![msg.chat.id, msg.message_id],
-            )
-        })
-        .map(|n| n != 0)
-        .unwrap_or(false);
+    let replay = is_replay(bot, msg);
     // Слой 1 против повторов: известный файл и тот же игрок — отвечаем без скачивания.
     match if replay {
         Ok(None)
@@ -312,6 +366,14 @@ pub fn accept(
             )
             .map_err(db_err)?
         }
+        IntakeKind::Faceit { link } => tx
+            .execute(
+                "INSERT OR IGNORE INTO tg_inbox(chat_id, message_id, user_id, kind, faceit_link, player, state,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'faceit', ?4, ?5, 'pending', ?6, ?6)",
+                params![msg.chat.id, msg.message_id, user.id, link, intake.player, now],
+            )
+            .map_err(db_err)?,
     };
     if n == 0 {
         return Ok(Accepted::Already);
@@ -351,6 +413,10 @@ fn ahead_phrase(ahead: i64) -> String {
 pub fn ack_text(bot: &Bot, row_id: i64) -> String {
     let ahead = ahead_phrase(ahead_of_row(bot, row_id));
     match store::inbox_row(bot.core().db(), row_id) {
+        Ok(Some(row)) if row.kind == "faceit" => format!(
+            "Принял ссылку на матч FACEIT для игрока {}. Демку скачает раннер. ({ahead})",
+            row.player
+        ),
         Ok(Some(row)) if !row.file_name.is_empty() => format!(
             "Принял «{}» для игрока {}. Скачиваю… ({ahead})",
             row.file_name, row.player
@@ -465,8 +531,13 @@ fn remember_file(bot: &Bot, unique: Option<&str>, job_id: i64) -> Result<()> {
 fn queue_row(bot: &Bot, row: &store::InboxRow, job_id: i64) -> Result<bool> {
     remember_file(bot, row.file_unique_id.as_deref(), job_id)?;
     store::mark_queued(bot.core().db(), row, job_id, bot.now_ms())?;
+    let what = if row.kind == "faceit" {
+        "ссылка FACEIT"
+    } else {
+        "демка"
+    };
     bot.log()
-        .info(&format!("бот: демка из чата принята как задача #{job_id}"));
+        .info(&format!("бот: {what} из чата принята как задача #{job_id}"));
     let ahead = bot.core().jobs_ahead(job_id).unwrap_or(0);
     let text = format!(
         "Задача #{job_id} в очереди (игрок {}), {}.",
@@ -485,6 +556,9 @@ fn own_job(bot: &Bot, row: &store::InboxRow) -> Result<Option<i64>> {
         && bot.core().job(id)?.is_some()
     {
         return Ok(Some(id));
+    }
+    if row.kind == "faceit" {
+        return own_faceit_job(bot, row);
     }
     let Some(size) = row.file_size else {
         return Ok(None);
@@ -518,6 +592,75 @@ fn own_job(bot: &Bot, row: &store::InboxRow) -> Result<Option<i64>> {
         }
     }
     Ok(None)
+}
+
+/// То же для строки `faceit`: активная задача того же пользователя, ссылки и игрока, созданная после приёма строки,
+/// которую не держит ни одна строка `tg_inbox` и ни одна `tg_jobs`.
+fn own_faceit_job(bot: &Bot, row: &store::InboxRow) -> Result<Option<i64>> {
+    let Some(link) = row.faceit_link.as_deref() else {
+        return Ok(None);
+    };
+    let ids: Vec<i64> = bot.core().db().read(|c| {
+        let mut st = c
+            .prepare(&format!(
+                "SELECT j.id FROM jobs j
+                 WHERE j.user_id = ?1 AND j.source_kind = 'faceit' AND j.faceit_link = ?2 AND j.created_at >= ?3
+                   AND j.state IN {ACTIVE_STATES}
+                   AND NOT EXISTS (SELECT 1 FROM tg_jobs t WHERE t.job_id = j.id)
+                   AND NOT EXISTS (SELECT 1 FROM tg_inbox i WHERE i.job_id = j.id)
+                 ORDER BY j.id"
+            ))
+            .map_err(db_err)?;
+        let rows = st
+            .query_map(params![row.user_id, link, row.created_at], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+    })?;
+    let key = player_key(&row.player);
+    for id in ids {
+        if let Some(job) = bot.core().job(id)?
+            && player_key(&job.player_name) == key
+        {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// Ссылка FACEIT: `getFile` не нужен, сервер только проверяет шаблон и ставит задачу; демку скачает раннер.
+fn ingest_faceit(bot: &Bot, row: &store::InboxRow, sub: &Submit) -> Result<bool> {
+    let Some(link) = row.faceit_link.clone() else {
+        return reject_with(
+            bot,
+            row,
+            "во входящем нет ссылки",
+            "Не получилось принять ссылку: её не видно во входящих. Пришлите её ещё раз.",
+        );
+    };
+    // Между приёмом строки и этим шагом та же пара могла стать задачей (две строки подряд).
+    let key = DedupKey::Faceit {
+        link: link.clone(),
+        player_key: player_key(&row.player),
+    };
+    if let Some(dup) = bot.core().find_duplicate(&key)? {
+        return reject_duplicate(bot, row, &dup);
+    }
+    match bot.core().submit_faceit(&link, sub) {
+        Ok(job_id) => queue_row(bot, row, job_id),
+        Err(e) => {
+            bot.log()
+                .warn("бот: сервер не принял ссылку FACEIT (проверка шаблона или запись)");
+            let clean = bot.core().redactor().clean(&e, 200);
+            reject_with(
+                bot,
+                row,
+                &clean,
+                "Не получилось принять ссылку: сервер не смог поставить задачу. Пришлите её ещё раз.",
+            )
+        }
+    }
 }
 
 /// Другая задача с тем же хешем демки и игроком (активная или готовая), кроме `exclude` — только что созданной.
@@ -572,6 +715,11 @@ pub fn ingest_once(bot: &Bot) -> Result<bool> {
     // Падение после `Core::submit`: задача уже есть.
     if let Some(job_id) = own_job(bot, &row)? {
         return queue_row(bot, &row, job_id);
+    }
+
+    // Ссылка FACEIT: файла нет, `getFile` не вызывается.
+    if row.kind == "faceit" {
+        return ingest_faceit(bot, &row, &sub);
     }
 
     // Слой 1: файл уже приходил (тот же `file_unique_id`) — берём демку той задачи без `getFile`.

@@ -176,16 +176,13 @@ fn needs_download(held: &HeldJob) -> bool {
     !(held.faceit.is_some() && held.demo_size == 0)
 }
 
-/// Задача для исполнителя из удерживаемой: без файла демки путь пустой, а ссылка FACEIT остаётся в `faceit`.
+/// Задача для исполнителя из удерживаемой: путь демки всегда `remote/srv{id}.dem`; у ссылки FACEIT без файла
+/// на сервере исполнитель сам скачивает в него демку, а ссылка остаётся в `faceit`.
 fn task_of(held: &HeldJob, attempt: u32, resumed_dir: Option<PathBuf>) -> Task {
     Task {
         job_id: held.server_job_id,
         attempt,
-        demo: if needs_download(held) {
-            held.demo_path.clone()
-        } else {
-            PathBuf::new()
-        },
+        demo: held.demo_path.clone(),
         faceit: held.faceit.clone(),
         hero_steam: held.hero_steam,
         hero_name: held.hero_name.clone(),
@@ -537,6 +534,15 @@ impl Runner {
                 let _ = fs::remove_file(&p);
             }
         }
+        self.remove_faceit_dir(job);
+    }
+
+    /// Временная папка скачивания FACEIT (`srv{id}.faceit`) убирается вместе с демкой, только внутри рабочей папки.
+    fn remove_faceit_dir(&self, job: &HeldJob) {
+        let dir = job.demo_path.with_extension("faceit");
+        if dir.starts_with(&self.cfg.dir) && dir != self.cfg.dir {
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     /// Задача закрыта сервером с принятым результатом: демка, ролик и папка с сырыми дублями больше не нужны,
@@ -565,6 +571,7 @@ impl Runner {
                 let _ = fs::remove_file(&p);
             }
         }
+        self.remove_faceit_dir(job);
     }
 
     /// Выданная задача: записать в outbox и довести.
@@ -1146,13 +1153,13 @@ mod tests {
     }
 
     #[test]
-    fn faceit_link_without_a_demo_file_is_not_downloaded() {
+    fn faceit_link_is_not_downloaded_from_the_server_and_keeps_the_demo_path() {
         let link = "https://www.faceit.com/ru/cs2/room/1-abc";
         let held = HeldJob::claimed(&assignment(Some(link), 0), PathBuf::from("remote/srv5.dem"));
         assert!(!needs_download(&held));
         let task = task_of(&held, 1, None);
         assert_eq!(task.faceit.as_deref(), Some(link));
-        assert!(task.demo.as_os_str().is_empty(), "{:?}", task.demo);
+        assert_eq!(task.demo, PathBuf::from("remote/srv5.dem"));
 
         // Ссылка вместе с файлом демки и обычная задача без ссылки качаются как раньше.
         let with_file = HeldJob::claimed(

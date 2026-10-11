@@ -13,9 +13,9 @@ use pipeline::assemble::verify_result;
 use pipeline::host::Host;
 use pipeline::inspect::{InspectArgs, InspectLimits, preflight};
 use pipeline::job::{DemoSource, JobConfig, JobSpec, Outcome, run_job};
-use pipeline::record::failure::{msg_result_invalid, msg_unsupported_source};
+use pipeline::record::failure::{msg_faceit_fetch_failed, msg_result_invalid, msg_unsupported_source};
 use pipeline::record::log::one_line;
-use pipeline::{CANCELLED, FailCode, Progress, RecordFailure, RecordState, RunError};
+use pipeline::{CANCELLED, FailCode, Progress, RecordFailure, RecordState, RunError, Stage};
 
 /// Сколько ждать ffprobe при проверке готового ролика.
 const VERIFY_DEADLINE: Duration = Duration::from_secs(60);
@@ -67,6 +67,10 @@ pub struct InspectSettings {
 /// Подмена `run_job` в тестах.
 type JobFn = dyn Fn(&dyn Host, &JobSpec, &dyn Progress) -> Result<Outcome, RunError> + Send + Sync;
 
+/// Подмена скачивания демки FACEIT в тестах: `(match_id, ключ, папка)` -> путь скачанного файла. Ошибка — текст
+/// `faceit` как есть; наружу из раннера идёт только фиксированная фраза (`fetch_phrase`).
+type FetchFn = dyn Fn(&str, &str, &Path) -> Result<PathBuf, String> + Send + Sync;
+
 /// Исполнитель раннера поверх `pipeline`: чужая демка до `run_job` проходит дочерний разбор, `run_job` идёт под
 /// `catch_unwind` (паника не роняет раннер), а после падения раннера свои осиротевшие процессы завершаются раньше,
 /// чем убирается папка игры.
@@ -75,6 +79,7 @@ pub struct PipelineExecutor {
     cfg: JobConfig,
     inspect: InspectSettings,
     job_fn: Arc<JobFn>,
+    fetch_fn: Arc<FetchFn>,
 }
 
 impl PipelineExecutor {
@@ -84,6 +89,7 @@ impl PipelineExecutor {
             cfg,
             inspect,
             job_fn: Arc::new(run_job),
+            fetch_fn: Arc::new(fetch_demo),
         }
     }
 
@@ -98,6 +104,61 @@ impl PipelineExecutor {
     ) -> Self {
         self.job_fn = Arc::new(f);
         self
+    }
+
+    /// Подменяет скачивание демки FACEIT (только для тестов).
+    #[doc(hidden)]
+    pub fn with_fetch_fn(
+        mut self,
+        f: impl Fn(&str, &str, &Path) -> Result<PathBuf, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.fetch_fn = Arc::new(f);
+        self
+    }
+
+    /// Демка FACEIT на месте: если файла задачи нет, раннер скачивает его своим ключом по `match_id` из ссылки
+    /// (первая демка матча). Скачивание идёт во временную папку рядом, затем файл переименовывается в
+    /// `task.demo`; папка убирается при любом исходе. Сервер в этом не участвует (D-01).
+    fn ensure_faceit_demo(&self, task: &Task, p: &dyn Progress) -> Result<(), RunError> {
+        let Some(link) = task.faceit.as_deref() else {
+            return Ok(());
+        };
+        if task.demo.is_file() {
+            return Ok(());
+        }
+        pipeline::check(p)?;
+        p.stage(Stage::Download);
+        // Ссылка проверяется заново тем же строгим разбором, что и на сервере: в клиент FACEIT идёт только id.
+        let Some(match_id) = wire::faceit::room_match_id(link) else {
+            return Err(unsupported_source());
+        };
+        let key = self.cfg.faceit_key.trim();
+        if key.is_empty() {
+            return Err(fetch_failed(
+                "у раннера не задан ключ FACEIT (переменная FACEIT_API_KEY)",
+            ));
+        }
+        p.log("качаю демку FACEIT…");
+        let tmp = task.demo.with_extension("faceit");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let fetched = (self.fetch_fn)(&match_id, key, &tmp);
+        let moved = match fetched {
+            Ok(path) => place_demo(&path, &task.demo),
+            Err(e) => {
+                // Исходный текст ошибки остаётся в журнале раннера (его сервер не получает), без ключа и адресов.
+                p.log(&format!(
+                    "скачивание демки FACEIT не удалось: {}",
+                    scrub_error(&e, key)
+                ));
+                Err(fetch_phrase(&e))
+            }
+        };
+        let _ = std::fs::remove_dir_all(&tmp);
+        if let Err(reason) = moved {
+            return Err(fetch_failed(&reason));
+        }
+        pipeline::check(p)?;
+        Ok(())
     }
 
     /// Дочерняя предпроверка демки: мусор, бомба, неверный игрок закрывают задачу своим кодом до запуска CS2.
@@ -188,7 +249,73 @@ impl PipelineExecutor {
     }
 }
 
-/// Сбой «источник не поддерживается»: раннер берёт только файл демки.
+/// Сбой скачивания демки FACEIT с фиксированной фразой (без адресов и ключа).
+fn fetch_failed(reason: &str) -> RunError {
+    let f = RecordFailure::new(
+        FailCode::FaceitFetchFailed,
+        RecordState::Precheck,
+        msg_faceit_fetch_failed(reason),
+        Duration::ZERO,
+    );
+    RunError {
+        message: f.message.clone(),
+        fail: Some(f),
+    }
+}
+
+/// Фраза для друга и сервера по тексту ошибки клиента FACEIT: исходный текст может нести подписанный адрес CDN.
+fn fetch_phrase(err: &str) -> String {
+    if err.contains("нет демки") {
+        "у матча FACEIT нет демки: матч ещё не доигран или демка удалена"
+    } else if err.contains("отказал в доступе") {
+        "FACEIT отказал в доступе к демке: ключу автора нужен доступ к Downloads API"
+    } else if err.contains("не найдено") {
+        "матч FACEIT не найден"
+    } else {
+        "не удалось скачать демку FACEIT: ошибка сети или FACEIT API"
+    }
+    .to_owned()
+}
+
+/// Текст ошибки для журнала раннера: одна строка, значение ключа заменено на `***`, адреса — на `<адрес>`.
+fn scrub_error(err: &str, key: &str) -> String {
+    let text = if key.is_empty() {
+        err.to_owned()
+    } else {
+        err.replace(key, "***")
+    };
+    one_line(&text)
+        .split_whitespace()
+        .map(|w| {
+            let l = w.to_ascii_lowercase();
+            if l.contains("http://") || l.contains("https://") {
+                "<адрес>"
+            } else {
+                w
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Скачанный файл становится демкой задачи (`remote/srv{id}.dem`): формат решает сигнатура, а не расширение.
+fn place_demo(from: &Path, to: &Path) -> Result<(), String> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|_| "не удалось подготовить папку для демки FACEIT".to_owned())?;
+    }
+    std::fs::rename(from, to).map_err(|_| "не удалось сохранить скачанную демку FACEIT".to_owned())
+}
+
+/// Настоящее скачивание: первая демка матча (в bo3 их несколько, A9) через `faceit::Client` ключом автора.
+fn fetch_demo(match_id: &str, key: &str, dir: &Path) -> Result<PathBuf, String> {
+    let client = faceit::Client::new(key);
+    let urls = client.demo_urls(match_id).map_err(|e| e.to_string())?;
+    let url = urls.first().ok_or("у матча нет демки")?;
+    client.download(url, dir).map_err(|e| e.to_string())
+}
+
+/// Сбой «источник не поддерживается»: ссылка в задаче не прошла строгий шаблон комнаты матча FACEIT.
 fn unsupported_source() -> RunError {
     let f = RecordFailure::new(
         FailCode::UnsupportedSource,
@@ -211,11 +338,13 @@ fn is_retry_no_data(e: &RunError) -> bool {
 
 impl Executor for PipelineExecutor {
     fn run(&self, task: &Task, p: &dyn Progress) -> Result<Outcome, RunError> {
+        // Без пути для файла демки скачивать некуда: раннер всегда задаёт `remote/srv{id}.dem`.
         if task.faceit.is_some() && task.demo.as_os_str().is_empty() {
             return Err(unsupported_source());
         }
         // Продолжение: демка прошла проверку при первом запуске, повторять её незачем (D-01).
         if !task.resume {
+            self.ensure_faceit_demo(task, p)?;
             self.inspect_demo(task, p)?;
         }
         let outcome = match self.call_job(task, task.resume, p) {
@@ -224,6 +353,7 @@ impl Executor for PipelineExecutor {
                     "продолжить нельзя ({}) — начинаю задачу заново",
                     one_line(&e.message)
                 ));
+                self.ensure_faceit_demo(task, p)?;
                 self.inspect_demo(task, p)?;
                 self.call_job(task, false, p)
             }

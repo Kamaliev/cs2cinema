@@ -3544,6 +3544,7 @@ name = "runner"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "faceit",
  "pipeline",
  "serde",
  "serde_json",

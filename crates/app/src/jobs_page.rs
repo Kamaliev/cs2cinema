@@ -20,6 +20,7 @@ enum Act {
     Delete(i64),
     Log(i64),
     Resume,
+    DismissSummary,
 }
 
 pub fn ui(app: &mut App, ui: &mut Ui) {
@@ -46,6 +47,24 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
     }
 
     let mut act: Option<Act> = None;
+    // итог очереди: тот же текст, что в тосте трея; остаётся, пока его не скроют
+    if let Some(text) = app.jobs.summary.clone() {
+        egui::Frame::new().stroke(egui::Stroke::new(1.0_f32, ui::BORDER)).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(
+            ui,
+            |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(text).color(ui::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Скрыть").clicked() {
+                            act = Some(Act::DismissSummary);
+                        }
+                    });
+                });
+            },
+        );
+        ui.add_space(8.0);
+    }
     // очередь стоит после отмены или прерванной задачи, пока пользователь не нажмёт «Продолжить» (D-13, D-16)
     let waiting = app.jobs.list.iter().filter(|j| j.status == JobStatus::Queued).count();
     let paused = app.queue.view().paused;
@@ -76,6 +95,7 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
     match act {
         Some(Act::Cancel(id)) => app.cancel_job(id),
         Some(Act::Resume) => app.resume_queue(),
+        Some(Act::DismissSummary) => app.dismiss_summary(),
         // «Повторить» (с записи, D-09) и «Заново» (с начала) — осознанные действия, пауза очереди снимается (D-13)
         Some(Act::Retry(id)) => requeue(app, id, true),
         Some(Act::Redo(id)) => requeue(app, id, false),

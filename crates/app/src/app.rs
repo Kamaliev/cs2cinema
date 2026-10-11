@@ -46,6 +46,8 @@ pub enum Msg {
         id: i64,
         result: Result<PathBuf, String>,
     },
+    /// Очередь опустела: «N готово / M упало · первая причина» для баннера, строки состояния и подсказки значка трея (OBS-04).
+    QueueSummary(String),
     Player(Result<(Player, Vec<MatchSummary>), String>),
     Stats(String, Result<MatchStats, String>),
     UpdateFound(Result<Option<update::Release>, String>),
@@ -72,6 +74,13 @@ impl Reporter {
     #[cfg(test)]
     pub fn detached() -> Self {
         Reporter { tx: channel().0, ctx: egui::Context::default() }
+    }
+
+    /// Отчёт без окна, но с приёмником: тест читает сообщения потока очереди.
+    #[cfg(test)]
+    pub fn with_receiver() -> (Self, Receiver<Msg>) {
+        let (tx, rx) = channel();
+        (Reporter { tx, ctx: egui::Context::default() }, rx)
     }
 
     pub fn send(&self, m: Msg) {
@@ -131,6 +140,8 @@ pub struct JobsState {
     pub old_logs: HashMap<i64, Vec<PathBuf>>,
     /// id задачи -> `updated_at`, при котором папку уже смотрели: файловая система проверяется при изменении задачи, а не в каждом кадре.
     pub fs_seen: HashMap<i64, i64>,
+    /// Итог последней очереди «N готово / M упало · первая причина»: баннер над списком, пока его не скрыли (OBS-04).
+    pub summary: Option<String>,
 }
 
 /// Размер превью ролика в карточке задачи.
@@ -450,6 +461,27 @@ impl App {
         self.refresh_jobs();
     }
 
+    /// Подсказка значка трея: итог очереди виден и тогда, когда тост не показали. Windows держит не больше 127 символов.
+    /// `None` возвращает обычную подпись. Ошибку игнорируем: значка может не быть.
+    fn set_tray_tooltip(&self, text: Option<&str>) {
+        #[cfg(windows)]
+        if let Some(tray) = &self._tray {
+            let tip = match text {
+                Some(t) => format!("CS2 Cinema — {t}").chars().take(120).collect::<String>(),
+                None => "CS2 Cinema".to_owned(),
+            };
+            let _ = tray.set_tooltip(Some(tip));
+        }
+        #[cfg(not(windows))]
+        let _ = text;
+    }
+
+    /// Скрыть баннер итога очереди и вернуть обычную подсказку значка.
+    pub fn dismiss_summary(&mut self) {
+        self.jobs.summary = None;
+        self.set_tray_tooltip(None);
+    }
+
     /// «Продолжить» после отмены: пауза снимается, очередь идёт дальше (D-13).
     pub fn resume_queue(&mut self) {
         self.queue.resume();
@@ -539,6 +571,11 @@ impl App {
                         Err(e) => self.status.finish(Err(format!("задача #{id}: {e}"))),
                     }
                     self.refresh_jobs();
+                }
+                Msg::QueueSummary(text) => {
+                    self.status.push(&text);
+                    self.set_tray_tooltip(Some(&text));
+                    self.jobs.summary = Some(text);
                 }
                 Msg::Player(r) => {
                     self.matches.loading = false;

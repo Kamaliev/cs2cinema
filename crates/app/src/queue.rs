@@ -61,31 +61,75 @@ pub enum PauseReason {
 /// Сколько символов сообщения о сбое попадает в причину паузы: в нём бывают строки консоли игры.
 const PAUSE_MESSAGE_MAX: usize = 200;
 
-/// Текст причины паузы: баннер дописывает к нему число ждущих задач, уведомление в трее показывает как есть.
+/// Текст причины паузы: баннер дописывает к нему число ждущих задач.
 pub fn pause_text(reason: &PauseReason) -> String {
+    pause_text_with(reason, true)
+}
+
+/// Текст причины паузы для уведомления в трее: то же, но без подсказки — длину в тосте режет хост, а подсказку и «Продолжить» читают в окне.
+pub fn pause_notice(reason: &PauseReason) -> String {
+    pause_text_with(reason, false)
+}
+
+fn pause_text_with(reason: &PauseReason, with_hint: bool) -> String {
     match reason {
         PauseReason::Cancelled => "Очередь на паузе после отмены".to_owned(),
         PauseReason::Interrupted => "Очередь на паузе: задача прервана закрытием приложения".to_owned(),
         PauseReason::Repeated { code, class, jobs, message, hint } => {
             let n = ui::plural(*jobs as usize, "задача", "задачи", "задач");
-            let hint = if hint.is_empty() { String::new() } else { format!(" {hint}") };
-            format!(
-                "Очередь на паузе: {n} подряд упали с кодом {code} ({}). Последняя: {}.{hint} Исправьте причину и нажмите «Продолжить»",
-                class.title(),
-                message.trim_end_matches('.')
-            )
+            let hint = if hint.is_empty() || !with_hint { String::new() } else { format!(" {hint}") };
+            let tail = if with_hint { " Исправьте причину и нажмите «Продолжить»" } else { "" };
+            format!("Очередь на паузе: {n} подряд упали с кодом {code} ({}). Последняя: {}.{hint}{tail}", class.title(), message.trim_end_matches('.'))
         }
     }
 }
 
-/// Сообщение сбоя для причины паузы: без управляющих символов, секретов и пути профиля, не длиннее `PAUSE_MESSAGE_MAX`.
-fn short_message(message: &str) -> String {
+/// Сколько символов сообщения о сбое попадает в итог очереди (окончательную длину тоста режет хост).
+const SUMMARY_MESSAGE_MAX: usize = 120;
+
+/// Сообщение сбоя для причины паузы и итога: без управляющих символов, секретов и пути профиля, не длиннее `max` символов.
+fn short(message: &str, max: usize) -> String {
     let clean = pipeline::record::log::clean(message);
-    if clean.chars().count() <= PAUSE_MESSAGE_MAX {
+    if clean.chars().count() <= max {
         return clean;
     }
-    let cut: String = clean.chars().take(PAUSE_MESSAGE_MAX - 1).collect();
+    let cut: String = clean.chars().take(max - 1).collect();
     format!("{}…", cut.trim_end())
+}
+
+/// Итог очереди с момента, когда она последний раз была пуста: сколько задач закончилось и почему упала первая.
+/// Отменённые задачи не считаются ни в `done`, ни в `failed`; задача с авто-повтором, дошедшая до конца, — одна.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Summary {
+    pub done: u32,
+    pub failed: u32,
+    /// «#id КОД — сообщение» первого итогового сбоя.
+    pub first_failure: Option<String>,
+}
+
+impl Summary {
+    fn add(&mut self, f: &Finished) {
+        match f {
+            Finished::Done => self.done += 1,
+            Finished::Cancelled => {}
+            Finished::Failed { id, code, message, .. } => {
+                self.failed += 1;
+                if self.first_failure.is_none() {
+                    let code = code.map_or("ошибка", |c| c.as_str());
+                    self.first_failure = Some(format!("#{id} {code} — {}", short(message, SUMMARY_MESSAGE_MAX)));
+                }
+            }
+        }
+    }
+}
+
+/// «N готово / M упало · первая причина: …» — одна строка для тоста, баннера и подсказки значка (OBS-04).
+pub fn summary_text(s: &Summary) -> String {
+    let head = format!("{} готово / {} упало", s.done, s.failed);
+    match &s.first_failure {
+        Some(reason) if s.failed > 0 => format!("{head} · первая причина: {reason}"),
+        _ => head,
+    }
 }
 
 /// Что окно видит в очереди: выполняемая задача с токеном отмены, пауза с причиной и «пауза для машины» перед авто-повтором.
@@ -198,7 +242,7 @@ impl QueuePolicy {
             return Verdict::Next;
         }
         self.streak = None;
-        Verdict::Pause(PauseReason::Repeated { code: code.to_owned(), class, jobs: n, message: short_message(message), hint: hint.to_owned() })
+        Verdict::Pause(PauseReason::Repeated { code: code.to_owned(), class, jobs: n, message: short(message, PAUSE_MESSAGE_MAX), hint: hint.to_owned() })
     }
 }
 
@@ -241,6 +285,7 @@ struct Worker {
     cfg: QueueConfig,
     shared: Arc<Mutex<QueueView>>,
     policy: QueuePolicy,
+    totals: Summary,
 }
 
 impl Worker {
@@ -256,7 +301,7 @@ impl Worker {
 pub fn start(store: Store, host: Arc<dyn Host>, runner: Runner, ui: Reporter, paused: Option<PauseReason>, cfg: QueueConfig) -> Queue {
     let (tx, rx) = channel();
     let view = Arc::new(Mutex::new(QueueView { running: None, paused, hold: None }));
-    let mut worker = Worker { store, host, runner, ui: ui.clone(), cfg, shared: view.clone(), policy: QueuePolicy::default() };
+    let mut worker = Worker { store, host, runner, ui: ui.clone(), cfg, shared: view.clone(), policy: QueuePolicy::default(), totals: Summary::default() };
     let spawned = std::thread::Builder::new().name("cs2cinema-queue".into()).spawn(move || {
         let mut last_error = String::new();
         loop {
@@ -266,6 +311,10 @@ pub fn start(store: Store, host: Arc<dyn Host>, runner: Runner, ui: Reporter, pa
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             if worker.shared.lock().map_or(true, |v| v.paused.is_some()) {
+                // пауза без ждущих задач ничего не держит (баннер её не показывает): итог не должен ждать «Продолжить»
+                if matches!(worker.store.next_queued(), Ok(None)) {
+                    worker.announce_summary();
+                }
                 continue;
             }
             // «пауза для машины» перед авто-повтором: задач не берём, пока она не истекла (DC-4)
@@ -278,7 +327,10 @@ pub fn start(store: Store, host: Arc<dyn Host>, runner: Runner, ui: Reporter, pa
             }
             let job = match worker.store.next_queued() {
                 Ok(Some(job)) => job,
-                Ok(None) => continue,
+                Ok(None) => {
+                    worker.announce_summary();
+                    continue;
+                }
                 Err(e) => {
                     note_error(&worker.ui, &mut last_error, &e);
                     continue;
@@ -349,13 +401,41 @@ impl Worker {
         }
         // итог берётся до любых `requeue_*`: они стирают `fail_*` в базе
         let finished = Finished::of(job.id, &result);
-        match self.policy.after(job.auto_retries, &finished) {
+        let verdict = self.policy.after(job.auto_retries, &finished);
+        if verdict != Verdict::AutoRetry {
+            self.totals.add(&finished);
+        }
+        match verdict {
             Verdict::AutoRetry => self.auto_retry(job.id, &finished),
-            Verdict::Pause(reason) => self.set(&|v| v.paused = Some(reason.clone())),
+            Verdict::Pause(reason) => {
+                self.set(&|v| v.paused = Some(reason.clone()));
+                // пользователь может быть далеко от компьютера; если ждущих задач нет, паузу заменит итог очереди
+                if matches!(reason, PauseReason::Repeated { .. }) && matches!(self.store.next_queued(), Ok(Some(_))) {
+                    self.notify("CS2 Cinema — очередь на паузе", &pause_notice(&reason));
+                }
+            }
             Verdict::Next => {}
         }
         self.set(&|v| v.running = None);
         self.ui.send(Msg::JobDone { id: job.id, result: result.map(|o| o.result).map_err(|e| e.message) });
+    }
+
+    /// Уведомление в трее; если его не показали, строка в окно (итог всё равно виден в окне).
+    fn notify(&self, title: &str, text: &str) {
+        if !self.host.notify(title, text) {
+            self.ui.send(Msg::Log("уведомление в трее не показано — итог в окне".to_owned()));
+        }
+    }
+
+    /// Очередь опустела после хотя бы одной законченной задачи: итог в трей и в окно (OBS-04, DC-6). Дальше итог обнуляется,
+    /// поэтому пустые такты нового уведомления не дают.
+    fn announce_summary(&mut self) {
+        if self.totals.done + self.totals.failed == 0 {
+            return;
+        }
+        let text = summary_text(&std::mem::take(&mut self.totals));
+        self.notify("CS2 Cinema", &text);
+        self.ui.send(Msg::QueueSummary(text));
     }
 
     /// Поставить задачу в очередь «с записи» и задержать очередь на `retry_pause`. Причина и счётчик остаются в журнале
@@ -862,5 +942,152 @@ mod tests {
         wait_for(&store, c, JobStatus::Failed);
         assert_eq!(*started.lock().unwrap(), ["первая", "вторая", "третья"]);
         assert_eq!(store.job(a).unwrap().unwrap().auto_retries, 0, "окружение не повторяется автоматически");
+    }
+
+    /// Ждёт, пока хост покажет `n` уведомлений (поток очереди отправляет их после смены статуса задачи).
+    fn wait_notifications(fake: &FakeHost, n: usize) -> Vec<(String, String)> {
+        let begin = Instant::now();
+        while fake.notifications().len() < n && begin.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fake.notifications()
+    }
+
+    /// Следующее сообщение окна заданного вида: сообщения потока приходят вперемешку.
+    fn next_summary(rx: &std::sync::mpsc::Receiver<Msg>) -> Option<String> {
+        let begin = Instant::now();
+        while begin.elapsed() < Duration::from_secs(5) {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Msg::QueueSummary(text)) => return Some(text),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn summary_text_counts_done_and_failed_with_the_first_reason() {
+        let s = Summary { done: 1, failed: 2, first_failure: Some("#2 TAKE_INVALID — дубль 1 из 2 обрезан".into()) };
+        assert_eq!(summary_text(&s), "1 готово / 2 упало · первая причина: #2 TAKE_INVALID — дубль 1 из 2 обрезан");
+        assert_eq!(summary_text(&Summary { done: 5, failed: 0, first_failure: None }), "5 готово / 0 упало");
+    }
+
+    #[test]
+    fn summary_ignores_cancelled_jobs_and_keeps_the_first_failure_cleaned_and_short() {
+        let mut s = Summary::default();
+        s.add(&Finished::Cancelled);
+        s.add(&Finished::Done);
+        let long = format!("\u{7}первая {}", "x".repeat(300));
+        s.add(&Finished::Failed { id: 7, code: None, state: None, message: long, hint: String::new() });
+        s.add(&failed(8, FailCode::TakeInvalid, RecordState::Take));
+        assert_eq!((s.done, s.failed), (1, 2), "отменённая не считается");
+        let reason = s.first_failure.unwrap();
+        assert!(reason.starts_with("#7 ошибка —") && reason.contains("первая xxx"), "{reason}");
+        assert!(!reason.contains('\u{7}') && reason.chars().count() <= 12 + 120 && reason.ends_with('…'), "{reason}");
+    }
+
+    #[test]
+    fn queue_end_notifies_once_with_done_and_failed() {
+        let store = Store::in_memory().unwrap();
+        let (a, b, c) = (add(&store, "первая"), add(&store, "вторая"), add(&store, "третья"));
+        let invalid = |m: &'static str| -> Behavior { Box::new(move || Err(failure(FailCode::TakeInvalid, RecordState::Take, m))) };
+        let (runner, _) = stub(vec![("первая", ok()), ("вторая", invalid("A")), ("третья", invalid("B"))]);
+        let fake = Arc::new(FakeHost::new(Scenario::happy(1)));
+        let (ui, rx) = Reporter::with_receiver();
+        let q = start(store.clone(), fake.clone(), runner, ui, None, cfg());
+
+        wait_for(&store, c, JobStatus::Failed);
+        let shown = wait_notifications(&fake, 1);
+        let expected = format!("1 готово / 2 упало · первая причина: #{b} TAKE_INVALID — A");
+        assert_eq!(shown, vec![("CS2 Cinema".to_owned(), expected.clone())]);
+        assert_eq!(next_summary(&rx), Some(expected), "тот же текст ушёл в окно");
+        // пустые такты нового уведомления не дают
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(fake.notifications().len(), 1);
+        assert_eq!(q.view().paused, None);
+        let _ = a;
+    }
+
+    #[test]
+    fn cancelled_job_is_not_counted_and_the_summary_does_not_wait_for_resume() {
+        let store = Store::in_memory().unwrap();
+        let (a, b) = (add(&store, "первая"), add(&store, "вторая"));
+        let cancelled: Behavior = Box::new(|| Err(RunError::from(pipeline::CANCELLED)));
+        let (runner, _) = stub(vec![("первая", ok()), ("вторая", cancelled)]);
+        let fake = Arc::new(FakeHost::new(Scenario::happy(1)));
+        let q = start(store.clone(), fake.clone(), runner, Reporter::detached(), None, cfg());
+
+        wait_for(&store, b, JobStatus::Cancelled);
+        let shown = wait_notifications(&fake, 1);
+        assert_eq!(shown, vec![("CS2 Cinema".to_owned(), "1 готово / 0 упало".to_owned())], "пауза после отмены пустую очередь не держит");
+        assert_eq!(q.view().paused, Some(PauseReason::Cancelled));
+        let _ = a;
+    }
+
+    #[test]
+    fn auto_retried_job_that_succeeds_counts_as_one_done() {
+        let store = Store::in_memory().unwrap();
+        let a = add(&store, "первая");
+        let calls = Arc::new(Mutex::new(0u32));
+        let c = calls.clone();
+        let runner: Runner = Arc::new(move |_job, _rep| {
+            let mut n = c.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                Err(failure(FailCode::ConsoleNotOpen, RecordState::Console, "консольный порт не открылся"))
+            } else {
+                Ok(JobOutcome { out_dir: "out".into(), result: "out/highlights.mp4".into(), shots: 1, secs: 1.0 })
+            }
+        });
+        let fake = Arc::new(FakeHost::new(Scenario::happy(1)));
+        let _q = start(store.clone(), fake.clone(), runner, Reporter::detached(), None, cfg());
+
+        wait_for(&store, a, JobStatus::Done);
+        let shown = wait_notifications(&fake, 1);
+        assert_eq!(shown, vec![("CS2 Cinema".to_owned(), "1 готово / 0 упало".to_owned())], "сбой, закрытый авто-повтором, в итог не попал");
+    }
+
+    #[test]
+    fn repeated_failure_pause_is_notified() {
+        let store = Store::in_memory().unwrap();
+        let (a, b, c) = (add(&store, "первая"), add(&store, "вторая"), add(&store, "третья"));
+        let precheck = || -> Behavior { Box::new(|| Err(failure(FailCode::PrecheckFailed, RecordState::Precheck, "нет ffmpeg"))) };
+        let (runner, _) = stub(vec![("первая", precheck()), ("вторая", precheck()), ("третья", precheck())]);
+        let fake = Arc::new(FakeHost::new(Scenario::happy(1)));
+        let q = start(store.clone(), fake.clone(), runner, Reporter::detached(), None, cfg());
+
+        wait_for(&store, b, JobStatus::Failed);
+        let shown = wait_notifications(&fake, 1);
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(shown[0].0, "CS2 Cinema — очередь на паузе");
+        assert!(
+            shown[0].1.starts_with("Очередь на паузе: 2 задачи подряд упали с кодом PRECHECK_FAILED (окружение). Последняя: нет ffmpeg."),
+            "{}",
+            shown[0].1
+        );
+        stays_queued(&store, c);
+        assert_eq!(fake.notifications().len(), 1, "итога нет, пока в очереди есть ждущие задачи");
+
+        // после «Продолжить» третья падает, очередь пустеет: итог «0 готово / 3 упало»
+        q.resume();
+        wait_for(&store, c, JobStatus::Failed);
+        let shown = wait_notifications(&fake, 2);
+        assert_eq!(shown[1], ("CS2 Cinema".to_owned(), format!("0 готово / 3 упало · первая причина: #{a} PRECHECK_FAILED — нет ffmpeg")));
+    }
+
+    #[test]
+    fn repeated_pause_without_waiting_jobs_is_replaced_by_the_summary() {
+        let store = Store::in_memory().unwrap();
+        let (a, b) = (add(&store, "первая"), add(&store, "вторая"));
+        let precheck = || -> Behavior { Box::new(|| Err(failure(FailCode::PrecheckFailed, RecordState::Precheck, "нет ffmpeg"))) };
+        let (runner, _) = stub(vec![("первая", precheck()), ("вторая", precheck())]);
+        let fake = Arc::new(FakeHost::new(Scenario::happy(1)));
+        let _q = start(store.clone(), fake.clone(), runner, Reporter::detached(), None, cfg());
+
+        wait_for(&store, b, JobStatus::Failed);
+        let shown = wait_notifications(&fake, 1);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(fake.notifications(), shown);
+        assert_eq!(shown, vec![("CS2 Cinema".to_owned(), format!("0 готово / 2 упало · первая причина: #{a} PRECHECK_FAILED — нет ffmpeg"))]);
     }
 }

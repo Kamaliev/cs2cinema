@@ -165,9 +165,9 @@ fn stranger_gets_only_the_id_and_nothing_is_fetched() {
         Some("s1mple"),
     ));
     st.tg.put_document("doc-2", "uniq-2", &bytes);
-    let mut forwarded =
-        st.tg
-            .document_update(stranger, stranger, "doc-2", "uniq-2", "b.dem", 4096, None);
+    let mut forwarded = st
+        .tg
+        .document_update(stranger, stranger, "doc-2", "uniq-2", "b.dem", 4096, None);
     forwarded.message.as_mut().unwrap().forward_origin =
         Some(serde_json::json!({"type": "user", "date": 1}));
     push(forwarded);
@@ -368,4 +368,176 @@ fn forwarded_document_from_a_friend_is_his_own_demo() {
     assert_eq!(jobs.len(), 1, "задача поставлена");
     assert_eq!(jobs[0].user_id, Some(user_id));
     assert_eq!(jobs[0].player_name, "ZywOo");
+}
+
+#[test]
+fn player_is_saved_and_fixed_in_the_job() {
+    let st = BotStand::start();
+    st.add_friend(FRIEND, "вася");
+    let core = st.server.running().core();
+
+    say(&st, FRIEND, "/player 76561198034202275");
+    st.step();
+    assert_eq!(last_text(&st, FRIEND), "Игрок: 76561198034202275");
+
+    st.send_demo(FRIEND, "");
+    st.step();
+    let jobs = core.jobs().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].player_steam.as_deref(), Some("76561198034202275"));
+
+    say(&st, FRIEND, "/player ZywOo");
+    st.step();
+    assert_eq!(last_text(&st, FRIEND), "Игрок: ZywOo");
+    let first = core.job(jobs[0].id).unwrap().unwrap();
+    assert_eq!(
+        first.player_steam.as_deref(),
+        Some("76561198034202275"),
+        "уже поставленная задача не меняется"
+    );
+
+    st.send_demo(FRIEND, "");
+    st.step();
+    let jobs = core.jobs().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[1].player_name, "ZywOo");
+    assert_eq!(jobs[1].player_steam, None, "ник не выдаётся за SteamID");
+
+    say(&st, FRIEND, "/player");
+    st.step();
+    assert_eq!(last_text(&st, FRIEND), "Игрок: ZywOo");
+}
+
+#[test]
+fn caption_overrides_the_saved_player_for_one_job() {
+    let st = BotStand::start();
+    st.add_friend(FRIEND, "вася");
+    let core = st.server.running().core();
+
+    say(&st, FRIEND, "/player s1mple");
+    st.send_demo(FRIEND, "ZywOo");
+    st.step();
+    st.send_demo(FRIEND, "");
+    st.step();
+
+    let jobs = core.jobs().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].player_name, "ZywOo", "подпись главнее сохранённого");
+    assert_eq!(jobs[1].player_name, "s1mple", "без подписи — сохранённый");
+    let user = server::users::find_user_by_tg(core.db(), FRIEND)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        user.player_name.as_deref(),
+        Some("s1mple"),
+        "сохранённый игрок не изменился"
+    );
+}
+
+#[test]
+fn player_with_control_or_bidi_characters_is_refused() {
+    let st = BotStand::start();
+    st.add_friend(FRIEND, "вася");
+    let core = st.server.running().core();
+    say(&st, FRIEND, "/player s1mple");
+    st.step();
+
+    let too_long = format!("/player {}", "я".repeat(65));
+    for bad in [
+        "/player a\u{202E}b",
+        "/player a\u{2028}b",
+        "/player \u{7}",
+        too_long.as_str(),
+    ] {
+        let before = st.tg.texts_to(FRIEND).len();
+        say(&st, FRIEND, bad);
+        st.step();
+        let texts = st.tg.texts_to(FRIEND);
+        assert_eq!(texts.len(), before + 1, "на {bad:?} один ответ");
+        assert!(
+            texts[before].contains("Не принял игрока"),
+            "отказ с объяснением на {bad:?}: {}",
+            texts[before]
+        );
+        let user = server::users::find_user_by_tg(core.db(), FRIEND)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            user.player_name.as_deref(),
+            Some("s1mple"),
+            "сохранённый игрок прежний после {bad:?}"
+        );
+    }
+}
+
+#[test]
+fn start_and_help_list_the_commands() {
+    let st = BotStand::start();
+    st.add_admin(ADMIN, "автор");
+    st.add_friend(FRIEND, "вася");
+
+    say(&st, FRIEND, "/start");
+    say(&st, FRIEND, "/help");
+    say(&st, ADMIN, "/help");
+    st.step();
+
+    let friend = st.tg.texts_to(FRIEND);
+    assert!(friend[0].contains("/player") && friend[0].contains(".dem"));
+    assert!(
+        !friend[1].contains("/adduser"),
+        "друг не видит команды управления: {}",
+        friend[1]
+    );
+    assert!(friend[1].contains("/player"));
+    let admin = st.tg.texts_to(ADMIN);
+    assert!(admin[0].contains("/adduser") && admin[0].contains("/removeuser"));
+
+    let names: Vec<String> = server::bot::commands::menu()
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect();
+    for want in ["start", "help", "player"] {
+        assert!(names.iter().any(|n| n == want), "в меню нет {want}");
+    }
+}
+
+#[test]
+fn removed_friend_job_still_finishes_and_is_delivered() {
+    let st = BotStand::start();
+    st.add_admin(ADMIN, "автор");
+    st.add_friend(FRIEND, "вася");
+    let core = st.server.running().core();
+
+    st.send_demo(FRIEND, "s1mple");
+    st.step();
+    let job_id = core.jobs().unwrap()[0].id;
+
+    say(&st, ADMIN, &format!("/removeuser {FRIEND}"));
+    st.step();
+    assert!(last_text(&st, ADMIN).contains("Убрал вася"));
+
+    let token = st.runner_token();
+    st.finish_done(job_id, &token);
+    st.step();
+
+    let videos = st.tg.videos();
+    assert_eq!(
+        videos.len(),
+        1,
+        "ролик доставлен убранному другу: {videos:?}"
+    );
+    assert_eq!(videos[0].chat, FRIEND);
+    assert_eq!(st.tg_job(job_id).delivery, "sent");
+
+    // Новая демка от убранного друга — только его ID.
+    st.clock().advance(Duration::from_secs(11 * 60));
+    st.send_demo(FRIEND, "s1mple");
+    st.step();
+    assert!(
+        last_text(&st, FRIEND).contains("111"),
+        "{}",
+        last_text(&st, FRIEND)
+    );
+    assert_eq!(core.jobs().unwrap().len(), 1, "новых задач нет");
+    assert_eq!(st.tg.get_file_calls(), 1);
 }

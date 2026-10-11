@@ -274,7 +274,7 @@ pub fn open_path(p: &std::path::Path) {
     {
         let mut c = std::process::Command::new("cmd");
         c.args(["/C", "start", ""]).arg(p);
-        let _ = crate::launch::no_window(&mut c).spawn();
+        let _ = no_window(&mut c).spawn();
     }
     #[cfg(not(windows))]
     {
@@ -284,4 +284,11 @@ pub fn open_path(p: &std::path::Path) {
 
 pub fn open_url(url: &str) {
     open_path(std::path::Path::new(url));
+}
+
+/// Запуск без окна консоли (`CREATE_NO_WINDOW`).
+#[cfg(windows)]
+fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000)
 }

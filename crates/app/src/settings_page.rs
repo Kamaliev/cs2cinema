@@ -6,7 +6,6 @@ use eframe::egui::{self, RichText, Ui};
 
 use crate::{
     app::App,
-    launch,
     ui::{self, BAD, MUTED, OK},
 };
 
@@ -59,19 +58,19 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
             let field_w = (ui.available_width() - 360.0).max(240.0);
             egui::Grid::new("paths").num_columns(4).spacing([12.0, 10.0]).show(ui, |ui| {
                 path_row(ui, field_w, "Папка HLAE", &mut d.hlae_dir, |p| p.join("HLAE.exe").is_file(), "нет HLAE.exe");
-                path_row(ui, field_w, "Папка CS2", &mut d.cs2_dir, |p| launch::cs2_exe(&p.to_string_lossy()).is_file(), "нет game\\bin\\win64\\cs2.exe");
+                path_row(ui, field_w, "Папка CS2", &mut d.cs2_dir, |p| pipeline::gamedir::cs2_exe(p).is_file(), "нет game\\bin\\win64\\cs2.exe");
                 path_row(ui, field_w, "Результаты", &mut d.out_root, |p| !p.to_string_lossy().contains(' '), "в пути есть пробел — HLAE не найдёт campath");
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.small_button("Найти CS2 в Steam").clicked() {
-                    match launch::find_cs2() {
+                    match crate::settings::find_cs2() {
                         Some(p) => d.cs2_dir = p.to_string_lossy().into_owned(),
                         None => status_note = Some("CS2 в библиотеках Steam не найден"),
                     }
                 }
                 if ui.small_button("Найти HLAE на компьютере").clicked() {
-                    match launch::find_hlae() {
+                    match crate::settings::find_hlae() {
                         Some(p) => d.hlae_dir = p.to_string_lossy().into_owned(),
                         None => status_note = Some("HLAE.exe не найден — укажите папку вручную или скачайте HLAE"),
                     }
@@ -173,7 +172,7 @@ fn first_run(app: &App, ui: &mut Ui) {
     let key = !d.faceit_key.trim().is_empty();
     let nick = !d.nickname.trim().is_empty();
     let hlae = Path::new(&d.hlae_dir).join("HLAE.exe").is_file();
-    let cs2 = launch::cs2_exe(&d.cs2_dir).is_file();
+    let cs2 = pipeline::gamedir::cs2_exe(Path::new(&d.cs2_dir)).is_file();
     if key && nick && hlae && cs2 {
         return;
     }

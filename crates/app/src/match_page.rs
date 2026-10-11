@@ -9,7 +9,6 @@ use store::JobKind;
 
 use crate::{
     app::{App, Page},
-    launch,
     player::kd_color,
     ui::{self, BAD, MUTED, OK},
 };
@@ -242,7 +241,7 @@ fn hint(app: &mut App, ui: &mut Ui) {
 fn enqueue(app: &mut App, kind: JobKind) {
     if kind == JobKind::Record {
         if !Path::new(&app.s.hlae_dir).join("HLAE.exe").is_file() {
-            if let Some(p) = launch::find_hlae() {
+            if let Some(p) = crate::settings::find_hlae() {
                 app.s.hlae_dir = p.to_string_lossy().into_owned();
                 app.draft.hlae_dir = app.s.hlae_dir.clone();
                 app.s.save();

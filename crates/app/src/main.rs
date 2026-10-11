@@ -3,7 +3,6 @@
 mod app;
 mod jobs;
 mod jobs_page;
-mod launch;
 mod match_page;
 #[cfg(debug_assertions)]
 mod mock;

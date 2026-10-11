@@ -2,11 +2,15 @@
 gsd_state_version: "1.0"
 milestone: v1.1
 milestone_name: Сервер и Telegram-бот
+current_phase: 5
+current_phase_name: Ядро сервера и протокол
 status: planning
-last_updated: "2026-10-11T08:47:53.532Z"
+stopped_at: Создан roadmap v1.1 (фазы 5–9), ждёт одобрения автора
+last_updated: "2026-10-11T09:22:17.899Z"
 last_activity: 2026-10-11
+state_head: 8f2f769f7ead6d2d1b94fd39dcec931d89f0c12f
 progress:
-  total_phases: 0
+  total_phases: 5
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -17,17 +21,19 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-10-10)
+See: .planning/PROJECT.md (updated 2026-10-11)
 
-**Core value:** Задача на монтаж из очереди доходит до готового `highlights.mp4` без ручного вмешательства, а если это невозможно — останавливается быстро и объясняет, что именно пошло не так.
-**Current focus:** Phase 04 — Очередь без присмотра и приёмка
+**Core value:** Задача на монтаж доходит до готового `highlights.mp4` без ручного вмешательства, а если это невозможно — останавливается быстро и объясняет, что именно пошло не так. Для v1.1 то же верно от демки, отправленной боту, до ролика в чате.
+**Current focus:** Phase 5 — Ядро сервера и протокол
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 5 of 9 (Ядро сервера и протокол)
 Plan: —
-Status: Defining requirements
-Last activity: 2026-10-11 — Milestone v1.1 started
+Status: Ready to plan
+Last activity: 2026-10-11
+
+Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 
@@ -93,6 +99,11 @@ Last activity: 2026-10-11 — Milestone v1.1 started
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [v1.1 Roadmap]: 5 фаз (5–9), нумерация продолжается после v1.0; порядок по исследованию — ядро сервера и протокол → раннер, защита входа и первый живой прогон → Telegram-бот и доставка → режим раннера в приложении → уборка, развёртывание и учения
+- [v1.1 Roadmap]: SEC-01, SEC-02, SEC-03 (инъекция текста из демки в cfg, нет лимитов разбора, `find_player` по подстроке) закрываются в фазе 6; фаза 7 зависит от фазы 6, чужие демки принимаются только после защиты входа
+- [v1.1 Roadmap]: SEC-04 (токены не в журналах) вводится в фазе 5, где появляются токены раннеров, и перепроверяется в фазе 7 (живой бот) и на учениях фазы 9
+- [v1.1 Roadmap]: фаза 7 может начаться параллельно с фазой 6 сразу после фазы 5 (на `cs2-server submit` и фейковом раннере), но закрывается после фазы 6; фаза 8 может идти параллельно с фазой 7
+- [v1.1 Roadmap]: первый живой прогон настоящей демки через сервер и настоящий CS2 (фаза 6) неформально закрывает долг v1.0 по живой проверке записи; приёмка 04-12 не возобновляется
 - Roadmap: 4 фазы (coarse), вертикальные срезы; после каждой фазы приложение записывает и остаётся рабочим
 - Phase 1: приложение переходит на `pipeline::record` уже в первой фазе; `cs2-cli` переводится на общий код и старый `launch.rs` удаляется в Phase 4
 - Phase 2: свои процессы держатся в Job Object, запасной вариант — (PID, время создания); выбор подтверждается спайком в Phase 1
@@ -148,10 +159,11 @@ None yet.
 
 ### Blockers/Concerns
 
-- Phase 1: поведение HLAE и CS2 не документировано (наследование Job Object через загрузчик HLAE, `-afxFixNetCon`, тексты консоли при сбоях, абсолютный `+playdemo`); это решается спайками в начале фазы
-- Phase 2: последовательность вызовов Job Object + IOCP в `windows-sys` 0.61 ещё не опробована; семантика `StateFlags` в `appmanifest_730.acf` не проверена
-- Phase 4: значения дедлайнов (консоль ~90 с, простой дубля ~60 с) и допуск `ffprobe` нужно подстроить на реальном прогоне
-- 01-05: реальные спайки S1-S4 требуют закрыть запущенный CS2 (PID 48660 на момент 01-01); стенд crates/host/examples/spikes.rs отказывается стартовать при чужом cs2.exe
+- Phase 5: модель доступа к БД сервера (поток-актор или `Arc<Mutex<Connection>>`) и поведение `tiny_http` под `PUT` по 8 МиБ, `Expect: 100-continue` и обрывы нужно решить коротким спайком в начале фазы
+- Phase 6: изоляция разбора демки в дочернем процессе с лимитом памяти (Job Object) не опробована; значения дедлайнов записи из v1.0 (консоль ~90 с, простой дубля ~60 с) и допуск `ffprobe` не подстроены на живом прогоне
+- Phase 7: поведение локального `telegram-bot-api` (общий том и права, `getFile` с абсолютным путём, `sendVideo` по `file://` на ~1 ГБ) требует спайка; приём ссылок FACEIT подтвердить с автором (риск SSRF)
+- Не выбраны ОС сервера (исследование рекомендует Linux + Tailscale Serve) и способ доступа к API раннера (Tailscale или Caddy); влияет на документацию фазы 9, не на код
+- В REQUIREMENTS.md число требований v1.1 было записано как 41, фактически их 37; счётчик исправлен при создании roadmap
 
 ### Quick Tasks Completed
 
@@ -169,6 +181,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T08:42:55.754Z
-Stopped at: Completed 04-11-PLAN.md (учения D1-D6 не проводились)
+Last session: 2026-10-11T09:17:40.000Z
+Stopped at: Создан roadmap v1.1 (фазы 5–9), ждёт одобрения автора
 Resume file: None

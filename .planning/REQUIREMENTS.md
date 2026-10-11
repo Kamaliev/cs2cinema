@@ -86,22 +86,55 @@
 
 ## Traceability
 
-Заполняется при создании roadmap.
+Нумерация фаз продолжается после v1.0 (фазы 1–4), v1.1 — фазы 5–9.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| SRV-01 … SRV-08 | — | Pending |
-| BOT-01 … BOT-11 | — | Pending |
-| RUN-01 … RUN-06 | — | Pending |
-| APP-01 … APP-04 | — | Pending |
-| SEC-01 … SEC-04 | — | Pending |
-| OPS-01 … OPS-04 | — | Pending |
+| SRV-01 | Phase 5 | Pending |
+| SRV-02 | Phase 5 | Pending |
+| SRV-03 | Phase 5 | Pending |
+| SRV-04 | Phase 5 | Pending |
+| SRV-05 | Phase 5 | Pending |
+| SRV-06 | Phase 5 | Pending |
+| SRV-07 | Phase 5 | Pending |
+| SRV-08 | Phase 5 | Pending |
+| SEC-04 | Phase 5 | Pending |
+| RUN-01 | Phase 6 | Pending |
+| RUN-02 | Phase 6 | Pending |
+| RUN-03 | Phase 6 | Pending |
+| RUN-04 | Phase 6 | Pending |
+| RUN-05 | Phase 6 | Pending |
+| RUN-06 | Phase 6 | Pending |
+| SEC-01 | Phase 6 | Pending |
+| SEC-02 | Phase 6 | Pending |
+| SEC-03 | Phase 6 | Pending |
+| BOT-01 | Phase 7 | Pending |
+| BOT-02 | Phase 7 | Pending |
+| BOT-03 | Phase 7 | Pending |
+| BOT-04 | Phase 7 | Pending |
+| BOT-05 | Phase 7 | Pending |
+| BOT-06 | Phase 7 | Pending |
+| BOT-07 | Phase 7 | Pending |
+| BOT-08 | Phase 7 | Pending |
+| BOT-09 | Phase 7 | Pending |
+| BOT-10 | Phase 7 | Pending |
+| BOT-11 | Phase 7 | Pending |
+| APP-01 | Phase 8 | Pending |
+| APP-02 | Phase 8 | Pending |
+| APP-03 | Phase 8 | Pending |
+| APP-04 | Phase 8 | Pending |
+| OPS-01 | Phase 9 | Pending |
+| OPS-02 | Phase 9 | Pending |
+| OPS-03 | Phase 9 | Pending |
+| OPS-04 | Phase 9 | Pending |
+
+SEC-04 вводится в фазе 5 (первые токены — токены раннеров и настройки сервера) и перепроверяется в фазе 7 (живой бот) и на учениях фазы 9. SEC-01, SEC-02 и SEC-03 закрываются в фазе 6, до того как фаза 7 начнёт принимать чужие демки.
 
 **Coverage:**
-- v1.1 requirements: 41 total
-- Mapped to phases: 0
-- Unmapped: 41 ⚠️ (roadmap ещё не создан)
+- v1.1 requirements: 37 total (SRV 8, BOT 11, RUN 6, APP 4, SEC 4, OPS 4; прежнее число 41 было ошибкой подсчёта)
+- Mapped to phases: 37
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-10-11*
-*Last updated: 2026-10-11 after milestone v1.1 start*
+*Last updated: 2026-10-11 after roadmap v1.1 creation (фазы 5–9)*

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response};
-use wire::{ApiError, ClaimRequest, ProgressRequest, ReleaseRequest, codes};
+use wire::{ApiError, ClaimRequest, HelloRequest, ProgressRequest, ReleaseRequest, codes};
 
 /// Самое большое JSON-тело запроса: 64 КиБ.
 pub const MAX_JSON: usize = 64 * 1024;
@@ -103,6 +103,7 @@ fn route(
 ) -> Result<Reply, Reject> {
     match (method, path) {
         (Method::Post, wire::paths::CLAIM) => claim(ctx, rq, trace),
+        (Method::Post, wire::paths::HELLO) => hello(ctx, rq, trace),
         (Method::Post, p) if p.starts_with("/v1/jobs/") => job_action(ctx, rq, p, trace),
         _ => Err(Reject::new(codes::NOT_FOUND, "нет такого адреса")),
     }
@@ -157,6 +158,40 @@ fn release(ctx: &Ctx, rq: &mut Request, job_id: i64, trace: &mut Trace) -> Resul
         }
     ));
     Ok(Reply::no_content())
+}
+
+/// `POST /v1/runner/hello`: раннер представляется и сверяет удерживаемые задачи. Версия протокола проверяется
+/// до любых записей хэндлера: чужая версия — 426.
+fn hello(ctx: &Ctx, rq: &mut Request, trace: &mut Trace) -> Result<Reply, Reject> {
+    let runner = authenticate(ctx, rq)?;
+    trace.runner = Some(runner.name.clone());
+    let req: HelloRequest = read_json(rq, MAX_JSON)?;
+    if req.protocol != wire::PROTOCOL_VERSION {
+        return Err(Reject::new(
+            codes::PROTOCOL_MISMATCH,
+            format!(
+                "версия протокола раннера {}, сервера {}: обновите раннер",
+                req.protocol,
+                wire::PROTOCOL_VERSION
+            ),
+        ));
+    }
+    let reply = ctx.core.hello(runner.id, &req)?;
+    ctx.log.info(&format!(
+        "раннер {} на связи ({}), задач: {}",
+        runner.name,
+        ctx.core.redactor().clean(&req.app_version, 64),
+        req.holding.len()
+    ));
+    for d in &reply.directives {
+        if d.action == wire::DirectiveAction::Abandon {
+            ctx.log.info(&format!(
+                "раннер {}: задача #{} ему больше не принадлежит (abandon)",
+                runner.name, d.job_id
+            ));
+        }
+    }
+    Reply::json(200, &reply)
 }
 
 /// `POST /v1/runner/claim?wait=N`: раннер просит задачу; сервер ждёт её до `min(N, longpoll_secs)` секунд.

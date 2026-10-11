@@ -296,3 +296,108 @@ fn release_returns_the_job_and_can_refund_the_grant() {
     );
     assert_eq!(core.job(id).unwrap().unwrap().epoch, 2, "эпоха не меняется");
 }
+
+fn open_on(dir: &TestDir, clock: &ManualClock) -> Core {
+    Core::open(CoreOptions {
+        data_dir: dir.0.join("data"),
+        limits: Limits::default(),
+        clock: Arc::new(clock.clone()),
+        redactor: Redactor::default(),
+    })
+    .unwrap()
+}
+
+fn clock_now(clock: &ManualClock) -> i64 {
+    use server::clock::Clock;
+    clock.now_ms()
+}
+
+#[test]
+fn startup_grace_keeps_leases_after_a_server_restart() {
+    let (core, clock, dir) = core_with_clock(Limits::default());
+    let id = submit(&core, &dir, "one");
+    let a = runner(&core, "a");
+    core.claim(a).unwrap();
+    progress(&core, a, id, 1, 1, Phase::Record).unwrap();
+    secs(&clock, 40);
+    drop(core);
+
+    // Новый процесс на той же папке данных: аренда живого раннера продлевается на льготный срок.
+    let core = open_on(&dir, &clock);
+    let rec = core.recover().unwrap();
+    assert_eq!(rec.grace_extended, 1);
+    assert!(rec.receive_failed.is_empty());
+    let job = core.job(id).unwrap().unwrap();
+    assert!(job.lease_until.unwrap() >= T0 + 40_000 + 90_000);
+
+    secs(&clock, 60);
+    assert!(core.sweep().unwrap().requeued.is_empty());
+    assert_eq!(
+        state(&core, id),
+        JobState::Running,
+        "раннер успел вернуться"
+    );
+    progress(&core, a, id, 1, 2, Phase::Record).unwrap();
+
+    // Если раннер так и не вернулся, по окончании срока аренда истекает как обычно.
+    secs(&clock, 46);
+    assert_eq!(core.sweep().unwrap().requeued, vec![id]);
+}
+
+#[test]
+fn stale_receiving_job_fails_on_recover_and_on_sweep() {
+    let (core, clock, _dir) = core_with_clock(Limits::default());
+    let begin = |player: &str| {
+        core.begin_receive(&Submit {
+            player: player.to_owned(),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let hung = begin("one");
+    secs(&clock, 31 * 60);
+    let fresh = begin("two");
+    secs(&clock, 60);
+
+    let rec = core.recover().unwrap();
+    assert_eq!(rec.receive_failed, vec![hung]);
+    let job = core.job(hung).unwrap().unwrap();
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.fail_code.as_deref(), Some("RECEIVE_FAILED"));
+    assert!(job.finished_at.is_some());
+    assert_eq!(state(&core, fresh), JobState::Receiving, "свежий приём цел");
+
+    // Тот же приём под `sweep`: зависшим он становится, когда прошло больше 30 минут.
+    secs(&clock, 31 * 60);
+    let out = core.sweep().unwrap();
+    assert_eq!(out.receive_failed, vec![fresh]);
+    assert_eq!(state(&core, fresh), JobState::Failed);
+}
+
+#[test]
+fn revoked_runner_loses_its_leases() {
+    let (core, clock, dir) = core_with_clock(Limits::default());
+    let id = submit(&core, &dir, "one");
+    let a = runner(&core, "main");
+    core.claim(a).unwrap();
+    progress(&core, a, id, 1, 1, Phase::Record).unwrap();
+    secs(&clock, 5);
+
+    auth::revoke_runner(core.db(), "main", clock_now(&clock)).unwrap();
+    let job = core.job(id).unwrap().unwrap();
+    assert_eq!(
+        job.lease_until,
+        Some(T0 + 5_000),
+        "аренда заканчивается сейчас"
+    );
+    assert_eq!(job.state, JobState::Running);
+
+    assert_eq!(core.sweep().unwrap().requeued, vec![id]);
+    let job = core.job(id).unwrap().unwrap();
+    assert_eq!(job.state, JobState::Queued);
+    assert_eq!(
+        (job.epoch, job.grants),
+        (1, 1),
+        "возврат — не сбой и не новая выдача"
+    );
+}

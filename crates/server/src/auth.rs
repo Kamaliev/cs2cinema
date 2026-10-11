@@ -141,6 +141,14 @@ pub fn revoke_runner(db: &Db, name: &str, now_ms: i64) -> Result<()> {
         if n == 0 {
             return Err(format!("раннера «{name}» нет"));
         }
+        // Аренды раннера заканчиваются «сейчас»: следующий `sweep` вернёт задачи в очередь. Вернуть их себе
+        // под отозванным токеном нельзя — вход закрыт до ядра.
+        tx.execute(
+            "UPDATE jobs SET lease_until = ?2, updated_at = ?2 WHERE state IN ('assigned','running','uploading') \
+             AND runner_id = (SELECT id FROM runners WHERE name = ?1)",
+            params![name, now_ms],
+        )
+        .map_err(db_err)?;
         Ok(())
     })
 }

@@ -80,6 +80,13 @@ pub fn serve(
         redactor: redactor.clone(),
     })?;
     let log = log::Log::new(sink, redactor);
+    // Восстановление до открытия порта: раннеры ещё не могли вернуться и увидеть полузавершённое состояние.
+    let rec = core.recover()?;
+    log.info(&format!(
+        "восстановление: упавших приёмов {}, продлённых аренд {}",
+        rec.receive_failed.len(),
+        rec.grace_extended
+    ));
     let listener = std::net::TcpListener::bind(&cfg.bind)
         .map_err(|e| format!("не удалось занять адрес {}: {e}", cfg.bind))?;
     let shutdown = Arc::new(AtomicBool::new(false));

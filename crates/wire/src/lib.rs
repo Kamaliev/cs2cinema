@@ -299,6 +299,65 @@ pub struct ReleaseRequest {
     pub counts: bool,
 }
 
+/// Что раннер держит у себя: задача и эпоха её выдачи.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holding {
+    pub job_id: i64,
+    pub epoch: i64,
+}
+
+/// Тело `POST /v1/runner/hello`: раннер представляется после запуска или обрыва связи и сверяет задачи.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HelloRequest {
+    /// Версия протокола раннера; не совпала с серверной — 426.
+    pub protocol: u32,
+    /// Имя раннера (токен всё равно решает, кто это); для журнала.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub status: String,
+    /// Задачи, которые раннер считает своими.
+    #[serde(default)]
+    pub holding: Vec<Holding>,
+}
+
+/// Что делать раннеру с удерживаемой задачей.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectiveAction {
+    /// Продолжать: аренда сервером подтверждена.
+    Keep,
+    /// Бросить: задача выдана заново, завершена или неизвестна.
+    Abandon,
+    /// Остановить работу: отмена запрошена.
+    Cancel,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Указание по одной задаче из `holding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Directive {
+    pub job_id: i64,
+    pub action: DirectiveAction,
+}
+
+/// Ответ на `hello`: настройки сервера для раннера и указания по его задачам.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HelloReply {
+    pub server_version: String,
+    pub server_time_ms: i64,
+    /// Сколько секунд раннер просит задачу в long-poll.
+    pub poll_secs: u64,
+    /// Как часто слать прогресс.
+    pub heartbeat_secs: u64,
+    pub chunk_size: u64,
+    #[serde(default)]
+    pub directives: Vec<Directive>,
+}
+
 /// Тело любого ответа с ошибкой.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApiError {
@@ -395,6 +454,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(r, r#"{"lease_until_ms":9,"cancel":"none"}"#);
+    }
+
+    #[test]
+    fn hello_request_defaults_and_unknown_directive_parse() {
+        let h: HelloRequest = serde_json::from_str(r#"{"protocol":1}"#).unwrap();
+        assert_eq!(h.protocol, 1);
+        assert!(h.holding.is_empty() && h.name.is_empty());
+        let r: HelloReply = serde_json::from_str(
+            r#"{"server_version":"0.1.0","server_time_ms":5,"poll_secs":25,"heartbeat_secs":10,
+                "chunk_size":8388608,"directives":[{"job_id":3,"action":"pause"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.directives[0].action, DirectiveAction::Unknown);
+        assert_eq!(
+            serde_json::to_string(&Directive {
+                job_id: 3,
+                action: DirectiveAction::Keep
+            })
+            .unwrap(),
+            r#"{"job_id":3,"action":"keep"}"#
+        );
     }
 
     #[test]

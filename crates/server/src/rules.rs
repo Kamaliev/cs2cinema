@@ -11,6 +11,9 @@
 use crate::core::{JobRow, Limits, Reject};
 use wire::{CancelMode, JobState, Phase, Take, codes};
 
+/// Приём демки, который не двигался дольше этого, считается оборванным: 30 минут.
+pub const RECEIVING_STALE_MS: i64 = 30 * 60 * 1000;
+
 /// Событие, меняющее задачу.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -24,6 +27,12 @@ pub enum Event {
     },
     /// Проверка срока аренды (по часам сервера).
     Expire,
+    /// `hello`: раннер сверяет удерживаемую задачу; то же, что прогресс, но этап берётся из сохранённой колонки.
+    Reattach { runner_id: i64, epoch: i64 },
+    /// Перезапуск сервера: аренды живых раннеров продлеваются как минимум до `grace_until`.
+    Recover { grace_until: i64 },
+    /// Приём демки завис: задача в `receiving` без движения дольше `RECEIVING_STALE_MS`.
+    ReceiveStale,
     /// Раннер возвращает задачу в очередь; `counts = false` возвращает и выдачу.
     Release {
         runner_id: i64,
@@ -147,8 +156,53 @@ pub fn decide(job: &JobRow, ev: &Event, now_ms: i64, limits: &Limits) -> Result<
             }
             Ok(Decision::of(j))
         }
+        Event::Reattach { runner_id, epoch } => {
+            if job.state.is_terminal() {
+                return Err(terminal());
+            }
+            let lost = job.state == JobState::Queued && job.lease_lost;
+            if !(job.state.is_leased() || lost) || !fenced(job, *runner_id, *epoch) {
+                return Err(stale());
+            }
+            let mut j = job.clone();
+            j.lease_until = Some(now_ms + limits.lease_ttl_ms);
+            if lost {
+                j.state = match Phase::parse(&job.phase) {
+                    None | Some(Phase::Fetch) => JobState::Assigned,
+                    Some(Phase::Upload) => JobState::Uploading,
+                    Some(_) => JobState::Running,
+                };
+                j.lease_lost = false;
+            }
+            Ok(Decision {
+                job: j,
+                reattached: lost,
+                discard_parts: false,
+            })
+        }
+        Event::Recover { grace_until } => {
+            let mut j = job.clone();
+            if job.state.is_leased() {
+                // Сервер после перезапуска не возвращает в очередь задачи живого раннера (PITFALLS P3.4).
+                j.lease_until = Some(job.lease_until.unwrap_or(0).max(*grace_until));
+            }
+            Ok(Decision::of(j))
+        }
+        Event::ReceiveStale => {
+            let mut j = job.clone();
+            if job.state == JobState::Receiving && job.updated_at < now_ms - RECEIVING_STALE_MS {
+                j.state = JobState::Failed;
+                j.fail_code = Some(wire::fail::RECEIVE_FAILED.to_owned());
+                j.fail_message = Some(
+                    "приём демки прервался (сервер или submit остановлены) — отправьте демку заново"
+                        .to_owned(),
+                );
+                j.finished_at = Some(now_ms);
+            }
+            Ok(Decision::of(j))
+        }
         Event::Expire => {
-            let overdue = job.state.is_leased() && job.lease_until.is_none_or(|l| l < now_ms);
+            let overdue = job.state.is_leased() && job.lease_until.is_none_or(|l| l <= now_ms);
             if !overdue {
                 return Ok(Decision::of(job.clone()));
             }
@@ -290,6 +344,79 @@ mod tests {
             JobState::Uploading,
             "из загрузки назад не уходят"
         );
+    }
+
+    #[test]
+    fn reattach_restores_the_state_from_the_stored_phase() {
+        let limits = Limits::default();
+        let mut job = row(JobState::Queued);
+        job.lease_lost = true;
+        job.lease_until = None;
+        for (phase, want) in [
+            ("", JobState::Assigned),
+            ("fetch", JobState::Assigned),
+            ("record", JobState::Running),
+            ("upload", JobState::Uploading),
+        ] {
+            job.phase = phase.to_owned();
+            let ev = Event::Reattach {
+                runner_id: 7,
+                epoch: 1,
+            };
+            let d = decide(&job, &ev, NOW, &limits).unwrap();
+            assert!(d.reattached && !d.job.lease_lost, "{phase}");
+            assert_eq!(d.job.state, want, "{phase}");
+            assert_eq!(d.job.lease_until, Some(NOW + 45_000));
+        }
+        let ev = Event::Reattach {
+            runner_id: 7,
+            epoch: 2,
+        };
+        assert_eq!(
+            decide(&job, &ev, NOW, &limits).unwrap_err().code,
+            codes::STALE_EPOCH
+        );
+    }
+
+    #[test]
+    fn recover_extends_leases_and_receive_stale_fails_old_receiving() {
+        let limits = Limits::default();
+        let grace = NOW + 90_000;
+        let running = row(JobState::Running);
+        let d = decide(
+            &running,
+            &Event::Recover { grace_until: grace },
+            NOW,
+            &limits,
+        )
+        .unwrap();
+        assert_eq!(d.job.lease_until, Some(grace));
+        let mut far = row(JobState::Running);
+        far.lease_until = Some(grace + 5);
+        let d = decide(&far, &Event::Recover { grace_until: grace }, NOW, &limits).unwrap();
+        assert_eq!(d.job.lease_until, Some(grace + 5), "срок не укорачивается");
+
+        let mut recv = row(JobState::Receiving);
+        recv.updated_at = NOW - RECEIVING_STALE_MS - 1;
+        let d = decide(&recv, &Event::ReceiveStale, NOW, &limits).unwrap();
+        assert_eq!(d.job.state, JobState::Failed);
+        assert_eq!(d.job.fail_code.as_deref(), Some("RECEIVE_FAILED"));
+        recv.updated_at = NOW - RECEIVING_STALE_MS + 1;
+        let d = decide(&recv, &Event::ReceiveStale, NOW, &limits).unwrap();
+        assert_eq!(d.job.state, JobState::Receiving);
+    }
+
+    #[test]
+    fn release_refund_never_goes_below_zero() {
+        let limits = Limits::default();
+        let mut job = row(JobState::Running);
+        job.grants = 0;
+        let ev = Event::Release {
+            runner_id: 7,
+            epoch: 1,
+            counts: false,
+        };
+        assert_eq!(decide(&job, &ev, NOW, &limits).unwrap().job.grants, 0);
     }
 
     #[test]

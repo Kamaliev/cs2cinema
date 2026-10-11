@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use wire::{Assignment, ProgressRequest, ReleaseRequest};
+use wire::{Assignment, HelloRequest, ProgressRequest, ReleaseRequest};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -186,6 +186,16 @@ impl TestServer {
     pub fn release(&self, token: &str, job_id: i64, req: &ReleaseRequest) -> (u16, String) {
         let r = self.send(
             &wire::paths::job(job_id, "release"),
+            Some(&format!("Bearer {token}")),
+            Some(&serde_json::to_string(req).unwrap()),
+        );
+        (r.status, r.body)
+    }
+
+    /// `POST /v1/runner/hello`: статус и тело ответа.
+    pub fn hello(&self, token: &str, req: &HelloRequest) -> (u16, String) {
+        let r = self.send(
+            wire::paths::HELLO,
             Some(&format!("Bearer {token}")),
             Some(&serde_json::to_string(req).unwrap()),
         );

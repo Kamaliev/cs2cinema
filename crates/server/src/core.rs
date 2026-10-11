@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use wire::{
-    Assignment, CancelMode, DemoInfo, JobState, Player, ProgressReply, ProgressRequest,
-    ReleaseRequest, codes,
+    Assignment, CancelMode, DemoInfo, Directive, DirectiveAction, HelloReply, HelloRequest,
+    JobState, Player, ProgressReply, ProgressRequest, ReleaseRequest, codes,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -441,6 +441,94 @@ impl Core {
         })
     }
 
+    /// `hello`: раннер представляется и сверяет удерживаемые задачи (SRV-05). Версию протокола проверяет
+    /// вызывающий до любых записей. По каждой задаче из `holding` ответ — `keep` (аренда подтверждена и
+    /// продлена, потерянная аренда возвращена раннеру), `cancel` (запрошена отмена) или `abandon`
+    /// (задача выдана заново, завершена или неизвестна).
+    pub fn hello(
+        &self,
+        runner_id: i64,
+        req: &HelloRequest,
+    ) -> std::result::Result<HelloReply, Reject> {
+        let now = self.clock.now_ms();
+        let version = self.redactor.clean(&req.app_version, 64);
+        let status = self.redactor.clean(&req.status, 200);
+        let directives = self.db.write(|tx| {
+            tx.execute(
+                "UPDATE runners SET version = ?2, status = ?3, last_seen_at = ?4 WHERE id = ?1",
+                params![runner_id, version, status, now],
+            )
+            .map_err(db_err)?;
+            let mut out = Vec::with_capacity(req.holding.len());
+            for h in &req.holding {
+                let ev = Event::Reattach {
+                    runner_id,
+                    epoch: h.epoch,
+                };
+                let action = match job_by_id(tx, h.job_id)? {
+                    None => DirectiveAction::Abandon,
+                    Some(before) => match rules::decide(&before, &ev, now, &self.limits) {
+                        Ok(d) => {
+                            apply(tx, &before, &d.job, now)?;
+                            if d.job.cancel_requested == CancelMode::NotRequested {
+                                DirectiveAction::Keep
+                            } else {
+                                DirectiveAction::Cancel
+                            }
+                        }
+                        Err(_) => DirectiveAction::Abandon,
+                    },
+                };
+                out.push(Directive {
+                    job_id: h.job_id,
+                    action,
+                });
+            }
+            Ok::<Vec<Directive>, String>(out)
+        })?;
+        Ok(HelloReply {
+            server_version: env!("CARGO_PKG_VERSION").to_owned(),
+            server_time_ms: now,
+            poll_secs: self.limits.longpoll_secs,
+            heartbeat_secs: self.limits.heartbeat_secs,
+            chunk_size: wire::CHUNK_SIZE,
+            directives,
+        })
+    }
+
+    /// Восстановление после перезапуска, до открытия порта: зависшие приёмы падают с `RECEIVE_FAILED`,
+    /// аренды живых раннеров продлеваются до `now + startup_grace`, чтобы раннер успел вернуться (SRV-05).
+    pub fn recover(&self) -> Result<Recovered> {
+        let now = self.clock.now_ms();
+        let grace_until = now + self.limits.startup_grace_ms;
+        self.db.write(|tx| {
+            let receive_failed = fail_stale_receiving(tx, now, &self.limits)?;
+            let ids: Vec<i64> = {
+                let mut st = tx
+                    .prepare("SELECT id FROM jobs WHERE state IN ('assigned','running','uploading') ORDER BY id")
+                    .map_err(db_err)?;
+                let rows = st.query_map([], |r| r.get(0)).map_err(db_err)?;
+                rows.collect::<rusqlite::Result<Vec<i64>>>().map_err(db_err)?
+            };
+            let mut grace_extended = 0;
+            for id in ids {
+                let Some(before) = job_by_id(tx, id)? else {
+                    continue;
+                };
+                let d = rules::decide(&before, &Event::Recover { grace_until }, now, &self.limits)
+                    .map_err(|r| r.message)?;
+                if d.job != before {
+                    apply(tx, &before, &d.job, now)?;
+                    grace_extended += 1;
+                }
+            }
+            Ok::<Recovered, String>(Recovered {
+                receive_failed,
+                grace_extended,
+            })
+        })
+    }
+
     /// Раннер возвращает задачу в очередь (`release`): окружение не готово, раннер уходит и т. п.
     /// `counts = false` возвращает и одну выдачу. Возврат чужой выдачи — `stale_epoch`.
     pub fn release(
@@ -493,11 +581,15 @@ impl Core {
         })
     }
 
-    /// Возвращает в очередь задачи с истёкшей арендой (или отменяет, если отмена была запрошена).
-    /// Зовётся потоком `sweep` раз в 5 с и лениво из `claim`.
+    /// Возвращает в очередь задачи с истёкшей арендой (или отменяет, если отмена была запрошена) и роняет
+    /// зависший приём демки. Зовётся потоком `sweep` раз в 5 с; аренды истекают и лениво из `claim`.
     pub fn sweep(&self) -> Result<Sweep> {
         let now = self.clock.now_ms();
-        let out = self.db.write(|tx| expire_leases(tx, now, &self.limits))?;
+        let out = self.db.write(|tx| {
+            let mut out = expire_leases(tx, now, &self.limits)?;
+            out.receive_failed = fail_stale_receiving(tx, now, &self.limits)?;
+            Ok::<Sweep, String>(out)
+        })?;
         if !out.requeued.is_empty() {
             self.wake();
         }
@@ -558,6 +650,13 @@ fn not_found() -> Reject {
     Reject::new(codes::NOT_FOUND, "нет такой задачи")
 }
 
+/// Итог `recover`: упавшие приёмы и число продлённых аренд.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Recovered {
+    pub receive_failed: Vec<i64>,
+    pub grace_extended: usize,
+}
+
 /// Итог `claim_report`: выдача (если есть) и задачи, упавшие с `TOO_MANY_GRANTS` по дороге.
 #[derive(Debug, Clone)]
 pub struct Claimed {
@@ -611,12 +710,44 @@ fn apply(tx: &rusqlite::Transaction<'_>, before: &JobRow, after: &JobRow, now: i
     Ok(())
 }
 
+/// Приёмы демки без движения дольше `RECEIVING_STALE_MS` падают с `RECEIVE_FAILED`.
+fn fail_stale_receiving(
+    tx: &rusqlite::Transaction<'_>,
+    now: i64,
+    limits: &Limits,
+) -> Result<Vec<i64>> {
+    let ids: Vec<i64> = {
+        let mut st = tx
+            .prepare(
+                "SELECT id FROM jobs WHERE state = 'receiving' AND updated_at < ?1 ORDER BY id",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([now - rules::RECEIVING_STALE_MS], |r| r.get(0))
+            .map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<i64>>>()
+            .map_err(db_err)?
+    };
+    let mut failed = Vec::new();
+    for id in ids {
+        let Some(before) = job_by_id(tx, id)? else {
+            continue;
+        };
+        let d = rules::decide(&before, &Event::ReceiveStale, now, limits).map_err(|r| r.message)?;
+        if d.job != before {
+            apply(tx, &before, &d.job, now)?;
+            failed.push(id);
+        }
+    }
+    Ok(failed)
+}
+
 /// Истекшие аренды через `rules::decide(Expire)`. Общая для `sweep` и ленивого истечения в начале `claim`.
 fn expire_leases(tx: &rusqlite::Transaction<'_>, now: i64, limits: &Limits) -> Result<Sweep> {
     let ids: Vec<i64> = {
         let mut st = tx
             .prepare(
-                "SELECT id FROM jobs WHERE state IN ('assigned','running','uploading')                  AND (lease_until IS NULL OR lease_until < ?1) ORDER BY id",
+                "SELECT id FROM jobs WHERE state IN ('assigned','running','uploading')                  AND (lease_until IS NULL OR lease_until <= ?1) ORDER BY id",
             )
             .map_err(db_err)?;
         let rows = st.query_map([now], |r| r.get(0)).map_err(db_err)?;

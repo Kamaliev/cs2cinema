@@ -7,7 +7,10 @@ mod common;
 use common::{TestOptions, TestServer, fake_demo};
 use server::clock::ManualClock;
 use std::time::Duration;
-use wire::{CancelMode, JobState, Phase, ProgressReply, ProgressRequest, ReleaseRequest, Take};
+use wire::{
+    CancelMode, DirectiveAction, HelloReply, HelloRequest, Holding, JobState, Phase, ProgressReply,
+    ProgressRequest, ReleaseRequest, Take,
+};
 
 const T0: i64 = 1_800_000_000_000;
 
@@ -232,4 +235,174 @@ fn release_over_http_requeues_the_job() {
         Some("{}"),
     );
     assert_eq!(r.status, 404);
+}
+
+fn hello_req(holding: Vec<Holding>) -> HelloRequest {
+    HelloRequest {
+        protocol: 1,
+        name: "main".to_owned(),
+        app_version: "0.5.0".to_owned(),
+        status: "idle".to_owned(),
+        holding,
+    }
+}
+
+fn hello_reply(body: &str) -> HelloReply {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+}
+
+fn action_of(reply: &HelloReply, job_id: i64) -> DirectiveAction {
+    reply
+        .directives
+        .iter()
+        .find(|d| d.job_id == job_id)
+        .unwrap_or_else(|| panic!("нет указания по задаче #{job_id}"))
+        .action
+}
+
+fn runner_version(srv: &TestServer) -> Option<String> {
+    srv.running()
+        .core()
+        .db()
+        .read(|c| {
+            c.query_row("SELECT version FROM runners WHERE name = 'main'", [], |r| {
+                r.get(0)
+            })
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+}
+
+#[test]
+fn hello_reconciles_held_jobs() {
+    let srv = clocked();
+    let clock = srv.clock();
+    let id = srv.submit(&fake_demo(4096), "s1mple");
+    let token = srv.add_runner("main");
+    srv.claim(&token, 0);
+    assert_eq!(srv.progress(&token, id, &req(1, 1, Phase::Record)).0, 200);
+    clock.advance(Duration::from_secs(20));
+
+    let held = vec![
+        Holding {
+            job_id: id,
+            epoch: 1,
+        },
+        Holding {
+            job_id: id + 100,
+            epoch: 1,
+        },
+    ];
+    let (status, body) = srv.hello(&token, &hello_req(held));
+    assert_eq!(status, 200, "{body}");
+    let reply = hello_reply(&body);
+    assert_eq!(action_of(&reply, id), DirectiveAction::Keep);
+    assert_eq!(
+        action_of(&reply, id + 100),
+        DirectiveAction::Abandon,
+        "задачи нет"
+    );
+    assert_eq!(
+        srv.job(id).lease_until,
+        Some(T0 + 20_000 + 45_000),
+        "аренда продлена"
+    );
+    assert_eq!(reply.poll_secs, 2, "longpoll стенда");
+    assert_eq!(reply.heartbeat_secs, 10);
+    assert_eq!(reply.chunk_size, 8 * 1024 * 1024);
+    assert_eq!(reply.server_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(reply.server_time_ms, T0 + 20_000);
+    assert_eq!(runner_version(&srv), Some("0.5.0".to_owned()));
+
+    // Эпоха 0 — «бросить».
+    let wrong = vec![Holding {
+        job_id: id,
+        epoch: 0,
+    }];
+    let (_, body) = srv.hello(&token, &hello_req(wrong));
+    assert_eq!(action_of(&hello_reply(&body), id), DirectiveAction::Abandon);
+    let log = srv.sink.lines().join("\n");
+    assert!(log.contains("раннер main на связи (0.5.0)"), "{log}");
+}
+
+#[test]
+fn hello_reattaches_a_lost_job() {
+    let srv = clocked();
+    let clock = srv.clock();
+    let id = srv.submit(&fake_demo(4096), "s1mple");
+    let token = srv.add_runner("main");
+    srv.claim(&token, 0);
+    assert_eq!(srv.progress(&token, id, &req(1, 1, Phase::Record)).0, 200);
+    clock.advance(Duration::from_secs(60));
+    srv.sweep();
+    assert_eq!(srv.job(id).state, JobState::Queued);
+
+    let held = vec![Holding {
+        job_id: id,
+        epoch: 1,
+    }];
+    let (status, body) = srv.hello(&token, &hello_req(held));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(action_of(&hello_reply(&body), id), DirectiveAction::Keep);
+    let job = srv.job(id);
+    assert_eq!(
+        job.state,
+        JobState::Running,
+        "этап взят из сохранённой фазы"
+    );
+    assert!(!job.lease_lost);
+    assert_eq!((job.epoch, job.grants), (1, 1));
+    assert_eq!(job.lease_until, Some(T0 + 60_000 + 45_000));
+}
+
+#[test]
+fn hello_with_another_protocol_is_refused_with_426() {
+    let srv = clocked();
+    let id = srv.submit(&fake_demo(4096), "s1mple");
+    let token = srv.add_runner("main");
+    srv.claim(&token, 0);
+    let before = srv.job(id);
+
+    let mut bad = hello_req(vec![Holding {
+        job_id: id,
+        epoch: 1,
+    }]);
+    bad.protocol = 2;
+    let r = srv.send(
+        wire::paths::HELLO,
+        Some(&format!("Bearer {token}")),
+        Some(&serde_json::to_string(&bad).unwrap()),
+    );
+    assert_eq!(r.status, 426, "{}", r.body);
+    assert_eq!(r.error_code(), "protocol_mismatch");
+    assert!(r.body.contains("обновите раннер"), "{}", r.body);
+    assert_eq!(srv.job(id), before, "задача не тронута");
+    assert_eq!(runner_version(&srv), None, "версия раннера не записана");
+}
+
+#[test]
+fn revoked_runner_is_refused_and_its_job_goes_to_another_runner() {
+    let srv = clocked();
+    let id = srv.submit(&fake_demo(4096), "s1mple");
+    let main = srv.add_runner("main");
+    let other = srv.add_runner("other");
+    srv.claim(&main, 0);
+    assert_eq!(srv.progress(&main, id, &req(1, 1, Phase::Record)).0, 200);
+
+    let core = srv.running().core();
+    server::auth::revoke_runner(core.db(), "main", core.clock().now_ms()).unwrap();
+    assert_eq!(srv.progress(&main, id, &req(1, 2, Phase::Record)).0, 401);
+    let held = vec![Holding {
+        job_id: id,
+        epoch: 1,
+    }];
+    let (status, _) = srv.hello(&main, &hello_req(held));
+    assert_eq!(status, 401);
+
+    srv.sweep();
+    assert_eq!(srv.job(id).state, JobState::Queued);
+    let (status, got) = srv.claim(&other, 0);
+    assert_eq!(status, 200);
+    assert_eq!(got.unwrap().epoch, 2, "новая выдача — новая эпоха");
+    assert_eq!(srv.job(id).grants, 2);
 }

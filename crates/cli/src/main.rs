@@ -408,7 +408,14 @@ impl pipeline::Progress for ConsoleProgress {
 /// `cs2-cli assemble <папка задачи>`: склеивает проверенные дубли задачи в `highlights.mp4` тем же кодом, что и приложение.
 fn assemble_cmd() -> ExitCode {
     let mut rest = env::args().skip(2);
-    let (Some(dir), None) = (rest.next(), rest.next()) else {
+    let first = rest.next();
+    if first.as_deref().is_some_and(|a| a.starts_with("--")) {
+        eprintln!(
+            "ошибка: старая склейка по --plan/--clips удалена: приложение пишет дубли в clips/takeNNNN с манифестом; укажите папку задачи: cs2-cli assemble <папка задачи>\n\n{USAGE}"
+        );
+        return ExitCode::from(2);
+    }
+    let (Some(dir), None) = (first, rest.next()) else {
         eprintln!("ошибка: укажите папку задачи: cs2-cli assemble <папка задачи>\n\n{USAGE}");
         return ExitCode::from(2);
     };

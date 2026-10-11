@@ -20,8 +20,6 @@
 //!
 //! Команды HLAE/CS2 собраны в `Dialect` и в `preamble` — правьте их здесь, а не в логике режиссёра.
 
-pub mod assemble;
-
 use std::{fmt::Write as _, io, path::Path};
 
 use cs2::Match;

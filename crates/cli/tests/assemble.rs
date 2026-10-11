@@ -88,3 +88,17 @@ fn assemble_without_record_json_names_the_file() {
     assert!(stderr.contains("record.json"), "{stderr}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn old_plan_and_clips_flags_explain_the_replacement() {
+    let out = Command::new(env!("CARGO_BIN_EXE_cs2-cli"))
+        .args(["assemble", "--plan", "plan.json", "--clips", "clips"])
+        .output()
+        .expect("cs2-cli запускается");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("cs2-cli assemble <папка задачи>"),
+        "{stderr}"
+    );
+}

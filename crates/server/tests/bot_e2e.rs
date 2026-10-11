@@ -131,3 +131,93 @@ fn server_without_bot_url_does_not_start_the_bot() {
         srv.sink_text()
     );
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// serve на настоящем клиенте: HttpTg против поддельного локального Bot API
+// ---------------------------------------------------------------------------------------------------------
+
+use common::FakeBotApi;
+
+const API_TOKEN: &str = "123456789:AAEsentinelSENTINELsentinelSENTINEL01";
+
+#[test]
+fn serve_starts_the_bot_against_a_local_bot_api_and_stops_quickly() {
+    // Поддельный bot-api объявлен первым: он умирает последним, после остановки сервера.
+    let api = FakeBotApi::start(API_TOKEN);
+    let mut srv = TestServer::start_with(TestOptions {
+        bot_token: Some(API_TOKEN.to_owned()),
+        bot_api_url: Some(api.url()),
+        ..Default::default()
+    });
+    assert!(srv.running().bot().is_some(), "бот должен быть запущен");
+    assert!(
+        wait_until(10, || !api.requests_to("getUpdates").is_empty()),
+        "опрос не начался: {:?}",
+        api.requests().iter().map(|r| &r.method).collect::<Vec<_>>()
+    );
+    assert!(!api.requests_to("getMe").is_empty(), "самопроверка getMe");
+    assert!(!api.requests_to("setMyCommands").is_empty(), "меню команд");
+    let poll = &api.requests_to("getUpdates")[0];
+    assert_eq!(poll.body["allowed_updates"], serde_json::json!(["message"]));
+    assert!(
+        api.requests().iter().all(|r| r.token_ok),
+        "все запросы с верным токеном"
+    );
+
+    let started = Instant::now();
+    srv.stop();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "остановка заняла {:?}",
+        started.elapsed()
+    );
+    let log = srv.sink_text();
+    assert!(log.contains("бот @cs2cinema_test_bot запущен"), "{log}");
+    assert!(!log.contains(API_TOKEN), "токен в журнале сервера: {log}");
+    assert!(!log.contains(&api.url()), "адрес bot-api в журнале: {log}");
+}
+
+#[test]
+fn bot_failing_getme_stops_serve_with_a_clear_error() {
+    let api = FakeBotApi::start(API_TOKEN);
+    api.reply(
+        "getMe",
+        serde_json::json!({"ok": false, "error_code": 401, "description": "Unauthorized"}),
+    );
+    let dir = TestDir::new("e2e-getme");
+    // Свободный порт: занять и сразу отпустить, потом проверить, что сервер его не удержал.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg = server::config::Config {
+        bind: format!("127.0.0.1:{port}"),
+        data_dir: dir.path.join("data"),
+        telegram_bot_token: Some(server::secret::Secret::new(API_TOKEN.to_owned())),
+        bot_api_url: Some(api.url()),
+        bot_api_files_root: Some(dir.path.join("bot-files")),
+        ..Default::default()
+    };
+    let sink = std::sync::Arc::new(server::log::MemorySink::default());
+    let err = match server::serve(
+        &cfg,
+        std::sync::Arc::new(server::clock::SystemClock),
+        sink.clone(),
+    ) {
+        Ok(running) => {
+            running.stop();
+            panic!("сервер не должен был запуститься при отказе getMe");
+        }
+        Err(e) => e,
+    };
+    assert!(err.contains("бот не запустился"), "{err}");
+    assert!(err.contains("getMe"), "{err}");
+    assert!(
+        !err.contains(API_TOKEN) && !err.contains(&api.url()),
+        "в ошибке токен или адрес: {err}"
+    );
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        "порт должен остаться свободным"
+    );
+}

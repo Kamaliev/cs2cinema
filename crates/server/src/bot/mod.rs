@@ -392,10 +392,10 @@ fn spawn_loop(
                         Pace::Pause(ERROR_PAUSE)
                     }
                 };
-                if let Pace::Pause(d) = pace {
-                    if !sleep_checked(d, &stop) {
-                        return;
-                    }
+                if let Pace::Pause(d) = pace
+                    && !sleep_checked(d, &stop)
+                {
+                    return;
                 }
             }
         })
@@ -418,7 +418,7 @@ impl Throttle {
     fn warn(&mut self, log: &Log, what: &str, err: &str) {
         if self.last.as_deref() == Some(err) {
             self.repeats += 1;
-            if self.repeats % 30 != 0 {
+            if !self.repeats.is_multiple_of(30) {
                 return;
             }
         } else {

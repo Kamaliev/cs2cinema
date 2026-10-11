@@ -612,3 +612,106 @@ fn job_show_prints_stage_take_and_result() {
         "{out}"
     );
 }
+
+#[test]
+fn bot_check_reports_the_bot_name_without_the_token() {
+    let d = test_dir("bot-check");
+    let api = common::FakeBotApi::start(SENTINEL_TOKEN);
+    let file = d.join("cfg.json");
+    let body = serde_json::json!({
+        "bot_api_url": api.url(),
+        "bot_api_files_root": d.join("bot-files").to_string_lossy(),
+    });
+    std::fs::write(&file, body.to_string()).unwrap();
+    let out = bin()
+        .args([
+            "--config",
+            file.to_str().unwrap(),
+            "--data-dir",
+            &data_arg(&d),
+            "bot",
+            "check",
+        ])
+        .env("TELEGRAM_BOT_TOKEN", SENTINEL_TOKEN)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stdout.contains("@cs2cinema_test_bot"), "{stdout}");
+    assert!(
+        !stdout.contains(SENTINEL_TOKEN) && !stderr.contains(SENTINEL_TOKEN),
+        "токен в выводе: {stdout} {stderr}"
+    );
+
+    // Неверный токен: bot-api отвечает 401, команда падает, токена в тексте нет.
+    let wrong = "999999999:AAEwrongWRONGwrongWRONGwrongWRONG0001";
+    let bad = bin()
+        .args([
+            "--config",
+            file.to_str().unwrap(),
+            "--data-dir",
+            &data_arg(&d),
+            "bot",
+            "check",
+        ])
+        .env("TELEGRAM_BOT_TOKEN", wrong)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bad.stdout),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    assert_eq!(bad.status.code(), Some(1), "{text}");
+    assert!(
+        !text.contains(wrong) && !text.contains(SENTINEL_TOKEN),
+        "{text}"
+    );
+
+    // Без адреса bot-api команде проверять нечего.
+    let (code, _, err) = run(&["--data-dir", &data_arg(&d), "bot", "check"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("не задан bot_api_url"), "{err}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn job_show_prints_the_telegram_delivery_state() {
+    let d = test_dir("job-delivery");
+    let data = data_arg(&d);
+    let demo = d.join("match.dem");
+    fake_demo(&demo, 1024 * 1024);
+    let (code, _, err) = run(&["user", "add", "вася", "--tg", "111", "--data-dir", &data]);
+    assert_eq!(code, 0, "{err}");
+    for _ in 0..2 {
+        let (code, _, err) = run(&[
+            "submit",
+            demo.to_str().unwrap(),
+            "--player",
+            "s1mple",
+            "--user",
+            "вася",
+            "--data-dir",
+            &data,
+        ]);
+        assert_eq!(code, 0, "{err}");
+    }
+    // Задача #1 поставлена ботом и доставлена; задача #2 пришла другим путём.
+    let conn = rusqlite::Connection::open(d.join("data").join("server.db")).unwrap();
+    conn.execute(
+        "INSERT INTO tg_jobs(job_id, chat_id, user_id, delivery, created_at, updated_at) \
+         VALUES (1, 111, 1, 'sent', 0, 0)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (code, out, err) = run(&["job", "show", "1", "--data-dir", &data]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("доставка в Telegram: sent"), "{out}");
+    let (code, out, err) = run(&["job", "show", "2", "--data-dir", &data]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains("доставка в Telegram"), "{out}");
+    let _ = std::fs::remove_dir_all(&d);
+}

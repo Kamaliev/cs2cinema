@@ -5,11 +5,14 @@
 
 use crate::Result;
 use crate::auth;
+use crate::bot::store::TgJob;
 use crate::clock::SystemClock;
 use crate::config::{self, Flags};
 use crate::core::{Core, CoreOptions, FileRow, JobRow, Submit};
 use crate::log::{self, StderrSink};
 use crate::secret::Redactor;
+use crate::tg::Tg;
+use crate::tg::http::HttpTg;
 use crate::users;
 use std::io::Write;
 use std::path::PathBuf;
@@ -33,6 +36,7 @@ cs2-server — сервер очереди монтажа
   user add {имя} [--tg {id}] [--admin]                   добавить пользователя
   user list                                              список пользователей
   config show                                            итоговые настройки (токен бота скрыт)
+  bot check                                              проверить связь с локальным telegram-bot-api (getMe)
 
 Общие флаги:
   --config {файл}      файл настроек (JSON; образец — cs2-server.example.json)
@@ -311,7 +315,8 @@ fn execute(
                 .ok_or_else(|| CliError::Run(format!("задачи #{id} нет")))?;
             let demo = core.demo_file(id)?;
             let result = core.result_file(id)?;
-            print_job(&job, demo.as_ref(), result.as_ref());
+            let delivery = crate::bot::store::tg_job(core.db(), id)?;
+            print_job(&job, demo.as_ref(), result.as_ref(), delivery.as_ref());
             Ok(())
         }
         ["job", "cancel", id] => {
@@ -394,6 +399,27 @@ fn execute(
             }
             Ok(())
         }
+        ["bot", "check"] => {
+            let loaded = load_config(&a, env, redactor)?;
+            let c = &loaded.config;
+            let url = c
+                .bot_api_url
+                .as_deref()
+                .ok_or_else(|| CliError::Run("не задан bot_api_url — бот выключен".to_owned()))?;
+            let token = c.telegram_bot_token.as_ref().ok_or_else(|| {
+                CliError::Run("не задан токен бота (TELEGRAM_BOT_TOKEN)".to_owned())
+            })?;
+            let tg = HttpTg::new(url, token, redactor.clone(), c.http_timeouts())?;
+            let me = tg
+                .get_me()
+                .map_err(|e| CliError::Run(format!("telegram-bot-api не отвечает (getMe): {e}")))?;
+            println!(
+                "бот @{} (id {}) отвечает через {url}",
+                me.username.as_deref().unwrap_or("без имени"),
+                me.id
+            );
+            Ok(())
+        }
         ["config", "show"] => {
             let loaded = load_config(&a, env, redactor)?;
             show_config(&loaded);
@@ -407,7 +433,12 @@ fn execute(
     }
 }
 
-fn print_job(j: &JobRow, demo: Option<&FileRow>, result: Option<&FileRow>) {
+fn print_job(
+    j: &JobRow,
+    demo: Option<&FileRow>,
+    result: Option<&FileRow>,
+    delivery: Option<&TgJob>,
+) {
     println!("задача #{}", j.id);
     println!("состояние: {} ({})", j.state.title(), j.state.as_str());
     println!("игрок: {}", j.player_name);
@@ -457,6 +488,13 @@ fn print_job(j: &JobRow, demo: Option<&FileRow>, result: Option<&FileRow>) {
     }
     if let Some(ms) = j.fail_elapsed_ms {
         println!("прошло до сбоя: {} мс", ms);
+    }
+    // Задача, поставленная ботом: состояние доставки ролика в чат.
+    if let Some(d) = delivery {
+        println!("доставка в Telegram: {}", d.delivery);
+        if let Some(e) = &d.delivery_error {
+            println!("ошибка доставки: {e}");
+        }
     }
 }
 

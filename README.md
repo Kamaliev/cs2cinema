@@ -199,6 +199,34 @@ $env:FACEIT_API_KEY = "ваш-ключ"
 время campath — время игры (`(тик демки + server_start_tick) / 64`), углы в XML: rx — крен, ry — тангаж, rz — рыскание;
 консоль режет аргументы по `:`, а `mirv_cmd` теряет кавычки — абсолютные пути задаются один раз в начале скрипта.
 
+## Запись из консоли
+
+Тот же код, что гоняет очередь в приложении (`pipeline::job::run_job`), доступен из консоли: игра запускается,
+дубли проверяются, ролик склеивается — без окна.
+
+```powershell
+$env:FACEIT_API_KEY = "ваш-ключ"          # нужен только для ссылки FACEIT
+$env:HLAE_DIR = "C:\Program Files (x86)\HLAE"
+$env:CS2_DIR  = "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive"
+
+# полная задача: предпроверка → демка → план → запись с проверкой дублей → склейка
+.\cs2-cli.exe record https://www.faceit.com/en/cs2/room/1-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx --player Sihnel
+
+# повтор упавшей задачи по record.json из её папки: без скачивания и плана; если дубли уже проверены — сразу склейка
+.\cs2-cli.exe retry out\<папка задачи>
+
+# только склейка: берёт record.json и clips\manifest.json, пишет highlights.mp4 через временный highlights.part.mp4
+.\cs2-cli.exe assemble out\<папка задачи>
+```
+
+* `cs2-cli record <ссылка FACEIT | .dem> --player <ник> [--hlae <папка>] [--cs2 <папка>] [--out <папка>] [--size ШxВ] [--fps N] [--margin X] [--no-gpu]` —
+  `--hlae` и `--cs2` по умолчанию берутся из `HLAE_DIR` и `CS2_DIR` (поиска по дискам в консоли нет);
+  `--margin` — множитель дедлайнов; `--no-gpu` — без кодирования на видеокарте.
+* `cs2-cli retry <папка задачи> [--hlae] [--cs2] [--margin] [--no-gpu]` — «Повторить» из окна.
+* `cs2-cli assemble <папка задачи>` — склейка тем же кодом, что в приложении (`pipeline::assemble`).
+* Ошибка печатается как `ошибка: КОД: сообщение` и `подсказка: …`; код выхода 1 — сбой задачи, 2 — ошибка в аргументах.
+* Закрытие консоли закрывает и запущенную игру (она живёт в Job Object процесса).
+
 ## Проверка на реальных данных
 
 ```powershell

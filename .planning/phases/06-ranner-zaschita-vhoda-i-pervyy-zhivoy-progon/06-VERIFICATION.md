@@ -1,7 +1,7 @@
 ---
 phase: 06-ranner-zaschita-vhoda-i-pervyy-zhivoy-progon
 verified: 2026-10-11T00:00:00Z
-status: human_needed
+status: passed
 score: 4/5 must-haves verified
 covered_files:
   - .planning/phases/06-ranner-zaschita-vhoda-i-pervyy-zhivoy-progon/06-01-PLAN.md

@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v1.1
 milestone_name: Сервер и Telegram-бот
-current_phase: 06
-current_phase_name: Раннер, защита входа и первый живой прогон
-status: executing
-stopped_at: Completed 06-10-PLAN.md
-last_updated: "2026-10-11T17:05:14.068Z"
+current_phase: 5
+current_phase_name: Ядро сервера и протокол
+status: planning
+stopped_at: Phase 06 complete, ready to plan Phase 5
+last_updated: "2026-10-11T18:16:21.929Z"
 last_activity: 2026-10-11
-last_activity_desc: Phase 06 execution started
-state_head: 6beb5fe21d13665bda6484bea23ba2d2d6a94d1e
+last_activity_desc: Phase 06 complete, transitioned to Phase 5
+state_head: 180b86269c0ac84c7c5e7a8f884e7227900f27ca
 progress:
   total_phases: 5
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 16
-  completed_plans: 15
-  percent: 0
+  completed_plans: 16
+  percent: 20
 ---
 
 # Project State
@@ -29,17 +29,17 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 
 ## Current Position
 
-Phase: 06 (Раннер, защита входа и первый живой прогон) — EXECUTING
-Plan: 11 of 11
-Status: Ready to execute
-Last activity: 2026-10-11 — Phase 06 execution started
+Phase: 5 — Ядро сервера и протокол
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-10-11 — Phase 06 complete, transitioned to Phase 5
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [██░░░░░░░░] 20%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 16
+- Total plans completed: 27
 - Average duration: -
 - Total execution time: 0 hours
 
@@ -49,6 +49,7 @@ Progress: [░░░░░░░░░░] 0%
 |-------|-------|-------|----------|
 | 02 | 8 | - | - |
 | 03 | 8 | - | - |
+| 06 | 11 | - | - |
 
 **Recent Trend:**
 - Last 5 plans: -
@@ -228,5 +229,5 @@ Items acknowledged and deferred at milestone close, most recent first:
 ## Session Continuity
 
 Last session: 2026-10-11T17:05:13.947Z
-Stopped at: Completed 06-10-PLAN.md
+Stopped at: Phase 06 complete, ready to plan Phase 5
 Resume file: None

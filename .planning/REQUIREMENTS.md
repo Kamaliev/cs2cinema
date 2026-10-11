@@ -38,7 +38,7 @@
 - [x] **RUN-01**: `cs2-cli runner` подключается к серверу сам, держит heartbeat, берёт задачу, скачивает демку, выполняет `run_job`, загружает результат
 - [x] **RUN-02**: Результат лежит в outbox, пока сервер не подтвердит размер и SHA-256; после перезапуска докачка идёт сама
 - [x] **RUN-03**: Этап и «дубль k из n» уходят на сервер; отмена с сервера доходит до пайплайна за секунды
-- [ ] **RUN-04**: Сбои класса «окружение» возвращают задачу в очередь, а не роняют задачу друга
+- [x] **RUN-04**: Сбои класса «окружение» возвращают задачу в очередь, а не роняют задачу друга
 - [x] **RUN-05**: Новые коды сбоев: `PLAYER_NOT_FOUND`, `PLAYER_AMBIGUOUS`, `NO_HIGHLIGHTS`, `BAD_DEMO`, `DEMO_TOO_LARGE`
 - [x] **RUN-06**: Перед загрузкой результат проверяется ffprobe (H.264, yuv420p, faststart), иначе Telegram не покажет видео
 
@@ -102,7 +102,7 @@
 | RUN-01 | Phase 6 | Complete |
 | RUN-02 | Phase 6 | Complete |
 | RUN-03 | Phase 6 | Complete |
-| RUN-04 | Phase 6 | Pending |
+| RUN-04 | Phase 6 | Complete |
 | RUN-05 | Phase 6 | Complete |
 | RUN-06 | Phase 6 | Complete |
 | SEC-01 | Phase 6 | Complete |

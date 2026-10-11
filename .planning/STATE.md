@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 06
 current_phase_name: Раннер, защита входа и первый живой прогон
 status: executing
-stopped_at: Completed 06-08-PLAN.md
-last_updated: "2026-10-11T16:34:52.266Z"
+stopped_at: Completed 06-09-PLAN.md
+last_updated: "2026-10-11T16:46:49.500Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 06 execution started
-state_head: 3a6820d999c767d26130ab625198cd5b38102229
+state_head: f231193109963870c459100b92110b2bc8cf913b
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 16
-  completed_plans: 13
+  completed_plans: 14
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 06 (Раннер, защита входа и первый живой прогон) — EXECUTING
-Plan: 9 of 11
+Plan: 10 of 11
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 06 execution started
 
@@ -105,6 +105,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 06 P06 | 55min | 2 tasks | 5 files |
 | Phase 06 P07 | 40 min | 2 tasks | 6 files |
 | Phase 06 P08 | 70min | 2 tasks | 7 files |
+| Phase 06 P09 | 60 min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -191,6 +192,8 @@ Recent decisions affecting current work:
 - [Phase 06]: Токен отозван (401): раннер останавливается с сообщением, задача остаётся в состоянии; stale_epoch и job_terminal бросают задачу без finish
 - [Phase 06]: Остановка раннера не отмена: серверная отмена важнее локальной остановки, при одной остановке задача остаётся в Executing
 - [Phase 06]: Строка эскалации мягкой отмены пишется один раз через inner.log; пульс не запускается на этапе Reporting
+- [Phase 06]: 06-09: release всегда засчитывает выдачу (counts = true, D-02 буквально); потолок — TOO_MANY_GRANTS сервера, пауза раннера — после двух одинаковых сбоев окружения или запуска
+- [Phase 06]: 06-09: отмена сервера проверяется до release (обход WR-01), решение о release пишется в runner_state.json (pending_release) и повторяется после перезапуска
 
 ### Pending Todos
 
@@ -220,6 +223,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T16:34:52.151Z
-Stopped at: Completed 06-08-PLAN.md
+Last session: 2026-10-11T16:46:49.385Z
+Stopped at: Completed 06-09-PLAN.md
 Resume file: None

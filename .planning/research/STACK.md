@@ -1,345 +1,340 @@
-# Stack Research
+# Stack Research — v1.1 «Сервер и Telegram-бот»
 
-**Domain:** Reliable automated CS2 demo recording (HLAE + CS2 + ffmpeg) driven from a Rust desktop app on Windows
-**Milestone:** Subsequent ("Reliable recording") on the existing cs2cinema workspace (Rust 1.99, edition 2024, egui/eframe, `std::thread`, rusqlite, no tokio)
-**Researched:** 2026-10-10
-**Overall confidence:** HIGH for HLAE/CS2/Windows facts (read from HLAE `main` source and cross-checked against the author's own `console.log` and HLAE install on this machine); MEDIUM for crate fit and timeout values (need one spike each, listed at the end)
+**Domain:** Telegram bot + job server + outbound-only remote runner, added to an existing sync Rust workspace (`std::thread`, `ureq` 3, `rusqlite` 0.32, `serde`)
+**Researched:** 2026-10-11
+**Confidence:** HIGH for versions, library capabilities and Telegram local-mode behaviour (crates.io API, library source, Telegram docs, tdlib source, and a compile-check of the recommended API calls); MEDIUM for deployment recipes (Docker volume permissions, long `getFile` timeouts, Windows hosting) which need one spike each (listed at the end).
 
-Confidence tags used below: **[HIGH]** = verified in primary source code or official docs AND/OR observed on this machine; **[MEDIUM]** = single good source or sound inference, verify in a spike; **[LOW]** = community claim or guess, do not build on it without a spike. (The GSD `classify-confidence` seam rates bare `webfetch`/`websearch` hits LOW and verified `websearch` MEDIUM; every [HIGH] item here was cross-verified against HLAE/CSDM source code or the local console log, not a bare web hit.)
+Confidence tags: **[HIGH]** = primary source (crate source/manifest, official docs, tdlib source) or reproduced locally; **[MEDIUM]** = sound inference from a primary source or one good secondary source; **[LOW]** = guess or single community claim, do not build on it without a spike. Scope: only what is NEW for v1.1. The existing validated stack (demo/highlights/director/renderer/FACEIT/`store`/`pipeline::job`/`host`) is not re-researched.
 
-## Executive recommendation
+---
 
-1. **Own the whole process tree with one Windows Job Object** (`windows-sys`, about 200 lines of isolated `unsafe`), created with `KILL_ON_JOB_CLOSE` and an I/O completion port. HLAE's loader creates `cs2.exe` without `CREATE_BREAKAWAY_FROM_JOB`, so `cs2.exe` and the `ffmpeg.exe` that HLAE spawns for each take both land in our job. That one object gives PID/handle ownership (no `taskkill /IM`), crash/exit notifications (no `tasklist` polling), exact "ffmpeg finished writing the take" detection, and guaranteed cleanup even if cs2cinema itself crashes.
-2. **One event channel, many producer threads, `recv_timeout` consumer.** Job events, netcon lines, `console.log` tail, a modal-dialog sniffer and phase deadlines all push `Event`s into one `crossbeam-channel`; the orchestrator waits with `recv_timeout(<=100 ms)` and checks the existing `Progress::cancelled()` every slice. Cancel latency is about 100 ms, no trait change, no async.
-3. **Evidence-based markers, not file mtimes.** HLAE prints `Recording to "<dir>"` and `Finishing recording ... done.`; our cfg prints `CS2C ...` markers with a per-run nonce. Completion of a take = marker AND ffmpeg child exited (job event) AND `ffprobe` passes. HLAE's own "Finishing recording ... done." is NOT proof the file is complete (capture shutdown is queued on the render thread).
-4. **Fix the console channel first.** On Windows CS2, `-netconport` does not reliably open unless `WSAStartup` has run early; HLAE ships `-afxFixNetCon` for exactly this (since AfxHookSource2 0.25.0). The current launcher does not pass it. Add it, and add `-condebug` so `game/csgo/console.log` is a second, always-available evidence stream.
-5. **Detect the hang-forever failure modes that are currently invisible**: AfxHookSource2 and HLAE.exe raise *modal* `MessageBox`/dialogs ("Error - AfxHookSource2", "Image injection problem. Continue waiting?", the missing-`-insecure` box that loops forever). Sniff top-level windows owned by job PIDs and fail fast with the dialog text.
+## Decision summary (read this first)
+
+| # | Question | Decision | Confidence |
+|---|----------|----------|------------|
+| 1 | Can tokio be avoided? | **Yes, completely.** No `tokio`, no `async` anywhere in the workspace for v1.1. | HIGH |
+| 2 | Telegram library | **`frankenstein` 0.52.1, feature `client-ureq`** (blocking, typed, built on the `ureq` 3 the workspace already uses). Not `teloxide`, not hand-rolled. | HIGH |
+| 3 | HTTP server for the runner API | **`tiny_http` 0.12.0** on `std::thread` workers, bound to `127.0.0.1`/tailnet, fronted by a TLS terminator (Tailscale Serve or Caddy). | MEDIUM (works, but the crate is stagnant, see risk below) |
+| 4 | Runner–server transport | **Plain HTTP/1.1 request/response: long-poll `claim` (<=25 s) + progress POST that doubles as heartbeat and carries cancel back.** Not WebSocket, not SSE. | HIGH |
+| 5 | File transfer | **Bounded chunks (8 MiB) with `Range` for download and `Upload-Offset` PUT for upload, SHA-256 verified at finish.** | HIGH (design), MEDIUM (chunk size, tune in spike) |
+| 6 | Local `telegram-bot-api` | **Linux + Docker (`aiogram/telegram-bot-api`, tag `10.3`, `TELEGRAM_LOCAL=1`)**, one shared volume with `cs2-server`; server reads `getFile` paths from disk and sends results as `file://` URIs. Windows = WSL2/Docker or build from source (no official binary). | HIGH (mechanism), MEDIUM (volume permissions) |
+| 7 | Runner auth + TLS | **256-bit random bearer token per runner, only its SHA-256 stored on the server; TLS terminated by Tailscale Serve (preferred) or Caddy; runner uses `ureq` + `platform-verifier` as today.** No in-process TLS server. | HIGH |
+| 8 | Server SQLite | **`rusqlite` 0.32 `bundled` — the exact workspace version; hand-rolled `PRAGMA user_version` migrations like `store`.** Do NOT bump to 0.40 inside the server crate. | HIGH (reproduced) |
+
+### Tokio: avoided, and what that costs
+
+**Why it can be avoided (evidence):**
+- `frankenstein` ships a first-class blocking client: `client-ureq = ["trait-sync", "dep:ureq", "dep:multipart", "dep:mime_guess", "dep:serde_json"]` (crate manifest, 0.52.1). It reuses the workspace `ureq` 3.4.2 (one HTTP/TLS stack, `ring` already in `Cargo.lock`). [HIGH]
+- The load is one runner, a handful of whitelisted users, one job at a time. One blocking thread long-polling `getUpdates`, one ingestion worker, one delivery worker, and ~8 `tiny_http` worker threads is far below any thread-count concern.
+- All state-owning code that the server shares a style with (`store::Store` = `Arc<Mutex<Connection>>`, `pipeline::Progress`) is synchronous; async would need `spawn_blocking` bridges around rusqlite everywhere.
+- Measured dependency cost (fresh probe crates, `cargo tree`, counting unique crate versions that are NEW on top of the baseline `ureq + rusqlite 0.32 + serde + serde_json + sha2` = 57 crates):
+
+| Candidate server stack | New crates | tokio in tree |
+|------------------------|-----------:|---------------|
+| **frankenstein `client-ureq` + `tiny_http` + `ctrlc` + `getrandom`** (recommended) | **34** | no |
+| frankenstein `client-reqwest` + `axum` 0.8 + `tower-http` + `tokio` | 91 | yes (second HTTP stack: reqwest/hyper next to ureq) |
+| `teloxide` 0.17 + `axum` + `tokio` | 115 | yes |
+
+**What avoiding it costs (be honest):**
+1. `tiny_http` is stagnant: 0.12.0 was released 2022-10-06, last commit 2023-05, repo last pushed 2024-08. It had a request-smuggling advisory (RUSTSEC-2020-0031, patched in >= 0.8.0, we use 0.12). Mitigation: it never faces the internet directly (TLS terminator in front, bind to loopback/tailnet), and the API is tiny. [HIGH on facts, MEDIUM on risk assessment]
+2. No built-in `Range` serving, graceful shutdown, per-read timeouts or body-size limits: ~150 lines of hand-written code (`Range: bytes=N-` -> `206` + `Content-Range`, `Upload-Offset` check, size caps). The chunked design (below) makes per-read timeouts unnecessary.
+3. No WebSocket/SSE push: cancel latency = progress-POST interval (2-5 s). Acceptable: the requirement is "cancel in seconds".
+4. `frankenstein` `client-ureq` depends on the archived `multipart` 0.18 crate (RUSTSEC-2023-0050, "unmaintained", not a vulnerability) and a second `rand` (0.8 next to the workspace's 0.9). Accepted: used only for multipart uploads we mostly avoid (we send `file://` URIs instead). [HIGH]
+
+**What accepting tokio would cost:** +57 crates over the sync option, a second TLS/HTTP stack, `spawn_blocking` around every SQLite call, and a rule that async must never leak into `wire`/`runner`/`app`/`cli`. The deviation would be legal under the PROJECT.md constraint (server crate only) but is not justified by the load.
+
+**Escape hatch (decide later, do not build now):** switch ONLY `crates/server` to `axum` 0.8.9 + `tokio` 1.53.2 (+ `tower-http` 0.7.1 for `ServeFile` Range support) if one of these triggers fires: more than one runner, WebSocket/SSE push becomes a requirement, or `tiny_http` shows a real bug. Keep the protocol HTTP/1.1 request/response and keep `wire` runtime-agnostic so the swap does not touch runner, app or CLI.
+
+**Hard rule for the workspace:** `tokio`/`reqwest`/`hyper`/`async-*` must not appear in the dependency tree of `app`, `cli`, `runner`, `wire` or any existing crate. Verify in CI with `cargo tree -p cli -i tokio` (must print "nothing to print"). Note: `Cargo.lock` already lists a `tokio 1.53.2` entry with only `pin-project-lite`; it is not in the build graph of any binary today (checked with `cargo tree -i tokio` -> nothing), keep it that way.
+
+---
 
 ## Recommended Stack
 
-### Core Technologies
+### Core Technologies (new in v1.1)
 
-| Technology | Version | Purpose | Why Recommended | Conf. |
-|------------|---------|---------|-----------------|-------|
-| `windows-sys` (cfg(windows)) | 0.61.2 | Job Object, IOCP, `OpenProcess`/`WaitForSingleObject`, ToolHelp snapshot, `EnumWindows`, `GetDiskFreeSpaceExW`, `GetFileVersionInfoW` | Thin raw bindings, no wrapper types, already in `Cargo.lock` at 0.61.2 (transitive via eframe/shared_child), so zero new resolution. All needed functions confirmed present in 0.61.2 on docs.rs. Latest published `windows` is 0.62.2 (Oct 2025); `windows-core`/`windows-link` jumped to 0.100.0 (Sep 2026), so do not mix `windows` versions - stay on `windows-sys` 0.61. | HIGH |
-| `crossbeam-channel` | 0.5.17 | Multi-producer event bus with `select!`/`recv_timeout`/`after` | Already in `Cargo.lock`. `std::sync::mpsc` has `recv_timeout` but no `select!`; we need several sources plus deadlines. Pure threads, no runtime. | HIGH |
-| `shared_child` | 1.1.2 | One-shot external commands (`ffmpeg`, `ffprobe`, NVENC probe) with timeout and cross-thread kill | `wait_timeout`/`wait_deadline` plus `kill()` callable from another thread while a reader waits (std `Child` needs `&mut self` for both, which forces a mutex and deadlocks on cancel). Depends on `windows-sys ^0.61`, same as ours. Sync, no tokio. | HIGH |
-| `thiserror` | 2.0.21 | Typed `RecordError { stage, cause }` | Already in lock. Lets tests assert "not started" vs "timeout" vs "cancelled" without string compares; map to Russian text only at the UI boundary. | HIGH |
-| std `File::try_lock` | Rust >= 1.89 (toolchain is 1.99) | Single-instance "one recording at a time" lock file across app + CLI | Stable in std, uses `LockFileEx` on Windows; no `fs4`/`fs2` needed (`fs2` unmaintained since 2018). | HIGH |
-| std `OpenOptionsExt::share_mode(0)` | std | Exclusive-open probe: "is anyone still writing this take file?" | Fails with `ERROR_SHARING_VIOLATION` while ffmpeg holds the file. Cheap secondary completion signal. | MEDIUM |
+| Technology | Version | Purpose | Why Recommended |
+|------------|---------|---------|-----------------|
+| `frankenstein` | 0.52.1 (`default-features = false`, `features = ["client-ureq"]`) | Telegram Bot API client in `crates/server` | Complete typed wrapper of Bot API **10.3** (README), which equals the current Bot API (changelog: 10.3, 2026-08-24) and the `aiogram/telegram-bot-api:10.3` image. Blocking `Bot` with configurable `api_url` and `ureq::Agent` (needed for local server and long timeouts). Published 2026-09-25, repo pushed the same day. Compile-checked locally: `Bot::builder().api_url(..).request_agent(..).build()`, `get_updates`, `get_file`, `send_document` with `FileUpload::String("file:///...")` all resolve on this toolchain. |
+| `tiny_http` | 0.12.0 | Runner-facing HTTP API in `crates/server` | Only mature **blocking** server in the ecosystem. `Server` is `Send + Sync`, `Request` is `Send` ("dispatch your requests to worker threads"), body is a streaming `Read` (`as_reader`, `body_length`), responses can stream any `Read` with a known length. Handles `Expect: 100-continue`. No runtime. |
+| `ureq` | 3.4.2 (already in workspace; `features = ["json","platform-verifier"]`) | Runner-side client (`crates/runner`), also what `frankenstein` uses | Already vetted in the repo (`faceit`, `app::update`). Blocking `Read`-based body streaming is the pattern used in `faceit::download` (`body_mut().with_config().limit(u64::MAX).reader()`). **Defaults to NO timeouts at all** (every `timeout_*` is `None`, only `await_100` = 1 s), so the runner MUST set explicit ones (see Protocol). |
+| `rusqlite` | **0.32.1 `bundled`** (workspace version, do not change) | Server state: users, whitelist, jobs, leases, runner tokens, outbox | Same crate/pattern as `crates/store` (`Arc<Mutex<Connection>>`, WAL, `user_version` migrations). **Reproduced locally:** having `rusqlite 0.32` and `rusqlite 0.40` in one dependency graph fails with `libsqlite3-sys ... links to the native library sqlite3, but it conflicts` -> the server crate cannot use the newer rusqlite (latest on crates.io is 0.40.2) unless the whole workspace, incl. `store`, is upgraded in a separate task. |
+| `serde` / `serde_json` | 1.0.229 / 1.0.151 (workspace) | `wire` protocol types, server config | Already everywhere; protocol is JSON for control + raw bytes for files. |
+| `sha2` | 0.10.x (workspace; latest on crates.io is 0.11.0 — do **not** bump) | SHA-256 of demos/results (streamed), hashing runner tokens | Already used in `app::update`. Hardware-accelerated SHA-256 is ~GB/s, hashing a 500 MB file adds seconds, not minutes. BLAKE3 1.8.7 is faster but adds a dependency for no user-visible gain. |
+| `getrandom` | 0.4.3 (already in `Cargo.lock`) | Generate 256-bit runner tokens | `getrandom::fill(&mut [0u8; 32])` (verified in docs.rs for 0.4.3). OS CSPRNG, no `rand` needed. MSRV 1.85 is fine (toolchain is 1.99). |
+| `ctrlc` | 3.5.2, `features = ["termination"]` | SIGINT/SIGTERM handling in `cs2-server` | In Docker the server is PID 1 and **ignores SIGTERM without a handler**; the handler sets an `AtomicBool` and calls `Server::unblock()`. One tiny dependency, works on Windows too. |
 
 ### Supporting Libraries
 
-| Library | Version | Purpose | When to Use | Conf. |
-|---------|---------|---------|-------------|-------|
-| `steamlocate` | 2.1.1 (Aug 2026) | Locate Steam + CS2 (`find_app(730)`) incl. `install_dir`, `state_flags`, `last_updated`, `build_id` from `appmanifest_730.acf` | Preflight: replaces the hard-coded drive list in `find_cs2()`; `state_flags` tells "game is mid-update". Note `App` is `#[non_exhaustive]`. Fallback to the current scan if it returns `None`. | MEDIUM |
-| `which` | 8.0.6 | Resolve `ffmpeg`/`ffprobe` to an absolute path once, log it, reuse it | Preflight + all spawns; avoids PATH drift between preflight and later `Command::new("ffmpeg")`, and shows the user *which* ffmpeg was picked. Honors PATHEXT on Windows. | HIGH |
-| `tracing` + `tracing-subscriber` + `tracing-appender` | 0.1.44 / 0.3.23 / 0.2.5 | Developer log file in `%LOCALAPPDATA%\cs2cinema\logs\` | The app is `windows_subsystem = "windows"`, so stderr goes nowhere; panics and thread failures currently vanish. Use rolling non-blocking file appender + a panic hook. Keep the user-facing Russian job journal in SQLite exactly as is; tracing is for developers. `tracing` 0.1.44 is already in the lock. | MEDIUM |
-| `serde_json` (existing) | 1.0.x | Per-take manifest (`clips/manifest.json`: expected duration, dir from "Recording to", ffprobe result, state) and `ffprobe -of json` parsing | Needed for "retry from record stage" and per-take validation; no new dependency. | HIGH |
-| `tempfile` (dev) | 3.27.0 | Fake game folders / clip dirs in tests | Already in lock. | HIGH |
+| Library | Version | Purpose | When to Use |
+|---------|---------|---------|-------------|
+| `chrono` | 0.4.45 (workspace, `default-features = false`, `features = ["clock"]`) | Timestamps in server log/DB | Already in workspace; do not add `time`. |
+| `thiserror`/`anyhow` | — | — | **Do not add.** Workspace convention is `Result<T, String>` / `Box<dyn Error>`. |
+| `tracing`, `log`, `env_logger` | — | — | **Do not add.** The workspace has no logging crate. Write a 30-line `logln!` (timestamp + level to stderr; systemd/Docker collect it) plus a `redact()` helper that strips the bot token and bearer tokens. A logging framework is not worth 10+ crates for one daemon. |
+| `toml`/`clap` | — | — | **Do not add.** Secrets via env (`TELEGRAM_BOT_TOKEN`, `CS2_ADMIN_ID`), the rest via flags/env or a small `server.json` read with `serde_json`; hand-written arg parsing like `cs2-cli`. |
+| `rusqlite_migration` | 2.6.0 | — | **Do not add**: targets newer rusqlite and would re-introduce the `links = "sqlite3"` conflict; `store` already has a working hand-rolled migrator (`Store::migrate`) to copy. |
+| `subtle` | 2.6.1 (already in lock) | constant-time compare | **Not needed.** Look the token up by `sha256(token)` in an indexed column; a 256-bit random token has nothing to time-attack. |
+| `argon2`/`bcrypt` | — | — | **Not needed.** Tokens are high-entropy random, not passwords; a fast hash is correct. |
 
-### Development Tools
+### Infrastructure / external programs (not Cargo crates)
 
-| Tool | Purpose | Notes |
-|------|---------|-------|
-| In-repo `fake-game` helper binary (`[[bin]]` or `examples/`, found via `env!("CARGO_BIN_EXE_...")`) | Integration-test the real Job Object / timeout / cancel code on CI without CS2 | Small program that: listens on a netcon port and prints scripted lines, optionally spawns a child (stand-in for ffmpeg), optionally hangs, crashes with an exception code, or shows a `MessageBox`. Lets the three required scenarios ("does not start", "timeout", "cancel") run against real Win32 primitives. Gate the job tests with `#[cfg(windows)]`; the trait-level fake covers Linux CI. |
-| Hand-written `GameHost` trait + `FakeHost` (scripted `Vec<Event>` over a crossbeam channel) | Unit-test the orchestrator state machine | Preferred over `mockall` 0.15: the host is an event source plus 4 commands, a scripted fake is shorter and keeps test intent readable. |
-| `HLAE\AfxHookSource2_changelog.xml` (shipped in the HLAE folder) | Offline HLAE-vs-CS2 compatibility heuristic | Contains `<version>`, `<time>`, and lines like `Adjusted to CS2 update (1.41.8.5)`. Compare with `PatchVersion=` in `game/csgo/steam.inf`. |
+| Tool | Version | Purpose | Why |
+|------|---------|---------|-----|
+| `telegram-bot-api` (tdlib) | built from `master`; Docker tag `aiogram/telegram-bot-api:10.3` (amd64/arm64/386/arm/ppc64le, pushed 2026-10-10) | Local Bot API server: lifts 20 MB download / 50 MB upload to unlimited / 2000 MB | Telegram docs ("Using a Local Bot API Server"): *download files without a size limit; upload files up to 2000 MB; upload by local path with `file://`; `getFile` returns the absolute local path*. Cloud limits verified in the docs: `getFile` "maximum file size to download is 20 MB"; multipart uploads "10 MB photos, 50 MB other files". Needs `api_id`/`api_hash` from my.telegram.org. Boost licence. |
+| Docker + Compose | any current | Run `telegram-bot-api` (+ optionally `cs2-server`) on a Linux host | There is **no official prebuilt binary** and no GitHub release in `tdlib/telegram-bot-api` (releases/tags API returned `[]`); the unofficial `aiogram` image is the de-facto way. |
+| Tailscale | current | Private network between the Windows runner and the server; `tailscale serve` gives a real `*.ts.net` HTTPS cert | Runner stays behind NAT with outbound-only traffic; server port is never public. Windows needs *unattended mode* (service starts before login). Direct path in most networks; falls back to DERP relay (slower) on double NAT / strict firewalls. |
+| Caddy 2 | current | Alternative TLS terminator when the server has a public IP/domain | Automatic Let's Encrypt; `reverse_proxy 127.0.0.1:PORT`. |
+| systemd unit or Compose service | — | Supervise `cs2-server` | Restart on failure; `EnvironmentFile` for the bot token. |
 
-## HLAE facilities (verified against advancedfx `main` and HLAE 2.192.7 / AfxHookSource2 0.41.7, released 2026-10-08)
+---
 
-### HLAE.exe command line [HIGH - `hlae/Program.cs`]
+## Protocol decisions (runner <-> server)
 
-`HLAE.exe -customLoader -noGui -autoStart -noConfig -hookDllPath <abs>\x64\AfxHookSource2.dll -programPath <abs>\cs2.exe -cmdLine "<game args>" [-addEnv KEY=VALUE ...]`
+### Transport: HTTP long-poll, not WebSocket, not SSE
 
-- Current launcher passes everything except **`-noConfig`**. Add it (CSDM does): HLAE otherwise loads/writes `%APPDATA%\HLAE\hlaeconfig.xml` and can inherit stale custom-loader settings from the user's GUI sessions.
-- `-addEnv` exists if env vars ever need forwarding (when used, HLAE rebuilds the environment from its own and appends).
-- **Exit code**: `Main` returns `0` if the loader succeeded and `1` if it failed. On failure HLAE first shows a modal `ErrorDialogue` and only returns after the user closes it, so an unattended failure shows up as "HLAE.exe still alive after N seconds", not as exit code 1.
-- **Lifetime**: loader does `CreateProcessW(cs2.exe, CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, no breakaway)` -> runs `injector.exe` (x64) -> `Sleep(2000)` -> `ResumeThread` -> HLAE.exe exits. Expect HLAE.exe alive roughly 3-8 s. If the injector hits a problem it can pop `MessageBox("Image injection problem.\nContinue waiting?")`.
-- **Consequence for process control**: `cs2.exe` is a grandchild of cs2cinema via a *short-lived launcher*; `Child` of HLAE.exe tells you nothing about the game. Because there is no `CREATE_BREAKAWAY_FROM_JOB`, the Job Object membership of HLAE.exe is inherited by `cs2.exe` (Microsoft Job Objects docs: children created with `CreateProcess` are associated with the job by default). [HIGH by source + docs; confirm empirically in spike 1]
+| Criterion | Long-poll + progress POST (chosen) | WebSocket | SSE |
+|-----------|-----------------------------------|-----------|-----|
+| Fits blocking `ureq` runner | Native | Needs `tungstenite` 0.30 (sync, exists) + reconnect/ping state machine | `ureq` can read a streaming body, but reconnect + `Last-Event-ID` is hand-written |
+| Fits `tiny_http` server | Native | `Request::upgrade` exists but framing/ping/close all hand-written | Chunked streaming works; proxies buffer unless `flush_interval -1` |
+| Behind NAT / proxies / Cloudflare | Works anywhere HTTP works; Cloudflare read timeout is 125 s, keep waits <= 25-30 s | Idle-timeout tuning per hop | Same as long-lived response |
+| Reconnect semantics | A retry loop with backoff **is** the reconnect logic | Separate state machine | Separate state machine |
+| Cancel latency | 2-5 s (rides back in the progress POST response) | Instant | Near-instant |
+| Testability | In-process server on port 0 + `ureq` | Harder | Harder |
 
-### AfxHookSource2 launch arguments [HIGH - `AfxHookSource2/main.cpp`]
+Concrete shape (names are suggestions for the architecture phase; `wire` crate owns the types):
+- `GET /v1/claim?wait=25` -> `200` + job JSON, or `204`. Runner sets `timeout_recv_response` = 40 s, `timeout_connect` = 10 s.
+- `POST /v1/jobs/{id}/events` (progress/log/heartbeat) -> response includes `{"cancel": bool, "lease": ...}`. Timeout 15 s.
+- `POST /v1/jobs/{id}/fail` with `{code: "TAKE_TIMEOUT", message, hint}` — `FailCode::as_str()` and the Russian `hint` already exist in `pipeline::record::failure`; the **server never depends on `pipeline`**, it forwards the strings.
+- Every request carries `Authorization: Bearer <token>`.
 
-| Argument | Effect | Recommendation |
-|----------|--------|----------------|
-| `-insecure` | **Mandatory.** Without it the DLL shows `ErrorBox` ("Please add -insecure ...") then `TerminateProcess` on itself and, if that fails, loops `MessageBox("Please terminate the game manually in the taskmanager!")` **forever** | Always passed (already is). Preflight asserts it is in the effective command line (see `[CommandLine]` echo below). |
-| `-afxFixNetCon` | Calls `WSAStartup` in `DllMain`. Reason: Valve bug csgo-osx-linux#3603 - on Windows `-netconport` socket creation fails with `WSANOTINITIALISED` because Winsock is initialised too late (only `-tools` or later Steam init fixes it). Added in AfxHookSource2 0.25.0 (2024-10-07). | **Add.** Likely a root cause of the observed intermittent "консоль игры не открылась". Harmless if Winsock already started (refcounted). [HIGH it exists; MEDIUM that it is the cause of the author's flakiness - spike 2] |
-| `-afxDisableSteamStorage` | Returns null for `STEAMREMOTESTORAGE_INTERFACE_VERSION016`, so the game cannot read/write Steam Cloud config | **Add.** `console.log` on this machine shows `Saved 'cs2_user_convars.vcfg' to SteamRemoteStorage` at quit, i.e. recording sessions currently write the author's real cloud config. HLAE's own launcher and CSDM pass it. |
-| `-afxThreadPoolSize N` | Capture thread pool size | Leave default. |
+### File transfer (hundreds of MB): bounded chunks, resumable, checksummed
 
-**There is no `-afxTrace` and no HLAE log file.** Grepping the whole HLAE source finds only the three `-afx*` args above, and no hook-side log writer. Diagnostics for HLAE come from: the game console (netcon stream + `console.log`), HLAE.exe's exit code, job events, and window titles. Do not plan around an HLAE trace flag.
+`ureq` 3 has no per-read stall timeout (only whole-request timeouts), and a stalled upload would pin a `tiny_http` worker thread. Therefore **do not stream a whole file in one request**:
 
-### Console output HLAE produces (usable as markers) [HIGH - source `RenderSystemDX11Hooks.cpp` + lines observed in local `console.log`]
+- **Download (server -> runner):** `GET /v1/jobs/{id}/demo` with `Range: bytes=N-M`, 8 MiB per request, per-request `timeout_global` 60 s. Server answers `206` + `Content-Range`, `ETag` = sha256 of the file. Runner writes to `<name>.part`, resumes from `metadata().len()`, verifies the full SHA-256 against the job offer, then renames. (This mirrors the `.part` + rename pattern of `faceit::download`.)
+- **Upload (runner -> server):** `HEAD /v1/jobs/{id}/result` -> `Upload-Offset: N`; then `PUT` of the next 8 MiB chunk with `Upload-Offset: N` and `Content-Length` (send a `Vec<u8>`/`&[u8]` so the length is known, `ureq` `AsSendBody` supports `Vec<u8>`, `&[u8]`, `File`). Server appends only if the offset equals the current `.part` size, otherwise `409` + current size (runner re-syncs). Finish with `POST .../finish {sha256, size}`; server verifies and renames. This is the core of the tus resumable-upload idea without the library; do not add a tus crate for one client.
+- **Why 8 MiB:** keeps each request well under Cloudflare's 100 MB Free/Pro body limit (so a Cloudflare Tunnel would also work), bounds the damage of a drop to one chunk, makes per-request timeouts meaningful. Tune in the spike (4-32 MiB).
+- **Integrity:** SHA-256 computed while writing on both sides (`sha2::Sha256::update` per chunk); mismatch -> delete `.part`, report a typed failure. TCP alone does not protect against a truncated-then-renamed file.
+- **Memory:** one chunk buffer (8 MiB) per transfer; never `read_to_end` a file.
 
-| Line (exact) | Meaning |
-|--------------|---------|
-| `\| AfxHookSource2 (Oct  8 2026 17:00:09)` (box banner) | The hook is loaded and running. Absent after `Source2Init OK` = game started vanilla (injection failed). Also gives the hook build date. |
-| `Starting recording ... done.` then `Recording to "C:\...\take0003".` | Take started; **the quoted path is the authoritative take directory** (no need to guess `takeNNNN` numbering). |
-| `Starting recording ... FAILED` + `Error: Failed to create directories for "<name>".` | Hard failure to start a take. |
-| `Finishing recording ... done.` | Capture shutdown was *queued* (`EndCapture` pushes `ShutDown` onto the render thread's `AfterPresentOrContextLossReliable` queue). **Not** proof the mp4/wav are finished. |
-| `AFXERROR: COutFFMPEGVideoStream::COutFFMPEGVideoStream: CreateProcessW.` followed by hundreds of `AFXERROR: Failed writing image for screen recording.` | HLAE could not start *its* ffmpeg (bad `ffmpeg.ini` path, AV blocking). **Observed on this machine.** HLAE keeps "recording" into the void, so today the pipeline would wait until stall/timeouts. Treat the first `AFXERROR:` as fail-fast; rate-limit/dedupe repeated lines when logging. |
-| `AFXERROR: ... could not create path "..."` | Take folder not creatable. |
-| `Could not find address for pattern: ...` | AfxHookSource2 signature scan failed = HLAE not compatible with this CS2 build. |
-| Modal box titled `Error - AfxHookSource2` (`MessageBoxA`) | Fatal hook error (failed detour, missing interface, etc.) - blocks the game thread until dismissed. CSDM detects this by checking window titles; we should too. |
-| `<n>: <tick> (eps=1) -> <command>` | `mirv_cmd` trace when a scheduled command fires (also contains the command text, so naive `contains("CS2C_...")` matches it; use anchored parsing, below). |
-| `Warning: You probably forgot to set host_framerate / mirv_streams record fps` | Misconfigured take (`m_Override fps` 0). |
+### Auth, tokens and TLS
 
-### Take mechanics [HIGH - source]
+- **Runner token:** 32 random bytes from `getrandom::fill`, hex- or base64url-encoded, shown once at creation (`cs2-server runner add <name>` prints it; the user pastes it into the app's runner settings / `cs2-cli runner --token`). Server stores only `sha256(token)` plus name, created/last-seen, `revoked_at`. Lookup by hash column; no constant-time compare needed.
+- **Never log:** the bearer token, the bot token, or any URL containing the bot token. **Trap:** the Bot API URL is `http://host:8081/bot<TOKEN>/method`, and HTTP/library errors can echo the URL; wrap every Telegram error through `redact()` before logging or sending to chat. [HIGH that the URL contains the token; MEDIUM that `ureq` errors echo it, redact defensively]
+- **Telegram whitelist:** Telegram numeric user IDs in SQLite, seeded by `CS2_ADMIN_ID`; ignore (and rate-limit the log of) anyone else. The runner API is separate from Telegram identity.
+- **TLS:** the Rust server speaks plain HTTP on loopback/tailnet. Do not enable `tiny_http`'s `ssl-rustls` feature (ships an old rustls and ties TLS renewal to our process). Preferred: **Tailscale Serve** (`tailscale serve` proxies a local port with an auto-provisioned Let's Encrypt cert on `<host>.<tailnet>.ts.net`; renewal handled by the daemon; resumes after reboot). Alternative with a public IP + domain: **Caddy** automatic HTTPS. The runner keeps `ureq` + `platform-verifier`, so Let's Encrypt chains validate through the Windows trust store with zero extra code. Plain `http://` should be accepted by the runner only for loopback/tailnet addresses and shown as a warning in settings.
+- **Runner secrets on disk:** the token lives in the runner's `settings.json` next to the FACEIT key (same trust model as today); the settings page must mask it and the journal must never print it (PROJECT.md Security constraint).
+- Cloudflare Tunnel works only because of the 8 MiB chunks (100 MB body limit on Free/Pro, 125 s read timeout, 30 s write timeout); it is not recommended as primary because Tailscale needs no public ingress at all.
 
-- Take dir = `<record name>\take` + 4 digits where the number is **max existing + 1** (`SuggestTakePath`, gaps are not reused). Existing code's "move old `clips/` aside so numbering restarts at 0000" is therefore correct but fragile; with the `Recording to "<dir>"` line we can map shot -> dir explicitly and stop depending on numbering.
-- ffmpeg for takes: path from `<HLAE>\ffmpeg\ffmpeg.ini` `[Ffmpeg] Path=` (fallback `<HLAE>\ffmpeg\bin\ffmpeg.exe`), spawned by `cs2.exe` with `CREATE_NO_WINDOW` and piped stdin/stdout/stderr. On this machine: `Path=C:\Program Files (x86)\HLAE FFMPEG\ffmpeg\bin\ffmpeg.exe`. Preflight must check that file exists and runs.
-- Finalisation is asynchronous and ordered by the render thread; on `quit` (`HostStateRequest::Start(HSR_QUIT)`) HLAE calls `AfxStreams_ShutDown()`, so a graceful `quit` finalises streams, while killing the job mid-take leaves a truncated mp4 (no `moov` atom -> `ffprobe` fails, which is exactly the check we want).
-- `ffmpeg` child exit is the real "file closed" signal. It is a child of `cs2.exe`, hence inside our job.
+---
 
-### Optional, not recommended now [LOW]
+## Telegram: local Bot API, concretely
 
-AfxHookSource2 embeds a JS engine (Boa) with `mirv.onRecordStart({takeFolder})` / `onRecordEnd` events and `mirv.exec`. It is a possible future replacement for console-marker parsing, but needs a script-load command we did not verify in 0.41.7 and adds a moving part to every HLAE update. Console markers + job events are enough.
+**How it behaves (verified in Telegram docs and tdlib source `Client.cpp`):**
+- Start with `--local` (Docker image: `TELEGRAM_LOCAL=1`), plus `TELEGRAM_API_ID`/`TELEGRAM_API_HASH`. Default port 8081 (`--http-port`). Data dir `/var/lib/telegram-bot-api` in the image.
+- In local mode `getFile` returns `file_path` = **absolute path on the Bot API server's own filesystem**, and the file is already on disk after the call (the call blocks while the server downloads it from Telegram). I grepped `Client.cpp`/`HttpConnection.cpp`/`ClientManager.cpp`/`Query.cpp`: there is no `/file/bot<token>/...` HTTP route in the open-source server, so **`cs2-server` must share a filesystem with the Bot API container** (same host, same volume mounted at the same absolute path) rather than download over HTTP. [HIGH from source grep; the docs say the same: "without the need to download the file"]
+- Sending: pass the string `file:///data/outbox/<job>/highlights.mp4` as the `document`/`video` field (`FileUpload::String`); the server accepts `file://` URIs only in local mode (`get_input_file`). Multipart upload of the same file also works (up to 2000 MB) but costs a pointless copy over loopback.
+- **Migration step:** a bot token already used with the cloud API must be `logOut`-ed from `api.telegram.org` once before first use on the local server; after that it cannot return to the cloud server for 10 minutes (docs: "You must log out the bot before running it locally"). Use a fresh bot or do this once, manually.
+- Updates: use `getUpdates` long polling (`timeout = 30`), not webhooks. Local mode allows plain-HTTP/local webhooks, but webhooks would add an inbound endpoint and a second listener for no gain.
+- Timeouts: `frankenstein`'s default agent has `timeout_global` = 500 s. Build **two** `Bot`s from the same URL: one for `getUpdates` (global ~60 s) and one "heavy" bot (`getFile` of a ~1 GB demo and `sendVideo`/`sendDocument` of a large result block until Bot API finishes the transfer; set 30 min) — [MEDIUM, size the timeout in a spike].
+- Threads: never call `getFile`/`send*` from the `getUpdates` loop; hand them to an ingestion/delivery worker via `mpsc`, so `/status` and `/cancel` stay responsive during a 2 GB transfer.
+- Sending video: prefer `sendDocument` as the always-works fallback and `sendVideo` with `supports_streaming`, `width`, `height`, `duration` (from `ffprobe`, already a dependency) for inline playback.
+- Disk: Bot API keeps downloaded files in its data dir. Move (`rename`) the demo into server storage right after `getFile` and delete leftovers on a retention sweep; budget disk for demo + result + Bot API copy.
 
-## CS2 facilities
+**Recommended deployment (Linux host):**
 
-### Launch options
-
-Recommended `-cmdLine` (all [HIGH] unless marked):
-
-```
--steam -insecure -novid -allow_third_party_software -console -condebug
--netconport <free port> -afxFixNetCon -afxDisableSteamStorage
--windowed -w <W> -h <H> +demo_ui_mode 0 +playdemo "<absolute path, forward slashes>"
-```
-
-| Option | Why | Conf. |
-|--------|-----|-------|
-| `-condebug` | Mirrors the console into `game/csgo/console.log`. **Already observed working on this machine** (4 MB log, 29,781 lines, with HLAE and `mirv_cmd` output). | HIGH |
-| `-conclearlog` | Community-documented (cs2-chat-translator / chat-strike READMEs) to truncate `console.log` at start; not verified here. Do **not** rely on it: record the file length at launch and tail from that offset; if `len < offset` restart from 0. | LOW |
-| `-netconport N` + `-afxFixNetCon` | TCP text console on 127.0.0.1. Per-launch free port (already done). See Valve issue #3603. | HIGH/MEDIUM |
-| `-console` | Lets the author open the console by hand when a run stalls; harmless. | HIGH |
-| `+playdemo "<abs path>"` | **Absolute paths work**: `console.log` shows `[Demo] Requesting playback of 'C:/Users/kamal/Downloads/1-...dem'` followed by `Host activate: Playing Demo` and `LOADINGSCREEN -> INGAME`. The current code copies every demo into `game/csgo/` (`install_files`/`write_demo`) and never deletes it: **six leaked copies, about 1.9 GB, in `game/csgo` right now, on a C: drive with 22 GB free of 465**. Stop copying (or delete after the run). Quoting through HLAE's `-cmdLine` needs one spike (spike 4). | HIGH that absolute path plays / MEDIUM on quoting |
-| `+sv_lan 1` | Present in the author's manual test line; suppresses nothing proven. Skip. | LOW |
-
-### Console log format and markers [HIGH - observed]
-
-- Lines look like `MM/DD HH:MM:SS <text>`; multi-line messages have continuation lines without a timestamp; **first line starts with a UTF-8 BOM** - strip it. Netcon lines arrive without the timestamp. Parse both with the same function.
-- Observed markers (use as phase-completion evidence, each with its own timeout):
-
-| Phase | Evidence line (substring) |
-|-------|---------------------------|
-| Game process args applied | `[CommandLine] command line arguments:` and the next line (verify `-insecure`, `-netconport`, `-condebug` are present) |
-| Engine up | `Source2Init OK` |
-| Hook loaded | `AfxHookSource2 (` banner |
-| Demo accepted | `[Demo] Requesting playback of '` / `[Demo] playing demo from '` |
-| Demo active | `[HostStateManager] Host activate: Playing Demo (` |
-| Demo loaded (UI) | `ChangeGameUIState: CSGO_GAME_UI_STATE_LOADINGSCREEN -> CSGO_GAME_UI_STATE_INGAME` |
-| Demo ticking + HLAE alive | our own `CS2C <nonce> READY` via `mirv_cmd addAtTick 64 "echo ..."` (existing idea; keep) |
-| cfg not found | `[InputService] exec: couldn't exec '{*}cfg/<name>.cfg', unable to read file` (**observed** for a missing cfg) -> fail fast "cfg did not install" |
-| Graceful end | `HostStateRequest::Start(HSR_QUIT)`, `Source2Shutdown`, `ShutdownSource2Logging` |
-
-- Failure of `playdemo` itself (missing/corrupt demo) has no sample in the local log; detect as "no `Host activate: Playing Demo` within the load timeout", report the last 20 log lines. [MEDIUM]
-
-### Our own markers (change in `crates/renderer` cfg generation)
-
-Make them anchored, nonce-stamped and unique per event:
-
-```
-echo CS2C <nonce> READY
-echo CS2C <nonce> TAKE_START <n>      (right after mirv_streams record start)
-echo CS2C <nonce> TAKE_END <n>        (right after mirv_streams record end; replaces CS2C_TAKE_DONE)
-echo CS2C <nonce> ALL_DONE
+```yaml
+# docker-compose.yml (sketch; paths/uids are the spike)
+services:
+  bot-api:
+    image: aiogram/telegram-bot-api:10.3
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: "1"
+    ports: ["127.0.0.1:8081:8081"]        # never publish to the internet: URL contains the bot token
+    volumes: ["botdata:/var/lib/telegram-bot-api"]
+  cs2-server:
+    image: cs2-server:local                # or a systemd service on the host with the same bind mount path
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      BOT_API_URL: http://bot-api:8081
+    volumes: ["botdata:/var/lib/telegram-bot-api", "serverdata:/data"]
+    ports: ["127.0.0.1:8080:8080"]         # fronted by tailscale serve / Caddy
+volumes: { botdata: {}, serverdata: {} }
 ```
 
-- Parse by stripping an optional `MM/DD HH:MM:SS ` prefix and requiring the **whole remaining line** to be `CS2C <nonce> <KIND> [n]`. That rejects the `mirv_cmd` trace line (`... -> echo CS2C ...`) and the netcon echo of our own command, without the current "contains echo / addAtTick" blacklist.
-- The nonce (random per launch) rejects stale lines left in an appended `console.log`.
-- No `:` and no quotes in markers (the renderer already documents that the console splits on `:` and `mirv_cmd` drops quotes).
-- Map shot n -> take dir by pairing `TAKE_START n` with the next `Recording to "<dir>"` line.
+**If the server must be Windows:** (a) run the same Compose file under Docker Desktop/WSL2 and run `cs2-server` in WSL2 too (path namespaces differ between Windows and WSL, so keep both processes on the Linux side); or (b) build `telegram-bot-api` from source with MSVC (README: needs OpenSSL, zlib, C++17 compiler, gperf, CMake 3.10+; supported compiler MSVC 19.1+; the tdlib build-instruction generator offers a Windows/PowerShell path). No official Windows binary exists. (b) is considerably more work for no benefit. Recommendation to the author: **put the server on Linux** (cheap VPS or home box). [HIGH that no official binary exists; MEDIUM on effort of (b)]
 
-### Version facts for compatibility preflight [HIGH - observed]
+---
 
-- `game/csgo/steam.inf`: `PatchVersion=1.41.9.0`, `ClientVersion=2000930`, `VersionDate=Oct 08 2026`.
-- `steamapps/appmanifest_730.acf`: `StateFlags 4` (fully installed and idle), `buildid 25815307`, `LastUpdated`.
-- HLAE on this machine: 2.192.7 / AfxHookSource2 0.41.7; its changelog's most recent `Adjusted to CS2 update` is `1.41.8.5` (0.41.5), i.e. older than the installed patch `1.41.9.0`. A static check can only **warn**; the authoritative test is dynamic (hook banner present, no `AFXERROR`/pattern error/`Error - AfxHookSource2` dialog during startup).
+## SQLite for the server
 
-## Windows process-control design (what the stack must provide)
+- `rusqlite` 0.32.1 `bundled`, same `Connection` setup as `store`: `PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;` plus `busy_timeout`.
+- Migrations: copy the `store` approach (a slice of SQL steps, step `k` raises `user_version` to `k+1` inside one transaction). Add a test that opens at every old version, like `store`'s `user_version` tests.
+- One writer: either `Arc<Mutex<Connection>>` (as `store`) or a dedicated DB thread owning the connection and receiving commands over `mpsc` (matches the "actor" idea in ARCHITECTURE.md). Both are sync; pick the actor if lease/state-machine transitions need to be atomic across bot and API threads.
+- Separate database file and schema from the desktop `cs2cinema.db`; reuse the *pattern*, not `crates/store` itself (it carries app-specific job/FACEIT tables).
+- Back up with `VACUUM INTO` or file copy while WAL is checkpointed; at this scale that is a cron line, not a library.
 
-```
-cs2cinema (worker thread, one recording at a time, File::try_lock guard)
-  GameSession::start()
-    CreateJobObjectW + SetInformationJobObject(KILL_ON_JOB_CLOSE) + completion port
-    Command(HLAE.exe ...).spawn()  ->  AssignProcessToJobObject(job, child handle)
-  threads -> one crossbeam Sender<Event>
-    [job-events]  GetQueuedCompletionStatus: NEW_PROCESS(pid) EXIT_PROCESS(pid)
-                  ABNORMAL_EXIT_PROCESS(pid) ACTIVE_PROCESS_ZERO
-    [netcon]      TcpStream lines (+ set_read_timeout, reconnect while no READY)
-    [console.log] offset-based tail (BOM strip, truncation handling)
-    [dialogs]     1 Hz EnumWindows over job PIDs: visible #32770 or any HLAE.exe window
-    [exit-watch]  per tracked PID: WaitForMultipleObjects([proc, stop_event])
-  orchestrator: loop { recv_timeout(min(100 ms, remaining)); check Progress::cancelled(); advance state machine }
-  stop(): TerminateJobObject -> wait ActiveProcesses == 0 (<= 10 s) -> verify no stray cs2.exe -> drop job (safety net)
-```
+---
 
-| Need | Primitive | Notes |
-|------|-----------|-------|
-| Own only our game | `AssignProcessToJobObject` on the `HLAE.exe` child immediately after `spawn()`. Race window (before HLAE spawns cs2) is hundreds of ms because HLAE is a .NET WinForms app; `process-wrap` closes it with `CREATE_SUSPENDED` + thread resume, which std cannot do. Cover the residual risk with a check: when cs2 appears, `IsProcessInJob(cs2, job)`; if false, assign it explicitly and log "adopted". | HIGH design / MEDIUM race analysis |
-| Liveness without polling | IOCP messages `JOB_OBJECT_MSG_NEW_PROCESS` / `EXIT_PROCESS` / `ABNORMAL_EXIT_PROCESS` / `ACTIVE_PROCESS_ZERO` (PID is delivered in the overlapped pointer). `ABNORMAL_EXIT_PROCESS` = process died with an exception code = **crash**, distinct from a clean `quit`. Microsoft notes delivery is not strictly guaranteed, so also re-check `JobObjectBasicAccountingInformation.ActiveProcesses` on timeouts. | HIGH |
-| Which PID is cs2 / ffmpeg | `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)` + `QueryFullProcessImageNameW`, compare to the expected `cs2.exe` path; `ffmpeg.exe` = anything else in the job. Keep the cs2 handle: gives exit code via `GetExitCodeProcess` *after* a signalled wait (never compare against 259 for liveness). | HIGH |
-| Cancel | `TerminateJobObject` (kills game, HLAE, take ffmpeg in one call); `KILL_ON_JOB_CLOSE` covers cs2cinema crash or task-manager kill. Then mark current take dir `incomplete` in the manifest. | HIGH |
-| Already-running check (preflight) | `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` + `Process32FirstW/NextW` for `cs2.exe` / `steam.exe` (30 lines). Report PID, image path, start time. | HIGH |
-| Error dialogs | `EnumWindows` -> `GetWindowThreadProcessId` -> `IsWindowVisible` -> `GetClassNameW == "#32770"` (standard MessageBox class) or any visible window of `HLAE.exe` (it has no window of its own with `-noGui`); read text via `GetWindowTextW` on the title and `EnumChildWindows` static controls. | HIGH logic from source / MEDIUM implementation |
-| Free disk space | `GetDiskFreeSpaceExW` on the output drive and on the CS2/game drive. | HIGH |
-| HLAE version | `GetFileVersionInfoW` + `VerQueryValueW` on `HLAE.exe` (CSDM reads the same `VS_FIXEDFILEINFO`); first 3 components map to GitHub tags (`2.192.7`). | MEDIUM |
+## Workspace integration (which crate may depend on what)
 
-Isolate all of this in one module/crate with `#![cfg(windows)]` and a portable `trait GameHost` + `FakeHost` for Linux CI and for the `pipeline` scenarios the milestone asks for. The workspace currently has no `unsafe` outside `crates/demo/build.rs`, so keep it to one small, heavily commented file.
+| Crate (new/changed) | Allowed new dependencies | Must NOT depend on |
+|---------------------|--------------------------|--------------------|
+| `wire` (new) | `serde`, `serde_json` only | anything with I/O, `pipeline`, `host`, any HTTP crate |
+| `server` (new, lib + bin `cs2-server`) | `wire`, `frankenstein` (`client-ureq`), `tiny_http`, `ureq`, `rusqlite` 0.32 (bundled), `sha2`, `getrandom`, `ctrlc`, `serde*`, `chrono` | `pipeline`, `host`, `demo`, `positions`, `geometry`, `app`, `store` — keeps the Linux build small and free of Windows-only code and `source2-demo` |
+| `runner` (new) | `wire`, `ureq`, `sha2`, `serde*` | `frankenstein`, `tiny_http`, `rusqlite`; stays sync, driven from a `std::thread` (app queue thread or CLI loop) |
+| `app`, `cli` | `runner`, `wire` | any server-side crate |
+| `pipeline`, `host`, `store`, ... | unchanged | `wire`/`server`/`runner` (the DAG stays one-directional; the runner adapts `pipeline::Progress` into `wire` events at the edge) |
 
-## Timeout and stall budget (starting values - tune during the 5-match acceptance run) [MEDIUM]
+Version-pinning rules: use the workspace's `ureq` 3 (`json`, `platform-verifier`), `rusqlite` 0.32, `sha2` 0.10; add `frankenstein`'s `ureq` requirement is `3.0.0` with `rustls` so Cargo unifies on the single 3.4.2 already in `Cargo.lock` (confirmed: probe resolves one `ureq` v3.4.2). The new server crate adds `rand 0.8` (via `multipart`) and `bon`/`serde_with`/`mime_guess` (via `frankenstein`) to the lockfile; they never reach `app`/`cli`.
 
-| Phase | Start condition -> end evidence | Budget | On expiry |
-|-------|----------------------------------|--------|-----------|
-| HLAE launcher | spawn -> HLAE.exe exit code 0 | 30 s | If alive with a visible window: report dialog text. Exit 1 = loader error. |
-| Game process | HLAE spawn -> `cs2.exe` in job | 20 s after HLAE exit | "game did not start" (+ HLAE exit code) |
-| Engine/hook | cs2 up -> `Source2Init OK` and hook banner | 90 s | "hook not loaded / HLAE incompatible with this CS2 build" |
-| Console channel | cs2 up -> netcon connected (or marker read from `console.log`) | 60 s | degrade to `console.log` only, then fail if no command channel at all |
-| Demo load | `exec`ed `+playdemo` -> `Host activate: Playing Demo` and `CS2C READY` | `max(load_wait, 150 s)` (existing `LOAD_CAP`) | "demo did not load" + last 20 console lines |
-| cfg start | `exec highlights` -> `TAKE_START 0` | 30 s, 3 retries (existing `EXEC_RETRY`) | "cfg did not execute" (also on `couldn't exec`) |
-| Each take | `TAKE_START n` -> `TAKE_END n` | `max(60 s, expected_secs * k)` where k comes from measured render speed; plus a **stall watchdog**: no marker and no growth of `take/video.mp4` for 45 s | "take n stalled/timeout" with elapsed vs expected |
-| Take finalise | `TAKE_END n` -> ffmpeg child exit (job) -> exclusive-open OK -> `ffprobe` OK | 60 s | "take n incomplete" |
-| Shutdown | `quit` -> `ACTIVE_PROCESS_ZERO` | 20 s | `TerminateJobObject` |
+CI: add a job that builds `cs2-server` on Linux (the real target) and runs `cargo tree -p cli -i tokio` / `-i reqwest` (must be empty). The existing `crates/cli/tests/pipeline.rs` contract is untouched because no existing crate gains a dependency.
 
-Stall detection must be liveness-based (progress signals), never a wall-clock guess for the whole recording; take length depends on GPU speed.
-
-## Preflight checklist -> API mapping
-
-| Check | How | Fails with |
-|-------|-----|-----------|
-| Steam running | ToolHelp scan for `steam.exe` (CSDM `assertSteamIsRunning` does the same) | "Запустите Steam" |
-| No `cs2.exe` already running | ToolHelp scan (we never kill an unowned process) | PID + path + "закройте игру" |
-| HLAE paths | `HLAE.exe`, `x64\AfxHookSource2.dll`, `ffmpeg\ffmpeg.ini` -> `Path=` exists | which file is missing |
-| HLAE's ffmpeg runs | spawn `<ini Path> -version` via `shared_child` with 5 s timeout; NVENC probe as today | the **observed** `CreateProcessW` class of failure caught before launching CS2 |
-| CS2 installed and idle | `steamlocate` -> `state_flags`; `steam.inf` readable; `cs2.exe` exists | "CS2 обновляется" |
-| HLAE vs CS2 compatibility (soft) | `PatchVersion` (steam.inf) vs last `Adjusted to CS2 update (x)` in `AfxHookSource2_changelog.xml`; optional online check of GitHub releases via existing `ureq` (60 unauthenticated req/h) | warning, never blocks |
-| `ffmpeg`/`ffprobe` | `which` -> absolute path, `-version` parse >= 7 | version/path shown |
-| Disk | `GetDiskFreeSpaceExW`: output drive >= estimate (takes) + headroom; game drive >= small margin | numbers in message |
-| Out dir has no spaces | existing `console_safe` check | existing message |
-| Single recorder | `File::try_lock` on `%LOCALAPPDATA%\cs2cinema\record.lock` | "запись уже идёт (другой экземпляр)" |
-
-## Alternatives Considered
-
-| Recommended | Alternative | When to Use Alternative |
-|-------------|-------------|-------------------------|
-| Own Job Object via `windows-sys` | `process-wrap` 10.0.1 (`JobObject` wrapper, successor of `command-group`; uses `windows` 0.62.2) | If you only need "kill the tree on drop" and a blocking `wait()`. Its `JobObjectChild` hides the job handle, `wait()` cannot take a timeout, `try_wait` reports only the HLAE.exe launcher (not job emptiness), and `wait`/`kill` need `&mut self` - so no PID list, no ffmpeg-child awareness, no cancel from another thread. Its `CREATE_SUSPENDED` + resume trick is worth copying. |
-| `crossbeam-channel` bus + slices of `Progress::cancelled()` | Add a cancel `Receiver` to `Progress` and `select!` on it | If sub-100 ms cancel ever matters. Costs a trait change touching CLI and tests. |
-| `windows-sys` 0.61.2 | `windows` 0.62.2 | If you prefer RAII `Owned<HANDLE>` and `Result`s; heavier compile, and mixing with `windows-core` 0.100 is a trap right now. |
-| ToolHelp scan in `windows-sys` | `sysinfo` 0.39.6 | If you want cross-platform process enumeration (not needed - Windows only) or CPU/mem stats. It is large, cannot wait on handles, and its process list is a snapshot - the opposite of event-driven. |
-| `shared_child` | `wait-timeout` 0.2.1 (last release Feb 2025), plain `try_wait` loop | `wait-timeout` is fine for a single-threaded "run and timeout"; it lacks cross-thread `kill`. |
-| `steamlocate` | Current hand-rolled `libraryfolders.vdf` scan; `winreg` 0.56 for `HKCU\Software\Valve\Steam` | Keep the scan as fallback when `find_app(730)` returns `None`. |
-| Console markers + job events | HLAE JS (`mirv.onRecordStart/End`) | Only if console parsing proves unreliable; ties us to HLAE's scripting API. |
-| `thiserror` typed errors | `anyhow` | `anyhow` loses the variant tests need to assert; use only at binary edges. |
-| Hand-written fakes + `fake-game` binary | `mockall` 0.15.0 | Large trait surface with many call-order expectations; not the case here. |
-
-## What NOT to Use
-
-| Avoid | Why | Use Instead |
-|-------|-----|-------------|
-| `taskkill /IM cs2.exe /F` | Kills any `cs2.exe`, including the user's own session or another tool's; PROJECT.md explicitly forbids it. Also leaves HLAE's ffmpeg child orphaned. | `TerminateJobObject` on the job we created |
-| `tasklist /FI "IMAGENAME eq cs2.exe"` polling (current `game_alive`) | Spawns a process per second, parses localized text, and on error returns `true` ("alive") so a failing poll means waiting forever. Also cannot say *which* cs2. | IOCP job events + `WaitForSingleObject` on the owned handle; an error is a failure, never "alive" |
-| Waiting on / killing the `Child` of `HLAE.exe` | HLAE.exe is a launcher that exits in seconds; `Child::kill` on it kills nothing useful. | Job Object |
-| Clip discovery by folder mtime + "quiet for N seconds" (current `wait_for_clips`) | Passes on a half-written file after any 20 s pause, never notices an `AFXERROR` storm, depends on clock/ordering. | `Recording to "<dir>"` + `TAKE_START/END` markers + ffmpeg-child exit + `ffprobe` |
-| Trusting HLAE's `Finishing recording ... done.` as "file complete" | Capture shutdown is queued on the render thread (verified in source). | ffmpeg-child exit (job) and `ffprobe` |
-| `contains("CS2C_...") && !contains("echo")` marker matching | Breaks as soon as a trace format changes; matches stale log lines. | Anchored, nonce-stamped parser |
-| Fixed `-netconport 29700` fallback | Can hit a dead socket from a previous game (the code already notes this). | Per-launch free port; fail if none |
-| `-netconport` without `-afxFixNetCon` | Valve bug #3603: Winsock not initialised in time on Windows. | Pass `-afxFixNetCon` |
-| Blocking `TcpStream` reads with no read timeout; unbounded `sleep(1s)` loops | Cancel latency and invisible hangs. | `set_read_timeout` + reader threads + `recv_timeout` slices |
-| Copying the demo into `game/csgo` and never deleting it | 1.9 GB leaked locally; fills a 22 GB-free C:. | Absolute `+playdemo` path (or delete after run) |
-| `Result<_, String>` for process errors | Cannot test "not started vs timeout vs cancel" structurally. | `thiserror` enum with `Stage` + cause, rendered to Russian at the UI edge |
-| `WMIC` for process queries | Deprecated and removed from current Windows 11 builds. | ToolHelp / Job APIs |
-| `command-group` 5.0.1 | Last release Nov 2023; superseded by `process-wrap`. | Own job module (or `process-wrap` if only kill-tree is needed) |
-| `duct` 1.1.2 | Shell-pipeline sugar; kills only the direct child and hides handles. | `shared_child` for one-shots |
-| `tokio` / `async-process` | Violates the project constraint (`std::thread`, no tokio) and buys nothing here. | Threads + crossbeam |
-| `fs2` 0.4.3 / `fs4` | Unneeded since std `File::try_lock` (1.89). | std |
-
-## Stack Patterns by Variant
-
-**If the job-inheritance spike fails (cs2.exe not in the job):**
-- Poll ToolHelp for `cs2.exe` whose image path equals the expected path and whose creation time is after launch, `OpenProcess`, `AssignProcessToJobObject` it (allowed unless it is already in a non-nestable job).
-- Because: Microsoft documents breakaway as the only way out of an inherited job; HLAE's flags say it should not happen, but a third-party launcher/AV can change it.
-
-**If `-afxFixNetCon` does not make netcon reliable:**
-- Make `console.log` (offset tail) the *only* evidence stream and use a boot cfg (`+exec cs2c_boot` containing `mirv_cmd addAtTick 64 "exec highlights"`) instead of netcon for sending the start command; keep netcon as optional. [LOW - needs its own spike]
-- Because: marker detection does not need netcon at all, only command injection does.
-
-**If `console.log` is buffered and markers lag by seconds:**
-- Keep netcon as the real-time marker source; use `console.log` for post-mortem and pre-netcon phases only. Because markers carry nonces, duplicates from two streams are idempotent.
-
-**If a take stalls but processes are alive:**
-- Watchdog on take-dir growth + marker age; on stall, `TerminateJobObject`, mark take `incomplete`, retry from record stage (manifest tells which takes already pass `ffprobe`, so only missing ones need re-recording if the cfg can be regenerated per subset - roadmap decision).
+---
 
 ## Installation
 
 ```toml
-# crates/<host crate or app>/Cargo.toml
+# crates/wire/Cargo.toml
 [dependencies]
-crossbeam-channel = "0.5.17"
-shared_child = "1.1.2"
-thiserror = "2.0"
-which = "8.0"
-steamlocate = "2.1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-tracing-appender = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-  "Win32_Foundation",
-  "Win32_Security",
-  "Win32_Storage_FileSystem",          # GetDiskFreeSpaceExW, GetFileVersionInfoW
-  "Win32_System_Diagnostics_ToolHelp", # process snapshot
-  "Win32_System_IO",                   # completion port
-  "Win32_System_JobObjects",
-  "Win32_System_Threading",            # OpenProcess, WaitFor*, QueryFullProcessImageNameW
-  "Win32_UI_WindowsAndMessaging",      # EnumWindows, GetWindowTextW, GetClassNameW
-] }
+# crates/server/Cargo.toml
+[dependencies]
+wire = { path = "../wire" }
+frankenstein = { version = "0.52", default-features = false, features = ["client-ureq"] }
+tiny_http = "0.12"
+ureq = { version = "3", features = ["json", "platform-verifier"] }   # same as faceit/app
+rusqlite = { version = "0.32", features = ["bundled"] }               # MUST match crates/store
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+getrandom = "0.4"
+ctrlc = { version = "3.5", features = ["termination"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-[dev-dependencies]
-tempfile = "3"
+# crates/runner/Cargo.toml
+[dependencies]
+wire = { path = "../wire" }
+ureq = { version = "3", features = ["json", "platform-verifier"] }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 ```
 
-No `cargo add` for tokio, sysinfo, process-wrap, duct, mockall.
+```bash
+# Server host (Linux): local Bot API
+docker compose up -d bot-api
+# one-time, only if the bot token was ever used with api.telegram.org (a fresh bot does not need it)
+# After logOut the bot can start on the local server at once, but cannot return to the cloud server for 10 minutes.
+curl https://api.telegram.org/bot<TOKEN>/logOut
+```
+
+Verified API sketch (compiled against frankenstein 0.52.1 / tiny_http 0.12.0 / ureq 3.4.2):
+
+```rust
+let agent = ureq::Agent::new_with_config(
+    ureq::config::Config::builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(1800)))
+        .build(),
+);
+let heavy = Bot::builder().api_url("http://127.0.0.1:8081/bot<TOKEN>").request_agent(agent).build();
+let p = GetUpdatesParams::builder().timeout(30u32).allowed_updates(vec![AllowedUpdate::Message]).build();
+let sent = SendDocumentParams::builder().chat_id(chat).document(FileUpload::String("file:///data/outbox/42/highlights.mp4".into())).build();
+let server = tiny_http::Server::http("127.0.0.1:8080")?;   // share via Arc, N worker threads call recv()
+```
+
+---
+
+## Alternatives Considered
+
+| Recommended | Alternative | When to use the alternative |
+|-------------|-------------|-----------------------------|
+| `frankenstein` `client-ureq` | `teloxide` 0.17.0 (2025-07-11) | A conversational bot with dialogue state machines and many commands. It needs tokio + reqwest, costs +115 crates in our probe (vs +34), and our bot has about five commands (`/start`, `/player`, `/status`, `/cancel`, document upload). Overkill. |
+| `frankenstein` `client-ureq` | Hand-rolled Bot API over `ureq` + `serde_json` | Only if `frankenstein` is abandoned. It is the thin typed layer we would write anyway (Update/Message/Document/File/SendDocument types, multipart); maintenance is active and tracks Bot API releases within weeks. Keep our own `trait` seam (`Telegram` with 4-5 methods) so swapping later is cheap. |
+| `tiny_http` (sync) | `axum` 0.8.9 + `tokio` 1.53.2 + `tower-http` 0.7.1 | The escape-hatch triggers above (multi-runner, push channel, real `tiny_http` defect). Best-in-class HTTP, built-in Range via `tower-http::ServeFile`, timeouts/limits layers. Confined to `crates/server`. |
+| `tiny_http` | `rouille` 3.6.2 (2023-04) | Adds routing/input helpers on top of `tiny_http`, but is itself stagnant and routing for ~8 endpoints is a `match` on `(method, path)`. |
+| `tiny_http` | `hyper` 1.12 / `reqwest` 0.13 | Async-only; same tokio cost as axum with less convenience. |
+| Long-poll | WebSocket (`tungstenite` 0.30 / `tokio-tungstenite` 0.30), SSE | Add only if sub-second cancel or live progress streaming becomes a requirement; table above. |
+| Own chunk protocol | tus protocol / `rustus` | Several clients, browser uploads. For one runner a 100-line `HEAD`+`PUT offset` is simpler than a spec implementation. |
+| SHA-256 (`sha2`) | `blake3` 1.8.7 | Only if hashing multi-GB files becomes a measurable bottleneck. |
+| Tailscale Serve | Caddy auto-HTTPS | Server has a public IP and a domain, and you do not want the runner PC on a tailnet. |
+| Linux + Docker for `telegram-bot-api` | Build from source on Windows | Only if the server must be a native Windows process. |
+
+## What NOT to Use
+
+| Avoid | Why | Use instead |
+|-------|-----|-------------|
+| `tokio`, `reqwest`, `hyper`, `async-std` anywhere outside a (future, optional) server crate | Violates the stack constraint; second HTTP/TLS stack; `+57` crates over the sync option (measured) | `ureq` + `std::thread` |
+| `teloxide` | Needs tokio/reqwest; +115 crates; dialogue framework we do not use | `frankenstein` |
+| `frankenstein` `client-reqwest` | Pulls tokio + reqwest 0.13 + hyper | `client-ureq` |
+| Cloud `api.telegram.org` for file transfer | 20 MB download / 50 MB upload limits (verified in Bot API docs) | Local `telegram-bot-api --local` |
+| `rusqlite` >= 0.33 in the server crate | `libsqlite3-sys` `links = "sqlite3"` conflict with `store` (reproduced) | `rusqlite` 0.32 until a workspace-wide upgrade |
+| `sha2` 0.11 / `rand` 0.10 / `getrandom` older duplicates | Version splits inside the workspace for no gain | `sha2` 0.10, `getrandom` 0.4 |
+| `tiny_http` `ssl-rustls` / `ssl-openssl` features | Old TLS stack inside our process, cert renewal becomes our job | Tailscale Serve or Caddy in front |
+| One giant streaming request per file | `ureq` has no stall timeout; a dead upload pins a `tiny_http` thread; breaks behind 100 MB-body proxies; no resume | 8 MiB `Range`/`Upload-Offset` chunks |
+| Downloading Telegram files over HTTP from the local Bot API | There is no HTTP file route in the open-source server | Read the absolute `file_path` from the shared volume |
+| Publishing port 8081 or 8080 on a public interface | 8081 URL contains the bot token in clear; 8080 is plain HTTP | Bind `127.0.0.1`, front 8080 with TLS terminator |
+| `unwrap()` on `Bot`/`ureq` errors that may contain URLs in logs | Leaks the bot token (URL path) | `redact()` all external error text before logging or replying |
+| Storing runner tokens in plaintext on the server | A DB leak equals runner takeover | Store `sha256(token)` only |
+| A logging/CLI/config framework (`tracing`, `clap`, `toml`) | Not used anywhere in the workspace; weight without need | `eprintln!`-style helper, hand-written flags, env + JSON |
+
+## Stack Patterns by Variant
+
+**If the server host is Linux (recommended):**
+- Compose: `bot-api` + `cs2-server`, shared `botdata` volume mounted at the same path in both, `tailscale serve --bg 8080` on the host.
+- Because the `file_path` the Bot API returns is valid verbatim inside `cs2-server`, no path translation layer is needed.
+
+**If the server host is Windows:**
+- Run both under WSL2/Docker; do not mix a native Windows `cs2-server` with a containerized Bot API (paths like `/var/lib/telegram-bot-api/...` do not exist on Windows). Native Windows is possible only with a self-built `telegram-bot-api.exe`.
+
+**If the server has a public IP + domain and no tailnet:**
+- Caddy: `example.org { reverse_proxy 127.0.0.1:8080 }`; same token auth; consider Caddy `request_body { max_size 16MB }` as a free body-size cap.
+
+**If a second runner or push-cancel is ever required:**
+- Move `crates/server` to axum + tokio (confined), keep `wire`, `runner` and the long-poll endpoints unchanged; add WebSocket as an optional upgrade, not a replacement.
 
 ## Version Compatibility
 
-| Package | Compatible With | Notes |
-|---------|-----------------|-------|
-| `windows-sys` 0.61.2 | `shared_child` 1.1.2 (`^0.61`), eframe stack (already resolves 0.52/0.59/0.61 side by side) | Do not add `windows` 0.62.x unless something forces it; `process-wrap` 10.0.1 would. |
-| `crossbeam-channel` 0.5.17 | std threads, Rust 1.99 | Already locked. |
-| `thiserror` 2.0.21 | existing 1.0.69 pulled by other crates | Both coexist in the lock; ours is 2.x. |
-| `rusqlite` 0.32.1 (existing; latest 0.40.2) | `store` crate | No need to upgrade for this milestone. Add retry/stage columns with `PRAGMA user_version` migrations. |
-| `File::try_lock` | Rust >= 1.89 | Toolchain is 1.99, edition 2024. |
-| HLAE 2.192.7 / AfxHookSource2 0.41.7 | CS2 patch 1.41.9.0 (installed) | Hook is newer than the last `Adjusted to CS2 update` entry (1.41.8.5) - treat as unverified until the dynamic startup check passes. HLAE ships updates within days of CS2 patches (0.41.3-0.41.7 in 15 days), so compatibility drift is a recurring, not one-off, failure source. |
-| ffmpeg | ffmpeg 7+ on PATH (assembly); HLAE's own ffmpeg via `ffmpeg.ini` (HLAE installer now ships 9.0.2-17) | Two different ffmpegs; preflight both. |
+| Package A | Compatible with | Notes |
+|-----------|-----------------|-------|
+| `frankenstein` 0.52.1 (`client-ureq`) | `ureq` 3.x | Its own dep is `ureq = "3.0.0"` (`rustls`); unifies with workspace `ureq` 3.4.2 `platform-verifier` (one copy in the tree, verified via `cargo tree`). |
+| `frankenstein` 0.52.1 | Bot API 10.3 / `aiogram/telegram-bot-api:10.3` | README states "up-to-date with version 10.3"; Telegram changelog lists 10.3 (2026-08-24) as latest. Pin the Docker tag to `10.3` rather than `latest`. |
+| `rusqlite` 0.32.1 | `libsqlite3-sys` 0.30.x | Only one `sqlite3`-linking package may exist in the graph; bump `store` and `server` together in a dedicated task if ever needed. |
+| `getrandom` 0.4.3 | Rust >= 1.85 | Toolchain is 1.99 / edition 2024. |
+| `tiny_http` 0.12.0 | std threads, no runtime | MSRV ~1.57. |
+| `ctrlc` 3.5.2 (`termination`) | Linux SIGTERM, Windows | Required for clean `docker stop`. |
+| `axum` 0.8.9 / `tokio` 1.53.2 / `tower-http` 0.7.1 / `tungstenite` 0.30.0 | — | Only for the escape hatch; not part of the baseline. |
 
-## Open spikes (resolve in the first phase before relying on them)
+## Open spikes (each one task, before or at the start of the phase that needs it)
 
-1. **Job inheritance**: launch HLAE.exe in a job, confirm `cs2.exe` and HLAE's `ffmpeg.exe` appear in `JobObjectBasicProcessIdList` and IOCP `NEW_PROCESS` events fire; confirm `TerminateJobObject` kills all three. [expected yes; HIGH by source]
-2. **`-afxFixNetCon`**: run 20 launches with and without it, count netcon-open successes and time-to-open.
-3. **`console.log` behavior**: write latency/flush behavior under load, share mode while open (can a second process read it), what `-conclearlog` really does.
-4. **Absolute `+playdemo` through HLAE `-cmdLine`**: paths with spaces/Cyrillic, quoting via `Command::arg`.
-5. **Render speed**: measure real-time ratio on the author's GPU at the planned fps to set take timeout factor `k`.
-6. **Dialog sniffer**: trigger `Error - AfxHookSource2` (launch without `-insecure` in a throwaway test) and confirm the window is visible, class `#32770`, text readable.
-7. **HLAE ffmpeg failure fast-fail**: reproduce the observed `CreateProcessW` AFXERROR (bad `ffmpeg.ini`) and confirm first-line detection beats the stall watchdog.
+1. **Bot API shared volume permissions** [MEDIUM]: files created by the `telegram-bot-api` user must be readable (and movable) by `cs2-server`, and `cs2-server` must be able to place `outbox/` files that Bot API can read for `file://` uploads. Check uid/gid, `chmod`, and `rename` across the same volume.
+2. **Large `getFile`/`send*` timeouts** [MEDIUM]: measure a 500 MB-1.5 GB demo through the local server; confirm `getFile` blocks until the file is on disk and that a 30-minute agent timeout is sufficient; confirm what Telegram clients show for a 400 MB MP4 sent via `sendVideo` vs `sendDocument`.
+3. **`tiny_http` under load shape** [MEDIUM]: 8 MiB `PUT` chunks, `Expect: 100-continue` from `ureq`, keep-alive reuse, 25 s long-poll on a worker, dropped-connection behaviour (does the worker get an `Err` promptly behind Tailscale/Caddy?). If it misbehaves, trigger the axum escape hatch before building more on top.
+4. **Chunk size and timeouts** [MEDIUM]: 4/8/16/32 MiB over the real Windows-runner-to-server link (including DERP-relayed Tailscale); set `timeout_global` per chunk accordingly.
+5. **Tailscale Serve on the server + unattended mode on the Windows runner** [MEDIUM]: confirm the runner reaches `https://<host>.<tailnet>.ts.net` through `ureq` `platform-verifier` after a reboot, with no user logged in.
+6. **Token redaction** [HIGH priority, small]: unit test that an error from `ureq`/`frankenstein` for a URL containing `bot<TOKEN>` never reaches the log, the DB or a chat message unredacted.
 
 ## Sources
 
-- HLAE source, advancedfx `main` (read directly): `hlae/Program.cs`, `hlae/Loader.cs`, `hlae/LaunchCs2.cs`, `AfxHookSource2/main.cpp` (`-insecure`, `-afxFixNetCon`, `-afxDisableSteamStorage`, `HostStateRequest::Start` hook), `AfxHookSource2/Globals.cpp` (`ErrorBox` title), `AfxHookSource2/RenderSystemDX11Hooks.cpp` (`CAfxStreams::RecordStart/RecordEnd`, `EndCapture`), `shared/AfxOutStreams.cpp` (HLAE ffmpeg spawn/close), `shared/FileTools.cpp` (`SuggestTakePath`) - https://github.com/advancedfx/advancedfx - HIGH
-- HLAE releases API (v2.192.7 published 2026-10-08, AfxHookSource2 0.25.0 release note for `-afxFixNetCon`) - https://api.github.com/repos/advancedfx/advancedfx/releases - HIGH
-- Valve issue on `-netconport` / `WSANOTINITIALISED` - https://github.com/ValveSoftware/csgo-osx-linux/issues/3603 - HIGH on the diagnosis, issue still open
-- CS Demo Manager source (prior art for HLAE launch flags `-noGui -autoStart -noConfig -afxDisableSteamStorage`, `Error - AfxHookSource` window detection, HLAE exit-code handling, Steam-running assertion, exe version parsing) - https://github.com/akiver/cs-demo-manager (`src/node/counter-strike/launcher/*`, `src/node/os/*`) - HIGH
-- Local evidence on the author's machine (2026-10-09/10): `...\game\csgo\console.log` (banner, `Recording to`, `AFXERROR` storm, demo load and quit markers, absolute-path `playdemo`, `couldn't exec` line), `steam.inf`, `appmanifest_730.acf`, `C:\Program Files (x86)\HLAE\AfxHookSource2_changelog.xml`, `ffmpeg\ffmpeg.ini`, leaked `cs2cinema_*.dem` copies - HIGH
-- Microsoft Learn, Job Objects (child inheritance, `BREAKAWAY` flags, nested jobs on Windows 8+, `KILL_ON_JOB_CLOSE`, completion-port notifications) - https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects - HIGH
-- docs.rs `windows-sys` 0.61.2 (existence of every function listed under Installation features) - https://docs.rs/windows-sys/0.61.2/ - HIGH
-- crates.io API (versions and dates as of 2026-10-10): windows 0.62.2, windows-sys 0.61.2, windows-core/link 0.100.0, crossbeam-channel 0.5.17, shared_child 1.1.2, process-wrap 10.0.1, command-group 5.0.1, sysinfo 0.39.6, duct 1.1.2, wait-timeout 0.2.1, thiserror 2.0.21, tracing 0.1.44, tracing-subscriber 0.3.23, tracing-appender 0.2.5, which 8.0.6, steamlocate 2.1.1, mockall 0.15.0, tempfile 3.27.0 - https://crates.io - HIGH
-- docs.rs `shared_child` 1.1.2 (`wait_timeout`, `wait_deadline`, cross-thread `kill`) and `process-wrap` 10.0.1 + its `src/std/job_object.rs` (behavior of `JobObjectChild`) - https://docs.rs/shared_child , https://github.com/watchexec/process-wrap - HIGH
-- docs.rs `steamlocate` 2.1.1 (`SteamDir::locate`, `find_app`, `App` fields) - MEDIUM
-- Rust std docs, `File::try_lock` stable since 1.89.0 - https://doc.rust-lang.org/std/fs/struct.File.html - HIGH
-- Community READMEs for `-condebug`/`-conclearlog` (handle1337/chat-strike, MeckeDev/cs2-chat-translator via web search) - MEDIUM for `-condebug` (also observed locally), LOW for `-conclearlog`
-- Valve Developer Community pages returned HTTP 403, so no official launch-option reference was available; launch-option claims rest on HLAE source, CSDM, and the local console log.
+- crates.io API (queried 2026-10-11): `frankenstein` 0.52.1 (published 2026-09-25; features `client-ureq`/`client-reqwest`), `tiny_http` 0.12.0 (2022-10-06), `rouille` 3.6.2 (2023-04-24), `axum` 0.8.9 (2026-04-14), `tokio` 1.53.2, `teloxide` 0.17.0 (2025-07-11), `tungstenite` 0.30.0, `ureq` 3.4.2, `rusqlite` 0.40.2 (latest; workspace uses 0.32.1), `sha2` 0.11.0 (latest; workspace 0.10), `getrandom` 0.4.3, `ctrlc` 3.5.2, `tower-http` 0.7.1, `blake3` 1.8.7 — HIGH.
+- `frankenstein` repo `Cargo.toml`, `README.md`, `src/client_ureq.rs` (raw GitHub, master) — blocking client, `Bot::builder().api_url().request_agent()`, default 500 s agent timeout, multipart streaming via `multipart` 0.18 — HIGH.
+- Local compile-check and `cargo tree` probes (scratch crates; frankenstein+tiny_http+rusqlite 0.32+ctrlc resolves and `cargo check` passes on Rust 1.99; dependency counts 34 / 91 / 115; `rusqlite 0.32 + 0.40` fails on `links = "sqlite3"`) — HIGH.
+- docs.rs `ureq` 3.4.2 (`ConfigBuilder` defaults: no timeouts; `AsSendBody` impls), `tiny_http` 0.12.0 (`Server`, `Request`), `getrandom` 0.4.3 (`fill`) — HIGH.
+- Telegram Bot API docs, https://core.telegram.org/bots/api — "Using a Local Bot API Server", `getFile` (20 MB), multipart upload limits (10 MB photos / 50 MB other), `logOut` (10-minute rule), `getUpdates` timeout; changelog https://core.telegram.org/bots/api-changelog (Bot API 10.3, 2026-08-24) — HIGH.
+- https://github.com/tdlib/telegram-bot-api README and `telegram-bot-api/Client.cpp` (`--local`, `file://` input in `get_input_file`, absolute `file_path` in `json_store_file`; no HTTP file route found by grep) — HIGH; GitHub releases/tags API returned empty (no official binaries) — HIGH.
+- Docker Hub `aiogram/telegram-bot-api` (tags `latest`/`10.3`, multi-arch, `TELEGRAM_LOCAL`, `TELEGRAM_API_ID/HASH`, data dir `/var/lib/telegram-bot-api`) — HIGH for tags, MEDIUM for env semantics (README via search summary).
+- RustSec advisory-db: RUSTSEC-2020-0031 (`tiny_http` request smuggling, patched >= 0.8.0), RUSTSEC-2023-0050 (`multipart` unmaintained) — HIGH.
+- Cloudflare docs (Workers/limits, connection limits, error 524): 100 MB request body on Free/Pro, 125 s proxy read timeout — MEDIUM (secondary search summary).
+- Tailscale docs (Serve HTTPS certs, unattended mode on Windows, DERP fallback) — MEDIUM (search summary, not hands-on).
+- Workspace files read: `.planning/PROJECT.md`, `.planning/codebase/STACK.md`, `ARCHITECTURE.md`, `Cargo.toml`/`Cargo.lock`, `crates/store` (migrations, WAL), `crates/faceit` (`download` streaming pattern), `crates/pipeline/src/record/failure.rs` (`FailCode::as_str`, `RecordFailure.hint`), sibling `.planning/research/ARCHITECTURE.md` (decisions D1, D3, D7 are consistent with this document).
 
 ---
-*Stack research for: reliable CS2 recording via HLAE from a Rust/Windows desktop app*
-*Researched: 2026-10-10*
+*Stack research for: Telegram bot + job server + outbound-only remote runner (v1.1)*
+*Researched: 2026-10-11*

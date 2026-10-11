@@ -222,3 +222,103 @@ fn pending_release_is_repeated_after_restart() {
     assert_eq!(exec.calls.load(Ordering::SeqCst), 0);
     assert!(runner_state(&stand).job.is_none());
 }
+
+/// Что раннер последним сообщил серверу в `hello.status`.
+fn runner_status(stand: &Stand) -> String {
+    stand
+        .core()
+        .db()
+        .read(|c| {
+            c.query_row(
+                "SELECT status FROM runners WHERE name = 'tester'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+}
+
+#[test]
+fn two_identical_environment_failures_pause_the_runner_until_resume() {
+    let stand = Stand::start();
+    let first = stand.submit(&fake_demo(MIB), "s1mple");
+    let second = stand.submit(&fake_demo(MIB), "s1mple");
+    let (mut runner, exec) = start(&stand, vec![env_failure()]);
+
+    assert_eq!(runner.tick().unwrap(), Tick::Released { job_id: first });
+    let paused = runner.tick().unwrap();
+    let Tick::Paused(reason) = paused else {
+        panic!("ожидалась пауза, пришло {paused:?}");
+    };
+    assert_eq!(reason.code, "FOREIGN_GAME_RUNNING");
+    assert_eq!(reason.jobs, 2);
+    assert!(
+        reason
+            .to_string()
+            .starts_with("раннер на паузе: 2 сбоя подряд «окружение»"),
+        "{reason}"
+    );
+    assert_eq!(stand.job(first).grants, 2);
+
+    // На паузе задач не берут: `claim` не вызывается, вторая задача стоит нетронутой.
+    for _ in 0..2 {
+        assert!(matches!(runner.tick().unwrap(), Tick::Paused(_)));
+    }
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(stand.job(second).state, JobState::Queued);
+    assert_eq!(stand.job(second).grants, 0);
+    assert_eq!(stand.job(first).grants, 2);
+    // Причина паузы видна серверу, раннер ничего не держит.
+    assert_eq!(runner_status(&stand), "пауза: FOREIGN_GAME_RUNNING");
+    let log = std::fs::read_to_string(stand.runner_dir().join("runner.log")).unwrap();
+    assert!(log.contains("раннер на паузе"), "{log}");
+
+    // Продолжение снимает паузу: следующий tick снова берёт задачу.
+    runner.control().resume();
+    assert!(matches!(
+        runner.tick().unwrap(),
+        Tick::Released { job_id } if job_id == first
+    ));
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(stand.job(first).grants, 3);
+    // Серия после паузы началась заново: одна неисправность паузы не даёт.
+    assert_eq!(stand.job(second).grants, 0);
+}
+
+#[test]
+fn environment_release_counts_every_grant_until_too_many_grants() {
+    let stand = Stand::start();
+    let id = stand.submit(&fake_demo(MIB), "s1mple");
+    let (mut runner, exec) = start(&stand, vec![env_failure()]);
+
+    let mut ticks = 0;
+    while stand.job(id).state != JobState::Failed {
+        ticks += 1;
+        assert!(ticks < 20, "задача так и не закрылась: {:?}", stand.job(id));
+        if matches!(runner.tick().unwrap(), Tick::Paused(_)) {
+            runner.control().resume();
+        }
+    }
+
+    let job = stand.job(id);
+    assert_eq!(job.fail_code.as_deref(), Some("TOO_MANY_GRANTS"));
+    assert_eq!(job.grants, 3);
+    assert_eq!(
+        exec.calls.load(Ordering::SeqCst),
+        3,
+        "исполнитель вызван ровно по числу выдач"
+    );
+}
+
+#[test]
+fn fail_codes_of_pipeline_are_known_to_the_protocol() {
+    for code in FailCode::ALL {
+        assert!(
+            wire::fail::KNOWN.contains(&code.as_str()),
+            "код {} есть в пайплайне, но не в wire::fail::KNOWN",
+            code.as_str()
+        );
+    }
+    assert!(wire::fail::KNOWN.contains(&wire::fail::JOB_ERROR));
+}

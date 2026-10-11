@@ -264,24 +264,24 @@ impl Runner {
             self.pause_hello = None;
             self.log.line("пауза снята: раннер снова берёт задачи");
         }
-        if self.state.job.is_some() {
-            let tick = self.drive()?;
-            // Вторая неисправность подряд: задача уже возвращена, раннер встаёт на паузу.
-            return Ok(match (tick, &self.paused) {
-                (Tick::Released { .. }, Some(reason)) => Tick::Paused(reason.clone()),
-                (tick, _) => tick,
-            });
-        }
-        if let Some(reason) = self.paused.clone() {
+        let tick = if self.state.job.is_some() {
+            self.drive()?
+        } else if let Some(reason) = self.paused.clone() {
             self.pause_ping(&reason)?;
             return Ok(Tick::Paused(reason));
-        }
-        self.wait_cooldown();
-        let poll = self.cfg.poll_secs.or(self.poll_secs).unwrap_or(0);
-        match self.link.claim(poll).map_err(link_error)? {
-            None => Ok(Tick::Idle),
-            Some(a) => self.accept(a),
-        }
+        } else {
+            self.wait_cooldown();
+            let poll = self.cfg.poll_secs.or(self.poll_secs).unwrap_or(0);
+            match self.link.claim(poll).map_err(link_error)? {
+                None => Tick::Idle,
+                Some(a) => self.accept(a)?,
+            }
+        };
+        // Вторая неисправность подряд: задача уже возвращена, раннер встаёт на паузу.
+        Ok(match (tick, &self.paused) {
+            (Tick::Released { .. }, Some(reason)) => Tick::Paused(reason.clone()),
+            (tick, _) => tick,
+        })
     }
 
     /// Ждёт `release_cooldown` после `release`, проверяя флаг остановки.

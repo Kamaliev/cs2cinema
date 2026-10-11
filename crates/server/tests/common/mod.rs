@@ -5,12 +5,13 @@ use server::clock::{Clock, ManualClock, SystemClock};
 use server::config::Config;
 use server::core::{JobRow, Submit};
 use server::log::MemorySink;
+use server::secret::Secret;
 use server::{Running, auth};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use wire::{Assignment, HelloRequest, ProgressRequest, ReleaseRequest};
+use wire::{Assignment, FinishRequest, HelloRequest, ProgressRequest, ReleaseRequest};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -40,6 +41,8 @@ pub struct TestOptions {
     pub threads: usize,
     pub longpoll_secs: u64,
     pub clock: Option<ManualClock>,
+    /// Токен бота Telegram в настройках стенда (для проверок SEC-04).
+    pub bot_token: Option<String>,
 }
 
 impl Default for TestOptions {
@@ -48,6 +51,7 @@ impl Default for TestOptions {
             threads: 4,
             longpoll_secs: 2,
             clock: None,
+            bot_token: None,
         }
     }
 }
@@ -89,6 +93,7 @@ impl TestServer {
             data_dir: dir.path.join("data"),
             threads: opts.threads,
             longpoll_secs: opts.longpoll_secs,
+            telegram_bot_token: opts.bot_token.map(Secret::new),
             ..Default::default()
         };
         let manual = opts.clock.clone();
@@ -190,6 +195,35 @@ impl TestServer {
             Some(&serde_json::to_string(req).unwrap()),
         );
         (r.status, r.body)
+    }
+
+    /// `POST /v1/jobs/{id}/finish`: статус и тело ответа.
+    pub fn finish(&self, token: &str, job_id: i64, req: &FinishRequest) -> (u16, String) {
+        let r = self.send(
+            &wire::paths::job(job_id, "finish"),
+            Some(&format!("Bearer {token}")),
+            Some(&serde_json::to_string(req).unwrap()),
+        );
+        (r.status, r.body)
+    }
+
+    /// Байты `server.db`, `server.db-wal` и `server.db-shm` (какие есть), склеенные подряд.
+    pub fn db_bytes(&self) -> Vec<u8> {
+        let base = self.dir.path.join("data").join("server.db");
+        let mut out = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = base.as_os_str().to_owned();
+            name.push(suffix);
+            if let Ok(bytes) = std::fs::read(std::path::PathBuf::from(name)) {
+                out.extend_from_slice(&bytes);
+            }
+        }
+        out
+    }
+
+    /// Все строки журнала сервера одним текстом.
+    pub fn sink_text(&self) -> String {
+        self.sink.lines().join("\n")
     }
 
     /// `POST /v1/runner/hello`: статус и тело ответа.

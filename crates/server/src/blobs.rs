@@ -66,6 +66,31 @@ impl Blobs {
             .join("demo")
     }
 
+    /// Папка результата задачи: `{root}/results/{id}`.
+    pub fn results_dir(&self, job_id: i64) -> PathBuf {
+        self.root.join("results").join(job_id.to_string())
+    }
+
+    /// Удаляет недозагруженные куски `*.part` результата задачи и возвращает их число; папки нет — `Ok(0)`.
+    /// Готовые файлы (без `.part`) не трогает.
+    pub fn discard_parts(&self, job_id: i64) -> std::io::Result<usize> {
+        let dir = self.results_dir(job_id);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let mut removed = 0;
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_some_and(|x| x == "part") && path.is_file() {
+                std::fs::remove_file(&path)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Копирует исходник в `demo.part` потоком, считая SHA-256, и переименовывает в `demo`.
     /// При любой ошибке `.part` удаляется. Базу при этом не держат.
     pub fn ingest_demo(&self, job_id: i64, src: &Path, max_bytes: u64) -> Result<Ingested> {
@@ -144,6 +169,23 @@ mod tests {
                 .contains("не похоже на демку CS2")
         );
         assert!(sniff_demo(&d.join("d.dem")).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn discard_parts_removes_only_part_files() {
+        let d = dir("parts");
+        let blobs = Blobs::new(d.join("blobs"));
+        assert_eq!(blobs.discard_parts(5).unwrap(), 0, "папки нет");
+        let r = blobs.results_dir(5);
+        std::fs::create_dir_all(&r).unwrap();
+        std::fs::write(r.join("highlights.mp4.part"), b"a").unwrap();
+        std::fs::write(r.join("plan.json.part"), b"b").unwrap();
+        std::fs::write(r.join("highlights.mp4"), b"done").unwrap();
+        assert_eq!(blobs.discard_parts(5).unwrap(), 2);
+        assert!(r.join("highlights.mp4").exists());
+        assert!(!r.join("plan.json.part").exists());
+        assert_eq!(blobs.discard_parts(5).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&d);
     }
 

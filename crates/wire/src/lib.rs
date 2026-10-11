@@ -299,6 +299,53 @@ pub struct ReleaseRequest {
     pub counts: bool,
 }
 
+/// Сбой задачи, как его видит раннер. Коды (`FailCode` v1.0), класс («запуск»/«окружение»/«прочее»), этап и
+/// подсказка приходят от раннера строками; сервер хранит их как есть после очистки от секретов и обрезки по длине.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Failure {
+    /// Код сбоя раннера, например `HLAE_ERROR`; допустимы только `A-Z`, `0-9`, `_`, иначе сервер сохранит `UNKNOWN`.
+    pub code: String,
+    #[serde(default)]
+    pub class: String,
+    /// Состояние автомата записи раннера в момент сбоя.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub hint: String,
+    #[serde(default)]
+    pub message: String,
+    /// Хвост консоли или журнала раннера.
+    #[serde(default)]
+    pub tail: String,
+    /// Сколько миллисекунд прошло от начала задачи до сбоя.
+    #[serde(default)]
+    pub elapsed_ms: u64,
+}
+
+/// Итог задачи, который сообщает раннер. Итог `done` с размером и SHA-256 результата описывает загрузка результата
+/// (план 05-05); до неё он читается как `Unknown`, как и любой итог от более новой стороны протокола.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Outcome {
+    Failed(Failure),
+    Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Тело `POST /v1/jobs/{id}/finish`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FinishRequest {
+    pub epoch: i64,
+    pub outcome: Outcome,
+}
+
+/// Ответ на `finish`: состояние задачи после итога.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FinishReply {
+    pub state: JobState,
+}
+
 /// Что раннер держит у себя: задача и эпоха её выдачи.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Holding {
@@ -474,6 +521,60 @@ mod tests {
             })
             .unwrap(),
             r#"{"job_id":3,"action":"keep"}"#
+        );
+    }
+
+    #[test]
+    fn finish_request_round_trips_failed_and_cancelled() {
+        let failed = FinishRequest {
+            epoch: 3,
+            outcome: Outcome::Failed(Failure {
+                code: "HLAE_ERROR".to_owned(),
+                class: "запуск".to_owned(),
+                state: "take".to_owned(),
+                hint: "проверьте HLAE".to_owned(),
+                message: "boom".to_owned(),
+                tail: "строка".to_owned(),
+                elapsed_ms: 1234,
+            }),
+        };
+        let json = serde_json::to_string(&failed).unwrap();
+        assert!(json.contains(r#""kind":"failed""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<FinishRequest>(&json).unwrap(),
+            failed
+        );
+
+        let cancelled = FinishRequest {
+            epoch: 1,
+            outcome: Outcome::Cancelled,
+        };
+        let json = serde_json::to_string(&cancelled).unwrap();
+        assert_eq!(json, r#"{"epoch":1,"outcome":{"kind":"cancelled"}}"#);
+        assert_eq!(
+            serde_json::from_str::<FinishRequest>(&json).unwrap(),
+            cancelled
+        );
+
+        // Минимальный сбой: только код; остальное по умолчанию.
+        let min: FinishRequest =
+            serde_json::from_str(r#"{"epoch":2,"outcome":{"kind":"failed","code":"X"}}"#).unwrap();
+        let Outcome::Failed(f) = min.outcome else {
+            panic!("ожидался сбой");
+        };
+        assert_eq!((f.code.as_str(), f.elapsed_ms), ("X", 0));
+
+        // Итог от более новой стороны не роняет разбор.
+        let new: FinishRequest =
+            serde_json::from_str(r#"{"epoch":2,"outcome":{"kind":"something_new","x":1}}"#)
+                .unwrap();
+        assert_eq!(new.outcome, Outcome::Unknown);
+        assert_eq!(
+            serde_json::to_string(&FinishReply {
+                state: JobState::Failed
+            })
+            .unwrap(),
+            r#"{"state":"failed"}"#
         );
     }
 

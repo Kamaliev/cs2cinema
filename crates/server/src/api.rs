@@ -14,7 +14,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response};
-use wire::{ApiError, ClaimRequest, HelloRequest, ProgressRequest, ReleaseRequest, codes};
+use wire::{
+    ApiError, ClaimRequest, FinishRequest, HelloRequest, Outcome, ProgressRequest, ReleaseRequest,
+    codes,
+};
 
 /// Самое большое JSON-тело запроса: 64 КиБ.
 pub const MAX_JSON: usize = 64 * 1024;
@@ -122,6 +125,7 @@ fn job_action(ctx: &Ctx, rq: &mut Request, path: &str, trace: &mut Trace) -> Res
     match action {
         "progress" => progress(ctx, rq, job_id, trace),
         "release" => release(ctx, rq, job_id, trace),
+        "finish" => finish(ctx, rq, job_id, trace),
         _ => Err(not_found()),
     }
 }
@@ -158,6 +162,28 @@ fn release(ctx: &Ctx, rq: &mut Request, job_id: i64, trace: &mut Trace) -> Resul
         }
     ));
     Ok(Reply::no_content())
+}
+
+/// `POST /v1/jobs/{id}/finish`: раннер сообщает итог задачи (сбой или отмену).
+fn finish(ctx: &Ctx, rq: &mut Request, job_id: i64, trace: &mut Trace) -> Result<Reply, Reject> {
+    let runner = authenticate(ctx, rq)?;
+    trace.runner = Some(runner.name.clone());
+    let req: FinishRequest = read_json(rq, MAX_JSON)?;
+    let done = ctx.core.finish_report(runner.id, job_id, &req)?;
+    if let Some(e) = &done.discard_error {
+        ctx.log.warn(e);
+    }
+    // В журнал идёт только код сбоя после очистки (из базы), а не текст раннера.
+    let code = match (&req.outcome, ctx.core.job(job_id)) {
+        (Outcome::Failed(_), Ok(Some(job))) => job.fail_code.unwrap_or_else(|| "—".to_owned()),
+        _ => "—".to_owned(),
+    };
+    ctx.log.info(&format!(
+        "задача #{job_id}: {} ({code}), раннер {}",
+        done.reply.state.as_str(),
+        runner.name
+    ));
+    Reply::json(200, &done.reply)
 }
 
 /// `POST /v1/runner/hello`: раннер представляется и сверяет удерживаемые задачи. Версия протокола проверяется

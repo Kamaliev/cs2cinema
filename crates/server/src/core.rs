@@ -6,15 +6,16 @@ use crate::Result;
 use crate::blobs::{Blobs, Ingested, demo_rel, sniff_demo};
 use crate::clock::Clock;
 use crate::db::{Db, db_err};
-use crate::rules::{self, Event};
+use crate::rules::{self, Event, FinishKind};
 use crate::secret::Redactor;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use wire::{
-    Assignment, CancelMode, DemoInfo, Directive, DirectiveAction, HelloReply, HelloRequest,
-    JobState, Player, ProgressReply, ProgressRequest, ReleaseRequest, codes,
+    Assignment, CancelMode, DemoInfo, Directive, DirectiveAction, Failure, FinishReply,
+    FinishRequest, HelloReply, HelloRequest, JobState, Outcome, Player, ProgressReply,
+    ProgressRequest, ReleaseRequest, codes,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -553,6 +554,83 @@ impl Core {
         Ok(())
     }
 
+    /// Очищает текст сбоя раннера до записи в базу (SEC-04, T-05-19): секреты маскируются, управляющие символы
+    /// удаляются, длины ограничены. Код сбоя — только `[A-Z0-9_]{1,64}`, иначе `UNKNOWN`.
+    fn sanitize_failure(&self, f: &Failure) -> Failure {
+        let code_ok = !f.code.is_empty()
+            && f.code.len() <= 64
+            && f.code
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+        Failure {
+            code: if code_ok {
+                f.code.clone()
+            } else {
+                "UNKNOWN".to_owned()
+            },
+            class: self.redactor.clean(&f.class, 32),
+            state: self.redactor.clean(&f.state, 64),
+            hint: self.redactor.clean(&f.hint, 1000),
+            message: self.redactor.clean(&f.message, 2000),
+            tail: self.redactor.clean(&f.tail, 16_384),
+            elapsed_ms: f.elapsed_ms,
+        }
+    }
+
+    /// Итог задачи от раннера (SRV-03): сбой или отмена. Поля сбоя очищаются до записи; повтор того же итога
+    /// идемпотентен, другой итог после конца — `job_terminal`, устаревшая эпоха — `stale_epoch`.
+    pub fn finish(
+        &self,
+        runner_id: i64,
+        job_id: i64,
+        req: &FinishRequest,
+    ) -> std::result::Result<FinishReply, Reject> {
+        Ok(self.finish_report(runner_id, job_id, req)?.reply)
+    }
+
+    /// То же, что `finish`, и ошибка удаления недозагруженных кусков (итог уже записан, ответ раннеру остаётся 200).
+    pub fn finish_report(
+        &self,
+        runner_id: i64,
+        job_id: i64,
+        req: &FinishRequest,
+    ) -> std::result::Result<Finished, Reject> {
+        let kind = match &req.outcome {
+            Outcome::Failed(f) => FinishKind::Failed(self.sanitize_failure(f)),
+            Outcome::Cancelled => FinishKind::Cancelled,
+            Outcome::Unknown => {
+                return Err(Reject::new(
+                    codes::BAD_REQUEST,
+                    "неизвестный итог задачи: обновите сервер",
+                ));
+            }
+        };
+        let now = self.clock.now_ms();
+        let ev = Event::Finish {
+            runner_id,
+            epoch: req.epoch,
+            kind,
+        };
+        let (state, discard) = self.db.write(|tx| {
+            let before = job_by_id(tx, job_id)?.ok_or_else(not_found)?;
+            let d = rules::decide(&before, &ev, now, &self.limits)?;
+            apply(tx, &before, &d.job, now)?;
+            Ok::<_, Reject>((d.job.state, d.discard_parts && before != d.job))
+        })?;
+        let discard_error = if discard {
+            self.blobs
+                .discard_parts(job_id)
+                .err()
+                .map(|e| format!("задача #{job_id}: не удалось удалить куски результата: {e}"))
+        } else {
+            None
+        };
+        Ok(Finished {
+            reply: FinishReply { state },
+            discard_error,
+        })
+    }
+
     /// Прогресс раннера (он же heartbeat): продлевает аренду и двигает состояние. Возвращает ответ и признак того,
     /// что раннер вернул себе задачу с потерянной арендой (вызывающий пишет это в журнал).
     pub fn progress(
@@ -662,6 +740,13 @@ pub struct Recovered {
 pub struct Claimed {
     pub assignment: Option<Assignment>,
     pub failed: Vec<i64>,
+}
+
+/// Итог `finish_report`: ответ раннеру и ошибка удаления кусков результата, если она была.
+#[derive(Debug, Clone)]
+pub struct Finished {
+    pub reply: FinishReply,
+    pub discard_error: Option<String>,
 }
 
 /// Что сделал `sweep`: id задач по исходам.
@@ -854,6 +939,45 @@ mod tests {
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.fail_code.as_deref(), Some("RECEIVE_FAILED"));
         assert!(job.finished_at.is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn failure_fields_are_cleaned_and_capped() {
+        let (core, d) = core("sanitize", Limits::default());
+        let token = format!("cs2r_{}", "ab".repeat(32));
+        let dirty = Failure {
+            code: "hlae error".to_owned(),
+            class: "к".repeat(100),
+            state: "take".to_owned(),
+            hint: format!("подсказка {token}"),
+            message: format!("боль\u{7}шая {}", "я".repeat(3000)),
+            tail: format!("a\nb\tc\u{1b}[0m {token}"),
+            elapsed_ms: 5,
+        };
+        let c = core.sanitize_failure(&dirty);
+        assert_eq!(c.code, "UNKNOWN", "код не из [A-Z0-9_]");
+        assert_eq!(c.class.chars().count(), 32);
+        assert_eq!(c.hint, "подсказка cs2r_***");
+        assert!(!c.message.contains('\u{7}') && c.message.chars().count() == 2000);
+        assert!(c.message.ends_with('…'));
+        assert_eq!(c.tail, "a\nb\tc[0m cs2r_***");
+        assert_eq!(c.elapsed_ms, 5);
+
+        for (code, want) in [
+            ("HLAE_ERROR", "HLAE_ERROR"),
+            ("", "UNKNOWN"),
+            ("E1", "E1"),
+            (&"A".repeat(64), &"A".repeat(64)),
+            (&"A".repeat(65), "UNKNOWN"),
+            ("ёж", "UNKNOWN"),
+        ] {
+            let f = Failure {
+                code: code.to_owned(),
+                ..Default::default()
+            };
+            assert_eq!(core.sanitize_failure(&f).code, want);
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

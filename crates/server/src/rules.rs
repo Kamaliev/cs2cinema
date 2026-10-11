@@ -9,10 +9,30 @@
 //! и тот же раннер с той же эпохой возвращает задачу себе.
 
 use crate::core::{JobRow, Limits, Reject};
-use wire::{CancelMode, JobState, Phase, Take, codes};
+use wire::{CancelMode, Failure, JobState, Phase, Take, codes};
 
 /// Приём демки, который не двигался дольше этого, считается оборванным: 30 минут.
 pub const RECEIVING_STALE_MS: i64 = 30 * 60 * 1000;
+
+/// Вид итога, который раннер сообщает в `finish`. `Failure` приходит уже очищенным (`Core::sanitize_failure`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FinishKind {
+    /// Результат загружен и проверен (проверку файла делает `Core` до вызова; загрузка — план 05-05).
+    Done,
+    Failed(Failure),
+    Cancelled,
+}
+
+impl FinishKind {
+    /// Состояние, в которое приводит этот итог.
+    fn target(&self) -> JobState {
+        match self {
+            FinishKind::Done => JobState::Done,
+            FinishKind::Failed(_) => JobState::Failed,
+            FinishKind::Cancelled => JobState::Cancelled,
+        }
+    }
+}
 
 /// Событие, меняющее задачу.
 #[derive(Debug, Clone)]
@@ -38,6 +58,12 @@ pub enum Event {
         runner_id: i64,
         epoch: i64,
         counts: bool,
+    },
+    /// Раннер сообщает итог: сбой, отмену или готовый результат.
+    Finish {
+        runner_id: i64,
+        epoch: i64,
+        kind: FinishKind,
     },
 }
 
@@ -155,6 +181,56 @@ pub fn decide(job: &JobRow, ev: &Event, now_ms: i64, limits: &Limits) -> Result<
                 j.grants = (j.grants - 1).max(0);
             }
             Ok(Decision::of(j))
+        }
+        Event::Finish {
+            runner_id,
+            epoch,
+            kind,
+        } => {
+            let fenced = fenced(job, *runner_id, *epoch);
+            if job.state.is_terminal() {
+                // Повтор того же итога идемпотентен (ответ раннеру мог потеряться), любой другой — отказ.
+                return if fenced && job.state == kind.target() {
+                    Ok(Decision::of(job.clone()))
+                } else {
+                    Err(terminal())
+                };
+            }
+            let lost = job.state == JobState::Queued && job.lease_lost;
+            if !(job.state.is_leased() || lost) || !fenced {
+                return Err(stale());
+            }
+            let mut j = job.clone();
+            match kind {
+                FinishKind::Done => {
+                    if !(job.state == JobState::Uploading || lost) {
+                        let mut r =
+                            Reject::new(codes::OFFSET_MISMATCH, "результат ещё не загружен");
+                        r.offset = Some(0);
+                        return Err(r);
+                    }
+                    j.state = JobState::Done;
+                }
+                FinishKind::Failed(f) => {
+                    j.state = JobState::Failed;
+                    j.fail_code = Some(f.code.clone());
+                    j.fail_class = Some(f.class.clone());
+                    j.fail_state = Some(f.state.clone());
+                    j.fail_hint = Some(f.hint.clone());
+                    j.fail_message = Some(f.message.clone());
+                    j.fail_tail = Some(f.tail.clone());
+                    j.fail_elapsed_ms = Some(i64::try_from(f.elapsed_ms).unwrap_or(i64::MAX));
+                }
+                FinishKind::Cancelled => j.state = JobState::Cancelled,
+            }
+            j.finished_at = Some(now_ms);
+            j.lease_until = None;
+            j.lease_lost = false;
+            Ok(Decision {
+                job: j,
+                reattached: false,
+                discard_parts: true,
+            })
         }
         Event::Reattach { runner_id, epoch } => {
             if job.state.is_terminal() {

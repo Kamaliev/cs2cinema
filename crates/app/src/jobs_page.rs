@@ -33,6 +33,13 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
             if ui.small_button("Обновить").clicked() {
                 app.refresh_jobs();
             }
+            // ACC-01: пять задач на пяти картах одним действием; проверка серии — в консоли
+            let accept = ui
+                .add_enabled(!app.jobs.acceptance_busy, egui::Button::new("Поставить приёмочный набор").small())
+                .on_hover_text("5 матчей из acceptance/matches.txt на 5 разных картах; проверка — cs2-cli acceptance check");
+            if accept.clicked() {
+                app.enqueue_acceptance();
+            }
         });
     });
     ui.add_space(6.0);

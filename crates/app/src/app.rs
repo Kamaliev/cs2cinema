@@ -48,6 +48,8 @@ pub enum Msg {
     },
     /// Очередь опустела: «N готово / M упало · первая причина» для баннера, строки состояния и подсказки значка трея (OBS-04).
     QueueSummary(String),
+    /// Приёмочный набор поставлен целиком (партия и число задач) или не поставлен вовсе (причина по-русски) (ACC-01).
+    AcceptanceQueued(Result<(String, usize), String>),
     Player(Result<(Player, Vec<MatchSummary>), String>),
     Stats(String, Result<MatchStats, String>),
     UpdateFound(Result<Option<update::Release>, String>),
@@ -142,6 +144,8 @@ pub struct JobsState {
     pub fs_seen: HashMap<i64, i64>,
     /// Итог последней очереди «N готово / M упало · первая причина»: баннер над списком, пока его не скрыли (OBS-04).
     pub summary: Option<String>,
+    /// Приёмочный набор ставится прямо сейчас (фоновый поток ещё не ответил): кнопка неактивна.
+    pub acceptance_busy: bool,
 }
 
 /// Размер превью ролика в карточке задачи.
@@ -409,6 +413,24 @@ impl App {
         }
     }
 
+    /// «Поставить приёмочный набор»: пять задач с записью на пяти разных картах про игрока из настроек, одной партией
+    /// (ACC-01). Проверка набора, FACEIT и база — в фоновом потоке; задачи ставятся только целиком.
+    pub fn enqueue_acceptance(&mut self) {
+        if self.jobs.acceptance_busy {
+            return;
+        }
+        let key = self.s.faceit_key.trim().to_owned();
+        let nick = self.s.nickname.trim().to_owned();
+        if key.is_empty() || nick.is_empty() {
+            self.status.push("приёмочный набор: укажите ключ FACEIT Data API и ник в настройках");
+            return;
+        }
+        self.jobs.acceptance_busy = true;
+        self.status.push("приёмочный набор: проверяю матчи…");
+        let store = self.store.clone();
+        self.spawn(move |r| r.send(Msg::AcceptanceQueued(queue_acceptance(&store, &key, &nick))));
+    }
+
     /// Поставить задачу на открытый матч и выбранного игрока; возвращает её id.
     pub fn enqueue(&mut self, kind: JobKind) -> Result<i64, String> {
         let (Some(a), Some(hero)) = (&self.game.analysis, self.game.hero) else {
@@ -576,6 +598,26 @@ impl App {
                     self.status.push(&text);
                     self.set_tray_tooltip(Some(&text));
                     self.jobs.summary = Some(text);
+                }
+                Msg::AcceptanceQueued(r) => {
+                    self.jobs.acceptance_busy = false;
+                    match r {
+                        Ok((batch, n)) => {
+                            self.status.push(&format!("приёмочный набор поставлен: {n} задач, партия {batch}"));
+                            // постановка — осознанное действие, пауза очереди снимается (D-13)
+                            self.queue.resume();
+                            self.refresh_jobs();
+                        }
+                        Err(e) => {
+                            // задачи не поставлены; идущую задачу строкой состояния не прерываем
+                            let text = format!("приёмочный набор не поставлен: {e}");
+                            if self.queue.view().running.is_some() {
+                                self.status.push(&text);
+                            } else {
+                                self.status.finish(Err(text));
+                            }
+                        }
+                    }
                 }
                 Msg::Player(r) => {
                     self.matches.loading = false;
@@ -765,6 +807,74 @@ impl eframe::App for App {
     }
 }
 
+/// Пять задач приёмки по набору и статистике матчей: каждая — запись про игрока из настроек, все на разных картах (ACC-01).
+/// Чистая: ничего не ставит; любая неполадка набора — ошибка по-русски, и тогда не ставится ни одна задача.
+pub fn acceptance_jobs(set: &[String], stats: &[(String, MatchStats)], player: &Player) -> Result<Vec<NewJob>, String> {
+    pipeline::acceptance::require_full(set)?;
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut jobs = Vec::with_capacity(set.len());
+    for (k, id) in set.iter().enumerate() {
+        let (_, st) = stats.iter().find(|(i, _)| i == id).ok_or_else(|| format!("нет статистики матча {id}"))?;
+        let (map_stats, _, _) = st.find(&player.id).ok_or_else(|| format!("в матче {id} нет игрока {}", player.nickname))?;
+        let map = map_stats.map.trim().to_owned();
+        if map.is_empty() {
+            return Err(format!("в матче {id} FACEIT не назвал карту"));
+        }
+        if let Some((_, first)) = seen.iter().find(|(m, _)| m.eq_ignore_ascii_case(&map)) {
+            return Err(format!("карта {map} повторяется: матчи {first} и {id} — нужны {} разных карт", pipeline::acceptance::SET_SIZE));
+        }
+        seen.push((map.clone(), id.clone()));
+        jobs.push(NewJob {
+            kind: JobKind::Record,
+            source: JobSource::Faceit(id.clone()),
+            label: format!("приёмка {}/{} · {map}", k + 1, set.len()),
+            hero_name: player.nickname.clone(),
+            hero_steam: player.steam_id,
+            map,
+        });
+    }
+    Ok(jobs)
+}
+
+/// Фоновая часть «Поставить приёмочный набор»: набор, игрок, статистика матчей (из кэша базы или FACEIT), проверка,
+/// и только потом постановка всех задач одной партией. Сбой базы посреди постановки снимает уже поставленные задачи.
+fn queue_acceptance(store: &Store, key: &str, nick: &str) -> Result<(String, usize), String> {
+    let (set, _source) = pipeline::acceptance::load_set(&|k| std::env::var(k).ok())?;
+    pipeline::acceptance::require_full(&set)?;
+    let client = faceit::Client::new(key);
+    let player = client.player(nick).map_err(|e| e.to_string())?;
+    let mut stats: Vec<(String, MatchStats)> = Vec::with_capacity(set.len());
+    for id in &set {
+        let cache_key = format!("stats:{id}");
+        let json = match store.cache_get(&cache_key) {
+            Ok(Some(v)) => v,
+            _ => {
+                let v = client.match_stats_json(id).map_err(|e| format!("матч {id}: {e}"))?;
+                let _ = store.cache_put(&cache_key, &v);
+                v
+            }
+        };
+        stats.push((id.clone(), MatchStats::from_json(&json)));
+    }
+    let jobs = acceptance_jobs(&set, &stats, &player)?;
+    let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let batch = pipeline::acceptance::batch_name(unix, std::process::id());
+    let mut added: Vec<i64> = Vec::with_capacity(jobs.len());
+    for job in &jobs {
+        let res = store.add_job(job).and_then(|id| {
+            added.push(id);
+            store.set_batch(id, &batch)
+        });
+        if let Err(e) = res {
+            for id in added {
+                let _ = store.delete_job(id);
+            }
+            return Err(e);
+        }
+    }
+    Ok((batch, jobs.len()))
+}
+
 fn cleanup_old() {
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -799,6 +909,69 @@ fn old_logs(out_dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IDS: [&str; 5] = [
+        "1-00000000-0000-0000-0000-000000000001",
+        "1-00000000-0000-0000-0000-000000000002",
+        "1-00000000-0000-0000-0000-000000000003",
+        "1-00000000-0000-0000-0000-000000000004",
+        "1-00000000-0000-0000-0000-000000000005",
+    ];
+
+    fn player() -> Player {
+        Player::from_json(&serde_json::json!({"player_id": "p-me", "nickname": "me", "games": {"cs2": {"game_player_id": "76561198000000001"}}})).unwrap()
+    }
+
+    /// Статистика матча с одной картой и одной командой; `who` — id игрока в ней.
+    fn stats(map: &str, who: &str) -> MatchStats {
+        MatchStats::from_json(&serde_json::json!({"rounds": [{
+            "round_stats": {"Map": map, "Winner": "t1", "Score": "13 / 5", "Rounds": "18"},
+            "teams": [{"team_id": "t1", "team_stats": {"Team": "A", "Final Score": "13"},
+                       "players": [{"player_id": who, "nickname": "x", "player_stats": {"Kills": "20"}}]}]
+        }]}))
+    }
+
+    fn set() -> Vec<String> {
+        IDS.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn five_stats(maps: [&str; 5]) -> Vec<(String, MatchStats)> {
+        IDS.iter().zip(maps).map(|(id, m)| ((*id).to_owned(), stats(m, "p-me"))).collect()
+    }
+
+    #[test]
+    fn acceptance_jobs_need_five_distinct_maps_and_the_player() {
+        let maps = ["de_mirage", "de_inferno", "de_nuke", "de_dust2", "de_ancient"];
+        let jobs = acceptance_jobs(&set(), &five_stats(maps), &player()).unwrap();
+        assert_eq!(jobs.len(), 5);
+        for (k, j) in jobs.iter().enumerate() {
+            assert_eq!(j.kind, JobKind::Record);
+            assert_eq!(j.source, JobSource::Faceit(IDS[k].to_owned()));
+            assert_eq!((j.hero_name.as_str(), j.hero_steam), ("me", 76561198000000001));
+            assert_eq!(j.map, maps[k]);
+            assert_eq!(j.label, format!("приёмка {}/5 · {}", k + 1, maps[k]));
+        }
+
+        // игрока нет в матче
+        let mut st = five_stats(maps);
+        st[2].1 = stats("de_nuke", "p-other");
+        let e = acceptance_jobs(&set(), &st, &player()).unwrap_err();
+        assert_eq!(e, format!("в матче {} нет игрока me", IDS[2]));
+
+        // две одинаковые карты (регистр не важен)
+        let e = acceptance_jobs(&set(), &five_stats(["de_mirage", "de_inferno", "de_nuke", "de_dust2", "De_Mirage"]), &player()).unwrap_err();
+        assert_eq!(e, format!("карта De_Mirage повторяется: матчи {} и {} — нужны 5 разных карт", IDS[0], IDS[4]));
+
+        // в наборе не 5 матчей
+        let e = acceptance_jobs(&set()[..4], &five_stats(maps), &player()).unwrap_err();
+        assert!(e.contains("4 матчей из 5"), "{e}");
+        let e = acceptance_jobs(&[], &[], &player()).unwrap_err();
+        assert!(e.contains("0 матчей из 5") && e.contains("acceptance/matches.txt"), "{e}");
+
+        // нет статистики матча
+        let e = acceptance_jobs(&set(), &five_stats(maps)[..4], &player()).unwrap_err();
+        assert_eq!(e, format!("нет статистики матча {}", IDS[4]));
+    }
 
     #[test]
     fn old_logs_are_listed_in_attempt_order() {

@@ -458,6 +458,15 @@ pub fn retry_no_data(reason: &str) -> RunError {
     }
 }
 
+/// Герой задачи — единственная точка выбора игрока: SteamID64 (0 — «нет») и ник → игрок демки
+/// (`resolve_player`), у которого есть что снимать (`ensure_highlights`). Неоднозначный, отсутствующий и
+/// «пустой» игрок — типизированный сбой в состоянии предпроверки, до папки задачи и запуска игры.
+pub fn hero_for(m: &cs2::Match, steam: u64, nick: &str) -> Result<cs2::PlayerId, RunError> {
+    let hero = crate::resolve_player(m, Some(steam), nick).map_err(crate::PlayerError::into_run_error)?;
+    crate::ensure_highlights(m, hero)?;
+    Ok(hero)
+}
+
 /// Все ли дубли плана проверены по манифесту (индексы дублей — из `record.json`).
 pub fn all_takes_validated(m: &Manifest, takes: &[TakePlan]) -> bool {
     m.all_validated()
@@ -509,8 +518,8 @@ pub fn run_job(host: &dyn Host, spec: &JobSpec, p: &dyn Progress) -> Result<Outc
             path: a.demo_path.clone(),
         });
     }
-    let hero = crate::find_player(&a.m, Some(spec.hero_steam), &spec.hero_name)
-        .ok_or_else(|| format!("игрок {} в демке не найден", spec.hero_name))?;
+    // герой выбирается сразу после разбора — до папки задачи, проб NVENC, плана и запуска игры
+    let hero = hero_for(&a.m, spec.hero_steam, &spec.hero_name)?;
     let out_dir = cfg.out_root.join(crate::console_name(&format!(
         "{}_{}",
         a.label,
@@ -1137,5 +1146,109 @@ mod tests {
         begin_plan(&dir).unwrap();
         begin_plan(&dir.join("нет такой папки")).unwrap();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn ev(tick: i32, name: &str, f: &[(&str, i64)]) -> demo::events::GameEvent {
+        demo::events::GameEvent {
+            tick,
+            name: name.into(),
+            fields: f
+                .iter()
+                .map(|(k, v)| (k.to_string(), demo::events::Value::Int(*v)))
+                .collect(),
+        }
+    }
+
+    fn death(tick: i32, victim: i64, attacker: i64) -> demo::events::GameEvent {
+        ev(
+            tick,
+            "player_death",
+            &[("userid", victim), ("attacker", attacker), ("headshot", 1)],
+        )
+    }
+
+    /// Матч с похожими никами: у `s1mple` три убийства в голову подряд (3K), у `ZywOo` одно,
+    /// у `quiet` нет ни убийств, ни гранат.
+    fn nick_match() -> cs2::Match {
+        let players = vec![
+            (0, 0, "s1mple".to_owned(), 76561198034202275),
+            (1, 1, "s1mple_fan".to_owned(), 76561198000000002),
+            (2, 2, "ZywOo".to_owned(), 76561198000000003),
+            (3, 3, "quiet".to_owned(), 76561198000000004),
+        ];
+        let events = vec![
+            ev(1000, "round_start", &[]),
+            death(1400, 1, 0),
+            death(1520, 2, 0),
+            death(1640, 1, 0),
+            death(1800, 0, 2),
+            ev(2000, "round_end", &[("winner", 2)]),
+        ];
+        cs2::Match::build("de_mirage".into(), 64.0, players, &events)
+    }
+
+    #[test]
+    fn ambiguous_nick_stops_the_job_before_recording_with_candidates() {
+        let m = nick_match();
+        assert_eq!((m.kills.len(), m.players.len()), (4, 4));
+
+        // точное имя выигрывает у подстроки
+        let hero = hero_for(&m, 0, "s1mple").expect("точное имя однозначно");
+        assert_eq!(m.name(hero), "s1mple");
+
+        // подстрока, которая подходит двум игрокам, героя не выбирает
+        let e = hero_for(&m, 0, "mple").expect_err("«mple» неоднозначен");
+        let fail = e.fail.as_ref().expect("типизированный сбой записи");
+        assert_eq!(fail.code, FailCode::PlayerAmbiguous);
+        assert_eq!(fail.state, RecordState::Precheck);
+        assert_eq!(
+            failure::classify(fail.code, fail.state),
+            failure::FailClass::Other
+        );
+        assert!(
+            e.message.contains("s1mple (76561198034202275)")
+                && e.message.contains("s1mple_fan (76561198000000002)"),
+            "{}",
+            e.message
+        );
+        assert_eq!(e.message, fail.message);
+        assert!(!fail.hint.is_empty());
+    }
+
+    #[test]
+    fn missing_and_idle_players_get_their_own_codes_in_precheck() {
+        let m = nick_match();
+        let e = hero_for(&m, 0, "nobody").expect_err("такого ника нет");
+        let fail = e.fail.expect("типизированный сбой");
+        assert_eq!(
+            (fail.code, fail.state),
+            (FailCode::PlayerNotFound, RecordState::Precheck)
+        );
+        assert!(fail.message.contains("nobody"), "{}", fail.message);
+
+        let e = hero_for(&m, 0, "quiet").expect_err("снимать нечего");
+        let fail = e.fail.expect("типизированный сбой");
+        assert_eq!(
+            (fail.code, fail.state),
+            (FailCode::NoHighlights, RecordState::Precheck)
+        );
+        assert_eq!(
+            failure::classify(fail.code, fail.state),
+            failure::FailClass::Other
+        );
+
+        // SteamID сильнее ника; ноль — «нет SteamID»
+        let hero = hero_for(&m, 76561198000000003, "s1mple").unwrap();
+        assert_eq!(m.name(hero), "ZywOo");
+        let hero = hero_for(&m, 0, "zywoo").unwrap();
+        assert_eq!(m.name(hero), "ZywOo");
+    }
+
+    #[test]
+    fn find_player_no_longer_guesses() {
+        let m = nick_match();
+        assert_eq!(crate::find_player(&m, None, "mple"), None);
+        let hero = crate::find_player(&m, None, "S1MPLE").expect("без регистра однозначно");
+        assert_eq!(m.name(hero), "s1mple");
     }
 }

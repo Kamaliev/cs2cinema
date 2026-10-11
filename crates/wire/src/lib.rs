@@ -142,12 +142,75 @@ impl CancelMode {
     }
 }
 
-/// Коды сбоев, которые ставит сам сервер (остальные приходят от раннера строкой).
+/// Строки кодов сбоев: свои у сервера и все, что может прислать раннер. Менять можно только добавлением:
+/// коды читают сервер, раннер и бот.
 pub mod fail {
     /// Задача выдавалась раннеру слишком много раз подряд.
     pub const TOO_MANY_GRANTS: &str = "TOO_MANY_GRANTS";
     /// Сервер не смог принять демку.
     pub const RECEIVE_FAILED: &str = "RECEIVE_FAILED";
+
+    // коды записи v1.0 (`pipeline::FailCode`)
+    pub const LAUNCHER_FAILED: &str = "LAUNCHER_FAILED";
+    pub const GAME_NOT_STARTED: &str = "GAME_NOT_STARTED";
+    pub const CONSOLE_NOT_OPEN: &str = "CONSOLE_NOT_OPEN";
+    pub const DEMO_NOT_LOADED: &str = "DEMO_NOT_LOADED";
+    pub const SCRIPT_NOT_RUN: &str = "SCRIPT_NOT_RUN";
+    pub const TAKE_TIMEOUT: &str = "TAKE_TIMEOUT";
+    pub const GAME_EXITED: &str = "GAME_EXITED";
+    pub const HLAE_ERROR: &str = "HLAE_ERROR";
+    pub const CANCELLED: &str = "CANCELLED";
+    pub const PRECHECK_FAILED: &str = "PRECHECK_FAILED";
+    pub const FOREIGN_GAME_RUNNING: &str = "FOREIGN_GAME_RUNNING";
+    pub const PREV_GAME_STUCK: &str = "PREV_GAME_STUCK";
+    pub const TAKE_INVALID: &str = "TAKE_INVALID";
+    pub const RETRY_NO_DATA: &str = "RETRY_NO_DATA";
+
+    // коды фазы 6
+    /// Ника нет в демке.
+    pub const PLAYER_NOT_FOUND: &str = "PLAYER_NOT_FOUND";
+    /// Ник подходит нескольким игрокам.
+    pub const PLAYER_AMBIGUOUS: &str = "PLAYER_AMBIGUOUS";
+    /// У игрока нет убийств и полезных гранат.
+    pub const NO_HIGHLIGHTS: &str = "NO_HIGHLIGHTS";
+    /// Демка не разбирается.
+    pub const BAD_DEMO: &str = "BAD_DEMO";
+    /// Демка больше допустимого размера.
+    pub const DEMO_TOO_LARGE: &str = "DEMO_TOO_LARGE";
+    /// Готовый ролик не прошёл проверку перед отправкой.
+    pub const RESULT_INVALID: &str = "RESULT_INVALID";
+    /// Источник задачи раннер не берёт.
+    pub const UNSUPPORTED_SOURCE: &str = "UNSUPPORTED_SOURCE";
+    /// Исполнитель раннера вернул ошибку без кода или упал.
+    pub const JOB_ERROR: &str = "JOB_ERROR";
+
+    /// Все известные коды. Страж фазы 6 в раннере сверяет с этим списком `pipeline::FailCode::ALL`.
+    pub const KNOWN: &[&str] = &[
+        LAUNCHER_FAILED,
+        GAME_NOT_STARTED,
+        CONSOLE_NOT_OPEN,
+        DEMO_NOT_LOADED,
+        SCRIPT_NOT_RUN,
+        TAKE_TIMEOUT,
+        GAME_EXITED,
+        HLAE_ERROR,
+        CANCELLED,
+        PRECHECK_FAILED,
+        FOREIGN_GAME_RUNNING,
+        PREV_GAME_STUCK,
+        TAKE_INVALID,
+        RETRY_NO_DATA,
+        PLAYER_NOT_FOUND,
+        PLAYER_AMBIGUOUS,
+        NO_HIGHLIGHTS,
+        BAD_DEMO,
+        DEMO_TOO_LARGE,
+        RESULT_INVALID,
+        UNSUPPORTED_SOURCE,
+        JOB_ERROR,
+        TOO_MANY_GRANTS,
+        RECEIVE_FAILED,
+    ];
 }
 
 /// Тело `POST /v1/runner/claim`: раннер сообщает, чем занят.
@@ -198,12 +261,16 @@ pub struct Assignment {
     pub options: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Этап работы раннера. `fetch` — скачивание демки с сервера, `upload` — загрузка результата, остальные —
-/// этапы `pipeline::Stage`, раннер (фаза 6) переводит их в эти имена сам. Незнакомое имя читается как `Unknown`.
+/// Этап работы раннера. `fetch` — скачивание демки с сервера, `upload` — загрузка результата, `precheck` —
+/// предпроверка: разбор демки в дочернем процессе и проверка окружения до запуска CS2 (его шлёт раннер сам),
+/// остальные — этапы `pipeline::Stage`, раннер переводит их в эти имена сам. Незнакомое имя читается как
+/// `Unknown` (старый сервер читает `precheck` как «идёт работа»).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     Fetch,
+    /// Предпроверка: разбор демки в дочернем процессе и проверка окружения до запуска CS2.
+    Precheck,
     Download,
     Parse,
     Positions,
@@ -218,8 +285,9 @@ pub enum Phase {
 
 impl Phase {
     /// Все известные этапы.
-    pub const ALL: [Phase; 9] = [
+    pub const ALL: [Phase; 10] = [
         Phase::Fetch,
+        Phase::Precheck,
         Phase::Download,
         Phase::Parse,
         Phase::Positions,
@@ -234,6 +302,7 @@ impl Phase {
     pub fn as_str(self) -> &'static str {
         match self {
             Phase::Fetch => "fetch",
+            Phase::Precheck => "precheck",
             Phase::Download => "download",
             Phase::Parse => "parse",
             Phase::Positions => "positions",
@@ -246,7 +315,7 @@ impl Phase {
         }
     }
 
-    /// Обратное к `as_str` для девяти известных этапов; прочее (в том числе пустая строка) — `None`.
+    /// Обратное к `as_str` для десяти известных этапов; прочее (в том числе пустая строка) — `None`.
     pub fn parse(s: &str) -> Option<Phase> {
         Phase::ALL.into_iter().find(|p| p.as_str() == s)
     }
@@ -479,6 +548,47 @@ mod tests {
             ClaimRequest::default()
         );
         assert_eq!(paths::job(5, "heartbeat"), "/v1/jobs/5/heartbeat");
+    }
+
+    #[test]
+    fn known_codes_are_ascii_and_unique() {
+        for code in fail::KNOWN {
+            assert!(
+                !code.is_empty()
+                    && code
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                "{code}"
+            );
+        }
+        let mut sorted = fail::KNOWN.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), fail::KNOWN.len(), "повторы в KNOWN");
+        for code in [
+            fail::PLAYER_NOT_FOUND,
+            fail::PLAYER_AMBIGUOUS,
+            fail::NO_HIGHLIGHTS,
+            fail::BAD_DEMO,
+            fail::DEMO_TOO_LARGE,
+            fail::RESULT_INVALID,
+            fail::UNSUPPORTED_SOURCE,
+            fail::JOB_ERROR,
+            fail::TOO_MANY_GRANTS,
+            fail::RECEIVE_FAILED,
+        ] {
+            assert!(fail::KNOWN.contains(&code), "{code} не в KNOWN");
+        }
+        assert_eq!(fail::KNOWN.len(), 24);
+    }
+
+    #[test]
+    fn precheck_phase_is_additive_and_parses() {
+        assert_eq!(Phase::parse("precheck"), Some(Phase::Precheck));
+        assert_eq!(Phase::ALL.len(), 10);
+        let p: ProgressRequest =
+            serde_json::from_str(r#"{"epoch":1,"seq":1,"phase":"precheck"}"#).unwrap();
+        assert_eq!(p.phase, Phase::Precheck);
     }
 
     #[test]

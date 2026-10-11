@@ -33,9 +33,48 @@ pub enum FailCode {
     TakeInvalid,
     /// Повтору нечего взять из папки задачи: нет или испорчен `record.json`, изменились скрипты.
     RetryNoData,
+    /// Ника нет в демке: ни по SteamID, ни по имени на одном из ярусов выбора.
+    PlayerNotFound,
+    /// Ник подходит двум и более игрокам на первом сработавшем ярусе: герой неизвестен.
+    PlayerAmbiguous,
+    /// Игрок найден, но убийств и полезных гранат у него нет: снимать нечего.
+    NoHighlights,
+    /// Демка не разбирается: обрезана, повреждена или не из CS2.
+    BadDemo,
+    /// Демка больше допустимого размера.
+    DemoTooLarge,
+    /// Раннер собрал ролик, но он не прошёл проверку перед отправкой на сервер.
+    ResultInvalid,
+    /// Источник задачи раннер не умеет брать (ссылка FACEIT вместо файла демки).
+    UnsupportedSource,
 }
 
 impl FailCode {
+    /// Все коды по порядку объявления: по этому списку раннер сверяет `wire::fail::KNOWN`.
+    pub const ALL: [FailCode; 21] = [
+        FailCode::LauncherFailed,
+        FailCode::GameNotStarted,
+        FailCode::ConsoleNotOpen,
+        FailCode::DemoNotLoaded,
+        FailCode::ScriptNotRun,
+        FailCode::TakeTimeout,
+        FailCode::GameExited,
+        FailCode::HlaeError,
+        FailCode::Cancelled,
+        FailCode::PrecheckFailed,
+        FailCode::ForeignGameRunning,
+        FailCode::PrevGameStuck,
+        FailCode::TakeInvalid,
+        FailCode::RetryNoData,
+        FailCode::PlayerNotFound,
+        FailCode::PlayerAmbiguous,
+        FailCode::NoHighlights,
+        FailCode::BadDemo,
+        FailCode::DemoTooLarge,
+        FailCode::ResultInvalid,
+        FailCode::UnsupportedSource,
+    ];
+
     /// Код в базе, журнале и карточке.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -53,6 +92,13 @@ impl FailCode {
             FailCode::PrevGameStuck => "PREV_GAME_STUCK",
             FailCode::TakeInvalid => "TAKE_INVALID",
             FailCode::RetryNoData => "RETRY_NO_DATA",
+            FailCode::PlayerNotFound => "PLAYER_NOT_FOUND",
+            FailCode::PlayerAmbiguous => "PLAYER_AMBIGUOUS",
+            FailCode::NoHighlights => "NO_HIGHLIGHTS",
+            FailCode::BadDemo => "BAD_DEMO",
+            FailCode::DemoTooLarge => "DEMO_TOO_LARGE",
+            FailCode::ResultInvalid => "RESULT_INVALID",
+            FailCode::UnsupportedSource => "UNSUPPORTED_SOURCE",
         }
     }
 
@@ -98,6 +144,20 @@ impl FailCode {
             }
             FailCode::RetryNoData => {
                 "Данных для повтора нет — нажмите «Заново»: задача начнётся со скачивания и плана."
+            }
+            FailCode::PlayerNotFound | FailCode::PlayerAmbiguous => {
+                "Укажите ник точнее или SteamID64 игрока."
+            }
+            FailCode::NoHighlights => "Выберите другого игрока или другой матч.",
+            FailCode::BadDemo => "Пришлите целую демку .dem или .dem.zst из матча CS2.",
+            FailCode::DemoTooLarge => {
+                "Демка больше допустимого размера — пришлите демку одной карты."
+            }
+            FailCode::ResultInvalid => {
+                "Ролик сохранён у раннера как улика; задачу можно поставить заново."
+            }
+            FailCode::UnsupportedSource => {
+                "Пришлите файл демки: ссылки FACEIT раннер пока не скачивает."
             }
         }
     }
@@ -276,6 +336,69 @@ pub fn hint_take_invalid(n: u32, dir: &str) -> String {
 /// Повтору нечего взять из папки задачи (D-08).
 pub fn msg_retry_no_data(reason: &str) -> String {
     format!("нет данных для повтора: {reason} — запустите задачу заново")
+}
+
+/// Самое длинное имя или запрос пользователя в тексте сбоя, символов.
+pub const TEXT_NAME_MAX: usize = 64;
+
+/// Строка из недоверенного источника (ник из запроса, имя из демки) для текста сбоя: без управляющих
+/// символов и не длиннее `max` символов (обрезка по символам, не по байтам; обрезанное помечается «…»).
+pub fn clean_text(s: &str, max: usize) -> String {
+    let all: Vec<char> = s.chars().filter(|c| !c.is_control()).collect();
+    let mut out: String = all.iter().take(max).collect();
+    if all.len() > max {
+        out.push('…');
+    }
+    out
+}
+
+/// «a, b, c[, и ещё N]» — список для сообщений о выборе игрока.
+fn list_with_more(items: &[String], more: usize) -> String {
+    let mut text = items.join(", ");
+    if more > 0 {
+        text.push_str(&format!(", и ещё {more}"));
+    }
+    text
+}
+
+/// Игрока с таким ником (SteamID64) в демке нет; `players` — кого можно выбрать.
+pub fn msg_player_not_found(query: &str, players: &[String], more: usize) -> String {
+    let q = clean_text(query, TEXT_NAME_MAX);
+    if players.is_empty() {
+        return format!("игрок «{q}» в демке не найден");
+    }
+    format!("игрок «{q}» в демке не найден; в демке: {}", list_with_more(players, more))
+}
+
+/// Ник подходит нескольким игрокам: герой не выбран, чтобы не снять ролик про чужого.
+pub fn msg_player_ambiguous(query: &str, candidates: &[String], more: usize) -> String {
+    let q = clean_text(query, TEXT_NAME_MAX);
+    format!("ник «{q}» подходит нескольким игрокам: {}", list_with_more(candidates, more))
+}
+
+/// У игрока нет моментов для ролика.
+pub fn msg_no_highlights(name: &str) -> String {
+    format!("у игрока {} в этом матче нет ни убийств, ни полезных гранат", clean_text(name, TEXT_NAME_MAX))
+}
+
+/// Демка не разобралась.
+pub fn msg_bad_demo(reason: &str) -> String {
+    format!("демка не разбирается: {reason}")
+}
+
+/// Демка больше допустимого размера.
+pub fn msg_demo_too_large(reason: &str) -> String {
+    format!("демка слишком большая: {reason}")
+}
+
+/// Готовый ролик не прошёл проверку перед отправкой на сервер.
+pub fn msg_result_invalid(reason: &str) -> String {
+    format!("ролик не прошёл проверку перед отправкой: {reason}")
+}
+
+/// Источник задачи раннер не берёт.
+pub fn msg_unsupported_source() -> String {
+    "раннер принимает только файл демки, а в задаче ссылка".to_owned()
 }
 
 /// Дубль проверен: длина, размер кадра и длина звука.
@@ -542,6 +665,13 @@ pub fn classify(code: FailCode, state: RecordState) -> FailClass {
         | FailCode::TakeTimeout
         | FailCode::TakeInvalid
         | FailCode::RetryNoData
+        | FailCode::PlayerNotFound
+        | FailCode::PlayerAmbiguous
+        | FailCode::NoHighlights
+        | FailCode::BadDemo
+        | FailCode::DemoTooLarge
+        | FailCode::ResultInvalid
+        | FailCode::UnsupportedSource
         | FailCode::Cancelled => FailClass::Other,
     }
 }

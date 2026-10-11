@@ -229,20 +229,111 @@ pub fn new_nonce() -> String {
     format!("{:08x}", h.finish() as u32)
 }
 
-/// Игрок демки по FACEIT: сначала по SteamID, затем по нику (точно, потом подстрокой без учёта регистра).
+/// Сколько кандидатов (или игроков демки) показывает текст сбоя выбора игрока.
+pub const CANDIDATES_MAX: usize = 10;
+
+/// Почему игрока не удалось выбрать. Списки — строки «имя (SteamID64)», не длиннее `CANDIDATES_MAX`;
+/// `more` — сколько не вошло.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayerError {
+    /// Ни SteamID, ни ник никого не нашли; `players` — кто есть в демке.
+    NotFound { query: String, players: Vec<String>, more: usize },
+    /// Первый сработавший ярус дал двух и более игроков.
+    Ambiguous { query: String, candidates: Vec<String>, more: usize },
+}
+
+impl PlayerError {
+    /// Типизированный сбой записи в состоянии предпроверки: до папки задачи и запуска игры.
+    pub fn into_run_error(self) -> RunError {
+        use record::failure;
+        let (code, message) = match self {
+            PlayerError::NotFound { query, players, more } => (FailCode::PlayerNotFound, failure::msg_player_not_found(&query, &players, more)),
+            PlayerError::Ambiguous { query, candidates, more } => (FailCode::PlayerAmbiguous, failure::msg_player_ambiguous(&query, &candidates, more)),
+        };
+        precheck_failure(code, message)
+    }
+}
+
+/// `RunError` с сбоем `code` в состоянии предпроверки.
+fn precheck_failure(code: FailCode, message: String) -> RunError {
+    let f = RecordFailure::new(code, RecordState::Precheck, message, std::time::Duration::ZERO);
+    RunError { message: f.message.clone(), fail: Some(f) }
+}
+
+/// Ник для сравнения: без краёв, серии пробельных символов — один пробел, без учёта регистра.
+fn normalized(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// «имя (SteamID64)»: имя из демки очищено от управляющих символов и обрезано.
+fn player_label(p: &cs2::Player) -> String {
+    let name = record::failure::clean_text(&p.name, record::failure::TEXT_NAME_MAX);
+    if p.xuid == 0 { format!("{name} (без SteamID)") } else { format!("{name} ({})", p.xuid) }
+}
+
+/// Не больше `CANDIDATES_MAX` подписей и число не вошедших.
+fn labels(players: &[&cs2::Player]) -> (Vec<String>, usize) {
+    (players.iter().take(CANDIDATES_MAX).map(|p| player_label(p)).collect(), players.len().saturating_sub(CANDIDATES_MAX))
+}
+
+/// Из совпавших на одном ярусе: один — он; все записи одного человека (тот же SteamID64 и то же имя
+/// после нормализации) — запись с наибольшим числом убийств и брошенных гранат; иначе неоднозначность.
+fn settle(m: &Match, query: &str, hits: Vec<&cs2::Player>) -> std::result::Result<PlayerId, PlayerError> {
+    if let [one] = hits.as_slice() {
+        return Ok(one.id);
+    }
+    let first = hits[0];
+    if first.xuid != 0 && hits.iter().all(|p| p.xuid == first.xuid && normalized(&p.name) == normalized(&first.name)) {
+        let activity = |p: &cs2::Player| m.kills.iter().filter(|k| k.attacker == p.id).count() + m.grenades.iter().filter(|g| g.thrower == p.id).count();
+        // при равенстве берётся первая запись (max_by_key отдаёт последнюю, поэтому идём с конца)
+        let best = hits.iter().rev().max_by_key(|p| activity(p)).expect("hits не пуст");
+        return Ok(best.id);
+    }
+    let (candidates, more) = labels(&hits);
+    Err(PlayerError::Ambiguous { query: query.to_owned(), candidates, more })
+}
+
+/// Игрок демки по SteamID64 и нику. Ярусы по порядку: SteamID64 → точное имя → имя без регистра и с
+/// одинарными пробелами → подстрока без регистра. На ярусе одно совпадение — игрок, несколько —
+/// `PlayerError::Ambiguous` (угадывать нельзя: ролик не про того человека), ни одного — следующий ярус.
+/// SteamID, которого нет в демке (или 0), не мешает выбору по нику. Минимальной длины запроса нет.
+pub fn resolve_player(m: &Match, steam: Option<u64>, nick: &str) -> std::result::Result<PlayerId, PlayerError> {
+    let steam = steam.filter(|&s| s != 0);
+    let query = if nick.trim().is_empty() { steam.map(|s| s.to_string()).unwrap_or_else(|| nick.to_owned()) } else { nick.to_owned() };
+    if let Some(s) = steam {
+        let hits: Vec<&cs2::Player> = m.players.iter().filter(|p| p.xuid == s).collect();
+        if !hits.is_empty() {
+            return settle(m, &query, hits);
+        }
+    }
+    let want = normalized(nick);
+    if !want.is_empty() {
+        let tiers: [&dyn Fn(&cs2::Player) -> bool; 3] = [&|p| p.name == nick, &|p| normalized(&p.name) == want, &|p| normalized(&p.name).contains(&want)];
+        for tier in tiers {
+            let hits: Vec<&cs2::Player> = m.players.iter().filter(|p| tier(p)).collect();
+            if !hits.is_empty() {
+                return settle(m, &query, hits);
+            }
+        }
+    }
+    let everyone: Vec<&cs2::Player> = m.players.iter().collect();
+    let (players, more) = labels(&everyone);
+    Err(PlayerError::NotFound { query, players, more })
+}
+
+/// Игрок демки по FACEIT: только точное или единственное совпадение (`resolve_player`);
+/// неоднозначность и отсутствие — `None`.
 pub fn find_player(m: &Match, steam_id: Option<u64>, nick: &str) -> Option<PlayerId> {
-    if let Some(p) = steam_id.filter(|&s| s != 0).and_then(|s| m.players.iter().find(|p| p.xuid == s)) {
-        return Some(p.id);
+    resolve_player(m, steam_id, nick).ok()
+}
+
+/// У героя есть что снимать: убийства или полезные гранаты. Иначе `NO_HIGHLIGHTS` до записи
+/// (та же проверка стоит в начале `plan_player`, но там её видит только приложение, строкой).
+pub fn ensure_highlights(m: &Match, hero: PlayerId) -> std::result::Result<(), RunError> {
+    if highlights::for_player(m, hero, &highlights::Config::default()).is_empty() && highlights::utility_for(m, hero).is_empty() {
+        return Err(precheck_failure(FailCode::NoHighlights, record::failure::msg_no_highlights(&m.name(hero))));
     }
-    let want = nick.trim().to_lowercase();
-    if want.is_empty() {
-        return None;
-    }
-    m.players
-        .iter()
-        .find(|p| p.name.to_lowercase() == want)
-        .or_else(|| m.players.iter().find(|p| p.name.to_lowercase().contains(&want)))
-        .map(|p| p.id)
+    Ok(())
 }
 
 /// Ролик про одного игрока (как `cs2-cli --player`): по раундам его глазами, повторы сильных

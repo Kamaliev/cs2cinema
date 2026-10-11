@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 06
 current_phase_name: Раннер, защита входа и первый живой прогон
 status: executing
-stopped_at: Completed 06-05-PLAN.md
-last_updated: "2026-10-11T15:53:07.081Z"
+stopped_at: Completed 06-06-PLAN.md
+last_updated: "2026-10-11T16:04:54.392Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 06 execution started
-state_head: 662d692ef940cc16ad6495cb05dc7e16628057e6
+state_head: dff69195218252fd968e36fa9b758c4086b6cd9e
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 16
-  completed_plans: 10
+  completed_plans: 11
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 06 (Раннер, защита входа и первый живой прогон) — EXECUTING
-Plan: 6 of 11
+Plan: 7 of 11
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 06 execution started
 
@@ -102,6 +102,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 06 P03 | 15min | 2 tasks | 5 files |
 | Phase 06 P04 | 15min | 2 tasks | 5 files |
 | Phase 06 P05 | 25min | 2 tasks | 9 files |
+| Phase 06 P06 | 55min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -178,6 +179,9 @@ Recent decisions affecting current work:
 - [Phase 06]: 06-04: самоограничение памяти через самоприсвоение Job Object без KILL_ON_JOB_CLOSE; лимит задаёт вызывающий
 - [Phase 06]: 06-05: job_id раннера = номер задачи на сервере; демка всегда remote/srv{id}.dem, orig_name в путях не участвует
 - [Phase 06]: 06-05: JOB_ERROR и BAD_DEMO в runner пока локальные константы, 06-09 заменит на wire::fail
+- [Phase 06]: 06-06: TransferEnd обобщён (Done(JobState) для загрузки результата); Dropped у демки = повреждена при передаче (BAD_DEMO), Err = сбой связи
+- [Phase 06]: 06-06: cancel из hello сохраняет итог Cancelled (Reporting) и уходит finish, файлы задачи убираются после ответа сервера
+- [Phase 06]: 06-06: out/srv{id} пишется в runner_state.json до первого запуска исполнителя; первый запуск без resume, после перезапуска resume=true
 
 ### Pending Todos
 
@@ -207,6 +211,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T15:53:06.978Z
-Stopped at: Completed 06-05-PLAN.md
+Last session: 2026-10-11T16:04:54.264Z
+Stopped at: Completed 06-06-PLAN.md
 Resume file: None

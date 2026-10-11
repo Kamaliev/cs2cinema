@@ -12,7 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -298,6 +298,21 @@ impl Store {
         Self::init(conn)
     }
 
+    /// Открывает существующую базу только на чтение: проверка приёмки не должна менять базу автора, пока приложение
+    /// открыто и пишет в неё (Pitfall 5). Режим журнала и схема не трогаются, шаги обновления схемы не выполняются;
+    /// база старше версии этой сборки отвергается до любых запросов. Запись через такой `Store` возвращает ошибку.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            return Err(format!("{}: базы нет — запустите приложение этой сборки", path.display()));
+        }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(err)?;
+        if version < schema_version() as i64 {
+            return Err(format!("база версии {version}, нужна {}: запустите приложение этой сборки, оно обновит базу", schema_version()));
+        }
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+    }
+
     /// База в памяти — для тестов.
     pub fn in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory().map_err(err)?)
@@ -548,6 +563,28 @@ impl Store {
             )?;
             Ok(())
         })
+    }
+
+    /// Метит задачу партией приёмочного прогона (ACC-01, DC-7); отдельный вызов, чтобы `NewJob` не менялся.
+    pub fn set_batch(&self, id: i64, batch: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE jobs SET batch = ?2, updated_at = ?3 WHERE id = ?1", params![id, batch, now()])?;
+            Ok(())
+        })
+    }
+
+    /// Задачи партии по порядку постановки.
+    pub fn jobs_in_batch(&self, batch: &str) -> Result<Vec<Job>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT * FROM jobs WHERE batch = ?1 ORDER BY id")?;
+            let rows = st.query_map([batch], Self::row)?;
+            rows.collect()
+        })
+    }
+
+    /// Партия самой новой помеченной задачи — приёмка без аргумента проверяет её.
+    pub fn last_batch(&self) -> Result<Option<String>> {
+        self.with(|c| c.query_row("SELECT batch FROM jobs WHERE batch IS NOT NULL AND batch <> '' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).optional())
     }
 
     pub fn delete_job(&self, id: i64) -> Result<()> {
@@ -947,6 +984,66 @@ mod tests {
         assert_eq!(job.attempt, 2);
         assert_eq!(journal::attempts(&job.log), vec![(1, StartKind::First), (2, StartKind::Auto)]);
         assert_eq!(journal::outcomes(&job.log), vec![(1, "сбой CONSOLE_NOT_OPEN".to_owned())]);
+    }
+
+    #[test]
+    fn read_only_store_reads_a_batch_while_the_writer_is_open() {
+        let db = TempDb::new("ro");
+        let w = Store::open(&db.0).unwrap();
+        let a = w.add_job(&new_job(JobKind::Record)).unwrap();
+        let b = w.add_job(&new_job(JobKind::Record)).unwrap();
+        let c = w.add_job(&new_job(JobKind::Record)).unwrap();
+        w.set_batch(a, "acc-1-2").unwrap();
+        w.set_batch(b, "acc-1-2").unwrap();
+        w.set_batch(c, "acc-2-1").unwrap();
+
+        let r = Store::open_read_only(&db.0).unwrap();
+        let ids: Vec<i64> = r.jobs_in_batch("acc-1-2").unwrap().iter().map(|j| j.id).collect();
+        assert_eq!(ids, vec![a, b], "по возрастанию id");
+        assert_eq!(r.jobs_in_batch("acc-1-2").unwrap()[0].batch.as_deref(), Some("acc-1-2"));
+        assert_eq!(r.last_batch().unwrap().as_deref(), Some("acc-2-1"));
+        assert!(r.append_log(a, "нельзя").is_err(), "запись через читателя отвергается");
+        assert!(r.requeue_auto(a).is_err());
+
+        // писатель продолжает работать, читатель видит новое
+        let d = w.add_job(&new_job(JobKind::Record)).unwrap();
+        w.set_batch(d, "acc-3-1").unwrap();
+        assert_eq!(r.last_batch().unwrap().as_deref(), Some("acc-3-1"));
+        assert!(w.job(a).unwrap().unwrap().log.is_empty(), "база писателя не изменилась");
+    }
+
+    #[test]
+    fn last_batch_is_none_without_batches() {
+        let s = Store::in_memory().unwrap();
+        s.add_job(&new_job(JobKind::Record)).unwrap();
+        assert_eq!(s.last_batch().unwrap(), None);
+        assert!(s.jobs_in_batch("нет такой").unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_only_store_refuses_an_old_database() {
+        let db = TempDb::new("ro-old");
+        {
+            let c = Connection::open(&db.0).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            for sql in &MIGRATIONS[..4] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.execute_batch("PRAGMA user_version = 4").unwrap();
+            insert_old_job(&c);
+        }
+        let e = Store::open_read_only(&db.0).err().expect("старая база отвергается");
+        assert!(e.contains("запустите приложение"), "{e}");
+        let c = Connection::open(&db.0).unwrap();
+        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 4, "читатель не обновил базу");
+    }
+
+    #[test]
+    fn read_only_store_does_not_create_a_missing_file() {
+        let db = TempDb::new("ro-missing");
+        assert!(Store::open_read_only(&db.0).is_err());
+        assert!(!db.0.exists(), "файл не создан");
     }
 
     #[test]

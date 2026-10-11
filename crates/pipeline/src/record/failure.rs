@@ -492,6 +492,48 @@ pub fn msg_partial_failed(name: &str, error: &str) -> String {
     format!("не удалось пометить {name}: {error} (уборка отложена)")
 }
 
+/// Класс сбоя для политики очереди (DIF-03, DIF-04, DC-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailClass {
+    /// Игра не дошла до дубля: очередь делает один авто-повтор после уборки и паузы (DIF-04).
+    Launch,
+    /// Неисправность окружения: два одинаковых сбоя подряд ставят очередь на паузу (DIF-03).
+    Environment,
+    /// Ни то, ни другое: авто-повтора нет, паузы нет.
+    Other,
+}
+
+impl FailClass {
+    pub fn title(self) -> &'static str {
+        match self {
+            FailClass::Launch => "запуск",
+            FailClass::Environment => "окружение",
+            FailClass::Other => "прочее",
+        }
+    }
+}
+
+/// Класс сбоя по коду и состоянию записи, в котором он случился. Без ветки `_`: новый код заставит решить его класс.
+/// `GAME_EXITED` до дубля — «игра умерла рано» (запуск); посреди дубля — «прочее» и не повторяется,
+/// иначе учение «завершить cs2.exe посреди дубля» прошло бы молча.
+pub fn classify(code: FailCode, state: RecordState) -> FailClass {
+    match code {
+        FailCode::GameNotStarted | FailCode::ConsoleNotOpen | FailCode::DemoNotLoaded => FailClass::Launch,
+        FailCode::GameExited if state < RecordState::Take => FailClass::Launch,
+        FailCode::GameExited => FailClass::Other,
+        FailCode::PrecheckFailed
+        | FailCode::ForeignGameRunning
+        | FailCode::PrevGameStuck
+        | FailCode::HlaeError
+        | FailCode::LauncherFailed => FailClass::Environment,
+        FailCode::ScriptNotRun
+        | FailCode::TakeTimeout
+        | FailCode::TakeInvalid
+        | FailCode::RetryNoData
+        | FailCode::Cancelled => FailClass::Other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +642,41 @@ mod tests {
             line(LauncherFact::Exited(None), Liveness::Alive),
             "HLAE.exe: код неизвестен · cs2.exe: жива"
         );
+    }
+
+    #[test]
+    fn launch_class_covers_start_codes_and_an_early_game_exit() {
+        assert_eq!(classify(FailCode::GameNotStarted, RecordState::Game), FailClass::Launch);
+        assert_eq!(classify(FailCode::ConsoleNotOpen, RecordState::Console), FailClass::Launch);
+        assert_eq!(classify(FailCode::DemoNotLoaded, RecordState::Demo), FailClass::Launch);
+        assert_eq!(classify(FailCode::GameExited, RecordState::Demo), FailClass::Launch);
+        assert_eq!(classify(FailCode::GameExited, RecordState::Script), FailClass::Launch);
+        assert_eq!(FailClass::Launch.title(), "запуск");
+    }
+
+    #[test]
+    fn game_exit_mid_take_is_not_retried() {
+        assert_eq!(classify(FailCode::GameExited, RecordState::Take), FailClass::Other);
+        assert_eq!(classify(FailCode::GameExited, RecordState::Closing), FailClass::Other);
+    }
+
+    #[test]
+    fn environment_class_holds_deterministic_codes() {
+        assert_eq!(classify(FailCode::PrecheckFailed, RecordState::Precheck), FailClass::Environment);
+        assert_eq!(classify(FailCode::ForeignGameRunning, RecordState::Precheck), FailClass::Environment);
+        assert_eq!(classify(FailCode::PrevGameStuck, RecordState::Precheck), FailClass::Environment);
+        assert_eq!(classify(FailCode::HlaeError, RecordState::Take), FailClass::Environment);
+        assert_eq!(classify(FailCode::LauncherFailed, RecordState::Launcher), FailClass::Environment);
+        assert_eq!(FailClass::Environment.title(), "окружение");
+    }
+
+    #[test]
+    fn everything_else_is_other() {
+        assert_eq!(classify(FailCode::TakeInvalid, RecordState::Take), FailClass::Other);
+        assert_eq!(classify(FailCode::Cancelled, RecordState::Game), FailClass::Other);
+        assert_eq!(classify(FailCode::TakeTimeout, RecordState::Take), FailClass::Other);
+        assert_eq!(classify(FailCode::ScriptNotRun, RecordState::Script), FailClass::Other);
+        assert_eq!(classify(FailCode::RetryNoData, RecordState::Precheck), FailClass::Other);
+        assert_eq!(FailClass::Other.title(), "прочее");
     }
 }

@@ -1,7 +1,7 @@
 ---
 phase: 05-yadro-servera-i-protokol
 verified: 2026-10-11T18:40:00Z
-status: human_needed
+status: passed
 score: 5/5 must-haves verified
 covered_files:
   - .github/workflows/ci.yml
@@ -150,3 +150,7 @@ human_verification:
 
 _Проверено: 2026-10-11_
 _Верификатор: Claude (gsd-verifier)_
+
+## Решение автора (2026-10-11)
+
+Автор выбрал вариант B: принять открытые пункты и закрыть фазу 5. CR-01, WR-01, WR-02 и прогон CI на ubuntu не закрыты и перенесены во вход фазы 9 (ROADMAP, Phase 9, Inherited from Phase 5). Статус passed выставлен по этому решению, а не потому, что дефекты исправлены.

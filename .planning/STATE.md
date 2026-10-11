@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v1.1
 milestone_name: Сервер и Telegram-бот
-current_phase: 5
-current_phase_name: Ядро сервера и протокол
+current_phase: 7
+current_phase_name: Telegram-бот и доставка
 status: planning
-stopped_at: Phase 06 complete, ready to plan Phase 5
-last_updated: "2026-10-11T18:16:21.929Z"
+stopped_at: Phase 05 complete, ready to plan Phase 7
+last_updated: "2026-10-11T18:40:17.341Z"
 last_activity: 2026-10-11
-last_activity_desc: Phase 06 complete, transitioned to Phase 5
-state_head: 180b86269c0ac84c7c5e7a8f884e7227900f27ca
+last_activity_desc: Phase 05 complete, transitioned to Phase 7
+state_head: 53543a585b9e74cafe5e799b9868805fc3bac358
 progress:
   total_phases: 5
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 16
   completed_plans: 16
-  percent: 20
+  percent: 40
 ---
 
 # Project State
@@ -29,17 +29,17 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 
 ## Current Position
 
-Phase: 5 — Ядро сервера и протокол
+Phase: 7 — Telegram-бот и доставка
 Plan: Not started
 Status: Ready to plan
-Last activity: 2026-10-11 — Phase 06 complete, transitioned to Phase 5
+Last activity: 2026-10-11 — Phase 05 complete, transitioned to Phase 7
 
-Progress: [██░░░░░░░░] 20%
+Progress: [████░░░░░░] 40%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 27
+- Total plans completed: 32
 - Average duration: -
 - Total execution time: 0 hours
 
@@ -50,6 +50,7 @@ Progress: [██░░░░░░░░] 20%
 | 02 | 8 | - | - |
 | 03 | 8 | - | - |
 | 06 | 11 | - | - |
+| 05 | 5 | - | - |
 
 **Recent Trend:**
 - Last 5 plans: -
@@ -229,5 +230,5 @@ Items acknowledged and deferred at milestone close, most recent first:
 ## Session Continuity
 
 Last session: 2026-10-11T17:05:13.947Z
-Stopped at: Phase 06 complete, ready to plan Phase 5
+Stopped at: Phase 05 complete, ready to plan Phase 7
 Resume file: None

@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 04
 current_phase_name: Очередь без присмотра и приёмка
 status: executing
-stopped_at: Completed 04-08-PLAN.md
-last_updated: "2026-10-11T08:02:12.766Z"
+stopped_at: Completed 04-09-PLAN.md
+last_updated: "2026-10-11T08:15:47.877Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 04 execution started
-state_head: d888846bcdc2824a18a45f4c035ca6411d007516
+state_head: 84efa3e849c9ea70beade7448b345295661cb760
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 36
-  completed_plans: 32
+  completed_plans: 33
   percent: 50
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 04 (Очередь без присмотра и приёмка) — EXECUTING
-Plan: 9 of 12
+Plan: 10 of 12
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 04 execution started
 
@@ -87,6 +87,7 @@ Progress: [█████░░░░░] 50%
 | Phase 04 P06 | 12 min | 2 tasks | 3 files |
 | Phase 04 P07 | 10 min | 2 tasks | 8 files |
 | Phase 04 P08 | 25 min | 2 tasks | 6 files |
+| Phase 04 P09 | 13min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -139,6 +140,7 @@ Recent decisions affecting current work:
 - [Phase 04]: cs2-cli retry отвергает флаги плана (--player/--out/--size/--fps): план берётся из record.json
 - [Phase 04]: 04-07: launch.rs удалён; recover_after_crash в app::jobs, find_cs2/find_hlae в app::settings, no_window в app::ui, old_logs в app::app
 - [Phase 04]: 04-08: очередь в потоке cs2cinema-queue; Cmd только Resume (Wake не нужен), Resume действует и сразу в виде, и по порядку в потоке
+- [Phase 04]: 04-09: политика очереди чистая (QueuePolicy); сбой «запуск» повторяется один раз, два одинаковых сбоя «окружение» (и «запуск» без бюджета) — пауза с объяснением; итог очереди объявляется и при паузе без ждущих задач
 
 ### Pending Todos
 
@@ -167,6 +169,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T08:02:12.623Z
-Stopped at: Completed 04-08-PLAN.md
+Last session: 2026-10-11T08:15:47.738Z
+Stopped at: Completed 04-09-PLAN.md
 Resume file: None

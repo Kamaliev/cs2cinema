@@ -1,19 +1,16 @@
 ---
 gsd_state_version: "1.0"
-current_phase: 04
-current_phase_name: Очередь без присмотра и приёмка
-status: executing
-stopped_at: Completed 04-11-PLAN.md (учения D1-D6 не проводились)
-last_updated: "2026-10-11T08:42:55.905Z"
+milestone: v1.1
+milestone_name: Сервер и Telegram-бот
+status: planning
+last_updated: "2026-10-11T08:47:53.532Z"
 last_activity: 2026-10-11
-last_activity_desc: Phase 04 execution started
-state_head: 7a5b6a66811edefa895d19581ef0b62ff583ce48
 progress:
-  total_phases: 4
-  completed_phases: 2
-  total_plans: 36
-  completed_plans: 35
-  percent: 50
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -27,12 +24,10 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 
 ## Current Position
 
-Phase: 04 (Очередь без присмотра и приёмка) — EXECUTING
-Plan: 12 of 12
-Status: Ready to execute
-Last activity: 2026-10-11 — Phase 04 execution started
-
-Progress: [█████░░░░░] 50%
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-10-11 — Milestone v1.1 started
 
 ## Performance Metrics
 

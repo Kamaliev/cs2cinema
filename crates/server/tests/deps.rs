@@ -17,6 +17,7 @@ const WORKSPACE_CRATES: &[&str] = &[
     "director",
     "highlights",
     "faceit",
+    "runner",
 ];
 
 /// Строки зависимостей из секций `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`:

@@ -5,9 +5,10 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pipeline::job::Outcome;
-use pipeline::{Progress, RunError};
+use pipeline::{FailCode, Progress, RecordFailure, RecordState, RunError};
 use runner::{Config, Executor, Task, Token};
 use server::clock::SystemClock;
 use server::config::Config as ServerConfig;
@@ -133,6 +134,12 @@ impl Drop for Stand {
 pub enum Scenario {
     /// Записывает в `out/srv{id}/highlights.mp4` столько детерминированных байт.
     Result(usize),
+    /// Сбой записи с кодом и состоянием автомата и двумя строками хвоста консоли.
+    Fail { code: FailCode, state: RecordState },
+    /// Ошибка без типизированного описания.
+    Plain(String),
+    /// Исполнитель остановился по отмене.
+    Cancel,
 }
 
 /// Исполнитель-заглушка: очередь сценариев, расходуемая по вызову (последний повторяется).
@@ -177,6 +184,30 @@ impl Executor for ScriptedExecutor {
         *self.last.lock().unwrap() = Some(task.clone());
         p.log("заглушка исполнителя");
         match self.next() {
+            Scenario::Fail { code, state } => {
+                let mut fail = RecordFailure::new(
+                    code,
+                    state,
+                    "дубль не записан".to_owned(),
+                    Duration::from_millis(1500),
+                );
+                fail.console_tail = vec![
+                    "строка консоли\nс переводом".to_owned(),
+                    "вторая".to_owned(),
+                ];
+                Err(RunError {
+                    message: "дубль не записан".to_owned(),
+                    fail: Some(fail),
+                })
+            }
+            Scenario::Plain(message) => Err(RunError {
+                message,
+                fail: None,
+            }),
+            Scenario::Cancel => Err(RunError {
+                message: pipeline::CANCELLED.to_owned(),
+                fail: None,
+            }),
             Scenario::Result(n) => {
                 let out_dir = self.dir.join("out").join(format!("srv{}", task.job_id));
                 std::fs::create_dir_all(&out_dir).unwrap();

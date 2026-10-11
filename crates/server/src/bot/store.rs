@@ -450,6 +450,26 @@ pub fn mark_sent(
     })
 }
 
+/// Запрос точно не ушёл или Telegram просит подождать: `sending` → `pending`, следующая попытка не раньше
+/// `next_try_ms`. Число попыток остаётся как есть (его увеличил `begin_sending`).
+pub fn retry_delivery(
+    db: &Db,
+    job_id: i64,
+    next_try_ms: i64,
+    error: &str,
+    now_ms: i64,
+) -> Result<()> {
+    db.write(|tx| {
+        tx.execute(
+            "UPDATE tg_jobs SET delivery = 'pending', next_try_ms = ?2, delivery_error = ?3, updated_at = ?4
+             WHERE job_id = ?1 AND delivery = 'sending'",
+            params![job_id, next_try_ms, error, now_ms],
+        )
+        .map(|_| ())
+        .map_err(db_err)
+    })
+}
+
 /// Итог без успеха: `uncertain` или `failed` с причиной.
 pub fn mark_delivery(db: &Db, job_id: i64, delivery: &str, error: &str, now_ms: i64) -> Result<()> {
     db.write(|tx| {

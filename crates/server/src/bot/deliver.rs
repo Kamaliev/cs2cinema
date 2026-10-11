@@ -2,7 +2,9 @@
 //! `pending` → `sending` (пишется ДО вызова Telegram) → `sent` | `uncertain` | `failed`.
 //!
 //! Слепого повтора нет: если запрос мог дойти (тайм-аут или обрыв после начала отправки), доставка
-//! `uncertain`, и решает человек. После перезапуска `sending` тоже становится `uncertain` (`Bot::recover`).
+//! `uncertain`, и решает человек (`/resend`). После перезапуска `sending` тоже становится `uncertain`
+//! (`Bot::recover`). Повторяется сам только запрос, который точно не ушёл (`429`, ошибка до отправки), и не
+//! больше пяти раз; `403` заглушает чат; ролик больше `SEND_LIMIT_BYTES` не отправляется.
 
 use super::store::{self, TgJob};
 use super::{Bot, SendAs};
@@ -13,6 +15,19 @@ use std::path::Path;
 use wire::JobState;
 
 const NOT_YOURS: &str = "Это не ваша задача.";
+
+/// Самый большой ролик, который бот пробует отправить: 1950 МиБ. Telegram принимает до 2000 МБ через локальный
+/// Bot API, запас защищает от расхождения в единицах и накладных расходах запроса (допущение A5 исследования).
+pub const SEND_LIMIT_BYTES: u64 = 1950 * 1024 * 1024;
+
+/// Сколько раз пробуем отправить ролик, прежде чем признать доставку несостоявшейся.
+const MAX_ATTEMPTS: i64 = 5;
+
+/// Пауза перед повтором, если запрос до Telegram не дошёл (нет соединения, тайм-аут до начала отправки).
+const UNSENT_RETRY_MS: i64 = 30_000;
+
+/// Меньше этого после `429` не ждём: нулевой `retry_after` не должен крутить цикл доставки.
+const MIN_RETRY_MS: i64 = 1_000;
 
 /// URI `file:///…` для процесса `telegram-bot-api`: `\` → `/`, у пути без начального `/` (диск Windows)
 /// добавляется `/`, всё вне `[A-Za-z0-9-_.~/:]` кодируется как `%XX` (остаток после `file:/` декодируется).
@@ -48,7 +63,7 @@ pub fn deliver_once(bot: &Bot) -> Result<bool> {
         .join("results")
         .join(id.to_string())
         .join("highlights.mp4");
-    if bot.core().result_file(id)?.is_none() || !on_disk.is_file() {
+    let Some(file) = bot.core().result_file(id)?.filter(|_| on_disk.is_file()) else {
         store::mark_delivery(
             db,
             id,
@@ -59,6 +74,36 @@ pub fn deliver_once(bot: &Bot) -> Result<bool> {
         bot.log().warn(&format!(
             "бот: у задачи #{id} нет файла результата для отправки"
         ));
+        tell(
+            bot,
+            &tj,
+            &format!("Ролик задачи #{id} не найден на сервере — автор уже получил подробности."),
+        );
+        return Ok(true);
+    };
+    // Telegram не примет файл больше своего предела: не грузим его полчаса впустую.
+    if file.size > SEND_LIMIT_BYTES {
+        store::mark_delivery(
+            db,
+            id,
+            "failed",
+            &format!(
+                "ролик {} МиБ больше лимита Telegram",
+                file.size / (1024 * 1024)
+            ),
+            now,
+        )?;
+        bot.log().warn(&format!(
+            "бот: ролик задачи #{id} ({} МиБ) больше лимита Telegram — не отправляю",
+            file.size / (1024 * 1024)
+        ));
+        tell(
+            bot,
+            &tj,
+            &format!(
+                "Ролик задачи #{id} больше лимита Telegram (≈2 ГБ); автор передаст его иначе."
+            ),
+        );
         return Ok(true);
     }
     let player = bot
@@ -87,29 +132,77 @@ pub fn deliver_once(bot: &Bot) -> Result<bool> {
                 .info(&format!("бот: ролик задачи #{id} отправлен"));
         }
         Err(e) => {
-            let state = if e.maybe_delivered() {
-                "uncertain"
-            } else {
-                "failed"
-            };
-            let text = bot.core().redactor().clean(&e.to_string(), 500);
-            store::mark_delivery(db, id, state, &text, done_at)?;
-            bot.log().warn(&format!(
-                "бот: отправка ролика задачи #{id} — {state}: {text}"
-            ));
-            // Запрос мог дойти: слепого повтора нет, решает друг (T-07-35).
-            if e.maybe_delivered() {
-                tell(
-                    bot,
-                    &tj,
-                    &format!(
-                        "Не уверен, что ролик задачи #{id} дошёл. Если его нет в чате — отправьте /resend {id}"
-                    ),
-                );
-            }
+            let attempts = tj.delivery_attempts + 1;
+            fail_delivery(bot, &tj, &e, attempts, done_at)?;
         }
     }
     Ok(true)
+}
+
+/// Разбор неудачной отправки. Повторяется только то, что точно не ушло (T-07-35):
+/// - запрос мог дойти → `uncertain` без автоповтора, друг решает `/resend`;
+/// - `403` → `failed`, чат заглушён, друг недоступен;
+/// - `429` → `pending` не раньше `retry_after`; ошибка до отправки запроса → `pending` через 30 с;
+///   после `MAX_ATTEMPTS` попыток → `failed`;
+/// - прочий ответ API → `failed`.
+fn fail_delivery(bot: &Bot, tj: &TgJob, e: &TgError, attempts: i64, now: i64) -> Result<()> {
+    let db = bot.core().db();
+    let id = tj.job_id;
+    let text = bot.core().redactor().clean(&e.to_string(), 500);
+    if e.maybe_delivered() {
+        store::mark_delivery(db, id, "uncertain", &text, now)?;
+        bot.log().warn(&format!(
+            "бот: отправка ролика задачи #{id} — uncertain: {text}"
+        ));
+        tell(
+            bot,
+            tj,
+            &format!(
+                "Не уверен, что ролик задачи #{id} дошёл. Если его нет в чате — отправьте /resend {id}"
+            ),
+        );
+        return Ok(());
+    }
+    if e.is_forbidden() {
+        store::mark_delivery(db, id, "failed", &text, now)?;
+        store::mute_chat(db, tj.chat_id, now)?;
+        bot.log().warn(&format!(
+            "бот: чат задачи #{id} закрыт для бота (403) — ролик не доставлен, чат заглушён"
+        ));
+        return Ok(());
+    }
+    let wait = match e {
+        TgError::Api { code: 429, .. } => Some(
+            e.retry_after_ms()
+                .unwrap_or(UNSENT_RETRY_MS)
+                .max(MIN_RETRY_MS),
+        ),
+        TgError::Timeout { .. } | TgError::Io { .. } => Some(UNSENT_RETRY_MS),
+        TgError::Api { .. } => None,
+    };
+    match wait {
+        Some(wait) if attempts < MAX_ATTEMPTS => {
+            store::retry_delivery(db, id, now + wait, &text, now)?;
+            bot.log().warn(&format!(
+                "бот: отправка ролика задачи #{id} не удалась (попытка {attempts} из {MAX_ATTEMPTS}), повтор через {} с: {text}",
+                wait / 1000
+            ));
+        }
+        _ => {
+            store::mark_delivery(db, id, "failed", &text, now)?;
+            bot.log().warn(&format!(
+                "бот: отправка ролика задачи #{id} — failed: {text}"
+            ));
+            tell(
+                bot,
+                tj,
+                &format!(
+                    "Не получилось отправить ролик задачи #{id} в Telegram. Попробуйте позже: /resend {id}"
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Подпись под роликом: номер задачи и игрок.

@@ -133,7 +133,7 @@ impl Progress for JobReporter {
         }
         if let (pipeline::Event::TakeDone { n, .. }, Some(dir)) = (e, self.out_dir.get()) {
             // номер дубля в событии с единицы, в `installed.json` и в имени `takeNNNN` — с нуля
-            launch::note_take_done(dir, n.saturating_sub(1));
+            pipeline::gamedir::note_take_done(dir, n.saturating_sub(1));
         }
         self.log(&e.to_string());
     }
@@ -486,7 +486,7 @@ fn record_takes(
         p.log(&format!("env.json не записан: {e}"));
     }
     p.log(&env.one_line());
-    let installed = launch::install_files(&s.cs2_dir, out_dir, &rj.demo_name, |path| pipeline::write_demo_copy(&rj.demo_path, path));
+    let installed = pipeline::gamedir::install_files(Path::new(&s.cs2_dir), out_dir, &rj.demo_name, |path| pipeline::write_demo_copy(&rj.demo_path, path));
     // игру закрывает сама запись при любом выходе, в том числе при отмене
     let recorded_run = installed.map_err(RunError::from).and_then(|()| {
         // каждая попытка записи в приложении идёт с проверкой дублей и ведением манифеста (TAK-03, D-05)
@@ -499,7 +499,7 @@ fn record_takes(
     });
     // папка игры чистая при любом исходе — успех, сбой, отмена (D-05, D-06, TMO-06): запись вернулась
     // только после подтверждённого закрытия игры, поэтому копия демки уже никем не занята
-    for note in launch::cleanup_installed(&s.cs2_dir, out_dir) {
+    for note in pipeline::gamedir::cleanup_installed(Path::new(&s.cs2_dir), out_dir) {
         p.log(&note);
     }
     let rep = recorded_run?;

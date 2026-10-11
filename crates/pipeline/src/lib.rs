@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 pub use host;
 pub mod assemble;
+pub mod gamedir;
 pub mod manifest;
 pub mod precheck;
 pub mod record;

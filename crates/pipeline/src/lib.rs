@@ -511,10 +511,11 @@ mod tests {
 
     #[test]
     fn resolve_player_ignores_case_and_spaces_after_the_exact_tier() {
+        // имена очищаются в Match::build (06-02): двойной пробел схлопывается, запрос с ним всё равно находит игрока
         let m = match_of(&[("Big  Boss", 1), ("other", 2)]);
         for q in [" big boss ", "BIG BOSS", "Big  Boss"] {
             let id = resolve_player(&m, None, q).unwrap_or_else(|e| panic!("{q:?}: {e:?}"));
-            assert_eq!(name_of(&m, id), "Big  Boss", "{q:?}");
+            assert_eq!(name_of(&m, id), "Big Boss", "{q:?}");
         }
         // точный ярус раньше регистрового
         let m = match_of(&[("Ace", 10), ("ace", 11)]);

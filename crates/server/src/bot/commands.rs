@@ -1,18 +1,24 @@
-//! Команды бота: `/start`, `/help`, `/player` и управление белым списком (`/adduser`, `/removeuser`, `/users`).
-//! Команды статуса, отмены и повтора добавляют следующие планы фазы.
+//! Команды бота: `/start`, `/help`, `/player`, ход задач (`/status`, `/queue`), управление ими (`/cancel`, `/retry`)
+//! и белый список (`/adduser`, `/removeuser`, `/users`).
 //!
 //! Роль берётся только из базы (`User::role`). Команды админа проверяют её до любого изменения; `/adduser`
 //! создаёт только участника, поэтому повысить права через чат нельзя.
 
-use super::Bot;
+use super::ingest::{self, ACTIVE_STATES, ahead_phrase};
+use super::store::{self, NewTgJob};
+use super::{Bot, notify};
 use crate::core::is_steam64;
 use crate::users::{self, User};
+use wire::{CancelMode, JobState};
 
 const ADMIN_ONLY: &str = "Эта команда только для администратора.";
 const ADDUSER_FORMAT: &str =
     "Формат: /adduser Telegram-ID [имя]. Например: /adduser 123456789 петя";
 const REMOVEUSER_FORMAT: &str = "Формат: /removeuser Telegram-ID. Например: /removeuser 123456789";
 const PLAYER_FORMAT: &str = "Формат: /player ник или SteamID64 (17 цифр). Например: /player s1mple";
+const CANCEL_FORMAT: &str = "Формат: /cancel [номер задачи]. Например: /cancel 12";
+const RETRY_FORMAT: &str = "Формат: /retry [номер задачи]. Например: /retry 12";
+const NOT_YOURS: &str = "Это не ваша задача.";
 
 /// Разбирает `/команда@имя_бота аргументы` в пару «команда без слеша в нижнем регистре, аргументы».
 pub fn parse(text: &str) -> (String, String) {
@@ -33,6 +39,10 @@ pub fn menu() -> Vec<(String, String)> {
         ("start", "Как пользоваться ботом"),
         ("help", "Справка"),
         ("player", "Игрок по умолчанию"),
+        ("status", "Мои задачи"),
+        ("queue", "Очередь"),
+        ("cancel", "Отменить задачу"),
+        ("retry", "Повторить задачу"),
         ("adduser", "Добавить друга (админ)"),
         ("removeuser", "Убрать друга (админ)"),
         ("users", "Список друзей (админ)"),
@@ -105,6 +115,10 @@ fn help_text(user: &User) -> String {
          Ник или SteamID64 игрока напишите в подписи к файлу. Если подписи нет, берётся сохранённый игрок.\n\n\
          /player — показать игрока по умолчанию\n\
          /player ник — запомнить игрока (ник или SteamID64)\n\
+         /status — мои задачи и их этапы\n\
+         /queue — очередь и моё место в ней\n\
+         /cancel [номер] — отменить задачу\n\
+         /retry [номер] — повторить упавшую или отменённую задачу\n\
          /start — как пользоваться\n\
          /help — эта справка",
     );
@@ -225,6 +239,161 @@ fn users_cmd(bot: &Bot) -> String {
     format!("Пользователи ({}):\n{}", list.len(), lines.join("\n"))
 }
 
+/// Номер задачи из аргумента команды: только десятичные цифры, положительное `i64`.
+fn parse_job_no(s: &str) -> Option<i64> {
+    parse_tg_id(s)
+}
+
+/// Задача по аргументу команды или, если аргумента нет, самая свежая задача пользователя в `states`.
+/// `Err` — готовый ответ пользователю.
+fn target_job(
+    bot: &Bot,
+    user: &User,
+    args: &str,
+    states: &str,
+    none_text: &str,
+    format_text: &str,
+) -> Result<crate::core::JobRow, String> {
+    let id = if args.is_empty() {
+        match store::user_job_ids(bot.core().db(), user.id, states, 1) {
+            Ok(ids) => match ids.first() {
+                Some(id) => *id,
+                None => return Err(none_text.to_owned()),
+            },
+            Err(e) => return Err(format!("Не удалось получить задачи: {e}")),
+        }
+    } else {
+        parse_job_no(args).ok_or_else(|| format_text.to_owned())?
+    };
+    match bot.core().job(id) {
+        Ok(Some(job)) => Ok(job),
+        // Несуществующий номер отвечает так же, как чужой: наличие чужих задач не раскрываем.
+        Ok(None) => Err(NOT_YOURS.to_owned()),
+        Err(e) => Err(format!("Не удалось получить задачу: {e}")),
+    }
+}
+
+/// `/cancel [N]`: своя задача (админ — любая). В очереди отменяется сразу, у раннера — флагом; повторная отмена
+/// жёсткая. Пустой ответ — сказать нечего: «отменена» уже говорит тик уведомлений.
+fn cancel_cmd(bot: &Bot, user: &User, chat_id: i64, args: &str) -> String {
+    let job = match target_job(
+        bot,
+        user,
+        args,
+        ACTIVE_STATES,
+        "У вас нет активных задач — отменять нечего.",
+        CANCEL_FORMAT,
+    ) {
+        Ok(j) => j,
+        Err(text) => return text,
+    };
+    let id = job.id;
+    if job.user_id != Some(user.id) && !is_admin(user) {
+        return NOT_YOURS.to_owned();
+    }
+    if job.state.is_terminal() {
+        return format!("Задача #{id} уже завершена, отменять нечего.");
+    }
+    let force = job.cancel_requested != CancelMode::NotRequested;
+    match bot.core().cancel(id, force) {
+        Ok(JobState::Cancelled) => cancelled_now(bot, id, chat_id),
+        Ok(_) if force => format!("Останавливаю задачу #{id} жёстко — раннер оборвёт работу."),
+        Ok(_) => format!("Отменяю задачу #{id} — раннер остановит запись."),
+        Err(e) => format!("Не отменил задачу #{id}: {e}"),
+    }
+}
+
+/// Задача отменена сразу (была в очереди). Если это чат её владельца, отчёт «отменена» занимаем здесь, чтобы тик
+/// не прислал его вторым сообщением; чужую задачу (отмена админом) владельцу объявит тик.
+fn cancelled_now(bot: &Bot, id: i64, chat_id: i64) -> String {
+    let text = format!("Задача #{id} отменена.");
+    let db = bot.core().db();
+    let Ok(Some(tj)) = store::tg_job(db, id) else {
+        return text;
+    };
+    if tj.chat_id != chat_id {
+        return text;
+    }
+    match store::claim_final(db, id, bot.now_ms()) {
+        Ok(true) => {
+            notify::mark_status_cancelled(bot, &tj);
+            text
+        }
+        // Тик успел раньше и уже сказал сам.
+        Ok(false) => String::new(),
+        Err(_) => text,
+    }
+}
+
+/// `/retry [N]`: ставит свою упавшую или отменённую задачу заново по сохранённой демке (`getFile` не нужен) в
+/// пределах тех же лимитов D-03. Успех отвечает сообщением статуса новой задачи, поэтому возвращает пустой ответ.
+fn retry_cmd(bot: &Bot, user: &User, chat_id: i64, args: &str) -> String {
+    let job = match target_job(
+        bot,
+        user,
+        args,
+        "('failed','cancelled')",
+        "У вас нет упавших или отменённых задач — повторять нечего.",
+        RETRY_FORMAT,
+    ) {
+        Ok(j) => j,
+        Err(text) => return text,
+    };
+    let id = job.id;
+    // Повтор занимает лимиты, поэтому и админ повторяет только свои задачи.
+    if job.user_id != Some(user.id) {
+        return NOT_YOURS.to_owned();
+    }
+    match job.state {
+        JobState::Failed | JobState::Cancelled => {}
+        JobState::Done => {
+            return format!("Задача #{id} уже готова. Прислать ролик ещё раз: /resend {id}");
+        }
+        _ => return format!("Задача #{id} ещё идёт — повторять нечего."),
+    }
+    // Лимиты D-03 проверяются до постановки (T-07-34).
+    match bot
+        .core()
+        .db()
+        .write(|tx| Ok::<_, String>(ingest::admit(bot, tx, user)))
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(refusal)) => return refusal,
+        Err(e) => return format!("Не удалось проверить лимиты: {e}"),
+    }
+    let new_id = match bot.core().resubmit(id, &user.name) {
+        Ok(n) => n,
+        Err(e) => return format!("Не удалось повторить задачу #{id}: {e}"),
+    };
+    let ahead = bot.core().jobs_ahead(new_id).unwrap_or(0);
+    let text = format!(
+        "Задача #{new_id} — повтор задачи #{id}, {}.",
+        ahead_phrase(ahead)
+    );
+    let now = bot.now_ms();
+    let message_id = bot.say(chat_id, &text);
+    let row = NewTgJob {
+        job_id: new_id,
+        chat_id,
+        user_id: user.id,
+        status_message_id: message_id,
+        // Если сообщение не ушло, тик пришлёт его сам: пустой текст отличается от любого статуса.
+        status_text: if message_id.is_some() { &text } else { "" },
+        next_edit_ms: if message_id.is_some() {
+            now + bot.settings().status_edit_ms
+        } else {
+            0
+        },
+    };
+    if let Err(e) = store::insert_tg_job(bot.core().db(), &row, now) {
+        return format!("Задача #{new_id} поставлена, но ход её в чате показывать не смогу: {e}");
+    }
+    bot.log().info(&format!(
+        "бот: задача #{id} повторена как #{new_id} по сохранённой демке"
+    ));
+    String::new()
+}
+
 /// Выполняет команду и отвечает в чат.
 pub fn handle(bot: &Bot, user: &User, chat_id: i64, text: &str) {
     let (cmd, args) = parse(text);
@@ -232,13 +401,20 @@ pub fn handle(bot: &Bot, user: &User, chat_id: i64, text: &str) {
         "start" => start_text(user),
         "help" => help_text(user),
         "player" => player_cmd(bot, user, &args),
+        "status" => notify::status_reply(bot, user),
+        "queue" => notify::queue_reply(bot, user),
+        "cancel" => cancel_cmd(bot, user, chat_id, &args),
+        "retry" => retry_cmd(bot, user, chat_id, &args),
         "adduser" | "removeuser" | "users" if !is_admin(user) => ADMIN_ONLY.to_owned(),
         "adduser" => adduser_cmd(bot, &args),
         "removeuser" => removeuser_cmd(bot, &args),
         "users" => users_cmd(bot),
         _ => "Не знаю такой команды. Список команд и порядок работы: /help".to_owned(),
     };
-    bot.say(chat_id, &reply);
+    // Пустой ответ — команда уже ответила сама (сообщением статуса новой задачи) или тик скажет вместо неё.
+    if !reply.is_empty() {
+        bot.say(chat_id, &reply);
+    }
 }
 
 #[cfg(test)]

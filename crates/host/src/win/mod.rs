@@ -13,6 +13,7 @@ pub mod job;
 pub mod netcon;
 pub mod notify;
 pub mod process;
+pub mod sandbox;
 pub mod system;
 pub mod watch;
 pub mod windows;

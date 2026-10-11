@@ -387,6 +387,34 @@ pub fn console_line_ok(line: &str) -> bool {
     !line.is_empty() && !line.contains(['\r', '\n', '\0'])
 }
 
+/// Процесс, ограничивший собственную память (см. [`limit_self_memory`]).
+///
+/// Handle Job Object не закрывается до конца процесса: закрытие не нужно, а его отсутствие
+/// гарантирует, что лимит действует всё время жизни процесса.
+pub struct SelfLimit {
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    guard: win::sandbox::Guard,
+}
+
+/// Ограничивает память текущего процесса значением `bytes` Job Object'ом и запрещает ему
+/// порождать процессы. Нужна дочернему разбору чужой демки (`cs2-cli inspect`): превысивший
+/// лимит процесс умирает за секунды, а машина автора с запущенным CS2 не остаётся без памяти.
+/// Вне Windows возвращает [`HostError::Unsupported`].
+pub fn limit_self_memory(bytes: u64) -> Result<SelfLimit, HostError> {
+    #[cfg(windows)]
+    {
+        Ok(SelfLimit {
+            guard: win::sandbox::limit_self_memory(bytes)?,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = bytes;
+        Err(HostError::Unsupported)
+    }
+}
+
 /// Хост по умолчанию: `WinHost` на Windows, на остальных платформах — заглушка `UnsupportedHost`.
 pub fn default_host() -> Box<dyn Host> {
     #[cfg(windows)]

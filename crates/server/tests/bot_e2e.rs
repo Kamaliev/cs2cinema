@@ -221,3 +221,103 @@ fn bot_failing_getme_stops_serve_with_a_clear_error() {
         "порт должен остаться свободным"
     );
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Отчёт о сбое на запущенном сервере с потоками бота (07-09)
+// ---------------------------------------------------------------------------------------------------------
+
+#[test]
+fn failure_report_reaches_friend_and_admin_through_the_running_server() {
+    const ADMIN: i64 = 900;
+    let tg_dir = TestDir::new("e2e-fail-tg");
+    let tg = FakeTelegram::new(tg_dir.path.clone());
+    let mut srv = TestServer::start_with(TestOptions {
+        tg: Some(tg.clone()),
+        clock: Some(ManualClock::new(1_800_000_000_000)),
+        ..Default::default()
+    });
+    {
+        let core = srv.running().core();
+        let now = core.clock().now_ms();
+        server::users::add_user(core.db(), "вася", Some(FRIEND), false, now).unwrap();
+        server::users::add_user(core.db(), "автор", Some(ADMIN), true, now).unwrap();
+    }
+
+    let bytes = common::fake_demo(4096);
+    tg.put_document("file-f", "uniq-f", &bytes);
+    let upd = tg.document_update(
+        FRIEND,
+        FRIEND,
+        "file-f",
+        "uniq-f",
+        "match.dem",
+        bytes.len() as u64,
+        Some("s1mple"),
+    );
+    tg.push_update(upd);
+    assert!(
+        wait_until(10, || srv.running().core().jobs().unwrap().len() == 1),
+        "задача не появилась; журнал: {}",
+        srv.sink_text()
+    );
+    let job_id = srv.running().core().jobs().unwrap()[0].id;
+
+    // Фейковый раннер по HTTP берёт задачу и сообщает о сбое запуска игры.
+    let token = srv.add_runner("e2e-fail-runner");
+    let (status, got) = srv.claim(&token, 0);
+    assert_eq!(status, 200);
+    let a = got.expect("раннер должен получить задачу");
+    assert_eq!(a.job_id, job_id);
+    let req = ProgressRequest {
+        epoch: a.epoch,
+        seq: 1,
+        phase: wire::Phase::Record,
+        take: None,
+        status: String::new(),
+    };
+    assert_eq!(srv.progress(&token, job_id, &req).0, 200);
+    let (status, body) = srv.finish(
+        &token,
+        job_id,
+        &wire::FinishRequest {
+            epoch: a.epoch,
+            outcome: wire::Outcome::Failed(wire::Failure {
+                code: wire::fail::GAME_NOT_STARTED.to_owned(),
+                class: "launch".to_owned(),
+                state: "launching".to_owned(),
+                hint: "проверьте путь к CS2".to_owned(),
+                message: "игра не запустилась за 120 с".to_owned(),
+                tail: String::new(),
+                elapsed_ms: 120_000,
+            }),
+        },
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(srv.job(job_id).state, JobState::Failed);
+
+    // Без участия теста: другу приходит фраза, админу — отчёт с кодом.
+    assert!(
+        wait_until(10, || {
+            tg.texts_to(FRIEND)
+                .iter()
+                .any(|t| t.contains(&format!("Задача #{job_id} не получилась")))
+                && !tg.texts_to(ADMIN).is_empty()
+        }),
+        "отчёты не дошли; друг: {:?}; админ: {:?}; журнал: {}",
+        tg.texts_to(FRIEND),
+        tg.texts_to(ADMIN),
+        srv.sink_text()
+    );
+    let friend = tg.texts_to(FRIEND);
+    let msg = friend.iter().find(|t| t.contains("не получилась")).unwrap();
+    assert!(msg.contains("не запустилась игра"), "{msg}");
+    assert!(
+        !msg.contains("GAME_NOT_STARTED") && msg.contains(&format!("/retry {job_id}")),
+        "{msg}"
+    );
+    let admin = tg.texts_to(ADMIN);
+    assert_eq!(admin.len(), 1, "{admin:?}");
+    assert!(admin[0].contains("GAME_NOT_STARTED"), "{}", admin[0]);
+    assert!(admin[0].contains("launching"), "{}", admin[0]);
+    srv.stop();
+}

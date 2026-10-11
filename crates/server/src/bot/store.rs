@@ -261,6 +261,36 @@ pub fn status_candidates(db: &Db) -> Result<Vec<TgJob>> {
     })
 }
 
+/// Строки `tg_jobs` упавших задач, о сбое которых ещё не сказано: другу (чат не заглушён) или админам.
+pub fn failure_candidates(db: &Db) -> Result<Vec<TgJob>> {
+    db.read(|c| {
+        let mut st = c
+            .prepare(&format!(
+                "SELECT {TG_JOB_COLUMNS} FROM tg_jobs
+                 WHERE job_id IN (SELECT id FROM jobs WHERE state = 'failed')
+                   AND (admin_reported_ms IS NULL OR (final_reported_ms IS NULL AND muted = 0))
+                 ORDER BY job_id"
+            ))
+            .map_err(db_err)?;
+        let rows = st.query_map([], tg_job_from_row).map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+    })
+}
+
+/// Занимает право отправить админам отчёт о сбое: `true` только первому, кто успел (`admin_reported_ms`).
+pub fn claim_admin_report(db: &Db, job_id: i64, now_ms: i64) -> Result<bool> {
+    db.write(|tx| {
+        let n = tx
+            .execute(
+                "UPDATE tg_jobs SET admin_reported_ms = ?2, updated_at = ?2
+                 WHERE job_id = ?1 AND admin_reported_ms IS NULL",
+                params![job_id, now_ms],
+            )
+            .map_err(db_err)?;
+        Ok(n == 1)
+    })
+}
+
 /// Запоминает текст сообщения статуса и время, раньше которого его не правят.
 pub fn note_status(db: &Db, job_id: i64, text: &str, next_edit_ms: i64, now_ms: i64) -> Result<()> {
     db.write(|tx| {

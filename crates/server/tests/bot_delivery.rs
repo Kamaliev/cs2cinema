@@ -74,7 +74,7 @@ fn timeout_after_upload_marks_uncertain_and_resend_sends_once_more() {
     let want = format!(
         "Не уверен, что ролик задачи #{id} дошёл. Если его нет в чате — отправьте /resend {id}"
     );
-    assert!(texts.iter().any(|t| *t == want), "{texts:?}");
+    assert!(texts.contains(&want), "{texts:?}");
     assert_eq!(
         texts.iter().filter(|t| t.contains("Не уверен")).count(),
         1,
@@ -379,4 +379,202 @@ fn resend_says_when_the_video_is_not_ready_or_already_going() {
         "{:?}",
         st.tg.texts_to(FRIEND)
     );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Отчёты о сбое задачи (Task 3)
+// ---------------------------------------------------------------------------------------------------------
+
+const ADMIN: i64 = 900;
+
+/// Фейковый раннер берёт задачу и завершает её сбоем с заданным содержимым.
+fn fail_job(st: &BotStand, id: i64, f: wire::Failure) {
+    let token = st.runner_token();
+    let (status, got) = st.server.claim(&token, 0);
+    assert_eq!(status, 200, "раннер должен получить задачу");
+    let a = got.unwrap();
+    assert_eq!(a.job_id, id, "выдана не та задача");
+    let req = wire::ProgressRequest {
+        epoch: a.epoch,
+        seq: 1,
+        phase: wire::Phase::Record,
+        take: None,
+        status: String::new(),
+    };
+    assert_eq!(st.server.progress(&token, id, &req).0, 200);
+    let (status, body) = st.server.finish(
+        &token,
+        id,
+        &wire::FinishRequest {
+            epoch: a.epoch,
+            outcome: wire::Outcome::Failed(f),
+        },
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(st.server.job(id).state, JobState::Failed);
+}
+
+#[test]
+fn failure_sends_a_friend_phrase_and_an_admin_report() {
+    let st = BotStand::start();
+    st.add_admin(ADMIN, "автор");
+    st.add_friend(FRIEND, "вася");
+    let id = queue_job(&st, FRIEND, "s1mple");
+    let status_id = st.tg_job(id).status_message_id.expect("сообщение статуса");
+
+    fail_job(
+        &st,
+        id,
+        wire::Failure {
+            code: wire::fail::PLAYER_NOT_FOUND.to_owned(),
+            class: "other".to_owned(),
+            state: "precheck".to_owned(),
+            hint: "проверьте ник игрока в демке".to_owned(),
+            message: "C:\\Users\\author\\out\\srv5: игрок не найден".to_owned(),
+            tail: "хвост консоли".to_owned(),
+            elapsed_ms: 1000,
+        },
+    );
+    st.step();
+
+    // Друг: новое сообщение с фразой про ник и /retry, без путей, кода и этапа.
+    let texts = st.tg.texts_to(FRIEND);
+    let report: Vec<_> = texts
+        .iter()
+        .filter(|t| t.contains(&format!("Задача #{id} не получилась")))
+        .collect();
+    assert_eq!(report.len(), 1, "{texts:?}");
+    assert!(report[0].contains("ник"), "{}", report[0]);
+    assert!(report[0].contains(&format!("/retry {id}")), "{}", report[0]);
+    for secret in ["C:\\", "Users", "PLAYER_NOT_FOUND", "precheck", "хвост"] {
+        assert!(!report[0].contains(secret), "{secret:?} в {}", report[0]);
+    }
+    assert!(
+        !st.tg.message_ids_to(FRIEND).is_empty()
+            && texts.iter().any(|t| *t == format!("Задача #{id}: сбой")),
+        "сообщение статуса правится на «сбой»: {texts:?} (статус #{status_id})"
+    );
+
+    // Админ: одно сообщение с кодом, этапом, подсказкой и числом выдач.
+    let admin = st.tg.texts_to(ADMIN);
+    assert_eq!(admin.len(), 1, "{admin:?}");
+    for want in [
+        &format!("#{id}"),
+        "вася",
+        "s1mple",
+        "PLAYER_NOT_FOUND",
+        "precheck",
+        "проверьте ник игрока в демке",
+        "выдач раннеру: 1",
+    ] {
+        assert!(admin[0].contains(want), "{want:?} нет в {}", admin[0]);
+    }
+    assert!(!admin[0].contains("хвост консоли"), "хвост в чат не идёт");
+
+    // Повторные тики ничего не дублируют.
+    st.clock().advance(Duration::from_secs(60));
+    st.step();
+    st.step();
+    assert_eq!(st.tg.texts_to(FRIEND), texts);
+    assert_eq!(st.tg.texts_to(ADMIN).len(), 1);
+    let tj = st.tg_job(id);
+    assert!(tj.final_reported_ms.is_some() && tj.admin_reported_ms.is_some());
+}
+
+#[test]
+fn server_side_failures_are_reported_too() {
+    let st = BotStand::start();
+    st.add_admin(ADMIN, "автор");
+    st.add_friend(FRIEND, "вася");
+    let id = queue_job(&st, FRIEND, "s1mple");
+    // Задачу трижды выдавали и ни разу не довели: четвёртая выдача её роняет.
+    st.server
+        .running()
+        .core()
+        .db()
+        .write(|tx| {
+            tx.execute("UPDATE jobs SET grants = 3 WHERE id = ?1", [id])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    let token = st.runner_token();
+    let _ = st.server.claim(&token, 0);
+    let job = st.server.job(id);
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.fail_code.as_deref(), Some("TOO_MANY_GRANTS"));
+    st.step();
+
+    let friend = st.tg.texts_to(FRIEND);
+    assert!(
+        friend.iter().any(|t| t.contains("срывалась")),
+        "фраза про срывы записи: {friend:?}"
+    );
+    assert!(
+        friend.iter().all(|t| !t.contains("TOO_MANY_GRANTS")),
+        "{friend:?}"
+    );
+    let admin = st.tg.texts_to(ADMIN);
+    assert_eq!(admin.len(), 1, "{admin:?}");
+    assert!(admin[0].contains("TOO_MANY_GRANTS"), "{}", admin[0]);
+    assert!(admin[0].contains("выдач раннеру: 3"), "{}", admin[0]);
+}
+
+#[test]
+fn admin_owner_gets_both_messages_and_a_muted_friend_only_the_admin_report() {
+    let st = BotStand::start();
+    st.add_admin(ADMIN, "автор");
+    st.add_friend(FRIEND, "вася");
+    let own = queue_job(&st, ADMIN, "s1mple");
+    let friends = queue_job(&st, FRIEND, "ZywOo");
+    // Друг заблокировал бота: чат заглушён.
+    st.server
+        .running()
+        .core()
+        .db()
+        .write(|tx| {
+            tx.execute("UPDATE tg_jobs SET muted = 1 WHERE chat_id = ?1", [FRIEND])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    let failure = |code: &str| wire::Failure {
+        code: code.to_owned(),
+        class: "launch".to_owned(),
+        state: "launching".to_owned(),
+        hint: String::new(),
+        message: "сбой для теста".to_owned(),
+        tail: String::new(),
+        elapsed_ms: 10,
+    };
+    fail_job(&st, own, failure(wire::fail::GAME_NOT_STARTED));
+    fail_job(&st, friends, failure(wire::fail::HLAE_ERROR));
+    let friend_before = st.tg.texts_to(FRIEND).len();
+    st.step();
+
+    let admin = st.tg.texts_to(ADMIN);
+    assert!(
+        admin
+            .iter()
+            .any(|t| t.contains(&format!("Задача #{own} не получилась"))),
+        "владелец-админ получает сообщение друга: {admin:?}"
+    );
+    assert!(
+        admin
+            .iter()
+            .any(|t| t.starts_with(&format!("Сбой задачи #{own}"))),
+        "и отчёт админа: {admin:?}"
+    );
+    assert!(
+        admin
+            .iter()
+            .any(|t| t.starts_with(&format!("Сбой задачи #{friends}"))),
+        "отчёт о задаче друга: {admin:?}"
+    );
+    assert_eq!(
+        st.tg.texts_to(FRIEND).len(),
+        friend_before,
+        "заглушённому чату не пишем"
+    );
+    assert!(st.tg_job(friends).admin_reported_ms.is_some());
 }

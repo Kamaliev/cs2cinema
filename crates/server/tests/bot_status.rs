@@ -488,6 +488,7 @@ fn retry_requeues_from_the_stored_demo_without_get_file() {
     st.step();
     let token = st.runner_token();
     st.finish_failed(1, &token, "RECORD_TIMEOUT");
+    st.step(); // отчёт о сбое (план 07-09) приходит до команды, а не вместе с ней
     assert_eq!(job_state(&st, 1), JobState::Failed);
     let downloads = st.tg.get_file_calls();
     assert_eq!(downloads, 1);
@@ -538,6 +539,7 @@ fn retry_requeues_from_the_stored_demo_without_get_file() {
     )
     .unwrap();
     st.finish_failed(faceit, &token, "FACEIT_FETCH_FAILED");
+    st.step(); // отчёт о сбое (план 07-09) приходит до команды, а не вместе с ней
     let reply = ask(&st, B, "/retry");
     assert!(
         reply.contains(&format!("повтор задачи #{faceit}")),

@@ -179,6 +179,17 @@ impl FakeTelegram {
         path
     }
 
+    /// Подменяет `file_path`, который `getFile` вернёт для `file_id` (проверки пути в тестах). `file_id` должен быть
+    /// уже зарегистрирован через `put_document`.
+    pub fn set_file_path(&self, file_id: &str, path: &str) {
+        let mut st = self.st();
+        let doc = st
+            .documents
+            .get_mut(file_id)
+            .expect("документ зарегистрирован через put_document");
+        doc.file_path = Some(path.to_owned());
+    }
+
     /// Следующий вызов метода `method` вернёт `err` (очередь по имени метода).
     pub fn fail_next(&self, method: &str, err: TgError) {
         self.st()

@@ -2,18 +2,19 @@
 gsd_state_version: "1.0"
 milestone: v1.1
 milestone_name: Сервер и Telegram-бот
-current_phase: 5
+current_phase: 05
 current_phase_name: Ядро сервера и протокол
-status: planning
-stopped_at: "Phase 5 planned: 5 plans, checker passed"
-last_updated: "2026-10-11T10:21:05.188Z"
+status: executing
+stopped_at: Completed 05-01-PLAN.md
+last_updated: "2026-10-11T10:50:51.180Z"
 last_activity: 2026-10-11
-state_head: 5cdbc670b4950c5a90de67cc2b61828f999b5e2f
+last_activity_desc: Phase 05 execution started
+state_head: 087094e05a509d06e09cd7eb72eb8780e9eab978
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 5
-  completed_plans: 0
+  completed_plans: 1
   percent: 0
 ---
 
@@ -24,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-11)
 
 **Core value:** Задача на монтаж доходит до готового `highlights.mp4` без ручного вмешательства, а если это невозможно — останавливается быстро и объясняет, что именно пошло не так. Для v1.1 то же верно от демки, отправленной боту, до ролика в чате.
-**Current focus:** Phase 5 — Ядро сервера и протокол
+**Current focus:** Phase 05 — Ядро сервера и протокол
 
 ## Current Position
 
-Phase: 5 of 9 (Ядро сервера и протокол)
-Plan: —
-Status: Ready to plan
-Last activity: 2026-10-11
+Phase: 05 (Ядро сервера и протокол) — EXECUTING
+Plan: 2 of 5
+Status: Ready to execute
+Last activity: 2026-10-11 — Phase 05 execution started
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -91,6 +92,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 04 P09 | 13min | 3 tasks | 4 files |
 | Phase 04 P10 | 35min | 3 tasks | 9 files |
 | Phase 04 P11 | n/a | 2 tasks | 7 files |
+| Phase 05 P01 | 35min | 3 tasks | 20 files |
 
 ## Accumulated Context
 
@@ -152,6 +154,7 @@ Recent decisions affecting current work:
 - [Phase 04]: 04-10: ручные действия приёмки выводятся только из журнала (First/Auto) и attempt == 1 + auto_retries; серия B доказывается другим PID в имени партии и постановкой после конца серии A
 - [Phase 04]: 04-10: acceptance check/state/job читают базу только Store::open_read_only; ничего не удаляют и не завершают
 - [Phase 04]: 04-11: учения D1-D6 не проводились, приняты по указанию автора без улик; ACC-03 остаётся Pending, A1/A3/кириллица в трее не проверены
+- [Phase 05]: Настройки сервера — JSON-файл без крейта toml; время в базе — unix-мс по часам сервера; пути хранилища только из целых id
 
 ### Pending Todos
 
@@ -181,6 +184,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T10:21:05.161Z
-Stopped at: Phase 5 planned: 5 plans, checker passed
-Resume file: .planning/phases/05-yadro-servera-i-protokol/05-01-PLAN.md
+Last session: 2026-10-11T10:50:51.150Z
+Stopped at: Completed 05-01-PLAN.md
+Resume file: None

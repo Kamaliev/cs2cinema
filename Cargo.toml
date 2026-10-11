@@ -15,4 +15,6 @@ members = [
     "crates/store",
     "crates/app",
     "crates/cli",
+    "crates/wire",
+    "crates/server",
 ]

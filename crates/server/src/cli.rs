@@ -1,0 +1,243 @@
+//! Командная строка оператора: `cs2-server submit | job | ...`.
+//!
+//! Разбор вручную, как в `cs2-cli`: ошибка разбора — «ошибка: …» и справка с кодом 2,
+//! ошибка выполнения — «ошибка: …» с кодом 1.
+
+use crate::Result;
+use crate::clock::SystemClock;
+use crate::config::{self, Flags};
+use crate::core::{Core, CoreOptions, JobRow, Submit};
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
+
+pub const USAGE: &str = "\
+cs2-server — сервер очереди монтажа
+
+Команды:
+  submit {демка} --player {ник|steamid} [--user {имя}]   поставить демку в очередь
+  job list                                               список задач
+  job show {id}                                          подробности задачи
+
+Общие флаги:
+  --config {файл}      файл настроек (JSON)
+  --data-dir {папка}   папка данных (база server.db и blobs/)
+  -h, --help           эта справка
+";
+
+#[derive(Default)]
+struct Args {
+    positional: Vec<String>,
+    config: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    player: Option<String>,
+    user: Option<String>,
+}
+
+enum CliError {
+    /// Ошибка разбора: печатается справка.
+    Usage(String),
+    /// Ошибка выполнения.
+    Run(String),
+}
+
+impl From<String> for CliError {
+    fn from(s: String) -> Self {
+        CliError::Run(s)
+    }
+}
+
+fn parse_args(args: Vec<String>) -> std::result::Result<Args, CliError> {
+    let mut out = Args::default();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        let mut value = |name: &str| {
+            it.next()
+                .ok_or_else(|| CliError::Usage(format!("{name} требует значение")))
+        };
+        match a.as_str() {
+            "-h" | "--help" => return Err(CliError::Usage(String::new())),
+            "--config" => out.config = Some(PathBuf::from(value("--config")?)),
+            "--data-dir" => out.data_dir = Some(PathBuf::from(value("--data-dir")?)),
+            "--player" => out.player = Some(value("--player")?),
+            "--user" => out.user = Some(value("--user")?),
+            s if s.starts_with("--") => {
+                return Err(CliError::Usage(format!("неизвестный флаг {s}")));
+            }
+            _ => out.positional.push(a),
+        }
+    }
+    Ok(out)
+}
+
+pub fn run_cli(args: Vec<String>, env: &dyn Fn(&str) -> Option<String>) -> ExitCode {
+    let parsed = parse_args(args).and_then(|a| execute(a, env));
+    match parsed {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(CliError::Usage(msg)) => {
+            if !msg.is_empty() {
+                eprintln!("ошибка: {msg}");
+            }
+            eprint!("{USAGE}");
+            ExitCode::from(2)
+        }
+        Err(CliError::Run(e)) => {
+            eprintln!("ошибка: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn open_core(a: &Args, env: &dyn Fn(&str) -> Option<String>) -> Result<Core> {
+    let flags = Flags {
+        config: a.config.clone(),
+        data_dir: a.data_dir.clone(),
+        ..Flags::default()
+    };
+    let loaded = config::load(&flags, env)?;
+    for w in &loaded.warnings {
+        eprintln!("внимание: {w}");
+    }
+    Core::open(CoreOptions {
+        data_dir: loaded.config.data_dir.clone(),
+        limits: loaded.config.limits(),
+        clock: Arc::new(SystemClock),
+    })
+}
+
+fn execute(a: Args, env: &dyn Fn(&str) -> Option<String>) -> std::result::Result<(), CliError> {
+    let words: Vec<&str> = a.positional.iter().map(String::as_str).collect();
+    match words.as_slice() {
+        ["submit", file] => {
+            let player = a
+                .player
+                .clone()
+                .ok_or_else(|| CliError::Usage("submit требует --player".to_owned()))?;
+            let core = open_core(&a, env)?;
+            let path = PathBuf::from(file);
+            let orig_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let sub = Submit {
+                player,
+                user_id: None,
+                requested_by: "оператор".to_owned(),
+                orig_name: orig_name.clone(),
+            };
+            let (id, got) = core.submit(&path, &sub)?;
+            println!(
+                "задача #{id} в очереди: {orig_name}, {:.1} МиБ, sha256 {}",
+                got.size as f64 / (1024.0 * 1024.0),
+                got.sha256
+            );
+            Ok(())
+        }
+        ["job", "list"] => {
+            let core = open_core(&a, env)?;
+            let jobs = core.jobs()?;
+            if jobs.is_empty() {
+                println!("задач нет");
+            }
+            for j in jobs {
+                println!(
+                    "#{}  {} ({})  {}  {}",
+                    j.id,
+                    j.state.title(),
+                    j.state.as_str(),
+                    j.player_name,
+                    utc(j.created_at)
+                );
+            }
+            Ok(())
+        }
+        ["job", "show", id] => {
+            let id: i64 = id
+                .parse()
+                .map_err(|_| CliError::Usage("job show: нужен числовой id".to_owned()))?;
+            let core = open_core(&a, env)?;
+            let job = core
+                .job(id)?
+                .ok_or_else(|| CliError::Run(format!("задачи #{id} нет")))?;
+            let demo = core.demo_file(id)?;
+            print_job(&job, demo.as_ref());
+            Ok(())
+        }
+        [] => Err(CliError::Usage(String::new())),
+        other => Err(CliError::Usage(format!(
+            "неизвестная команда «{}»",
+            other.join(" ")
+        ))),
+    }
+}
+
+fn print_job(j: &JobRow, demo: Option<&crate::core::FileRow>) {
+    println!("задача #{}", j.id);
+    println!("состояние: {} ({})", j.state.title(), j.state.as_str());
+    println!("игрок: {}", j.player_name);
+    if let Some(s) = &j.player_steam {
+        println!("steamid: {s}");
+    }
+    println!("источник: {} {}", j.source_kind, j.orig_name);
+    println!("заказал: {}", j.requested_by);
+    println!("создана: {}", utc(j.created_at));
+    println!("обновлена: {}", utc(j.updated_at));
+    if let Some(t) = j.finished_at {
+        println!("закончена: {}", utc(t));
+    }
+    println!("эпоха: {}, выдач: {}", j.epoch, j.grants);
+    if let Some(d) = demo {
+        println!("демка: {:.1} МиБ", d.size as f64 / (1024.0 * 1024.0));
+        println!("sha256: {}", d.sha256);
+    }
+    for (k, v) in [
+        ("код сбоя", &j.fail_code),
+        ("класс сбоя", &j.fail_class),
+        ("состояние при сбое", &j.fail_state),
+        ("подсказка", &j.fail_hint),
+        ("сообщение", &j.fail_message),
+        ("хвост журнала", &j.fail_tail),
+    ] {
+        if let Some(v) = v {
+            println!("{k}: {v}");
+        }
+    }
+    if let Some(ms) = j.fail_elapsed_ms {
+        println!("прошло до сбоя: {} мс", ms);
+    }
+}
+
+/// «2026-10-11 15:04:05 UTC» из unix-миллисекунд (без chrono: серверу хватает григорианской арифметики).
+fn utc(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Алгоритм civil_from_days (Говард Хиннант).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utc_formats_known_instants() {
+        assert_eq!(utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(utc(1_700_000_000_000), "2023-11-14 22:13:20 UTC");
+        assert_eq!(utc(951_782_400_000), "2000-02-29 00:00:00 UTC");
+    }
+}

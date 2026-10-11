@@ -122,11 +122,12 @@ fn unix_ms() -> u64 {
 
 impl RunnerState {
     /// Читает состояние из папки раннера. Второе значение — предупреждение для журнала.
-    /// Нет файла — пустое состояние без предупреждения.
+    /// Нет файла — пустое состояние без предупреждения. Файл, который не разбирается (или другой версии),
+    /// откладывается в `runner_state.bad-{unix-мс}.json`, раннер стартует пустым, а не падает.
     pub fn load(dir: &Path) -> (RunnerState, Option<String>) {
         let path = dir.join(STATE_FILE);
-        let text = match fs::read_to_string(&path) {
-            Ok(t) => t,
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return (RunnerState::default(), None);
             }
@@ -137,21 +138,24 @@ impl RunnerState {
                 );
             }
         };
-        match serde_json::from_str::<RunnerState>(&text) {
-            Ok(s) if s.version == VERSION => (s, None),
-            Ok(s) => (
-                RunnerState::default(),
-                Some(format!(
-                    "{}: версия формата {} вместо {VERSION}",
-                    path.display(),
-                    s.version
-                )),
+        let problem = match serde_json::from_slice::<RunnerState>(&bytes) {
+            Ok(s) if s.version == VERSION => return (s, None),
+            Ok(s) => format!("версия формата {} вместо {VERSION}", s.version),
+            Err(e) => format!("не разобран: {e}"),
+        };
+        let aside = dir.join(format!("runner_state.bad-{}.json", unix_ms()));
+        let warning = match fs::rename(&path, &aside) {
+            Ok(()) => format!(
+                "{} {problem}; файл отложен как {}, раннер начинает с пустого состояния",
+                path.display(),
+                aside.display()
             ),
-            Err(e) => (
-                RunnerState::default(),
-                Some(format!("{} не разобран: {e}", path.display())),
+            Err(e) => format!(
+                "{} {problem}; отложить файл не удалось ({e}), раннер начинает с пустого состояния",
+                path.display()
             ),
-        }
+        };
+        (RunnerState::default(), Some(warning))
     }
 
     /// Записывает состояние атомарно: временный файл → `sync_all` → `rename`.

@@ -334,9 +334,17 @@ impl Runner {
                     "задача #{id}: сервер подтвердил выдачу, продолжаю с этапа {stage:?}"
                 ));
             }
+            // Отмена: итог `Cancelled` сохраняется и уходит как обычный `finish`, файлы убираются после ответа.
+            Some(DirectiveAction::Cancel) => {
+                self.log
+                    .line(&format!("задача #{id}: сервер запросил отмену"));
+                let held = self.held();
+                held.pending = Some(Outcome::Cancelled);
+                held.stage = Stage::Reporting;
+                self.persist()?;
+            }
             _ => {
                 let why = match action {
-                    Some(DirectiveAction::Cancel) => "сервер отменил задачу",
                     Some(DirectiveAction::Abandon) => "сервер велел бросить задачу",
                     _ => "сервер не знает этой задачи",
                 };
@@ -434,22 +442,44 @@ impl Runner {
 
     /// Запускает исполнитель и записывает его итог в outbox.
     fn execute(&mut self, started: Instant) -> Result<(), String> {
-        {
+        // Демки на месте нет (диск почистили): сначала скачать заново.
+        if !self.held().demo_path.is_file() {
+            let id = self.held().server_job_id;
+            self.log
+                .line(&format!("задача #{id}: файла демки нет, скачиваю заново"));
+            self.held().stage = Stage::Claimed;
+            return self.persist();
+        }
+        let planned = self
+            .cfg
+            .dir
+            .join("out")
+            .join(format!("srv{}", self.held().server_job_id));
+        // Перезапуск посреди записи (этап уже `Executing`): исполнитель идёт с `resume` по папке прошлой попытки.
+        let (resumed_dir, attempt) = {
             let held = self.held();
+            let resumed_dir = if held.stage == Stage::Executing {
+                held.out_dir.clone()
+            } else {
+                None
+            };
             held.stage = Stage::Executing;
             held.attempt += 1;
-        }
+            // Папка известна заранее: если раннер упадёт посреди записи, после перезапуска исполнитель найдёт её.
+            held.out_dir.get_or_insert(planned);
+            (resumed_dir, held.attempt)
+        };
         self.persist()?;
         let held = self.state.job.clone().expect("задача удерживается");
         let task = Task {
             job_id: held.server_job_id,
-            attempt: held.attempt,
+            attempt,
             demo: held.demo_path.clone(),
             faceit: held.faceit.clone(),
             hero_steam: held.hero_steam,
             hero_name: held.hero_name.clone(),
-            resume: false,
-            out_dir: None,
+            resume: resumed_dir.is_some(),
+            out_dir: resumed_dir,
         };
         let progress = RunnerProgress {
             log: self.log.clone(),
@@ -562,6 +592,12 @@ impl Runner {
             Ok(reply) => {
                 self.log
                     .line(&format!("задача #{id}: {}", reply.state.as_str()));
+                if matches!(held.pending, Some(Outcome::Cancelled)) {
+                    self.log.line(&format!(
+                        "задача #{id}: отменена, файлы задачи удалены из outbox"
+                    ));
+                    self.remove_files(&held);
+                }
                 self.state.job = None;
                 self.persist()?;
                 Ok(Tick::Settled {

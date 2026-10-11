@@ -5,14 +5,14 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 5
 current_phase_name: Ядро сервера и протокол
 status: planning
-stopped_at: Phase 5 context gathered
-last_updated: "2026-10-11T09:30:30.369Z"
+stopped_at: "Phase 5 planned: 5 plans, checker passed"
+last_updated: "2026-10-11T10:21:05.188Z"
 last_activity: 2026-10-11
-state_head: 0f47363a3b22fb1d76e7be07a34418feb4fe0b69
+state_head: 5cdbc670b4950c5a90de67cc2b61828f999b5e2f
 progress:
   total_phases: 5
   completed_phases: 0
-  total_plans: 0
+  total_plans: 5
   completed_plans: 0
   percent: 0
 ---
@@ -181,6 +181,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T09:30:30.349Z
-Stopped at: Phase 5 context gathered
-Resume file: phases/05-yadro-servera-i-protokol/05-CONTEXT.md
+Last session: 2026-10-11T10:21:05.161Z
+Stopped at: Phase 5 planned: 5 plans, checker passed
+Resume file: .planning/phases/05-yadro-servera-i-protokol/05-01-PLAN.md

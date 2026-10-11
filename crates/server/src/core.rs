@@ -9,8 +9,9 @@ use crate::db::{Db, db_err};
 use crate::secret::Redactor;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use wire::{CancelMode, JobState};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+use wire::{Assignment, CancelMode, DemoInfo, JobState, Player};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -47,6 +48,39 @@ pub struct CoreOptions {
     pub redactor: Redactor,
 }
 
+/// Отказ ядра запросу: код из `wire::codes`, текст для человека по-русски и, при необходимости,
+/// подробность для журнала (в ответ раннеру она не попадает).
+#[derive(Debug, Clone)]
+pub struct Reject {
+    pub code: &'static str,
+    pub message: String,
+    pub offset: Option<u64>,
+    pub detail: Option<String>,
+}
+
+impl Reject {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            offset: None,
+            detail: None,
+        }
+    }
+}
+
+/// Строка ошибки ядра (база, файлы) — внутренняя ошибка: раннер видит общий текст, журнал — подробность.
+impl From<String> for Reject {
+    fn from(detail: String) -> Self {
+        Self {
+            code: wire::codes::INTERNAL,
+            message: "внутренняя ошибка сервера".to_owned(),
+            offset: None,
+            detail: Some(detail),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Core {
     db: Db,
@@ -55,6 +89,8 @@ pub struct Core {
     redactor: Redactor,
     limits: Limits,
     data_dir: PathBuf,
+    /// Поколение «появилась работа» и условная переменная для long-poll.
+    wake: Arc<(Mutex<u64>, Condvar)>,
 }
 
 /// Заявка на постановку демки в очередь.
@@ -164,6 +200,7 @@ impl Core {
             redactor: opts.redactor,
             limits: opts.limits,
             data_dir: opts.data_dir,
+            wake: Arc::new((Mutex::new(0), Condvar::new())),
         })
     }
 
@@ -238,6 +275,7 @@ impl Core {
                     .map_err(db_err)?;
                     Ok(())
                 })?;
+                self.wake();
                 Ok(got)
             }
             Err(e) => {
@@ -294,16 +332,88 @@ impl Core {
 
     /// Демка задачи (строка `files` с `kind = 'demo'`, не удалённая).
     pub fn demo_file(&self, job_id: i64) -> Result<Option<FileRow>> {
-        self.db.read(|c| {
-            c.query_row(
-                "SELECT rel_path, size, sha256 FROM files WHERE job_id = ?1 AND kind = 'demo' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
-                [job_id],
-                |r| Ok(FileRow { rel_path: r.get(0)?, size: r.get::<_, i64>(1)? as u64, sha256: r.get(2)? }),
-            )
-            .optional()
-            .map_err(db_err)
+        self.db.read(|c| demo_by_job(c, job_id))
+    }
+
+    /// Выдача задачи раннеру (SRV-04, D-04): одна транзакция `BEGIN IMMEDIATE`, один `UPDATE … RETURNING`.
+    /// Самая старая задача в `queued` получает эпоху +1, раннера и аренду; два вызова из любых потоков
+    /// и процессов не получат одну задачу дважды. Очередь пуста — `None`.
+    pub fn claim(&self, runner_id: i64) -> std::result::Result<Option<Assignment>, Reject> {
+        let now = self.clock.now_ms();
+        let lease_until = now + self.limits.lease_ttl_ms;
+        self.db.write(|tx| {
+            let id: Option<i64> = tx
+                .query_row(
+                    "UPDATE jobs SET state = 'assigned', epoch = epoch + 1, grants = grants + 1, runner_id = ?1, \
+                     lease_until = ?2, lease_lost = 0, updated_at = ?3 \
+                     WHERE id = (SELECT id FROM jobs WHERE state = 'queued' ORDER BY id LIMIT 1) RETURNING id",
+                    params![runner_id, lease_until, now],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db_err)?;
+            let Some(id) = id else {
+                return Ok(None);
+            };
+            let job = job_by_id(tx, id)?
+                .ok_or_else(|| format!("задача #{id} исчезла сразу после выдачи"))?;
+            let demo = demo_by_job(tx, id)?
+                .ok_or_else(|| format!("у задачи #{id} в очереди нет демки"))?;
+            Ok(Some(Assignment {
+                job_id: id,
+                epoch: job.epoch,
+                lease_until_ms: lease_until,
+                demo: DemoInfo {
+                    size: demo.size,
+                    sha256: demo.sha256,
+                    orig_name: job.orig_name,
+                },
+                faceit_link: job.faceit_link,
+                player: Player {
+                    steam64: job.player_steam,
+                    name: job.player_name,
+                },
+                requested_by: job.requested_by,
+                options: serde_json::Map::new(),
+            }))
         })
     }
+
+    /// Будит всех, кто ждёт работу в long-poll: в очередь встала задача.
+    pub fn wake(&self) {
+        let (lock, cv) = &*self.wake;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        cv.notify_all();
+    }
+
+    /// Номер поколения «работа появилась»; брать до проверки очереди, чтобы не потерять пробуждение.
+    pub fn work_generation(&self) -> u64 {
+        *self.wake.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Ждёт, пока поколение не уйдёт от `seen`, но не дольше `timeout`.
+    pub fn wait_for_work_since(&self, seen: u64, timeout: Duration) {
+        let (lock, cv) = &*self.wake;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = cv
+            .wait_timeout_while(guard, timeout, |g| *g == seen)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+
+    /// Ждёт любой `wake` или `timeout`.
+    pub fn wait_for_work(&self, timeout: Duration) {
+        self.wait_for_work_since(self.work_generation(), timeout);
+    }
+}
+
+fn demo_by_job(c: &Connection, job_id: i64) -> Result<Option<FileRow>> {
+    c.query_row(
+        "SELECT rel_path, size, sha256 FROM files WHERE job_id = ?1 AND kind = 'demo' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
+        [job_id],
+        |r| Ok(FileRow { rel_path: r.get(0)?, size: r.get::<_, i64>(1)? as u64, sha256: r.get(2)? }),
+    )
+    .optional()
+    .map_err(db_err)
 }
 
 fn job_by_id(c: &Connection, id: i64) -> Result<Option<JobRow>> {

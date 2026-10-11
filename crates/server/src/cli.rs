@@ -8,16 +8,21 @@ use crate::auth;
 use crate::clock::SystemClock;
 use crate::config::{self, Flags};
 use crate::core::{Core, CoreOptions, FileRow, JobRow, Submit};
+use crate::log::{self, StderrSink};
 use crate::secret::Redactor;
 use crate::users;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 pub const USAGE: &str = "\
 cs2-server — сервер очереди монтажа
 
 Команды:
+  serve [--bind {адрес}] [--threads {N}]               запустить HTTP-сервер для раннеров (Ctrl+C — остановка)
   submit {демка} --player {ник|steamid} [--user {имя}]   поставить демку в очередь
   job list                                               список задач
   job show {id}                                          подробности задачи
@@ -191,6 +196,25 @@ fn execute(
 ) -> std::result::Result<(), CliError> {
     let words: Vec<&str> = a.positional.iter().map(String::as_str).collect();
     match words.as_slice() {
+        ["serve"] => {
+            let loaded = load_config(&a, env, redactor)?;
+            let running =
+                crate::serve(&loaded.config, Arc::new(SystemClock), Arc::new(StderrSink))?;
+            log::install_panic_hook(running.log().clone());
+            // Первая строка stdout — адрес: по ней тесты и скрипты узнают настоящий порт.
+            println!("cs2-server слушает http://{}", running.addr());
+            let _ = std::io::stdout().flush();
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst))
+                .map_err(|e| CliError::Run(format!("обработчик Ctrl+C: {e}")))?;
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            running.stop();
+            println!("cs2-server остановлен");
+            Ok(())
+        }
         ["submit", file] => {
             let player = a
                 .player

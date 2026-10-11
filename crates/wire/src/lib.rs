@@ -150,9 +150,124 @@ pub mod fail {
     pub const RECEIVE_FAILED: &str = "RECEIVE_FAILED";
 }
 
+/// Тело `POST /v1/runner/claim`: раннер сообщает, чем занят.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClaimRequest {
+    /// Состояние раннера («idle» и т. п.); сервер пока только принимает его.
+    #[serde(default)]
+    pub status: String,
+}
+
+/// Демка задачи: размер и SHA-256 для проверки после скачивания.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DemoInfo {
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub orig_name: String,
+}
+
+/// Игрок, чьи моменты нужно смонтировать.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Player {
+    /// Steam64, если он известен.
+    #[serde(default)]
+    pub steam64: Option<String>,
+    pub name: String,
+}
+
+/// Выдача задачи раннеру: ответ 200 на `claim`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Assignment {
+    pub job_id: i64,
+    /// Эпоха выдачи: растёт при каждой новой выдаче, раннер присылает её в `X-Epoch`.
+    pub epoch: i64,
+    /// Конец аренды по часам сервера, unix-миллисекунды.
+    pub lease_until_ms: i64,
+    #[serde(default)]
+    pub demo: DemoInfo,
+    #[serde(default)]
+    pub faceit_link: Option<String>,
+    pub player: Player,
+    #[serde(default)]
+    pub requested_by: String,
+    /// Параметры монтажа; неизвестные ключи раннер пропускает.
+    #[serde(default)]
+    pub options: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Тело любого ответа с ошибкой.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiError {
+    /// ASCII-код из `codes`.
+    pub error: String,
+    /// Текст для человека, по-русски.
+    #[serde(default)]
+    pub message: String,
+    /// Принятое сервером смещение файла (для `offset_mismatch`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+}
+
+/// ASCII-коды ошибок API; текст для человека — в `ApiError.message` по-русски.
+pub mod codes {
+    pub const UNAUTHORIZED: &str = "unauthorized";
+    pub const BAD_REQUEST: &str = "bad_request";
+    pub const NOT_FOUND: &str = "not_found";
+    pub const TOO_LARGE: &str = "too_large";
+    pub const LENGTH_REQUIRED: &str = "length_required";
+    pub const OVERLOADED: &str = "overloaded";
+    pub const INTERNAL: &str = "internal";
+    pub const STALE_EPOCH: &str = "stale_epoch";
+    pub const JOB_TERMINAL: &str = "job_terminal";
+    pub const ALREADY_HOLDING: &str = "already_holding";
+    pub const OFFSET_MISMATCH: &str = "offset_mismatch";
+    pub const UPLOAD_BUSY: &str = "upload_busy";
+    pub const SHA256_MISMATCH: &str = "sha256_mismatch";
+    pub const RANGE_NOT_SATISFIABLE: &str = "range_not_satisfiable";
+    pub const PROTOCOL_MISMATCH: &str = "protocol_mismatch";
+}
+
+/// Адреса API.
+pub mod paths {
+    pub const CLAIM: &str = "/v1/runner/claim";
+    pub const HELLO: &str = "/v1/runner/hello";
+
+    /// Адрес действия над задачей: `/v1/jobs/{id}/{action}`.
+    pub fn job(id: i64, action: &str) -> String {
+        format!("/v1/jobs/{id}/{action}")
+    }
+}
+
+/// Имена заголовков протокола.
+pub mod headers {
+    pub const EPOCH: &str = "X-Epoch";
+    pub const UPLOAD_OFFSET: &str = "Upload-Offset";
+    pub const RETRY_AFTER: &str = "Retry-After";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assignment_without_optional_fields_still_parses() {
+        let a: Assignment = serde_json::from_str(
+            r#"{"job_id":7,"epoch":1,"lease_until_ms":99,"player":{"name":"s1mple"}}"#,
+        )
+        .unwrap();
+        assert_eq!((a.job_id, a.epoch, a.lease_until_ms), (7, 1, 99));
+        assert_eq!(a.player.name, "s1mple");
+        assert_eq!(a.demo, DemoInfo::default());
+        assert!(a.faceit_link.is_none() && a.requested_by.is_empty() && a.options.is_empty());
+        assert_eq!(
+            serde_json::from_str::<ClaimRequest>("{}").unwrap(),
+            ClaimRequest::default()
+        );
+        assert_eq!(paths::job(5, "heartbeat"), "/v1/jobs/5/heartbeat");
+    }
 
     #[test]
     fn job_state_round_trips_through_json_and_db_strings() {

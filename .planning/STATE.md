@@ -3,16 +3,16 @@ gsd_state_version: "1.0"
 current_phase: 04
 current_phase_name: Очередь без присмотра и приёмка
 status: executing
-stopped_at: Completed 04-04-PLAN.md
-last_updated: "2026-10-11T07:41:17.144Z"
+stopped_at: Completed 04-05-PLAN.md
+last_updated: "2026-10-11T07:48:39.747Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 04 execution started
-state_head: e1be156bd9233d4c92f83e548a332f2f74d4f35d
+state_head: 9044492ce2b72bd16aeddfc6700455e9870b74b1
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 36
-  completed_plans: 28
+  completed_plans: 29
   percent: 50
 ---
 
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-10)
 ## Current Position
 
 Phase: 04 (Очередь без присмотра и приёмка) — EXECUTING
-Plan: 5 of 12
+Plan: 6 of 12
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 04 execution started
 
@@ -83,6 +83,7 @@ Progress: [█████░░░░░] 50%
 | Phase 04 P02 | 15min | 2 tasks | 3 files |
 | Phase 04 P03 | 25min | 3 tasks | 6 files |
 | Phase 04 P04 | 75min | 3 tasks | 8 files |
+| Phase 04 P05 | 35 min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -131,6 +132,7 @@ Recent decisions affecting current work:
 - [Phase 04]: 04-02: бюджет авто-повтора — колонка auto_retries, обнуляется ручным Повторить/Заново; партия приёмки — batch + set_batch; GAME_EXITED до Take — класс «запуск»
 - [Phase 04]: 04-03: Host::notify через Shell_NotifyIconW на отдельном потоке (DC-6); A1 и A3 спайка не проверены, кириллица не подтверждена, A2 подтверждено; 04-08 не опирается на A1, D6 в 04-11 проверяет A1/A3
 - [Phase 04]: 04-04: граница pipeline без Store — Progress::artifact, JobSpec/JobConfig; Debug JobConfig без ключа FACEIT
+- [Phase 04]: 04-05: record_request принимает Verify обязательно — запись через pipeline::job всегда с проверкой дублей (DC-1 закреплён типом)
 
 ### Pending Todos
 
@@ -159,6 +161,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T07:27:18.485Z
-Stopped at: Completed 04-04-PLAN.md
+Last session: 2026-10-11T07:48:39.621Z
+Stopped at: Completed 04-05-PLAN.md
 Resume file: None

@@ -4,7 +4,7 @@
 //! делается заново в фоновом потоке — и задачу можно повторить после перезапуска.
 
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -294,6 +294,7 @@ fn store_outcome(o: job::Outcome) -> JobOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     use pipeline::{Deadlines, RecordRequest, host::LaunchSpec};
 

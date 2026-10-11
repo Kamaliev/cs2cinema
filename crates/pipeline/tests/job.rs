@@ -571,3 +571,40 @@ fn plan_only_job_skips_the_precheck_and_reports_a_missing_demo() {
     );
     cleanup(&spec.cfg);
 }
+
+#[test]
+fn job_recording_always_verifies_takes() {
+    let (mut spec, dir) = retry_spec("verify-always", &[TakeStatus::Pending, TakeStatus::Pending]);
+    let root = spec.cfg.cs2_dir.parent().unwrap().to_path_buf();
+    with_steam_layout(&mut spec.cfg);
+    let rj = RecordJson::load(&dir).unwrap();
+    let host = FakeHost::new(Scenario::happy(2).clips_dir(dir.join("clips")));
+    // путь записи без предпроверки: проверка дублей не зависит от отчёта
+    let rep = job::record_takes(
+        &host,
+        &spec.cfg,
+        (1, 3),
+        &dir,
+        &rj,
+        None,
+        &Capture::default(),
+    )
+    .expect("запись двух дублей");
+
+    assert_eq!(host.launches(), 1);
+    assert!(rep.elapsed > Duration::ZERO, "{rep:?}");
+    let m = Manifest::load(&dir.join("clips")).expect("манифест дублей записан");
+    assert_eq!(m.takes.len(), 2);
+    for t in &m.takes {
+        assert_eq!(
+            (t.status, t.attempt),
+            (TakeStatus::Validated, 3),
+            "ffprobe проверил дубль, номер попытки — из аргумента: {t:?}"
+        );
+    }
+    assert!(
+        m.attempts.last().is_some_and(|a| a.env.is_some()),
+        "снимок окружения попал в манифест попытки"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}

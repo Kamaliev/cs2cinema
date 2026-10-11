@@ -42,8 +42,8 @@ pub struct RecordRequest {
     pub header: String,
     /// Подстроки строк `AFXERROR`, которые не останавливают запись (D-09, из `settings.json`).
     pub afxerror_ignore: Vec<String>,
-    /// Проверка дублей `ffprobe` и `clips/manifest.json` (D-02); `None` — без проверки, как раньше
-    /// (старые тесты и CLI до фазы 4).
+    /// Проверка дублей `ffprobe` и `clips/manifest.json` (D-02 фазы 3). Пусто — только в тестах самой машины записи:
+    /// задачи приложения и `cs2-cli` идут через `pipeline::job`, который передаёт проверку всегда.
     pub verify: Option<Verify>,
 }
 

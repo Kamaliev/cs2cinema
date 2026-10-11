@@ -224,12 +224,13 @@ pub fn space_pass(
 
 /// Запрос записи из конфига и `record.json`: кадр, метка, имя демки и дубли берутся из `record.json`, а не из
 /// текущего конфига — старые скрипты и граф склейки нельзя смешивать с новым разрешением (Pattern 5).
+/// Проверка дублей обязательна: через `pipeline::job` запись без неё не строится (T-04-11).
 pub fn record_request(
     cfg: &JobConfig,
     out_dir: &Path,
     rj: &RecordJson,
     job_id: i64,
-    verify: Option<Verify>,
+    verify: Verify,
 ) -> RecordRequest {
     RecordRequest {
         out_dir: out_dir.to_path_buf(),
@@ -248,7 +249,7 @@ pub fn record_request(
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
         ),
         afxerror_ignore: cfg.afxerror_ignore.clone(),
-        verify,
+        verify: Some(verify),
     }
 }
 
@@ -423,15 +424,13 @@ pub fn record_takes(
     // игру закрывает сама запись при любом выходе, в том числе при отмене
     let recorded_run = installed.map_err(RunError::from).and_then(|()| {
         // каждая попытка записи идёт с проверкой дублей и ведением манифеста (TAK-03, D-05)
-        let req = RecordRequest {
-            verify: Some(Verify {
-                ffprobe: cfg.ffprobe.clone(),
-                plan_hash: rj.plan_hash.clone(),
-                attempt,
-                env: Some(env),
-            }),
-            ..record_request(cfg, out_dir, rj, job_id, None)
+        let verify = Verify {
+            ffprobe: cfg.ffprobe.clone(),
+            plan_hash: rj.plan_hash.clone(),
+            attempt,
+            env: Some(env),
         };
+        let req = record_request(cfg, out_dir, rj, job_id, verify);
         p.log(&format!("запас по времени ×{:.2}", cfg.time_margin));
         record_stage(host, &req, p)
     });
@@ -805,6 +804,15 @@ mod tests {
             })
             .collect()
     }
+    /// Проверка дублей для запроса записи в тестах.
+    fn verify() -> Verify {
+        Verify {
+            ffprobe: PathBuf::from("ffprobe"),
+            plan_hash: "h".into(),
+            attempt: 1,
+            env: None,
+        }
+    }
 
     /// `record.json` на `n` дублей по 5 игровых секунд в кадре 1280x720.
     fn sample_record_json(n: usize, demo: PathBuf, plan_hash: String) -> RecordJson {
@@ -941,16 +949,26 @@ mod tests {
         let mut cfg = JobConfig::default();
         let rj = sample_record_json(2, PathBuf::from("match.dem"), "h".into());
         assert!(
-            record_request(&cfg, Path::new("out"), &rj, 7, None)
+            record_request(&cfg, Path::new("out"), &rj, 7, verify())
                 .afxerror_ignore
                 .is_empty(),
             "по умолчанию список пуст"
         );
         cfg.afxerror_ignore = vec!["shader cache".into()];
         assert_eq!(
-            record_request(&cfg, Path::new("out"), &rj, 7, None).afxerror_ignore,
+            record_request(&cfg, Path::new("out"), &rj, 7, verify()).afxerror_ignore,
             vec!["shader cache".to_owned()]
         );
+    }
+
+    #[test]
+    fn record_request_always_carries_the_take_verification() {
+        let rj = sample_record_json(2, PathBuf::from("match.dem"), "h".into());
+        let req = record_request(&JobConfig::default(), Path::new("out"), &rj, 7, verify());
+        let v = req
+            .verify
+            .expect("запрос из pipeline::job идёт с проверкой дублей");
+        assert_eq!((v.plan_hash.as_str(), v.attempt), ("h", 1));
     }
 
     #[test]
@@ -960,7 +978,7 @@ mod tests {
             ..JobConfig::default()
         };
         let rj = sample_record_json(2, PathBuf::from("match.dem"), "h".into());
-        let req = record_request(&cfg, Path::new("out"), &rj, 7, None);
+        let req = record_request(&cfg, Path::new("out"), &rj, 7, verify());
         assert_eq!(req.launch.size, (1280, 720), "кадр — из record.json");
         assert_eq!(
             (req.launch.nonce.as_str(), req.launch.demo_name.as_str()),

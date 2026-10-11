@@ -4,12 +4,15 @@
 //! Правило: ядро (`core`) работает без HTTP и с внедрёнными часами (`clock`), HTTP — тонкая обёртка над ним.
 //! Секреты хранятся только в `secret::Secret`, а любой текст, уходящий из процесса, проходит `secret::Redactor`.
 
+pub mod auth;
 pub mod blobs;
 pub mod cli;
 pub mod clock;
 pub mod config;
 pub mod core;
 pub mod db;
+pub mod secret;
+pub mod users;
 
 pub type Result<T> = std::result::Result<T, String>;
 

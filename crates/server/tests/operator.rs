@@ -143,3 +143,144 @@ fn job_show_prints_the_demo_hash() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+fn data_arg(d: &Path) -> String {
+    d.join("data").to_str().unwrap().to_owned()
+}
+
+/// Токен — строка `cs2r_` + 64 hex в выводе `runner add`.
+fn token_from(out: &str) -> String {
+    out.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("cs2r_"))
+        .expect("токен в выводе")
+        .to_owned()
+}
+
+fn read_all_db_bytes(data: &Path) -> Vec<u8> {
+    let mut all = Vec::new();
+    for name in ["server.db", "server.db-wal"] {
+        if let Ok(b) = std::fs::read(data.join(name)) {
+            all.extend(b);
+        }
+    }
+    all
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+#[test]
+fn runner_token_is_shown_once_and_only_its_hash_is_stored() {
+    let d = test_dir("token");
+    let data = data_arg(&d);
+    let (code, out, err) = run(&["runner", "add", "main", "--data-dir", &data]);
+    assert_eq!(code, 0, "{err}");
+    let token = token_from(&out);
+    assert_eq!(token.len(), 5 + 64);
+    let bytes = read_all_db_bytes(&d.join("data"));
+    assert!(
+        !contains(&bytes, token.as_bytes()),
+        "токен не должен лежать в базе"
+    );
+    let hash = server::auth::hash_token(&token);
+    assert!(
+        contains(&bytes, hash.as_bytes()),
+        "хеш токена должен лежать в базе"
+    );
+    let (code, out, err) = run(&["runner", "list", "--data-dir", &data]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("main") && out.contains(&hash[..8]), "{out}");
+    assert!(!out.contains(&token), "{out}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn revoked_token_no_longer_authenticates() {
+    let d = test_dir("revoke");
+    let data = data_arg(&d);
+    let (_, out, _) = run(&["runner", "add", "main", "--data-dir", &data]);
+    let token = token_from(&out);
+    let db = server::db::Db::open(&d.join("data/server.db")).unwrap();
+    assert!(server::auth::authenticate(&db, &token, 1).is_ok());
+    drop(db);
+    let (code, _, err) = run(&["runner", "revoke", "main", "--data-dir", &data]);
+    assert_eq!(code, 0, "{err}");
+    let db = server::db::Db::open(&d.join("data/server.db")).unwrap();
+    assert!(matches!(
+        server::auth::authenticate(&db, &token, 2),
+        Err(server::auth::AuthError::Revoked { .. })
+    ));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn runners_users_and_jobs_survive_a_restart() {
+    let d = test_dir("restart");
+    let data = data_arg(&d);
+    let demo = d.join("match.dem");
+    fake_demo(&demo, 64 * 1024);
+    let (code, _, err) = run(&[
+        "user",
+        "add",
+        "alice",
+        "--tg",
+        "42",
+        "--admin",
+        "--data-dir",
+        &data,
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let (code, _, err) = run(&["runner", "add", "main", "--data-dir", &data]);
+    assert_eq!(code, 0, "{err}");
+    let (code, _, err) = run(&[
+        "submit",
+        demo.to_str().unwrap(),
+        "--player",
+        "s1mple",
+        "--user",
+        "alice",
+        "--data-dir",
+        &data,
+    ]);
+    assert_eq!(code, 0, "{err}");
+
+    let (_, users, _) = run(&["user", "list", "--data-dir", &data]);
+    assert!(
+        users.contains("alice") && users.contains("admin") && users.contains("42"),
+        "{users}"
+    );
+    let (_, runners, _) = run(&["runner", "list", "--data-dir", &data]);
+    assert!(runners.contains("main"), "{runners}");
+    let (_, jobs, _) = run(&["job", "list", "--data-dir", &data]);
+    assert!(jobs.contains("#1") && jobs.contains("alice"), "{jobs}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn submit_for_an_unknown_user_is_refused() {
+    let d = test_dir("nouser");
+    let data = data_arg(&d);
+    let demo = d.join("match.dem");
+    fake_demo(&demo, 64 * 1024);
+    let (code, _, err) = run(&[
+        "submit",
+        demo.to_str().unwrap(),
+        "--player",
+        "s1mple",
+        "--user",
+        "nobody",
+        "--data-dir",
+        &data,
+    ]);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("ошибка: пользователь «nobody» не найден"),
+        "{err}"
+    );
+    let (_, jobs, _) = run(&["job", "list", "--data-dir", &data]);
+    assert!(!jobs.contains("#1"), "{jobs}");
+    let _ = std::fs::remove_dir_all(&d);
+}

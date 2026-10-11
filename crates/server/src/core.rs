@@ -6,6 +6,7 @@ use crate::Result;
 use crate::blobs::{Blobs, Ingested, demo_rel, sniff_demo};
 use crate::clock::Clock;
 use crate::db::{Db, db_err};
+use crate::secret::Redactor;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,6 +44,7 @@ pub struct CoreOptions {
     pub data_dir: PathBuf,
     pub limits: Limits,
     pub clock: Arc<dyn Clock>,
+    pub redactor: Redactor,
 }
 
 #[derive(Clone)]
@@ -50,6 +52,7 @@ pub struct Core {
     db: Db,
     blobs: Blobs,
     clock: Arc<dyn Clock>,
+    redactor: Redactor,
     limits: Limits,
     data_dir: PathBuf,
 }
@@ -145,20 +148,6 @@ fn job_from_row(r: &Row<'_>) -> rusqlite::Result<JobRow> {
     })
 }
 
-/// Убирает управляющие символы (кроме `\n` и `\t`) и режет до `max_chars` по границе символа.
-fn clean_text(s: &str, max_chars: usize) -> String {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-        .collect();
-    if cleaned.chars().count() <= max_chars {
-        return cleaned;
-    }
-    let mut out: String = cleaned.chars().take(max_chars.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
 /// Ник вида Steam64 (17 цифр, начинается с 7656) — это steamid, иначе обычное имя.
 fn is_steam64(s: &str) -> bool {
     s.len() == 17 && s.starts_with("7656") && s.bytes().all(|b| b.is_ascii_digit())
@@ -172,6 +161,7 @@ impl Core {
             db,
             blobs,
             clock: opts.clock,
+            redactor: opts.redactor,
             limits: opts.limits,
             data_dir: opts.data_dir,
         })
@@ -183,6 +173,10 @@ impl Core {
 
     pub fn blobs(&self) -> &Blobs {
         &self.blobs
+    }
+
+    pub fn redactor(&self) -> &Redactor {
+        &self.redactor
     }
 
     pub fn clock(&self) -> &Arc<dyn Clock> {
@@ -200,13 +194,13 @@ impl Core {
     /// Создаёт задачу в состоянии `receiving`; демка копируется следом (`finish_receive`).
     pub fn begin_receive(&self, s: &Submit) -> Result<i64> {
         let now = self.clock.now_ms();
-        let player = clean_text(s.player.trim(), 64);
+        let player = self.redactor.clean(s.player.trim(), 64);
         if player.is_empty() {
             return Err("не указан игрок".to_owned());
         }
         let steam = is_steam64(&player).then(|| player.clone());
-        let orig = clean_text(&s.orig_name, 120);
-        let by = clean_text(&s.requested_by, 64);
+        let orig = self.redactor.clean(&s.orig_name, 120);
+        let by = self.redactor.clean(&s.requested_by, 64);
         self.db.write(|tx| {
             tx.execute(
                 "INSERT INTO jobs(user_id, requested_by, state, source_kind, orig_name, player_steam, player_name, created_at, updated_at)
@@ -248,7 +242,9 @@ impl Core {
             }
             Err(e) => {
                 let now = self.clock.now_ms();
-                let msg = clean_text(&format!("не удалось принять демку: {e}"), 2000);
+                let msg = self
+                    .redactor
+                    .clean(&format!("не удалось принять демку: {e}"), 2000);
                 self.db.write(|tx| {
                     tx.execute(
                         "UPDATE jobs SET state = 'failed', fail_code = ?2, fail_message = ?3, updated_at = ?4, finished_at = ?4
@@ -338,6 +334,7 @@ mod tests {
             data_dir: d.join("data"),
             limits,
             clock: Arc::new(ManualClock::new(1_000)),
+            redactor: Redactor::default(),
         })
         .unwrap();
         (core, d)

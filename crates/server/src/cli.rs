@@ -1,12 +1,15 @@
-//! Командная строка оператора: `cs2-server submit | job | ...`.
+//! Командная строка оператора: `cs2-server submit | job | runner | user | ...`.
 //!
 //! Разбор вручную, как в `cs2-cli`: ошибка разбора — «ошибка: …» и справка с кодом 2,
-//! ошибка выполнения — «ошибка: …» с кодом 1.
+//! ошибка выполнения — «ошибка: …» с кодом 1. Все строки «ошибка:» проходят `Redactor` процесса.
 
 use crate::Result;
+use crate::auth;
 use crate::clock::SystemClock;
 use crate::config::{self, Flags};
-use crate::core::{Core, CoreOptions, JobRow, Submit};
+use crate::core::{Core, CoreOptions, FileRow, JobRow, Submit};
+use crate::secret::Redactor;
+use crate::users;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -18,6 +21,11 @@ cs2-server — сервер очереди монтажа
   submit {демка} --player {ник|steamid} [--user {имя}]   поставить демку в очередь
   job list                                               список задач
   job show {id}                                          подробности задачи
+  runner add {имя}                                       выдать раннеру токен (показывается один раз)
+  runner list                                            раннеры и отпечатки их токенов
+  runner revoke {имя}                                    отозвать токен раннера
+  user add {имя} [--tg {id}] [--admin]                   добавить пользователя
+  user list                                              список пользователей
 
 Общие флаги:
   --config {файл}      файл настроек (JSON)
@@ -32,6 +40,8 @@ struct Args {
     data_dir: Option<PathBuf>,
     player: Option<String>,
     user: Option<String>,
+    tg: Option<i64>,
+    admin: bool,
 }
 
 enum CliError {
@@ -61,6 +71,14 @@ fn parse_args(args: Vec<String>) -> std::result::Result<Args, CliError> {
             "--data-dir" => out.data_dir = Some(PathBuf::from(value("--data-dir")?)),
             "--player" => out.player = Some(value("--player")?),
             "--user" => out.user = Some(value("--user")?),
+            "--tg" => {
+                out.tg = Some(
+                    value("--tg")?
+                        .parse()
+                        .map_err(|_| CliError::Usage("--tg: нужно целое число".to_owned()))?,
+                )
+            }
+            "--admin" => out.admin = true,
             s if s.starts_with("--") => {
                 return Err(CliError::Usage(format!("неизвестный флаг {s}")));
             }
@@ -71,24 +89,29 @@ fn parse_args(args: Vec<String>) -> std::result::Result<Args, CliError> {
 }
 
 pub fn run_cli(args: Vec<String>, env: &dyn Fn(&str) -> Option<String>) -> ExitCode {
-    let parsed = parse_args(args).and_then(|a| execute(a, env));
+    let mut redactor = Redactor::default();
+    let parsed = parse_args(args).and_then(|a| execute(a, env, &mut redactor));
     match parsed {
         Ok(()) => ExitCode::SUCCESS,
         Err(CliError::Usage(msg)) => {
             if !msg.is_empty() {
-                eprintln!("ошибка: {msg}");
+                eprintln!("ошибка: {}", redactor.redact(&msg));
             }
             eprint!("{USAGE}");
             ExitCode::from(2)
         }
         Err(CliError::Run(e)) => {
-            eprintln!("ошибка: {e}");
+            eprintln!("ошибка: {}", redactor.redact(&e));
             ExitCode::FAILURE
         }
     }
 }
 
-fn open_core(a: &Args, env: &dyn Fn(&str) -> Option<String>) -> Result<Core> {
+fn open_core(
+    a: &Args,
+    env: &dyn Fn(&str) -> Option<String>,
+    redactor: &mut Redactor,
+) -> Result<Core> {
     let flags = Flags {
         config: a.config.clone(),
         data_dir: a.data_dir.clone(),
@@ -96,16 +119,21 @@ fn open_core(a: &Args, env: &dyn Fn(&str) -> Option<String>) -> Result<Core> {
     };
     let loaded = config::load(&flags, env)?;
     for w in &loaded.warnings {
-        eprintln!("внимание: {w}");
+        eprintln!("внимание: {}", redactor.redact(w));
     }
     Core::open(CoreOptions {
         data_dir: loaded.config.data_dir.clone(),
         limits: loaded.config.limits(),
         clock: Arc::new(SystemClock),
+        redactor: redactor.clone(),
     })
 }
 
-fn execute(a: Args, env: &dyn Fn(&str) -> Option<String>) -> std::result::Result<(), CliError> {
+fn execute(
+    a: Args,
+    env: &dyn Fn(&str) -> Option<String>,
+    redactor: &mut Redactor,
+) -> std::result::Result<(), CliError> {
     let words: Vec<&str> = a.positional.iter().map(String::as_str).collect();
     match words.as_slice() {
         ["submit", file] => {
@@ -113,7 +141,15 @@ fn execute(a: Args, env: &dyn Fn(&str) -> Option<String>) -> std::result::Result
                 .player
                 .clone()
                 .ok_or_else(|| CliError::Usage("submit требует --player".to_owned()))?;
-            let core = open_core(&a, env)?;
+            let core = open_core(&a, env, redactor)?;
+            let (user_id, requested_by) = match &a.user {
+                Some(name) => {
+                    let u = users::find_user(core.db(), name)?
+                        .ok_or_else(|| CliError::Run(format!("пользователь «{name}» не найден")))?;
+                    (Some(u.id), u.name)
+                }
+                None => (None, "оператор".to_owned()),
+            };
             let path = PathBuf::from(file);
             let orig_name = path
                 .file_name()
@@ -121,8 +157,8 @@ fn execute(a: Args, env: &dyn Fn(&str) -> Option<String>) -> std::result::Result
                 .unwrap_or_default();
             let sub = Submit {
                 player,
-                user_id: None,
-                requested_by: "оператор".to_owned(),
+                user_id,
+                requested_by,
                 orig_name: orig_name.clone(),
             };
             let (id, got) = core.submit(&path, &sub)?;
@@ -134,18 +170,19 @@ fn execute(a: Args, env: &dyn Fn(&str) -> Option<String>) -> std::result::Result
             Ok(())
         }
         ["job", "list"] => {
-            let core = open_core(&a, env)?;
+            let core = open_core(&a, env, redactor)?;
             let jobs = core.jobs()?;
             if jobs.is_empty() {
                 println!("задач нет");
             }
             for j in jobs {
                 println!(
-                    "#{}  {} ({})  {}  {}",
+                    "#{}  {} ({})  {}  {}  {}",
                     j.id,
                     j.state.title(),
                     j.state.as_str(),
                     j.player_name,
+                    j.requested_by,
                     utc(j.created_at)
                 );
             }
@@ -155,12 +192,73 @@ fn execute(a: Args, env: &dyn Fn(&str) -> Option<String>) -> std::result::Result
             let id: i64 = id
                 .parse()
                 .map_err(|_| CliError::Usage("job show: нужен числовой id".to_owned()))?;
-            let core = open_core(&a, env)?;
+            let core = open_core(&a, env, redactor)?;
             let job = core
                 .job(id)?
                 .ok_or_else(|| CliError::Run(format!("задачи #{id} нет")))?;
             let demo = core.demo_file(id)?;
             print_job(&job, demo.as_ref());
+            Ok(())
+        }
+        ["runner", "add", name] => {
+            let core = open_core(&a, env, redactor)?;
+            let (runner, token) = auth::add_runner(core.db(), name, core.clock().now_ms())?;
+            println!("раннер «{}» добавлен", runner.name);
+            println!("{token}");
+            println!(
+                "токен показывается один раз; на сервере хранится только его хеш (отпечаток {})",
+                runner.fingerprint
+            );
+            Ok(())
+        }
+        ["runner", "list"] => {
+            let core = open_core(&a, env, redactor)?;
+            let list = auth::list_runners(core.db())?;
+            if list.is_empty() {
+                println!("раннеров нет");
+            }
+            for r in list {
+                let seen = r
+                    .last_seen_at
+                    .map(utc)
+                    .unwrap_or_else(|| "не входил".to_owned());
+                let revoked = match r.revoked_at {
+                    Some(t) => format!("  отозван {}", utc(t)),
+                    None => String::new(),
+                };
+                println!(
+                    "{}  отпечаток {}  создан {}  последний вход: {}{}",
+                    r.name,
+                    r.fingerprint,
+                    utc(r.created_at),
+                    seen,
+                    revoked
+                );
+            }
+            Ok(())
+        }
+        ["runner", "revoke", name] => {
+            let core = open_core(&a, env, redactor)?;
+            auth::revoke_runner(core.db(), name, core.clock().now_ms())?;
+            println!("раннер «{name}» отозван");
+            Ok(())
+        }
+        ["user", "add", name] => {
+            let core = open_core(&a, env, redactor)?;
+            let u = users::add_user(core.db(), name, a.tg, a.admin, core.clock().now_ms())?;
+            println!("пользователь «{}» добавлен ({})", u.name, u.role);
+            Ok(())
+        }
+        ["user", "list"] => {
+            let core = open_core(&a, env, redactor)?;
+            let list = users::list_users(core.db())?;
+            if list.is_empty() {
+                println!("пользователей нет");
+            }
+            for u in list {
+                let tg = u.tg_id.map(|t| format!("  tg {t}")).unwrap_or_default();
+                println!("{}  {}{}  создан {}", u.name, u.role, tg, utc(u.created_at));
+            }
             Ok(())
         }
         [] => Err(CliError::Usage(String::new())),
@@ -171,7 +269,7 @@ fn execute(a: Args, env: &dyn Fn(&str) -> Option<String>) -> std::result::Result
     }
 }
 
-fn print_job(j: &JobRow, demo: Option<&crate::core::FileRow>) {
+fn print_job(j: &JobRow, demo: Option<&FileRow>) {
     println!("задача #{}", j.id);
     println!("состояние: {} ({})", j.state.title(), j.state.as_str());
     println!("игрок: {}", j.player_name);

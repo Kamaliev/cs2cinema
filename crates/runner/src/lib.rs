@@ -9,6 +9,7 @@
 
 pub mod exec;
 pub mod link;
+pub mod policy;
 pub mod state;
 pub mod tee;
 pub mod transfer;
@@ -20,26 +21,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pipeline::record::failure::classify;
 use pipeline::record::log::one_line;
-use pipeline::{FailCode, RunError};
 use wire::{
     Assignment, DirectiveAction, Failure, FinishRequest, HelloRequest, Holding, JobState, Outcome,
-    Phase,
+    Phase, ReleaseRequest, fail,
 };
 
 pub use exec::{Executor, Task};
 pub use link::{Link, LinkError, Token};
+pub use policy::{Disposition, Flags, PausePolicy, PauseReason, dispose, failure_of};
 pub use state::{HeldJob, ResultFile, RunnerState, Stage};
 pub use tee::{FORCE_AFTER, SeqSource, Shared, Tee, Uplink};
 pub use transfer::{StopWhy, TransferEnd, sha256_file};
 
 use transfer::{Verdict, judge};
 
-/// Код сбоя исполнителя без собственного кода. Позже заменится на `wire::fail::JOB_ERROR`.
-const JOB_ERROR: &str = "JOB_ERROR";
-/// Код «демка не сошлась по SHA-256». Позже заменится на `wire::fail::BAD_DEMO`.
-const BAD_DEMO: &str = "BAD_DEMO";
+/// Сколько раннер ждёт после `release` перед следующим `claim`: кратковременная неисправность (игра ещё
+/// закрывается) успевает пройти.
+pub const RELEASE_COOLDOWN: Duration = Duration::from_secs(15);
+/// Как часто раннер на паузе напоминает серверу о себе.
+const PAUSE_HELLO_EVERY: Duration = Duration::from_secs(30);
 
 /// Настройки раннера.
 #[derive(Clone)]
@@ -63,6 +64,8 @@ pub struct Config {
     pub debounce: Duration,
     /// Через сколько мягкая отмена сервера становится жёсткой (по умолчанию `FORCE_AFTER`).
     pub force_after: Duration,
+    /// Сколько ждать после `release` перед следующим `claim` (по умолчанию `RELEASE_COOLDOWN`, в тестах ноль).
+    pub release_cooldown: Duration,
 }
 
 impl std::fmt::Debug for Config {
@@ -77,6 +80,7 @@ impl std::fmt::Debug for Config {
             .field("heartbeat", &self.heartbeat)
             .field("debounce", &self.debounce)
             .field("force_after", &self.force_after)
+            .field("release_cooldown", &self.release_cooldown)
             .finish()
     }
 }
@@ -92,6 +96,10 @@ pub enum Tick {
     Dropped { job_id: i64 },
     /// Остановлено флагом или лимитом кусков; задача осталась в outbox и продолжится при следующем запуске.
     Stopped,
+    /// Сбой окружения или запуска: задача возвращена в очередь сервера через `release`, выдача засчитана.
+    Released { job_id: i64 },
+    /// Раннер на паузе и задач не берёт, пока его не продолжат (`Control::resume`).
+    Paused(PauseReason),
 }
 
 /// Журнал `runner.log`: строки `{время} {текст}`, значение токена заменено на `***`.
@@ -154,50 +162,22 @@ fn link_error(e: LinkError) -> String {
     }
 }
 
-/// Итог для сервера по ошибке исполнителя: отмена — `Cancelled`, сбой записи — `Failed` со своим кодом, классом и
-/// состоянием автомата, ошибка без описания — `JOB_ERROR`. Весь текст проходит `one_line`.
-fn outcome_of(e: &RunError, elapsed_ms: u64) -> Outcome {
-    let cancelled = e.message == pipeline::CANCELLED
-        || e.fail
-            .as_ref()
-            .is_some_and(|f| f.code == FailCode::Cancelled);
-    if cancelled {
-        return Outcome::Cancelled;
-    }
-    Outcome::Failed(match &e.fail {
-        Some(f) => Failure {
-            code: f.code.as_str().to_owned(),
-            class: classify(f.code, f.state).title().to_owned(),
-            state: f.state.code().to_owned(),
-            hint: one_line(&f.hint),
-            message: one_line(&f.message),
-            tail: f
-                .console_tail
-                .iter()
-                .map(|line| one_line(line))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            elapsed_ms,
-        },
-        None => Failure {
-            code: JOB_ERROR.to_owned(),
-            message: one_line(&e.message),
-            elapsed_ms,
-            ..Default::default()
-        },
-    })
-}
-
 /// Ручка остановки раннера из другого потока (поток консоли, Ctrl+C). Остановка не отмена: задача остаётся в
 /// состоянии и продолжится после перезапуска (D-01).
 #[derive(Clone)]
 pub struct Control {
     stop: Arc<AtomicBool>,
+    resume: Arc<AtomicBool>,
 }
 
 impl Control {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Снять паузу раннера: следующий `tick` снова берёт задачи. Без паузы ничего не меняет.
+    pub fn resume(&self) {
+        self.resume.store(true, Ordering::SeqCst);
     }
 }
 
@@ -216,6 +196,16 @@ pub struct Runner {
     shared: Arc<Shared>,
     /// Содержимое `runner_state.json`: единственная удерживаемая задача.
     state: RunnerState,
+    /// Серия одинаковых неисправностей подряд.
+    pause: PausePolicy,
+    /// Раннер на паузе: пока `Some`, задачи не берутся.
+    paused: Option<PauseReason>,
+    /// Флаг `Control::resume`.
+    resume: Arc<AtomicBool>,
+    /// Когда раннер последний раз сообщил серверу о паузе.
+    pause_hello: Option<Instant>,
+    /// Раньше этого момента новый `claim` не делается (пауза после `release`).
+    cooldown_until: Option<Instant>,
 }
 
 impl Runner {
@@ -242,6 +232,11 @@ impl Runner {
             seq: Arc::new(SeqSource::new(state.last_seq)),
             shared: Arc::new(Shared::new(Phase::Fetch)),
             state,
+            pause: PausePolicy::default(),
+            paused: None,
+            resume: Arc::new(AtomicBool::new(false)),
+            pause_hello: None,
+            cooldown_until: None,
         })
     }
 
@@ -254,19 +249,34 @@ impl Runner {
     pub fn control(&self) -> Control {
         Control {
             stop: self.stop.clone(),
+            resume: self.resume.clone(),
         }
     }
 
     /// Один шаг: представиться серверу (в первый раз, с удерживаемой задачей), довести удерживаемую задачу до
-    /// конца или спросить новую и довести её.
+    /// конца или спросить новую и довести её. На паузе задач не берёт.
     pub fn tick(&mut self) -> Result<Tick, String> {
         if self.poll_secs.is_none() {
             self.recover_executor();
             self.hello()?;
         }
-        if self.state.job.is_some() {
-            return self.drive();
+        if self.resume.swap(false, Ordering::SeqCst) && self.paused.take().is_some() {
+            self.pause_hello = None;
+            self.log.line("пауза снята: раннер снова берёт задачи");
         }
+        if self.state.job.is_some() {
+            let tick = self.drive()?;
+            // Вторая неисправность подряд: задача уже возвращена, раннер встаёт на паузу.
+            return Ok(match (tick, &self.paused) {
+                (Tick::Released { .. }, Some(reason)) => Tick::Paused(reason.clone()),
+                (tick, _) => tick,
+            });
+        }
+        if let Some(reason) = self.paused.clone() {
+            self.pause_ping(&reason)?;
+            return Ok(Tick::Paused(reason));
+        }
+        self.wait_cooldown();
         let poll = self.cfg.poll_secs.or(self.poll_secs).unwrap_or(0);
         match self.link.claim(poll).map_err(link_error)? {
             None => Ok(Tick::Idle),
@@ -274,12 +284,55 @@ impl Runner {
         }
     }
 
+    /// Ждёт `release_cooldown` после `release`, проверяя флаг остановки.
+    fn wait_cooldown(&mut self) {
+        let Some(until) = self.cooldown_until.take() else {
+            return;
+        };
+        while Instant::now() < until && !self.stop.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(50).min(until - Instant::now()));
+        }
+    }
+
+    /// Раннер на паузе раз в 30 с говорит серверу «пауза: {код}» с пустым `holding`.
+    fn pause_ping(&mut self, reason: &PauseReason) -> Result<(), String> {
+        if self
+            .pause_hello
+            .is_some_and(|t| t.elapsed() < PAUSE_HELLO_EVERY)
+        {
+            return Ok(());
+        }
+        let req = HelloRequest {
+            protocol: wire::PROTOCOL_VERSION,
+            name: self.cfg.name.clone(),
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            status: format!("пауза: {}", reason.code),
+            holding: Vec::new(),
+        };
+        self.link.hello(&req).map_err(link_error)?;
+        self.pause_hello = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Раннер встаёт на паузу: строка в `runner.log` и stderr.
+    fn start_pause(&mut self, reason: PauseReason) {
+        self.log.line(&reason.to_string());
+        self.pause_hello = None;
+        self.paused = Some(reason);
+    }
+
     /// Цикл до флага остановки; ошибки связи — пауза 1, 2, 4 … 30 с.
     pub fn run(&mut self) {
         let mut pause = 0u64;
         while !self.stop.load(Ordering::SeqCst) {
             match self.tick() {
-                Ok(Tick::Settled { .. } | Tick::Dropped { .. }) => pause = 0,
+                Ok(Tick::Settled { .. } | Tick::Dropped { .. } | Tick::Released { .. }) => {
+                    pause = 0
+                }
+                Ok(Tick::Paused(_)) => {
+                    pause = 0;
+                    self.sleep(1);
+                }
                 Ok(Tick::Stopped) => {
                     self.stop.store(true, Ordering::SeqCst);
                 }
@@ -396,6 +449,7 @@ impl Runner {
                     .line(&format!("задача #{id}: сервер запросил отмену"));
                 let held = self.held();
                 held.pending = Some(Outcome::Cancelled);
+                held.pending_release = None;
                 held.stage = Stage::Reporting;
                 self.persist()?;
             }
@@ -565,8 +619,10 @@ impl Runner {
         let id = self.held().server_job_id;
         self.log
             .line(&format!("задача #{id}: сервер запросил отмену"));
+        self.pause.after(&Disposition::Cancel);
         let held = self.held();
         held.pending = Some(Outcome::Cancelled);
+        held.pending_release = None;
         held.stage = Stage::Reporting;
         self.persist()
     }
@@ -592,12 +648,15 @@ impl Runner {
             }
             TransferEnd::Lost => self.lose().map(Some),
             TransferEnd::Dropped(reason) => {
-                let held = self.held();
-                held.pending = Some(Outcome::Failed(Failure {
-                    code: BAD_DEMO.to_owned(),
+                let failure = Failure {
+                    code: fail::BAD_DEMO.to_owned(),
                     message: reason,
                     ..Default::default()
-                }));
+                };
+                // Контентный сбой обрывает серию неисправностей.
+                self.pause.after(&Disposition::Fail(failure.clone()));
+                let held = self.held();
+                held.pending = Some(Outcome::Failed(failure));
                 held.stage = Stage::Reporting;
                 self.persist()?;
                 Ok(None)
@@ -679,17 +738,21 @@ impl Runner {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let id = held.server_job_id;
 
-        // Задача потеряна, пока шёл исполнитель: ничего не закрываем (D-03).
-        if self.shared.is_lost() {
-            return self.lose().map(Some);
-        }
+        let flags = Flags {
+            server_cancel: self.shared.cancel_mode(),
+            local_stop: self.stop.load(Ordering::SeqCst),
+            abandoned: self.shared.is_lost(),
+            elapsed_ms,
+        };
+        let disposition = policy::dispose(&run, flags);
         if let Some(dir) = self.shared.out_dir() {
             self.held().out_dir = Some(dir);
         }
-        let server_cancel = self.shared.server_cancel();
-        let local_stop = self.stop.load(Ordering::SeqCst);
-        match run {
-            Ok(outcome) => match sha256_file(&outcome.result) {
+        if let Some(reason) = self.pause.after(&disposition) {
+            self.start_pause(reason);
+        }
+        match disposition {
+            Disposition::Done(outcome) => match sha256_file(&outcome.result) {
                 Ok((size, sha256)) => {
                     let job = self.held();
                     job.out_dir = Some(outcome.out_dir);
@@ -706,7 +769,7 @@ impl Runner {
                         .line(&format!("задача #{id} не удалась: {message}"));
                     let job = self.held();
                     job.pending = Some(Outcome::Failed(Failure {
-                        code: JOB_ERROR.to_owned(),
+                        code: fail::JOB_ERROR.to_owned(),
                         message,
                         elapsed_ms,
                         ..Default::default()
@@ -714,22 +777,49 @@ impl Runner {
                     job.stage = Stage::Reporting;
                 }
             },
-            Err(e) => {
-                let outcome = outcome_of(&e, elapsed_ms);
-                // Остановка раннера не отмена: задача остаётся в состоянии `Executing` и продолжится (D-01).
-                if matches!(outcome, Outcome::Cancelled) && local_stop && !server_cancel {
-                    self.log.line(&format!(
-                        "задача #{id}: раннер остановлен, задача останется для продолжения"
-                    ));
-                    self.persist()?;
-                    return Ok(Some(Tick::Stopped));
-                }
-                self.log
-                    .line(&format!("задача #{id} не удалась: {}", e.message));
+            // Остановка раннера не отмена: задача остаётся в состоянии `Executing` и продолжится (D-01).
+            Disposition::Keep => {
+                self.log.line(&format!(
+                    "задача #{id}: раннер остановлен, задача останется для продолжения"
+                ));
+                self.persist()?;
+                return Ok(Some(Tick::Stopped));
+            }
+            Disposition::Fail(failure) => {
+                self.log.line(&format!(
+                    "задача #{id} не удалась: {} ({})",
+                    failure.message, failure.code
+                ));
                 let job = self.held();
-                job.pending = Some(outcome);
+                job.pending = Some(Outcome::Failed(failure));
                 job.stage = Stage::Reporting;
             }
+            Disposition::Cancel => {
+                self.log
+                    .line(&format!("задача #{id}: отменена, итог — отмена"));
+                let job = self.held();
+                job.pending = Some(Outcome::Cancelled);
+                job.stage = Stage::Reporting;
+            }
+            // Неисправность окружения или запуска не вина демки: решение записывается до запроса, чтобы
+            // перезапуск повторил `release`, а не гонял исполнителя заново.
+            Disposition::Release {
+                reason,
+                code,
+                class,
+                ..
+            } => {
+                self.log.line(&format!(
+                    "задача #{id}: неисправность «{}» ({code}), возвращаю в очередь",
+                    class.title()
+                ));
+                let job = self.held();
+                job.pending = None;
+                job.pending_release = Some(reason);
+                job.stage = Stage::Reporting;
+            }
+            // Задача потеряна, пока шёл исполнитель: ничего не закрываем (D-03).
+            Disposition::Abandon => return self.lose().map(Some),
         }
         self.persist()?;
         Ok(None)
@@ -796,13 +886,51 @@ impl Runner {
         }
     }
 
+    /// Возвращает задачу в очередь сервера: выдача засчитывается всегда (D-02 буквально). Потолок держит сервер:
+    /// после `max_grants` выдач он сам закроет задачу `TOO_MANY_GRANTS`.
+    fn release(&mut self, held: HeldJob, reason: String) -> Result<Tick, String> {
+        let id = held.server_job_id;
+        let req = ReleaseRequest {
+            epoch: held.epoch,
+            reason,
+            counts: true,
+        };
+        match self.link.release(id, &req) {
+            Ok(()) => {
+                self.log
+                    .line(&format!("задача #{id}: возвращена в очередь сервера"));
+                self.remove_files(&held);
+                self.state.job = None;
+                self.persist()?;
+                if !self.cfg.release_cooldown.is_zero() {
+                    self.cooldown_until = Some(Instant::now() + self.cfg.release_cooldown);
+                }
+                Ok(Tick::Released { job_id: id })
+            }
+            // Чужая эпоха или закрытая задача: возвращать нечего, дело сделано.
+            Err(e) => match judge(&e) {
+                Verdict::Drop(why) => {
+                    self.drop_job(&format!("сервер не принял release — {why}"))?;
+                    Ok(Tick::Dropped { job_id: id })
+                }
+                Verdict::Retry => Err(format!("задача #{id}: release: {e}")),
+            },
+        }
+    }
+
     /// Сообщает серверу сохранённый итог (`Failed` или `Cancelled`); сеть повторяется следующим `tick`.
     fn report(&mut self) -> Result<Tick, String> {
         let held = self.state.job.clone().expect("задача удерживается");
         let id = held.server_job_id;
+        // Итог важнее возврата: отмена, пришедшая после решения о `release`, закрывает задачу (WR-01 сервера).
+        if held.pending.is_none()
+            && let Some(reason) = held.pending_release.clone()
+        {
+            return self.release(held, reason);
+        }
         let outcome = held.pending.clone().unwrap_or_else(|| {
             Outcome::Failed(Failure {
-                code: JOB_ERROR.to_owned(),
+                code: fail::JOB_ERROR.to_owned(),
                 message: "итог задачи не сохранён".to_owned(),
                 ..Default::default()
             })

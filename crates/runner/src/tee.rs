@@ -191,6 +191,15 @@ impl Shared {
         }
     }
 
+    /// Какую отмену запросил сервер.
+    pub fn cancel_mode(&self) -> CancelMode {
+        match self.cancel.load(Ordering::SeqCst) {
+            0 => CancelMode::NotRequested,
+            SOFT => CancelMode::Soft,
+            _ => CancelMode::Force,
+        }
+    }
+
     /// Сервер запросил отмену (мягкую или жёсткую).
     pub fn server_cancel(&self) -> bool {
         self.cancel.load(Ordering::SeqCst) >= SOFT

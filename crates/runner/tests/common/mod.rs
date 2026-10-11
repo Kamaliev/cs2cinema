@@ -163,6 +163,7 @@ impl Stand {
             heartbeat: None,
             debounce: Duration::from_secs(2),
             force_after: runner::FORCE_AFTER,
+            release_cooldown: Duration::ZERO,
         }
     }
 }

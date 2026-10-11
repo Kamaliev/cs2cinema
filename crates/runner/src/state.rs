@@ -65,6 +65,10 @@ pub struct HeldJob {
     pub pending: Option<Outcome>,
     /// Сколько раз сервер отверг SHA-256 результата.
     pub sha_retries: u32,
+    /// Причина `release`: задача возвращается в очередь (сбой окружения или запуска). Решение записано до
+    /// запроса, поэтому после перезапуска раннер повторит `release`, а не станет запускать исполнителя заново.
+    #[serde(default)]
+    pub pending_release: Option<String>,
 }
 
 impl HeldJob {
@@ -90,6 +94,7 @@ impl HeldJob {
             result: None,
             pending: None,
             sha_retries: 0,
+            pending_release: None,
         }
     }
 }
@@ -212,6 +217,7 @@ mod tests {
                 }),
                 pending: None,
                 sha_retries: 1,
+                pending_release: Some("FOREIGN_GAME_RUNNING: игра запущена".to_owned()),
             }),
             last_seq: 42,
         }

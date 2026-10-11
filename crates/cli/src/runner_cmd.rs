@@ -25,7 +25,7 @@ cs2-cli runner — раннер очереди сервера: сам забир
                  [--margin X] [--no-gpu] [--max-demo-mib N] [--max-unpacked-mib N] [--inspect-mem-mib N] [--inspect-mins N]
 
 Параметры:
-  --server <адрес>        адрес cs2-server, например http://хост:8080  (иначе $CS2_RUNNER_SERVER)
+  --server <адрес>        адрес cs2-server, например https://хост:8080 (http:// только для localhost и частной сети; иначе $CS2_RUNNER_SERVER)
   --token-file <файл>     файл с токеном раннера, одна строка          (иначе $CS2_RUNNER_TOKEN)
   --name <имя>            имя раннера в журнале сервера                (по умолчанию $COMPUTERNAME или runner)
   --dir <папка>           рабочая папка: remote/ (демки), out/ (результаты), runner.log, runner_state.json

@@ -126,12 +126,41 @@ pub struct Link {
     agent: ureq::Agent,
 }
 
+/// Можно ли слать токен по открытому `http://`: только на этот же компьютер или в частную сеть. Имя хоста,
+/// кроме `localhost`, не проверить без DNS, поэтому для него нужен `https://`.
+fn plain_http_allowed(base: &str) -> bool {
+    let rest = base.strip_prefix("http://").unwrap_or(base);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // после логина `user@` и до порта: `[::1]:80` и `127.0.0.1:80`
+    let host = authority.rsplit('@').next().unwrap_or("");
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(a)) => a.is_loopback() || a.is_private() || a.is_link_local(),
+        Ok(std::net::IpAddr::V6(a)) => {
+            a.is_loopback() || (a.segments()[0] & 0xfe00) == 0xfc00 || (a.segments()[0] & 0xffc0) == 0xfe80
+        }
+        Err(_) => false,
+    }
+}
+
 impl Link {
     pub fn new(server: &str, token: Token) -> Result<Link, String> {
         let base = server.trim().trim_end_matches('/').to_owned();
         if !(base.starts_with("http://") || base.starts_with("https://")) {
             return Err(format!(
                 "адрес сервера должен начинаться с http:// или https://: {}",
+                pipeline::record::log::one_line(&base)
+            ));
+        }
+        if base.starts_with("http://") && !plain_http_allowed(&base) {
+            return Err(format!(
+                "токен нельзя слать по открытому http:// на внешний адрес: используйте https:// ({})",
                 pipeline::record::log::one_line(&base)
             ));
         }
@@ -383,5 +412,29 @@ mod tests {
     fn server_address_must_be_http() {
         assert!(Link::new("example.org", Token::new("t")).is_err());
         assert!(Link::new("http://127.0.0.1:8080/", Token::new("t")).is_ok());
+    }
+
+    #[test]
+    fn plain_http_is_allowed_only_for_loopback_and_private_addresses() {
+        for ok in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080/",
+            "http://[::1]:8080",
+            "http://192.168.1.5:8080",
+            "http://10.0.0.2",
+            "http://172.16.3.4:80/v1",
+            "https://example.org",
+        ] {
+            assert!(Link::new(ok, Token::new("t")).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://example.org",
+            "http://8.8.8.8:8080",
+            "http://172.32.0.1",
+            "http://127.0.0.1@evil.example",
+            "http://evil.example/127.0.0.1",
+        ] {
+            assert!(Link::new(bad, Token::new("t")).is_err(), "{bad}");
+        }
     }
 }

@@ -2,12 +2,18 @@
 //!
 //! Раннер сам ходит к серверу, сервер к нему никогда не подключается. Всё, что делает задачу роликом, прячется
 //! за `Executor`; здесь только транспорт и порядок шагов. Токен живёт в `Token` и в журнал не попадает.
+//!
+//! Задача, пока она у раннера, записана в `runner_state.json` (outbox, модуль `state`): после перезапуска раннер
+//! здоровается с `holding`, по указанию сервера продолжает с сохранённого этапа или бросает задачу. Пока в
+//! состоянии есть задача, новая не берётся: одна запись и одна загрузка за раз.
 
 pub mod exec;
 pub mod link;
+pub mod state;
+pub mod transfer;
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,11 +22,16 @@ use std::time::{Duration, Instant};
 use pipeline::record::failure::classify;
 use pipeline::record::log::one_line;
 use pipeline::{FailCode, RunError};
-use sha2::{Digest, Sha256};
-use wire::{Assignment, CHUNK_SIZE, Failure, FinishRequest, HelloRequest, JobState, Outcome};
+use wire::{
+    Assignment, DirectiveAction, Failure, FinishRequest, HelloRequest, Holding, JobState, Outcome,
+};
 
 pub use exec::{Executor, Task};
 pub use link::{Link, LinkError, Token};
+pub use state::{HeldJob, ResultFile, RunnerState, Stage};
+pub use transfer::{TransferEnd, sha256_file};
+
+use transfer::{Verdict, judge};
 
 /// Код сбоя исполнителя без собственного кода. Позже заменится на `wire::fail::JOB_ERROR`.
 const JOB_ERROR: &str = "JOB_ERROR";
@@ -33,12 +44,16 @@ pub struct Config {
     /// Адрес сервера: `http://хост:порт`.
     pub server: String,
     pub token: Token,
-    /// Рабочая папка: `remote/` (демки), `out/` (результаты), `runner.log`.
+    /// Рабочая папка: `remote/` (демки), `out/` (результаты), `runner.log`, `runner_state.json`.
     pub dir: PathBuf,
     /// Имя раннера для журнала сервера.
     pub name: String,
     /// Замена `poll_secs` сервера (для тестов).
     pub poll_secs: Option<u64>,
+    /// Остановиться после стольких принятых кусков результата, оставив его в outbox. Только для тестов и учения
+    /// «обрыв загрузки».
+    #[doc(hidden)]
+    pub upload_chunk_limit: Option<u32>,
 }
 
 impl std::fmt::Debug for Config {
@@ -49,6 +64,7 @@ impl std::fmt::Debug for Config {
             .field("dir", &self.dir)
             .field("name", &self.name)
             .field("poll_secs", &self.poll_secs)
+            .field("upload_chunk_limit", &self.upload_chunk_limit)
             .finish()
     }
 }
@@ -60,6 +76,10 @@ pub enum Tick {
     Idle,
     /// Задача выдана и закрыта на сервере.
     Settled { job_id: i64, state: JobState },
+    /// Сервер окончательно отказал в задаче: файлы убраны из outbox, причина в `runner.log`.
+    Dropped { job_id: i64 },
+    /// Остановлено флагом или лимитом кусков; задача осталась в outbox и продолжится при следующем запуске.
+    Stopped,
 }
 
 /// Журнал `runner.log`: строки `{время} {текст}`, значение токена заменено на `***`.
@@ -114,24 +134,6 @@ impl pipeline::Progress for RunnerProgress {
     }
 }
 
-/// Запись скачиваемой демки: в файл и в хеш одновременно.
-struct HashingFile<'a> {
-    file: &'a mut File,
-    hasher: &'a mut Sha256,
-}
-
-impl Write for HashingFile<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.file.write(buf)?;
-        self.hasher.update(&buf[..n]);
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()
-    }
-}
-
 /// Итог для сервера по ошибке исполнителя: отмена — `Cancelled`, сбой записи — `Failed` со своим кодом, классом и
 /// состоянием автомата, ошибка без описания — `JOB_ERROR`. Весь текст проходит `one_line`.
 fn outcome_of(e: &RunError, elapsed_ms: u64) -> Outcome {
@@ -166,15 +168,6 @@ fn outcome_of(e: &RunError, elapsed_ms: u64) -> Outcome {
     })
 }
 
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
 pub struct Runner {
     cfg: Config,
     link: Link,
@@ -182,6 +175,8 @@ pub struct Runner {
     log: Arc<Log>,
     stop: Arc<AtomicBool>,
     poll_secs: Option<u64>,
+    /// Содержимое `runner_state.json`: единственная удерживаемая задача.
+    state: RunnerState,
 }
 
 impl Runner {
@@ -193,6 +188,10 @@ impl Runner {
         }
         let log = Arc::new(Log::open(&cfg.dir.join("runner.log"), cfg.token.secret())?);
         let link = Link::new(&cfg.server, cfg.token.clone())?;
+        let (state, warning) = RunnerState::load(&cfg.dir);
+        if let Some(w) = warning {
+            log.line(&format!("состояние раннера: {w}"));
+        }
         Ok(Runner {
             cfg,
             link,
@@ -200,6 +199,7 @@ impl Runner {
             log,
             stop: Arc::new(AtomicBool::new(false)),
             poll_secs: None,
+            state,
         })
     }
 
@@ -208,16 +208,20 @@ impl Runner {
         self.stop.clone()
     }
 
-    /// Один шаг: представиться серверу (в первый раз), спросить задачу, довести выданную до конца.
+    /// Один шаг: представиться серверу (в первый раз, с удерживаемой задачей), довести удерживаемую задачу до
+    /// конца или спросить новую и довести её.
     pub fn tick(&mut self) -> Result<Tick, String> {
         if self.poll_secs.is_none() {
+            self.recover_executor();
             self.hello()?;
         }
+        if self.state.job.is_some() {
+            return self.drive();
+        }
         let poll = self.cfg.poll_secs.or(self.poll_secs).unwrap_or(0);
-        let assignment = self.link.claim(poll).map_err(|e| e.to_string())?;
-        match assignment {
+        match self.link.claim(poll).map_err(|e| e.to_string())? {
             None => Ok(Tick::Idle),
-            Some(a) => self.handle(a),
+            Some(a) => self.accept(a),
         }
     }
 
@@ -226,7 +230,10 @@ impl Runner {
         let mut pause = 0u64;
         while !self.stop.load(Ordering::SeqCst) {
             match self.tick() {
-                Ok(Tick::Settled { .. }) => pause = 0,
+                Ok(Tick::Settled { .. } | Tick::Dropped { .. }) => pause = 0,
+                Ok(Tick::Stopped) => {
+                    self.stop.store(true, Ordering::SeqCst);
+                }
                 Ok(Tick::Idle) => {
                     pause = 0;
                     // Long-poll уже ждал на сервере; без него (poll_secs = 0) не крутимся вхолостую.
@@ -251,219 +258,324 @@ impl Runner {
         }
     }
 
+    /// Записывает `runner_state.json`.
+    fn persist(&self) -> Result<(), String> {
+        self.state
+            .save(&self.cfg.dir)
+            .map_err(|e| format!("не удалось записать {}: {e}", state::STATE_FILE))
+    }
+
+    fn held(&mut self) -> &mut HeldJob {
+        self.state
+            .job
+            .as_mut()
+            .expect("вызывается только при удерживаемой задаче")
+    }
+
+    /// Убирает за прошлым запуском исполнителя после падения: строки уходят в журнал.
+    fn recover_executor(&self) {
+        let Some(out_dir) = self.state.job.as_ref().and_then(|j| j.out_dir.as_ref()) else {
+            return;
+        };
+        for line in self.exec.recover(out_dir) {
+            self.log.line(&line);
+        }
+    }
+
     fn hello(&mut self) -> Result<(), String> {
+        let holding: Vec<Holding> = self
+            .state
+            .job
+            .iter()
+            .map(|j| Holding {
+                job_id: j.server_job_id,
+                epoch: j.epoch,
+            })
+            .collect();
         let req = HelloRequest {
             protocol: wire::PROTOCOL_VERSION,
             name: self.cfg.name.clone(),
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
-            status: "idle".to_owned(),
-            holding: Vec::new(),
+            status: if holding.is_empty() { "idle" } else { "busy" }.to_owned(),
+            holding,
         };
-        match self.link.hello(&req) {
-            Ok(reply) => {
-                self.log.line(&format!(
-                    "на связи с сервером {} (протокол {})",
-                    reply.server_version,
-                    wire::PROTOCOL_VERSION
-                ));
-                self.poll_secs = Some(reply.poll_secs);
-                Ok(())
-            }
+        let reply = match self.link.hello(&req) {
+            Ok(reply) => reply,
             Err(LinkError::Status {
                 status: 426,
                 message,
                 ..
-            }) => Err(format!(
-                "версия протокола сервера не совпадает с раннером: {message}"
-            )),
-            Err(e) => Err(e.to_string()),
+            }) => {
+                return Err(format!(
+                    "версия протокола сервера не совпадает с раннером: {message}"
+                ));
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        self.log.line(&format!(
+            "на связи с сервером {} (протокол {})",
+            reply.server_version,
+            wire::PROTOCOL_VERSION
+        ));
+        self.poll_secs = Some(reply.poll_secs);
+
+        let Some(id) = self.state.job.as_ref().map(|j| j.server_job_id) else {
+            return Ok(());
+        };
+        let action = reply
+            .directives
+            .iter()
+            .find(|d| d.job_id == id)
+            .map(|d| d.action);
+        match action {
+            Some(DirectiveAction::Keep) => {
+                let stage = self.held().stage;
+                self.log.line(&format!(
+                    "задача #{id}: сервер подтвердил выдачу, продолжаю с этапа {stage:?}"
+                ));
+            }
+            _ => {
+                let why = match action {
+                    Some(DirectiveAction::Cancel) => "сервер отменил задачу",
+                    Some(DirectiveAction::Abandon) => "сервер велел бросить задачу",
+                    _ => "сервер не знает этой задачи",
+                };
+                self.drop_job(why)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Бросает удерживаемую задачу: файлы убираются, причина и номер задачи пишутся в журнал, состояние очищается.
+    fn drop_job(&mut self, reason: &str) -> Result<(), String> {
+        let Some(job) = self.state.job.take() else {
+            return Ok(());
+        };
+        let id = job.server_job_id;
+        self.log.line(&format!(
+            "задача #{id}: {reason}; файлы задачи удалены из outbox"
+        ));
+        self.remove_files(&job);
+        self.persist()
+    }
+
+    /// Удаляет демку и результат задачи, но только внутри рабочей папки раннера.
+    fn remove_files(&self, job: &HeldJob) {
+        let mut paths = vec![
+            job.demo_path.clone(),
+            job.demo_path.with_extension("dem.part"),
+        ];
+        if let Some(r) = &job.result {
+            paths.push(r.path.clone());
+        }
+        for p in paths {
+            if p.starts_with(&self.cfg.dir) {
+                let _ = fs::remove_file(&p);
+            }
         }
     }
 
-    /// Выданная задача: демка → исполнитель → результат → `finish`.
-    fn handle(&mut self, a: Assignment) -> Result<Tick, String> {
-        let started = Instant::now();
-        let (id, epoch) = (a.job_id, a.epoch);
+    /// Выданная задача: записать в outbox и довести.
+    fn accept(&mut self, a: Assignment) -> Result<Tick, String> {
+        let id = a.job_id;
         self.log
-            .line(&format!("задача #{id} выдана (эпоха {epoch})"));
+            .line(&format!("задача #{id} выдана (эпоха {})", a.epoch));
+        // Имя файла строится только из номера задачи: `orig_name` от пользователя в путях не участвует.
+        let demo = self.cfg.dir.join("remote").join(format!("srv{id}.dem"));
+        self.state.job = Some(HeldJob::claimed(&a, demo));
+        self.persist()?;
+        self.drive()
+    }
 
-        let demo = match self.fetch_demo(&a)? {
-            Some(path) => path,
-            None => {
-                let failure = Failure {
-                    code: BAD_DEMO.to_owned(),
-                    message: "демка повреждена при передаче".to_owned(),
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                    ..Default::default()
-                };
-                return self.finish(id, epoch, Outcome::Failed(failure));
+    /// Ведёт удерживаемую задачу по этапам с того, на котором она записана.
+    fn drive(&mut self) -> Result<Tick, String> {
+        let started = Instant::now();
+        loop {
+            let Some(stage) = self.state.job.as_ref().map(|j| j.stage) else {
+                return Ok(Tick::Idle);
+            };
+            match stage {
+                Stage::Claimed => {
+                    if let Some(t) = self.fetch()? {
+                        return Ok(t);
+                    }
+                }
+                Stage::Fetched | Stage::Executing => self.execute(started)?,
+                Stage::Finished => return self.upload(),
+                Stage::Reporting => return self.report(),
             }
-        };
+        }
+    }
 
+    /// Скачивает демку; не сошлась по SHA-256 — итог задачи `BAD_DEMO`.
+    fn fetch(&mut self) -> Result<Option<Tick>, String> {
+        let job = self.state.job.clone().expect("задача удерживается");
+        let log = |m: &str| self.log.line(m);
+        match transfer::download_demo(&self.link, &job, &self.stop, &log)? {
+            TransferEnd::Done(()) => {
+                self.held().stage = Stage::Fetched;
+                self.persist()?;
+                Ok(None)
+            }
+            TransferEnd::Stopped => Ok(Some(Tick::Stopped)),
+            TransferEnd::Dropped(reason) => {
+                let held = self.held();
+                held.pending = Some(Outcome::Failed(Failure {
+                    code: BAD_DEMO.to_owned(),
+                    message: reason,
+                    ..Default::default()
+                }));
+                held.stage = Stage::Reporting;
+                self.persist()?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Запускает исполнитель и записывает его итог в outbox.
+    fn execute(&mut self, started: Instant) -> Result<(), String> {
+        {
+            let held = self.held();
+            held.stage = Stage::Executing;
+            held.attempt += 1;
+        }
+        self.persist()?;
+        let held = self.state.job.clone().expect("задача удерживается");
         let task = Task {
-            job_id: id,
-            attempt: 1,
-            demo,
-            faceit: a.faceit_link.clone(),
-            hero_steam: a
-                .player
-                .steam64
-                .as_deref()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0),
-            hero_name: a.player.name.clone(),
+            job_id: held.server_job_id,
+            attempt: held.attempt,
+            demo: held.demo_path.clone(),
+            faceit: held.faceit.clone(),
+            hero_steam: held.hero_steam,
+            hero_name: held.hero_name.clone(),
             resume: false,
             out_dir: None,
         };
         let progress = RunnerProgress {
             log: self.log.clone(),
         };
-        match self.exec.run(&task, &progress) {
-            Ok(outcome) => {
-                let (size, sha256) = self.upload(&a, &outcome.result)?;
-                self.finish(id, epoch, Outcome::Done { size, sha256 })
-            }
+        let run = self.exec.run(&task, &progress);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let id = held.server_job_id;
+        match run {
+            Ok(outcome) => match sha256_file(&outcome.result) {
+                Ok((size, sha256)) => {
+                    let job = self.held();
+                    job.out_dir = Some(outcome.out_dir);
+                    job.result = Some(ResultFile {
+                        path: outcome.result,
+                        size,
+                        sha256,
+                    });
+                    job.stage = Stage::Finished;
+                }
+                Err(e) => {
+                    let message = format!("результат не читается: {e}");
+                    self.log
+                        .line(&format!("задача #{id} не удалась: {message}"));
+                    let job = self.held();
+                    job.pending = Some(Outcome::Failed(Failure {
+                        code: JOB_ERROR.to_owned(),
+                        message,
+                        elapsed_ms,
+                        ..Default::default()
+                    }));
+                    job.stage = Stage::Reporting;
+                }
+            },
             Err(e) => {
                 self.log
                     .line(&format!("задача #{id} не удалась: {}", e.message));
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                self.finish(id, epoch, outcome_of(&e, elapsed_ms))
+                let job = self.held();
+                job.pending = Some(outcome_of(&e, elapsed_ms));
+                job.stage = Stage::Reporting;
             }
         }
+        self.persist()
     }
 
-    fn finish(&self, id: i64, epoch: i64, outcome: Outcome) -> Result<Tick, String> {
-        let reply = self
-            .link
-            .finish(id, &FinishRequest { epoch, outcome })
-            .map_err(|e| format!("задача #{id}: finish: {e}"))?;
-        self.log
-            .line(&format!("задача #{id}: {}", reply.state.as_str()));
-        Ok(Tick::Settled {
-            job_id: id,
-            state: reply.state,
-        })
-    }
-
-    /// Скачивает демку в `remote/srv{id}.dem` кусками и сверяет размер и SHA-256 с выдачей.
-    /// `None` — демка не сошлась; `Err` — сбой связи или диска.
-    fn fetch_demo(&self, a: &Assignment) -> Result<Option<PathBuf>, String> {
-        // Имя файла строится только из номера задачи: `orig_name` от пользователя в путях не участвует.
-        let dest = self
-            .cfg
-            .dir
-            .join("remote")
-            .join(format!("srv{}.dem", a.job_id));
-        let part = self
-            .cfg
-            .dir
-            .join("remote")
-            .join(format!("srv{}.dem.part", a.job_id));
-        let mut file = File::create(&part)
-            .map_err(|e| format!("не удалось создать {}: {e}", part.display()))?;
-        let mut hasher = Sha256::new();
-        let want = a.demo.size;
-        let mut have = 0u64;
-        self.log.line(&format!(
-            "задача #{}: скачиваю демку, {want} байт",
-            a.job_id
-        ));
-        while have < want {
-            let mut sink = HashingFile {
-                file: &mut file,
-                hasher: &mut hasher,
+    /// Загружает результат со смещения сервера и закрывает задачу `Done`.
+    fn upload(&mut self) -> Result<Tick, String> {
+        let mut held = self.state.job.take().expect("задача удерживается");
+        let id = held.server_job_id;
+        let end = {
+            let dir = self.cfg.dir.clone();
+            let last_seq = self.state.last_seq;
+            let log = |m: &str| self.log.line(m);
+            let mut save = |h: &HeldJob| {
+                let snapshot = RunnerState {
+                    version: state::VERSION,
+                    job: Some(h.clone()),
+                    last_seq,
+                };
+                if let Err(e) = snapshot.save(&dir) {
+                    self.log
+                        .line(&format!("не удалось записать {}: {e}", state::STATE_FILE));
+                }
             };
-            let got = self
-                .link
-                .demo_range(a.job_id, a.epoch, have, &mut sink)
-                .map_err(|e| format!("задача #{}: скачивание демки: {e}", a.job_id))?;
-            if got == 0 {
-                return Err(format!(
-                    "задача #{}: сервер прислал пустой кусок демки",
-                    a.job_id
-                ));
+            transfer::upload_result(
+                &self.link,
+                &mut held,
+                &mut save,
+                &self.stop,
+                self.cfg.upload_chunk_limit,
+                &log,
+            )
+        };
+        match end {
+            TransferEnd::Done(state) => {
+                self.log.line(&format!("задача #{id}: {}", state.as_str()));
+                self.persist()?;
+                Ok(Tick::Settled { job_id: id, state })
             }
-            have += got;
+            TransferEnd::Stopped => {
+                self.state.job = Some(held);
+                self.persist()?;
+                Ok(Tick::Stopped)
+            }
+            TransferEnd::Dropped(reason) => {
+                self.state.job = Some(held);
+                self.drop_job(&format!("сервер не принял результат — {reason}"))?;
+                Ok(Tick::Dropped { job_id: id })
+            }
         }
-        file.flush().map_err(|e| format!("запись демки: {e}"))?;
-        drop(file);
-        let sha = hex(&hasher.finalize());
-        if have != want || want == 0 || !sha.eq_ignore_ascii_case(&a.demo.sha256) {
-            self.log.line(&format!(
-                "задача #{}: демка не сошлась: получено {have} из {want} байт",
-                a.job_id
-            ));
-            let _ = fs::remove_file(&part);
-            return Ok(None);
-        }
-        fs::rename(&part, &dest).map_err(|e| format!("не удалось переименовать демку: {e}"))?;
-        Ok(Some(dest))
     }
 
-    /// Загружает результат кусками по `CHUNK_SIZE` с смещения, которое назвал сервер.
-    /// Возвращает размер и SHA-256 всего файла для `finish`.
-    fn upload(&self, a: &Assignment, result: &Path) -> Result<(u64, String), String> {
-        let id = a.job_id;
-        let mut file = File::open(result)
-            .map_err(|e| format!("не удалось открыть результат {}: {e}", result.display()))?;
-        let size = file
-            .metadata()
-            .map_err(|e| format!("не удалось прочитать размер результата: {e}"))?
-            .len();
-        // Первый проход: SHA-256 всего файла, не загружая его в память целиком.
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 1024 * 1024];
-        loop {
-            let n = file
-                .read(&mut buf)
-                .map_err(|e| format!("чтение результата: {e}"))?;
-            if n == 0 {
-                break;
+    /// Сообщает серверу сохранённый итог (`Failed` или `Cancelled`); сеть повторяется следующим `tick`.
+    fn report(&mut self) -> Result<Tick, String> {
+        let held = self.state.job.clone().expect("задача удерживается");
+        let id = held.server_job_id;
+        let outcome = held.pending.clone().unwrap_or_else(|| {
+            Outcome::Failed(Failure {
+                code: JOB_ERROR.to_owned(),
+                message: "итог задачи не сохранён".to_owned(),
+                ..Default::default()
+            })
+        });
+        match self.link.finish(
+            id,
+            &FinishRequest {
+                epoch: held.epoch,
+                outcome,
+            },
+        ) {
+            Ok(reply) => {
+                self.log
+                    .line(&format!("задача #{id}: {}", reply.state.as_str()));
+                self.state.job = None;
+                self.persist()?;
+                Ok(Tick::Settled {
+                    job_id: id,
+                    state: reply.state,
+                })
             }
-            hasher.update(&buf[..n]);
-        }
-        let sha256 = hex(&hasher.finalize());
-
-        let mut offset = self
-            .link
-            .result_head(id, a.epoch)
-            .map_err(|e| format!("задача #{id}: HEAD результата: {e}"))?;
-        if offset > size {
-            return Err(format!(
-                "задача #{id}: сервер принял {offset} байт, а в результате {size}"
-            ));
-        }
-        self.log.line(&format!(
-            "задача #{id}: загружаю результат, {size} байт, с {offset}"
-        ));
-        let mut chunk = vec![0u8; CHUNK_SIZE as usize];
-        let mut resyncs = 0;
-        while offset < size {
-            file.seek(SeekFrom::Start(offset))
-                .map_err(|e| format!("чтение результата: {e}"))?;
-            let len = (size - offset).min(CHUNK_SIZE) as usize;
-            file.read_exact(&mut chunk[..len])
-                .map_err(|e| format!("чтение результата: {e}"))?;
-            match self.link.result_put(id, a.epoch, offset, &chunk[..len]) {
-                Ok(next) if next == offset + len as u64 => offset = next,
-                Ok(next) => {
-                    return Err(format!(
-                        "задача #{id}: сервер принял до {next}, ожидалось {}",
-                        offset + len as u64
-                    ));
+            Err(e) => match judge(&e) {
+                Verdict::Drop(reason) => {
+                    self.drop_job(&format!("сервер не принял итог — {reason}"))?;
+                    Ok(Tick::Dropped { job_id: id })
                 }
-                // Сервер принял другое число байт: продолжаем с названного им смещения.
-                Err(LinkError::Status {
-                    error,
-                    offset: Some(server),
-                    ..
-                }) if error == wire::codes::OFFSET_MISMATCH && server <= size && resyncs < 5 => {
-                    resyncs += 1;
-                    offset = server;
-                }
-                Err(e) => return Err(format!("задача #{id}: загрузка результата: {e}")),
-            }
+                Verdict::Retry => Err(format!("задача #{id}: finish: {e}")),
+            },
         }
-        Ok((size, sha256))
     }
 }

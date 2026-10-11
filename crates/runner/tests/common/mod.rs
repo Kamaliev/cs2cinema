@@ -117,6 +117,7 @@ impl Stand {
             dir: self.runner_dir(),
             name: "tester".to_owned(),
             poll_secs: Some(0),
+            upload_chunk_limit: None,
         }
     }
 }

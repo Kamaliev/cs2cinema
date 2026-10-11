@@ -486,6 +486,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Матч только из игроков (без раундов) — для проверок выбора по нику.
+    fn match_of(players: &[(&str, u64)]) -> Match {
+        let list = players.iter().enumerate().map(|(i, (name, xuid))| (i as i32, i as i32, name.to_string(), *xuid)).collect();
+        Match::build("de_mirage".into(), 64.0, list, &[])
+    }
+
+    fn name_of(m: &Match, id: PlayerId) -> String {
+        m.name(id)
+    }
+
+    fn crowd() -> Match {
+        let names: Vec<String> = (1..=12).map(|i| format!("player{i:02}")).collect();
+        let list: Vec<(&str, u64)> = names.iter().enumerate().map(|(i, n)| (n.as_str(), 76561198000000100 + i as u64)).collect();
+        match_of(&list)
+    }
+
+    fn ambiguous(r: std::result::Result<PlayerId, PlayerError>) -> (Vec<String>, usize) {
+        match r {
+            Err(PlayerError::Ambiguous { candidates, more, .. }) => (candidates, more),
+            other => panic!("ожидалась неоднозначность, а вышло {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_player_ignores_case_and_spaces_after_the_exact_tier() {
+        let m = match_of(&[("Big  Boss", 1), ("other", 2)]);
+        for q in [" big boss ", "BIG BOSS", "Big  Boss"] {
+            let id = resolve_player(&m, None, q).unwrap_or_else(|e| panic!("{q:?}: {e:?}"));
+            assert_eq!(name_of(&m, id), "Big  Boss", "{q:?}");
+        }
+        // точный ярус раньше регистрового
+        let m = match_of(&[("Ace", 10), ("ace", 11)]);
+        let id = resolve_player(&m, None, "ace").unwrap();
+        assert_eq!(name_of(&m, id), "ace");
+        let (candidates, more) = ambiguous(resolve_player(&m, None, "ACE"));
+        assert_eq!(more, 0);
+        assert!(candidates.iter().any(|c| c == "Ace (10)") && candidates.iter().any(|c| c == "ace (11)"), "{candidates:?}");
+    }
+
+    #[test]
+    fn resolve_player_prefers_steam_id_over_nick() {
+        let m = match_of(&[("s1mple", 76561198034202275), ("ZywOo", 76561198000000003)]);
+        let id = resolve_player(&m, Some(76561198000000003), "s1mple").unwrap();
+        assert_eq!(name_of(&m, id), "ZywOo", "SteamID сильнее ника");
+        // SteamID, которого нет, — выбор по нику; ноль — «нет SteamID»
+        let id = resolve_player(&m, Some(76561198999999999), "s1mple").unwrap();
+        assert_eq!(name_of(&m, id), "s1mple");
+        assert_eq!(resolve_player(&m, Some(0), "zywoo"), resolve_player(&m, None, "zywoo"));
+        // SteamID без ника
+        let id = resolve_player(&m, Some(76561198034202275), "").unwrap();
+        assert_eq!(name_of(&m, id), "s1mple");
+    }
+
+    #[test]
+    fn resolve_player_merges_steam_id_twins_with_one_name() {
+        use demo::events::{GameEvent, Value};
+        let ev = |tick, name: &str, f: &[(&str, i64)]| GameEvent { tick, name: name.into(), fields: f.iter().map(|(k, v)| (k.to_string(), Value::Int(*v))).collect() };
+        let players = vec![(0, 0, "Twin".to_owned(), 77), (1, 1, "twin ".to_owned(), 77), (2, 2, "other".to_owned(), 78)];
+        let events = vec![
+            ev(10, "round_start", &[]),
+            ev(20, "player_death", &[("userid", 2), ("attacker", 1), ("headshot", 0)]),
+            ev(30, "player_death", &[("userid", 2), ("attacker", 1), ("headshot", 0)]),
+            ev(40, "player_death", &[("userid", 2), ("attacker", 0), ("headshot", 0)]),
+        ];
+        let m = Match::build("de_mirage".into(), 64.0, players, &events);
+        assert_eq!(resolve_player(&m, Some(77), "").unwrap(), PlayerId(1), "берётся запись с большим числом убийств");
+        // разные имена при одном SteamID — не один человек
+        let m = match_of(&[("Alpha", 77), ("Beta", 77)]);
+        let (candidates, _) = ambiguous(resolve_player(&m, Some(77), ""));
+        assert_eq!(candidates, vec!["Alpha (77)".to_owned(), "Beta (77)".to_owned()]);
+    }
+
+    #[test]
+    fn resolve_player_caps_candidates_at_ten() {
+        let m = crowd();
+        let r = resolve_player(&m, None, "player");
+        let (candidates, more) = ambiguous(r.clone());
+        assert_eq!((candidates.len(), more), (CANDIDATES_MAX, 2));
+        let message = r.unwrap_err().into_run_error().message;
+        assert!(message.contains("и ещё 2"), "{message}");
+        assert!(message.contains("player01 (") && !message.contains("player11"), "{message}");
+    }
+
+    #[test]
+    fn resolve_player_empty_nick_is_not_found() {
+        let m = crowd();
+        for q in ["", "   ", "\t\n"] {
+            match resolve_player(&m, None, q) {
+                Err(PlayerError::NotFound { players, more, .. }) => assert_eq!((players.len(), more), (CANDIDATES_MAX, 2), "{q:?}"),
+                other => panic!("{q:?}: {other:?}"),
+            }
+        }
+        // чужой SteamID и пустой ник — тоже «не найден»
+        assert!(matches!(resolve_player(&m, Some(5), ""), Err(PlayerError::NotFound { .. })));
+        assert_eq!(find_player(&m, None, "player"), None);
+    }
+
+    #[test]
+    fn resolve_player_cleans_candidates_and_cuts_a_long_query() {
+        let m = match_of(&[("bad\nname", 1), ("bad\u{7}name2", 2), ("clean", 3)]);
+        let message = resolve_player(&m, None, "bad").unwrap_err().into_run_error().message;
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+        assert!(message.contains("badname (1)") && message.contains("badname2 (2)"), "{message}");
+
+        let long = "x".repeat(500);
+        let e = resolve_player(&m, None, &long).unwrap_err().into_run_error();
+        let run = e.message.chars().filter(|&c| c == 'x').count();
+        assert_eq!(run, record::failure::TEXT_NAME_MAX, "запрос обрезан до 64 символов: {}", e.message);
+        // обрезка по символам, а не по байтам
+        let cyr = "ж".repeat(200);
+        let e = resolve_player(&m, None, &cyr).unwrap_err().into_run_error();
+        assert_eq!(e.message.chars().filter(|&c| c == 'ж').count(), record::failure::TEXT_NAME_MAX);
+        assert_eq!(e.fail.unwrap().code, FailCode::PlayerNotFound);
+    }
+
     #[test]
     fn console_name_is_safe() {
         assert_eq!(console_name("1-abc def/ü"), "1-abc_def__");

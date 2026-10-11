@@ -695,6 +695,67 @@ mod tests {
         assert!(FailCode::PrecheckFailed.hint().contains("Повторить"));
         assert!(FailCode::ForeignGameRunning.hint().contains("не закрывает"));
         assert!(FailCode::PrevGameStuck.hint().contains("30 с"));
+        // полный список: 21 разный код, у каждого непустая строка
+        let names: std::collections::HashSet<_> =
+            FailCode::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(names.len(), 21);
+        assert!(FailCode::ALL.iter().all(|c| !c.as_str().is_empty()));
+        for c in [
+            FailCode::PlayerNotFound,
+            FailCode::PlayerAmbiguous,
+            FailCode::NoHighlights,
+            FailCode::BadDemo,
+            FailCode::DemoTooLarge,
+            FailCode::ResultInvalid,
+            FailCode::UnsupportedSource,
+        ] {
+            assert!(!c.hint().is_empty(), "{c}: нет подсказки");
+        }
+        assert_eq!(FailCode::PlayerAmbiguous.as_str(), "PLAYER_AMBIGUOUS");
+        assert_eq!(FailCode::UnsupportedSource.as_str(), "UNSUPPORTED_SOURCE");
+        assert!(FailCode::PlayerAmbiguous.hint().contains("SteamID64"));
+    }
+
+    #[test]
+    fn new_codes_are_class_other_in_any_state() {
+        for state in [RecordState::Precheck, RecordState::Take] {
+            for code in [
+                FailCode::PlayerNotFound,
+                FailCode::PlayerAmbiguous,
+                FailCode::NoHighlights,
+                FailCode::BadDemo,
+                FailCode::DemoTooLarge,
+                FailCode::ResultInvalid,
+                FailCode::UnsupportedSource,
+            ] {
+                assert_eq!(classify(code, state), FailClass::Other, "{code} в {state:?}");
+            }
+        }
+        assert_eq!(
+            classify(FailCode::PlayerAmbiguous, RecordState::Precheck),
+            FailClass::Other
+        );
+    }
+
+    #[test]
+    fn player_texts_name_candidates_and_cut_untrusted_input() {
+        let list = vec!["a (1)".to_owned(), "b (2)".to_owned()];
+        assert_eq!(
+            msg_player_ambiguous("a", &list, 0),
+            "ник «a» подходит нескольким игрокам: a (1), b (2)"
+        );
+        assert!(msg_player_ambiguous("a", &list, 3).ends_with("b (2), и ещё 3"));
+        assert_eq!(
+            msg_player_not_found("zz", &[], 0),
+            "игрок «zz» в демке не найден"
+        );
+        assert!(msg_player_not_found("zz", &list, 0).contains("в демке: a (1), b (2)"));
+        assert_eq!(clean_text("a\u{7}b\nc", 64), "abc");
+        assert_eq!(clean_text(&"я".repeat(70), 64).chars().count(), 65);
+        assert_eq!(
+            msg_no_highlights("q"),
+            "у игрока q в этом матче нет ни убийств, ни полезных гранат"
+        );
     }
 
     #[test]

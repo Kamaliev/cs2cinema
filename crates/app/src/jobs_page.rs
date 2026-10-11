@@ -55,7 +55,7 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
             |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(pause_banner(reason, waiting)).color(ACCENT));
+                    ui.label(RichText::new(pause_banner(&reason, waiting)).color(ACCENT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui::primary(ui, true, "Продолжить") {
                             act = Some(Act::Resume);
@@ -123,7 +123,9 @@ pub fn card_buttons(status: JobStatus, resumable: bool, has_dir: bool, busy: boo
 }
 
 fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
-    let running = app.queue.view().running.is_some_and(|(id, _)| id == j.id);
+    let view = app.queue.view();
+    let running = view.running.is_some_and(|(id, _)| id == j.id);
+    let hold = view.hold.filter(|(id, _)| *id == j.id).map(|(_, until)| until);
     ui::card(ui, |ui| {
         ui.horizontal_top(|ui| {
             thumb(app, ui, j);
@@ -147,6 +149,11 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                 ui.horizontal(|ui| match j.status {
                     JobStatus::Queued => {
                         ui::pill(ui, "в очереди", MUTED);
+                        // «пауза для машины» перед авто-повтором: сколько осталось (DC-4); карточка перерисовывается раз в секунду
+                        if let Some(until) = hold {
+                            ui.label(RichText::new(hold_text(until, std::time::Instant::now())).color(ACCENT));
+                            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+                        }
                     }
                     JobStatus::Running => {
                         ui.spinner();
@@ -307,8 +314,14 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
     });
 }
 
+/// Отметка на ждущей карточке: сколько секунд осталось до авто-повтора (округление вверх, не меньше 0).
+pub fn hold_text(until: std::time::Instant, now: std::time::Instant) -> String {
+    let left = until.saturating_duration_since(now);
+    format!("авто-повтор через {} с", left.as_millis().div_ceil(1000))
+}
+
 /// Текст баннера паузы очереди: называет причину (D-16).
-pub fn pause_banner(reason: PauseReason, waiting: usize) -> String {
+pub fn pause_banner(reason: &PauseReason, waiting: usize) -> String {
     let n = plural(waiting, "задача", "задачи", "задач");
     match reason {
         PauseReason::Cancelled => format!("Очередь на паузе после отмены: {n} ждут"),
@@ -484,10 +497,19 @@ mod tests {
 
     #[test]
     fn pause_banner_names_the_reason() {
-        assert_eq!(pause_banner(PauseReason::Cancelled, 1), "Очередь на паузе после отмены: 1 задача ждут");
-        assert_eq!(pause_banner(PauseReason::Cancelled, 2), "Очередь на паузе после отмены: 2 задачи ждут");
-        assert_eq!(pause_banner(PauseReason::Interrupted, 1), "Очередь на паузе: задача прервана закрытием приложения — 1 задача ждут");
-        assert_eq!(pause_banner(PauseReason::Interrupted, 2), "Очередь на паузе: задача прервана закрытием приложения — 2 задачи ждут");
+        assert_eq!(pause_banner(&PauseReason::Cancelled, 1), "Очередь на паузе после отмены: 1 задача ждут");
+        assert_eq!(pause_banner(&PauseReason::Cancelled, 2), "Очередь на паузе после отмены: 2 задачи ждут");
+        assert_eq!(pause_banner(&PauseReason::Interrupted, 1), "Очередь на паузе: задача прервана закрытием приложения — 1 задача ждут");
+        assert_eq!(pause_banner(&PauseReason::Interrupted, 2), "Очередь на паузе: задача прервана закрытием приложения — 2 задачи ждут");
+    }
+
+    #[test]
+    fn hold_mark_counts_seconds_up_and_never_below_zero() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        assert_eq!(hold_text(now + Duration::from_millis(19_200), now), "авто-повтор через 20 с");
+        assert_eq!(hold_text(now + Duration::from_secs(1), now), "авто-повтор через 1 с");
+        assert_eq!(hold_text(now, now + Duration::from_secs(3)), "авто-повтор через 0 с");
     }
 
     #[test]

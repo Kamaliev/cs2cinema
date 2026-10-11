@@ -195,6 +195,7 @@ impl App {
         // очередь стартует после уборки; прерванная задача ставит её на паузу до «Продолжить» (D-16)
         let queue = queue::start(
             store.clone(),
+            host.clone(),
             jobs::runner(Arc::new(Settings::load), host),
             Reporter { tx: tx.clone(), ctx: cc.egui_ctx.clone() },
             (reset.interrupted > 0).then_some(PauseReason::Interrupted),

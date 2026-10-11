@@ -11,6 +11,7 @@
 //! `quit` — выход игры и пустой job. Любую метку сценарий может убрать или задержать (задержка
 //! сдвигает и все последующие метки той же цепочки — как медленная игра).
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -416,6 +417,10 @@ struct HostState {
     sent: Vec<String>,
     terminated: u32,
     launches: u32,
+    /// Все вызовы `launch`, включая неудачные (`launches` их не считает).
+    launch_calls: u32,
+    /// Сценарии для следующих запусков (`FakeHost::sequence`); по одному на каждый запуск.
+    pending: VecDeque<Scenario>,
     /// Своя игра, пережившая сессию: (момент завершения job, момент выхода или `None` — никогда).
     leftover: Option<(Duration, Option<Duration>)>,
     /// Момент последнего подтверждённого выхода своей игры.
@@ -460,6 +465,8 @@ impl FakeHost {
                 sent: vec![],
                 terminated: 0,
                 launches: 0,
+                launch_calls: 0,
+                pending: VecDeque::new(),
                 leftover,
                 last_exit: None,
                 runs: vec![],
@@ -469,6 +476,21 @@ impl FakeHost {
                 notifications: vec![],
             })),
         }
+    }
+
+    /// k-й вызов `launch` идёт по k-му сценарию, после конца списка повторяется последний;
+    /// сценарий целиком — и запуск, и сессия, и `run`/`processes` — переключается в момент
+    /// запуска. Виртуальные часы, `runs`, `sent` и `notifications` между сценариями не
+    /// сбрасываются (DIF-04: на этом тестируется авто-повтор).
+    pub fn sequence(scenarios: Vec<Scenario>) -> Self {
+        assert!(
+            !scenarios.is_empty(),
+            "FakeHost::sequence: пустой список сценариев"
+        );
+        let mut it = scenarios.into_iter();
+        let host = FakeHost::new(it.next().expect("список не пуст"));
+        lock(&host.state).pending = it.collect();
+        host
     }
 
     /// Все вызовы `Host::run` (в том числе отменённые): виртуальное время, программа, аргументы.
@@ -511,6 +533,12 @@ impl FakeHost {
 impl Host for FakeHost {
     fn launch(&self, spec: &LaunchSpec) -> Result<Box<dyn Session>, HostError> {
         let mut st = lock(&self.state);
+        if st.launch_calls > 0
+            && let Some(next) = st.pending.pop_front()
+        {
+            st.scenario = next;
+        }
+        st.launch_calls += 1;
         if let Some(e) = st.scenario.launch_error.clone() {
             return Err(e);
         }
@@ -1725,6 +1753,64 @@ mod tests {
             Err(HostError::Io("диск".into()))
         );
         assert_eq!(host.file_version(Path::new("HLAE.exe")), None);
+    }
+
+    #[test]
+    fn sequence_switches_the_scenario_on_each_launch() {
+        let host = FakeHost::sequence(vec![
+            Scenario::happy(1).launch_error(HostError::Spawn("нет".into())),
+            Scenario::happy(1).console_never_up(),
+            Scenario::happy(1),
+        ]);
+        assert!(matches!(host.launch(&spec()), Err(HostError::Spawn(_))));
+        assert_eq!(host.launches(), 0, "неудачный запуск не считается");
+
+        // вторая сессия — игра без консоли: за 30 виртуальных секунд консоль не открылась
+        let mut s = host
+            .launch(&spec())
+            .expect("второй запуск идёт по второму сценарию");
+        let mut seen = vec![];
+        let mut waited = Duration::ZERO;
+        while waited < secs(30) {
+            match s.poll(secs(1)) {
+                Some(ev) => seen.push(ev),
+                None => waited += secs(1),
+            }
+        }
+        assert!(!seen.contains(&SessionEvent::ConsoleUp), "{seen:?}");
+        assert!(
+            seen.contains(&SessionEvent::GameAppeared { pid: FAKE_PID }),
+            "{seen:?}"
+        );
+
+        // третья — счастливая: консоль открывается
+        let mut s = host
+            .launch(&spec())
+            .expect("третий запуск идёт по третьему сценарию");
+        until_console(s.as_mut());
+        assert_eq!(host.launches(), 2);
+    }
+
+    #[test]
+    fn sequence_repeats_the_last_scenario() {
+        let host = FakeHost::sequence(vec![
+            Scenario::happy(1).launch_error(HostError::Spawn("нет".into())),
+            Scenario::happy(1),
+        ]);
+        assert!(host.launch(&spec()).is_err());
+        for _ in 0..2 {
+            let mut s = host
+                .launch(&spec())
+                .expect("последний сценарий повторяется");
+            until_console(s.as_mut());
+        }
+        assert_eq!(host.launches(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "пустой список")]
+    fn empty_sequence_panics() {
+        let _ = FakeHost::sequence(vec![]);
     }
 
     #[test]

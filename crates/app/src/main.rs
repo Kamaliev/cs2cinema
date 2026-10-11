@@ -7,6 +7,7 @@ mod match_page;
 #[cfg(debug_assertions)]
 mod mock;
 mod player;
+mod queue;
 mod settings;
 mod settings_page;
 mod status;

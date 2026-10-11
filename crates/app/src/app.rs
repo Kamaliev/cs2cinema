@@ -3,7 +3,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::{
+        Arc,
+        mpsc::{Receiver, Sender, channel},
+    },
     time::Duration,
 };
 
@@ -11,11 +14,12 @@ use cs2::{PlayerId, report::Report};
 use eframe::egui::{self, RichText};
 use faceit::stats::{MatchStats, MatchSummary, Player};
 use highlights::{Highlight, Utility};
-use pipeline::{Analysis, Stage};
+use pipeline::{Analysis, Stage, host::Host};
 use store::{Job, JobKind, JobSource, JobStatus, NewJob, Store};
 
 use crate::{
-    jobs::{self, CancelToken},
+    jobs,
+    queue::{self, PauseReason, Queue, QueueConfig},
     settings::{self, Settings},
     status::Status,
     ui, update,
@@ -33,6 +37,10 @@ pub enum Msg {
     Log(String),
     Stage(Stage),
     Analyzed(Result<Analysis, String>),
+    /// Очередь начала задачу: заголовок для строки состояния.
+    JobStarted {
+        title: String,
+    },
     /// Задача на монтаж завершилась (успех — путь к ролику или папке плана; `CANCELLED` — отмена).
     JobDone {
         id: i64,
@@ -53,6 +61,7 @@ pub enum Msg {
 }
 
 /// Отчёт конвейера из фонового потока в окно.
+#[derive(Clone)]
 pub struct Reporter {
     tx: Sender<Msg>,
     ctx: egui::Context,
@@ -108,8 +117,6 @@ pub struct MatchState {
 #[derive(Default)]
 pub struct JobsState {
     pub list: Vec<Job>,
-    /// Выполняемая сейчас задача и её токен отмены.
-    pub running: Option<(i64, CancelToken)>,
     /// Чей журнал развёрнут на странице задач.
     pub open_log: Option<i64>,
     /// Список надо перечитать из базы (пришли новые строки журнала).
@@ -118,27 +125,12 @@ pub struct JobsState {
     pub thumbs: HashMap<i64, egui::TextureHandle>,
     pub thumb_requested: std::collections::HashSet<i64>,
     pub sizes: HashMap<i64, u64>,
-    /// Очередь стоит после отмены выполняемой задачи и после задачи, прерванной закрытием приложения, до «Продолжить» (D-13, D-16).
-    /// Только в памяти: если при запуске прерванных задач нет, задачи из очереди продолжаются.
-    pub paused: bool,
-    /// Почему очередь на паузе — для текста баннера.
-    pub paused_reason: PauseReason,
     /// У каких задач в папке лежит `record.json`: только с ним «Повторить» может продолжить с записи (D-09).
     pub resumable: std::collections::HashSet<i64>,
     /// Журналы прошлых попыток `record.log.N` по id задачи (D-11).
     pub old_logs: HashMap<i64, Vec<PathBuf>>,
     /// id задачи -> `updated_at`, при котором папку уже смотрели: файловая система проверяется при изменении задачи, а не в каждом кадре.
     pub fs_seen: HashMap<i64, i64>,
-}
-
-/// Причина паузы очереди (D-16).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum PauseReason {
-    /// Пользователь отменил выполняемую задачу.
-    #[default]
-    Cancelled,
-    /// При запуске приложения нашлась задача, прерванная его закрытием.
-    Interrupted,
 }
 
 /// Размер превью ролика в карточке задачи.
@@ -175,6 +167,8 @@ pub struct App {
     /// Последний отчёт кнопки «Проверить окружение» в настройках.
     pub precheck: Option<Result<pipeline::precheck::Report, String>>,
     pub precheck_busy: bool,
+    /// Очередь задач в своём потоке: окно читает её вид и шлёт команды (RET-05).
+    pub queue: Queue,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
     ctx: egui::Context,
@@ -196,7 +190,16 @@ impl App {
         };
         // приложение упало посреди задачи: сначала завершаем осиротевшую игру по processes.json, затем убираем из папки игры
         // файлы задачи и помечаем оборванные дубли (D-08, D-15), и только потом задача становится «прервана» (`reset_running`)
-        let reset = crate::jobs::recover_after_crash(&store, &*pipeline::host::default_host(), &s.cs2_dir).unwrap_or_default();
+        let host: Arc<dyn Host> = Arc::from(pipeline::host::default_host());
+        let reset = crate::jobs::recover_after_crash(&store, &*host, &s.cs2_dir).unwrap_or_default();
+        // очередь стартует после уборки; прерванная задача ставит её на паузу до «Продолжить» (D-16)
+        let queue = queue::start(
+            store.clone(),
+            jobs::runner(Arc::new(Settings::load), host),
+            Reporter { tx: tx.clone(), ctx: cc.egui_ctx.clone() },
+            (reset.interrupted > 0).then_some(PauseReason::Interrupted),
+            QueueConfig::default(),
+        );
         let mut app = Self {
             draft: s.clone(),
             matches: MatchesState { nickname: s.nickname.clone(), ..Default::default() },
@@ -210,6 +213,7 @@ impl App {
             update_note: None,
             precheck: None,
             precheck_busy: false,
+            queue,
             rx,
             tx,
             ctx: cc.egui_ctx.clone(),
@@ -232,17 +236,12 @@ impl App {
         }
         if reset.interrupted > 0 {
             // прерванная задача останавливает очередь до «Продолжить» (D-16); без неё оставшиеся задачи продолжаются
-            app.jobs.paused = true;
-            app.jobs.paused_reason = PauseReason::Interrupted;
             app.status.push(&format!("задач прервано при прошлом запуске: {} — очередь на паузе, нажмите «Продолжить»", reset.interrupted));
         }
         app.refresh_jobs();
         // `cs2cinema.exe demo.dem` — открыть демку сразу (и для «Открыть с помощью»)
         if let Some(p) = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file()) {
             app.open_source(pipeline::Source::File(p));
-        } else if !first_run {
-            // задачи, оставшиеся в очереди, продолжаем (при паузе `run_next` ничего не берёт)
-            jobs::run_next(&mut app);
         }
         #[cfg(debug_assertions)]
         if std::env::var_os("CS2CINEMA_MOCK").is_some() {
@@ -280,7 +279,7 @@ impl App {
     /// «Проверить окружение» в настройках: тот же `precheck::run` и те же входы, что у задачи (D-01),
     /// но по значениям черновика страницы и без демки. Во время задачи не запускается (T-02-25).
     pub fn run_precheck(&mut self) {
-        if self.precheck_busy || self.jobs.running.is_some() {
+        if self.precheck_busy || self.queue.view().running.is_some() {
             return;
         }
         self.precheck_busy = true;
@@ -420,22 +419,21 @@ impl App {
         let job = NewJob { kind, source, label, hero_name: a.m.name(hero), hero_steam: a.m.player(hero).map_or(0, |p| p.xuid), map: a.m.map.clone() };
         let id = self.store.add_job(&job)?;
         // постановка новой задачи — осознанное действие, пауза после отмены снимается (D-13)
-        self.jobs.paused = false;
+        self.queue.resume();
         self.refresh_jobs();
-        jobs::run_next(self);
         Ok(id)
     }
 
     /// Отменить задачу: из очереди — сразу, выполняемую — через токен (поток сам остановится).
     /// У выполняемой статус «отменяется» ставится в этом же кадре (D-11), не дожидаясь потока задачи.
     pub fn cancel_job(&mut self, id: i64) {
-        match &self.jobs.running {
+        match self.queue.view().running {
             // второе нажатие: игра уже закрывается — закрыть свой job сразу, без `quit` и ожидания (D-12)
-            Some((rid, token)) if *rid == id && token.is_cancelled() => {
+            Some((rid, token)) if rid == id && token.is_cancelled() => {
                 token.force();
                 self.status.push(&format!("задача #{id}: закрываю игру сразу, без ожидания"));
             }
-            Some((rid, token)) if *rid == id => {
+            Some((rid, token)) if rid == id => {
                 token.cancel();
                 if let Err(e) = self.store.set_cancelling(id) {
                     self.status.push(&e);
@@ -453,8 +451,7 @@ impl App {
 
     /// «Продолжить» после отмены: пауза снимается, очередь идёт дальше (D-13).
     pub fn resume_queue(&mut self) {
-        self.jobs.paused = false;
-        jobs::run_next(self);
+        self.queue.resume();
     }
 
     /// Разобрать демку; для файла страница матча открывается без FACEIT-шапки.
@@ -500,11 +497,11 @@ impl App {
             match m {
                 Msg::Log(t) => {
                     self.status.push(&t);
-                    self.jobs.dirty = self.jobs.running.is_some();
+                    self.jobs.dirty = self.queue.view().running.is_some();
                 }
                 Msg::Stage(s) => {
                     self.status.set_stage(s);
-                    self.jobs.dirty = self.jobs.running.is_some();
+                    self.jobs.dirty = self.queue.view().running.is_some();
                 }
                 Msg::Analyzed(r) => match r {
                     Ok(a) => {
@@ -515,16 +512,11 @@ impl App {
                     }
                     Err(e) => self.status.finish(Err(e)),
                 },
+                Msg::JobStarted { title } => {
+                    self.status.start(&title);
+                    self.refresh_jobs();
+                }
                 Msg::JobDone { id, result } => {
-                    // осознанная отмена останавливает очередь, сбой и успех — нет (D-13)
-                    if jobs::pauses_queue(&result) {
-                        self.jobs.paused = true;
-                        self.jobs.paused_reason = PauseReason::Cancelled;
-                        self.status.push("очередь на паузе после отмены — нажмите «Продолжить»");
-                    }
-                    if self.jobs.running.as_ref().is_some_and(|(rid, _)| *rid == id) {
-                        self.jobs.running = None;
-                    }
                     match result {
                         Ok(p) => {
                             let what = if p.extension().is_some_and(|e| e == "mp4") { "ролик" } else { "план и скрипты" };
@@ -542,7 +534,6 @@ impl App {
                         Err(e) => self.status.finish(Err(format!("задача #{id}: {e}"))),
                     }
                     self.refresh_jobs();
-                    jobs::run_next(self);
                 }
                 Msg::Player(r) => {
                     self.matches.loading = false;

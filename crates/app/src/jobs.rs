@@ -18,15 +18,12 @@ use pipeline::{
     job::{self, DemoSource, JobConfig, JobSpec},
     precheck::{Demo, Inputs},
 };
-use store::{
-    Job, JobFailure, JobKind, JobOutcome, JobSource, Store,
-    journal::{self, StartKind},
-};
+use store::{Job, JobFailure, JobKind, JobOutcome, JobSource, Store, journal};
 
 use crate::{
-    app::{App, Msg, Reporter},
+    app::{Msg, Reporter},
+    queue::Runner,
     settings::Settings,
-    ui,
 };
 
 /// Токен отмены: кнопка в окне ставит флаг, исполнитель проверяет его между этапами
@@ -56,19 +53,19 @@ impl CancelToken {
 }
 
 /// Отчёт задачи: в базу (переживает перезапуск) и в строку состояния окна.
-struct JobReporter {
-    store: Store,
+pub struct JobReporter {
+    pub(crate) store: Store,
     id: i64,
     ui: Reporter,
     cancel: CancelToken,
     /// Номер попытки — в метке каждой строки журнала.
-    attempt: u32,
+    pub(crate) attempt: u32,
     /// Текущий этап для метки строк журнала и время входа в него — по нему считается длительность (OBS-01, D-11).
     cur: Mutex<Option<(String, Instant)>>,
 }
 
 impl JobReporter {
-    fn new(store: Store, id: i64, ui: Reporter, cancel: CancelToken, attempt: u32) -> Self {
+    pub fn new(store: Store, id: i64, ui: Reporter, cancel: CancelToken, attempt: u32) -> Self {
         JobReporter { store, id, ui, cancel, attempt, cur: Mutex::new(None) }
     }
 
@@ -252,55 +249,14 @@ pub fn recover_after_crash(store: &Store, host: &dyn Host, cs2_dir: &str) -> sto
     store.reset_running()
 }
 
-/// Останавливает ли итог задачи очередь: только осознанная отмена (D-13); сбой и успех — очередь идёт дальше.
-pub fn pauses_queue(result: &Result<PathBuf, String>) -> bool {
-    matches!(result, Err(e) if e == pipeline::CANCELLED)
-}
-
-/// Запускает следующую задачу из очереди, если сейчас ничего не выполняется и очередь не на паузе.
-pub fn run_next(app: &mut App) {
-    if app.jobs.running.is_some() || app.status.busy || app.jobs.paused {
-        return;
-    }
-    let Ok(Some(job)) = app.store.next_queued() else {
-        return;
-    };
-    let attempt = match app.store.start_job(job.id) {
-        Ok(n) => n,
-        Err(e) => {
-            app.status.finish(Err(e));
-            return;
-        }
-    };
-    // журнал не стирается: каждая попытка открывается разделителем с номером, датой и способом запуска (D-10)
-    let kind = if job.resume {
-        StartKind::Retry
-    } else if attempt <= 1 {
-        StartKind::First
-    } else {
-        StartKind::Redo
-    };
-    let _ = app.store.append_log(job.id, &journal::separator(attempt, &chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(), kind));
-    let cancel = CancelToken::default();
-    app.jobs.running = Some((job.id, cancel.clone()));
-    app.status.start(&format!("Задача #{}: {} · {}", job.id, job.label, job.kind.title()));
-    let (store, s, ui) = (app.store.clone(), app.s.clone(), app.reporter());
-    std::thread::spawn(move || {
-        let host = pipeline::host::default_host();
-        let rep = JobReporter::new(store.clone(), job.id, ui, cancel, attempt);
-        let result = job::run_job(&*host, &job_spec(&job, &store, &s, attempt), &rep).map(store_outcome);
-        // длительность последнего этапа — до итога попытки (успех, сбой и отмена)
-        rep.close_stage();
-        let _ = finish(&store, job.id, &result);
-        // готовый ролик открываем в плеере здесь, а не в `run_job`: тесты `pipeline` плеер не запускают
-        if let Ok(o) = &result {
-            if o.result.extension().is_some_and(|e| e == "mp4") {
-                ui::open_path(&o.result);
-            }
-        }
-        rep.ui.send(Msg::JobDone { id: job.id, result: result.map(|o| o.result).map_err(|e| e.message) });
-    });
-    app.refresh_jobs();
+/// Исполнитель задач для очереди: каждая задача идёт через `pipeline::job::run_job` на общем хосте, настройки читаются
+/// заново для каждой задачи (так же, как их применяет «Сохранить» на странице настроек). Хост один на приложение:
+/// `WinHost` хранит только момент старта, а тесты подставляют `FakeHost`.
+pub fn runner(settings: Arc<dyn Fn() -> Settings + Send + Sync>, host: Arc<dyn Host>) -> Runner {
+    Arc::new(move |job, rep| {
+        let s = settings();
+        job::run_job(&*host, &job_spec(job, &rep.store, &s, rep.attempt), rep).map(store_outcome)
+    })
 }
 
 /// Итог общей задачи `pipeline` в строку базы: поля перекладываются как есть.
@@ -312,6 +268,7 @@ fn store_outcome(o: job::Outcome) -> JobOutcome {
 mod tests {
     use super::*;
     use std::path::Path;
+    use store::journal::StartKind;
 
     use pipeline::{Deadlines, RecordRequest, host::LaunchSpec};
 
@@ -327,13 +284,6 @@ mod tests {
         token.force();
         assert!(token.is_cancelled(), "force включает и отмену");
         assert!(rep.cancelled() && rep.force_cancelled());
-    }
-
-    #[test]
-    fn only_a_cancelled_job_pauses_the_queue() {
-        assert!(pauses_queue(&Err(pipeline::CANCELLED.to_owned())));
-        assert!(!pauses_queue(&Err("сбой записи".to_owned())));
-        assert!(!pauses_queue(&Ok(PathBuf::from("highlights.mp4"))));
     }
 
     use pipeline::host::fake::{FakeHost, Scenario};

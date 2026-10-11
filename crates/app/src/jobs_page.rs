@@ -8,8 +8,8 @@ use pipeline::{
 use store::{Job, JobKind, JobStatus};
 
 use crate::{
-    app::{App, Page, PauseReason, THUMB},
-    jobs,
+    app::{App, Page, THUMB},
+    queue::PauseReason,
     ui::{self, ACCENT, BAD, MUTED, OK},
 };
 
@@ -48,13 +48,14 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
     let mut act: Option<Act> = None;
     // очередь стоит после отмены или прерванной задачи, пока пользователь не нажмёт «Продолжить» (D-13, D-16)
     let waiting = app.jobs.list.iter().filter(|j| j.status == JobStatus::Queued).count();
-    if app.jobs.paused && waiting > 0 {
+    let paused = app.queue.view().paused;
+    if let Some(reason) = paused.filter(|_| waiting > 0) {
         egui::Frame::new().stroke(egui::Stroke::new(1.0_f32, ACCENT)).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(
             ui,
             |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(pause_banner(app.jobs.paused_reason, waiting)).color(ACCENT));
+                    ui.label(RichText::new(pause_banner(reason, waiting)).color(ACCENT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui::primary(ui, true, "Продолжить") {
                             act = Some(Act::Resume);
@@ -92,13 +93,12 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
 
 /// Ставит задачу в очередь заново: `resume` — с записи по `record.json`, иначе с самого начала.
 fn requeue(app: &mut App, id: i64, resume: bool) {
-    app.jobs.paused = false;
     let queued = if resume { app.store.requeue_resume(id) } else { app.store.requeue(id) };
     if let Err(e) = queued {
         app.status.finish(Err(e));
     }
+    app.queue.resume();
     app.refresh_jobs();
-    jobs::run_next(app);
 }
 
 /// Какие кнопки показывает карточка задачи.
@@ -123,7 +123,7 @@ pub fn card_buttons(status: JobStatus, resumable: bool, has_dir: bool, busy: boo
 }
 
 fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
-    let running = app.jobs.running.as_ref().is_some_and(|(id, _)| *id == j.id);
+    let running = app.queue.view().running.is_some_and(|(id, _)| id == j.id);
     ui::card(ui, |ui| {
         ui.horizontal_top(|ui| {
             thumb(app, ui, j);

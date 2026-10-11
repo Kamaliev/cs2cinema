@@ -108,7 +108,7 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
 
         // действие откладывается флагом: `d` занимает `app.draft`, а запуск проверки берёт `&mut app`
         let mut run_precheck = false;
-        let (busy, job_running) = (app.precheck_busy, app.jobs.running.is_some());
+        let (busy, job_running) = (app.precheck_busy, app.queue.view().running.is_some());
         ui::section(ui, "Проверка окружения", |ui| {
             ui.horizontal(|ui| {
                 let btn = ui.add_enabled(!busy && !job_running, egui::Button::new("Проверить окружение"));

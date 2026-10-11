@@ -441,6 +441,8 @@ struct Pending {
     sizes: Option<(u64, u64)>,
     /// Первое «ещё дописывается» уже записано в журнал.
     noted: bool,
+    /// Сколько раз в финальном проходе размер сдвигался во время проверки.
+    regrown: u32,
 }
 
 /// Через сколько повторять проверку недописанного файла.
@@ -448,6 +450,11 @@ const REPROBE: Duration = Duration::from_secs(1);
 
 /// Негодный ответ при неизменных размерах файлов становится окончательным через столько.
 const SETTLE: Duration = Duration::from_secs(2);
+
+/// Сколько раз в финальном проходе перепроверять дубль, чей размер сдвигается под `ffprobe`. После
+/// закрытия игры (job пуст) файл расти не может, так что этого хватает, чтобы перечитать
+/// окончательный размер; дальше сбой «не дописан», а не вечный цикл в `verify_rest`.
+const FINAL_REPROBES: u32 = 3;
 
 /// Решение по проверенному дублю.
 enum Verdict {
@@ -523,6 +530,7 @@ impl<'a> Verifier<'a> {
             next_at: now,
             sizes,
             noted: false,
+            regrown: 0,
         });
     }
 
@@ -574,6 +582,7 @@ impl<'a> Verifier<'a> {
         let now = host.now();
         // ffprobe прочитал контейнер, который ffmpeg HLAE ещё дописывает: размер после проверки ушёл
         // вперёд от снятого до неё. Это «ещё пишется», а не «годен» — иначе склейка увидит другой размер.
+        let mut grew = false;
         let outcome = match outcome {
             verify::ProbeOutcome::Valid(f) => {
                 let before = (f.video_bytes, f.audio_bytes);
@@ -581,6 +590,7 @@ impl<'a> Verifier<'a> {
                 if after == Some(before) {
                     verify::ProbeOutcome::Valid(f)
                 } else {
+                    grew = true;
                     if let Some(s) = after {
                         self.manifest.mark_recorded(plan.index, s);
                         self.save(now, j);
@@ -606,6 +616,16 @@ impl<'a> Verifier<'a> {
                 return Verdict::Settled;
             }
             verify::ProbeOutcome::NotReady(r) => {
+                if last && grew && pend.regrown < FINAL_REPROBES {
+                    // игра закрыта, но размер сдвинулся под ffprobe: перечитать окончательный размер
+                    pend.regrown += 1;
+                    pend.next_at = now;
+                    let text = format!(
+                        "дубль {n}/{m}: размер {dir} сдвинулся во время проверки после закрытия игры, проверяю снова: {r}"
+                    );
+                    j.line(now, "app", &text);
+                    return Verdict::Settled;
+                }
                 if !last && waited < finalize {
                     pend.next_at = now + REPROBE;
                     if !pend.noted {
@@ -649,6 +669,33 @@ impl<'a> Verifier<'a> {
             .first()
             .map(|x| host.now().saturating_sub(x.first_at))
             .unwrap_or_default();
+        // Игра закрыта, файлы больше не растут. Годный дубль, чей размер ушёл после проверки,
+        // перепроверяется, чтобы склейка не увидела устаревший размер; пропавший файл даст понятный
+        // сбой здесь, а не на склейке.
+        let lines = self.manifest.reconcile(&self.clips);
+        if !lines.is_empty() {
+            for line in &lines {
+                j.line(host.now(), "app", line);
+            }
+            self.save(host.now(), j);
+        }
+        for (pos, plan) in req.takes.iter().enumerate() {
+            let recorded = self
+                .manifest
+                .entry(plan.index)
+                .is_some_and(|e| e.status == manifest::TakeStatus::Recorded);
+            if recorded && !self.pending.iter().any(|x| x.take == pos) {
+                let now = host.now();
+                self.pending.push(Pending {
+                    take: pos,
+                    first_at: now,
+                    next_at: now,
+                    sizes: self.sizes(&plan.dir_name()),
+                    noted: false,
+                    regrown: 0,
+                });
+            }
+        }
         let mut first: Option<String> = None;
         while !self.pending.is_empty() {
             match self.probe(0, host, req, p, j, true) {

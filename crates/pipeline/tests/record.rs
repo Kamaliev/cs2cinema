@@ -62,9 +62,18 @@ struct Capture {
     /// Фейк, по часам которого запоминается момент отмены.
     fake: Option<FakeHost>,
     cancelled_at: Mutex<Option<Duration>>,
+    /// Когда в событии появится эта подстрока, к файлу один раз дописываются байты: ffmpeg HLAE
+    /// дописал хвост уже после проверки.
+    grow_once: Mutex<Option<(String, PathBuf)>>,
 }
 
 impl Capture {
+    /// Дописать байты к `file` один раз, когда в событии появится `needle`.
+    fn growing_on(self, needle: &str, file: PathBuf) -> Self {
+        *self.grow_once.lock().unwrap() = Some((needle.to_owned(), file));
+        self
+    }
+
     fn cancelling_after(state: RecordState) -> Self {
         Capture {
             cancel_after: Some(state),
@@ -129,6 +138,18 @@ impl Progress for Capture {
             }
             self.cancel.store(true, Ordering::SeqCst);
         }
+        let mut hook = self.grow_once.lock().unwrap();
+        if hook
+            .as_ref()
+            .is_some_and(|(needle, _)| e.to_string().contains(needle.as_str()))
+        {
+            // повторная проверка того же дубля снова пишет «проверен»: крючок срабатывает ровно раз
+            let (_, file) = hook.take().unwrap();
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(file) {
+                let _ = std::io::Write::write_all(&mut f, &[0u8; 4096]);
+            }
+        }
+        drop(hook);
         self.events.lock().unwrap().push(e.clone());
     }
     fn cancelled(&self) -> bool {
@@ -1260,6 +1281,70 @@ fn take_growing_past_take_finalize_fails_as_not_final() {
     );
     let m = manifest_of(&req);
     assert_eq!(m.entry(0).unwrap().status, TakeStatus::Invalid);
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn validated_take_growing_before_game_exit_is_reprobed_with_the_new_size() {
+    // дубль 1 проверен, и только потом ffmpeg HLAE дописал хвост: после выхода игры размер сверяется
+    let (req, clips) = verified("verify-growing-late", 2);
+    let fake = FakeHost::new(Scenario::happy(2).clips_dir(clips.clone()));
+    let cap = Capture::default().growing_on(
+        "дубль 1/2 проверен",
+        clips.join("take0000").join("video.mp4"),
+    );
+    record(&fake, &req, &cap).expect("дубль с новым размером перепроверяется и годен");
+
+    let mut m = manifest_of(&req);
+    let on_disk = std::fs::metadata(clips.join("take0000").join("video.mp4"))
+        .unwrap()
+        .len();
+    assert!(on_disk > 10, "файл действительно вырос: {on_disk}");
+    assert_eq!(m.entry(0).unwrap().status, TakeStatus::Validated);
+    assert_eq!(m.entry(0).unwrap().video_bytes, Some(on_disk));
+    assert!(
+        m.reconcile(&clips).is_empty(),
+        "склейка не увидит расхождения"
+    );
+    let probes = video_probes(&fake, "take0000");
+    let end_1 = fake.take_ends()[1].1;
+    assert!(probes.len() >= 2, "{probes:?}");
+    assert!(
+        *probes.last().unwrap() >= end_1,
+        "последняя проверка — в финальном проходе после выхода игры: {probes:?} против {end_1:?}"
+    );
+    let log = read_log(&req);
+    assert!(
+        log.contains("файл изменился или пропал после проверки"),
+        "{log}"
+    );
+    let _ = std::fs::remove_dir_all(&req.out_dir);
+}
+
+#[test]
+fn take_growing_after_the_game_closed_fails_after_bounded_reprobes() {
+    let (req, clips) = verified("verify-growing-last", 2);
+    let fake = FakeHost::new(
+        Scenario::happy(2)
+            .clips_dir(clips)
+            .growing_take(1, secs(600)),
+    );
+    let f = record(&fake, &req, &Capture::default()).expect_err("файл так и не перестал расти");
+
+    assert_eq!(f.code, FailCode::TakeInvalid);
+    assert!(f.message.contains("дубль 2 из 2"), "{}", f.message);
+    assert!(f.message.contains("не дописан"), "{}", f.message);
+    let end = fake.now();
+    let final_pass = video_probes(&fake, "take0001")
+        .into_iter()
+        .filter(|at| *at == end)
+        .count();
+    assert!(
+        (2..=10).contains(&final_pass),
+        "финальный проход конечен: {final_pass} проверок"
+    );
+    let m = manifest_of(&req);
+    assert_eq!(m.entry(1).unwrap().status, TakeStatus::Invalid);
     let _ = std::fs::remove_dir_all(&req.out_dir);
 }
 

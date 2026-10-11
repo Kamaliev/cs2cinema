@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 07
 current_phase_name: Telegram-бот и доставка
 status: executing
-stopped_at: Completed 07-04-PLAN.md
-last_updated: "2026-10-11T20:13:18.748Z"
+stopped_at: Completed 07-05-PLAN.md
+last_updated: "2026-10-11T20:19:59.388Z"
 last_activity: 2026-10-12
 last_activity_desc: Phase 07 execution started
-state_head: 3af7bc9ebd07de221dfe96adfa5ef8796564579f
+state_head: 0759cf9a97262b05fdc0cf36bb8727b45f3a3c33
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 27
-  completed_plans: 20
+  completed_plans: 21
   percent: 40
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 07 (Telegram-бот и доставка) — EXECUTING
-Plan: 5 of 11
+Plan: 6 of 11
 Status: Ready to execute
 Last activity: 2026-10-12 — Phase 07 execution started
 
@@ -113,6 +113,7 @@ Progress: [████░░░░░░] 40%
 | Phase 07 P02 | 40min | 2 tasks | 14 files |
 | Phase 07 P03 | 25min | 3 tasks | 5 files |
 | Phase 07 P04 | 25min | 3 tasks | 4 files |
+| Phase 07 P05 | 25min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -211,6 +212,8 @@ Recent decisions affecting current work:
 - [Phase 07]: 07-03: ссылка FACEIT проходит строгий разбор wire::faceit, в базе только канонический URL; submit_from вставляет файловую задачу как receiving и ставит queued после link_demo
 - [Phase 07]: 07-04: роль только из базы; /adduser создаёт только member, админа назначает оператор; убранный друг — мягко (removed_at), его принятые задачи доставляются
 - [Phase 07]: 07-04: valid_player (1-64 символа, без управляющих и bidi) общий для /player и имени в /adduser; ник сбрасывает прежний player_steam
+- [Phase 07]: 07-05: HttpTg принимает только http:// loopback с портом, прокси из окружения и перенаправления отключены; sent=false только пока соединения не было
+- [Phase 07]: 07-05: Redactor маскирует токен бота и в форме цифры~секрет (рабочая папка telegram-bot-api)
 
 ### Pending Todos
 
@@ -240,6 +243,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T20:13:18.621Z
-Stopped at: Completed 07-04-PLAN.md
+Last session: 2026-10-11T20:19:59.263Z
+Stopped at: Completed 07-05-PLAN.md
 Resume file: None

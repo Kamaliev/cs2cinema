@@ -647,6 +647,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "cs2",
+ "ctrlc",
  "demo",
  "director",
  "faceit",
@@ -656,6 +657,7 @@ dependencies = [
  "positions",
  "prost",
  "renderer",
+ "runner",
  "serde_json",
  "store",
 ]

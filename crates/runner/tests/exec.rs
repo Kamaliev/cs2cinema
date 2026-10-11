@@ -483,3 +483,18 @@ fn recover_kills_own_orphans_before_cleaning_the_game_dir() {
         "строка для журнала: {notes:?}"
     );
 }
+
+#[test]
+fn run_returns_an_error_when_the_server_rejects_the_token() {
+    let stand = Stand::start();
+    let dir = TestDir::new("exec-token");
+    let host = probing_host();
+    let mut cfg = stand.runner_config();
+    cfg.token = Token::new("wrong-token");
+    let mut runner = Runner::new(cfg, Arc::new(executor(&host, &dir))).unwrap();
+
+    let e = runner
+        .run()
+        .expect_err("раннер с чужим токеном должен остановиться");
+    assert!(e.contains("токен"), "{e}");
+}

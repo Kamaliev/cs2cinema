@@ -5,6 +5,7 @@ use director::{NoPositions, Order, PositionSource};
 mod acceptance;
 mod inspect;
 mod record;
+mod runner_cmd;
 
 use record::ConsoleProgress;
 
@@ -38,6 +39,9 @@ cs2-cli — хайлайт-ролик из матча FACEIT
 
 Запись и повтор задачи:
   cs2-cli record … / cs2-cli retry … (подробно: cs2-cli record --help)
+
+Раннер очереди сервера:
+  cs2-cli runner --server <адрес> (токен — переменная CS2_RUNNER_TOKEN или --token-file; подробно: cs2-cli runner --help)
 
 Приёмка (база приложения только на чтение):
   cs2-cli acceptance check [--db <файл>] [--batch <имя> | --last] [--expect-restart-from <партия A>]
@@ -132,6 +136,7 @@ fn main() -> ExitCode {
         Some("inspect") => return inspect::inspect_cmd(),
         Some("record") => return record::record_cmd(),
         Some("retry") => return record::retry_cmd(),
+        Some("runner") => return runner_cmd::runner_cmd(),
         Some("acceptance") => {
             return match env::args().nth(2).as_deref() {
                 Some("check") => acceptance::check_cmd(),

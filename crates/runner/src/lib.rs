@@ -43,6 +43,8 @@ use transfer::{Verdict, judge};
 pub const RELEASE_COOLDOWN: Duration = Duration::from_secs(15);
 /// Потолок размера демки по умолчанию: 2000 МиБ, как у дочернего разбора (`InspectLimits`).
 pub const MAX_DEMO_BYTES: u64 = 2000 << 20;
+/// Начало ошибки `hello` при несовпадении версии протокола: по нему `run` понимает, что повторы не помогут.
+pub const PROTOCOL_MISMATCH: &str = "версия протокола сервера не совпадает с раннером";
 /// Как часто раннер на паузе напоминает серверу о себе.
 const PAUSE_HELLO_EVERY: Duration = Duration::from_secs(30);
 
@@ -244,6 +246,8 @@ pub struct Runner {
     paused: Option<PauseReason>,
     /// Флаг `Control::resume`.
     resume: Arc<AtomicBool>,
+    /// Причина, по которой `run` обязан вернуть ошибку: токен отозван, протокол не совпал.
+    fatal: Option<String>,
     /// Когда раннер последний раз сообщил серверу о паузе.
     pause_hello: Option<Instant>,
     /// Раньше этого момента новый `claim` не делается (пауза после `release`).
@@ -279,6 +283,7 @@ impl Runner {
             resume: Arc::new(AtomicBool::new(false)),
             pause_hello: None,
             cooldown_until: None,
+            fatal: None,
         })
     }
 
@@ -363,8 +368,9 @@ impl Runner {
         self.paused = Some(reason);
     }
 
-    /// Цикл до флага остановки; ошибки связи — пауза 1, 2, 4 … 30 с.
-    pub fn run(&mut self) {
+    /// Цикл до флага остановки; ошибки связи — пауза 1, 2, 4 … 30 с. `Err` — раннер остановило то, что повторами
+    /// не лечится: сервер не принял токен или версия протокола не совпала; задача при этом остаётся в состоянии.
+    pub fn run(&mut self) -> Result<(), String> {
         let mut pause = 0u64;
         while !self.stop.load(Ordering::SeqCst) {
             match self.tick() {
@@ -385,10 +391,11 @@ impl Runner {
                         self.sleep(1);
                     }
                 }
-                Err(e) if e == tee::TOKEN_REJECTED => {
+                Err(e) if e == tee::TOKEN_REJECTED || e.starts_with(PROTOCOL_MISMATCH) => {
                     self.log.line(&format!(
                         "ошибка: {e}; раннер остановлен, задача остаётся в состоянии"
                     ));
+                    self.fatal = Some(e);
                     self.stop.store(true, Ordering::SeqCst);
                 }
                 Err(e) => {
@@ -397,6 +404,10 @@ impl Runner {
                     self.sleep(pause);
                 }
             }
+        }
+        match self.fatal.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 
@@ -456,9 +467,7 @@ impl Runner {
                 message,
                 ..
             }) => {
-                return Err(format!(
-                    "версия протокола сервера не совпадает с раннером: {message}"
-                ));
+                return Err(format!("{PROTOCOL_MISMATCH}: {message}"));
             }
             Err(e) => return Err(link_error(e)),
         };
@@ -649,6 +658,7 @@ impl Runner {
                 "задача #{id}: {}; раннер остановлен, задача остаётся в состоянии",
                 tee::TOKEN_REJECTED
             ));
+            self.fatal = Some(tee::TOKEN_REJECTED.to_owned());
             return Ok(Tick::Stopped);
         }
         let reason = self.shared.lost_reason();

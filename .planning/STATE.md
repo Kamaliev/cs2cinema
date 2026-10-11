@@ -2,19 +2,19 @@
 gsd_state_version: "1.0"
 milestone: v1.1
 milestone_name: Сервер и Telegram-бот
-current_phase: 05
-current_phase_name: Ядро сервера и протокол
-status: verifying
-stopped_at: Completed 05-05-PLAN.md
-last_updated: "2026-10-11T11:40:18.305Z"
+current_phase: 06
+current_phase_name: Раннер, защита входа и первый живой прогон
+status: executing
+stopped_at: Completed 06-01-PLAN.md
+last_updated: "2026-10-11T15:21:27.232Z"
 last_activity: 2026-10-11
-last_activity_desc: Phase 05 execution started
-state_head: 985235afaa900a5042dc4dcda36972a41b80b184
+last_activity_desc: Phase 06 execution started
+state_head: bfbf8c6bf2db330619e17b68c1b5bc791e04ab32
 progress:
   total_phases: 5
   completed_phases: 0
-  total_plans: 5
-  completed_plans: 5
+  total_plans: 16
+  completed_plans: 6
   percent: 0
 ---
 
@@ -25,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-11)
 
 **Core value:** Задача на монтаж доходит до готового `highlights.mp4` без ручного вмешательства, а если это невозможно — останавливается быстро и объясняет, что именно пошло не так. Для v1.1 то же верно от демки, отправленной боту, до ролика в чате.
-**Current focus:** Phase 05 — Ядро сервера и протокол
+**Current focus:** Phase 06 — Раннер, защита входа и первый живой прогон
 
 ## Current Position
 
-Phase: 05 (Ядро сервера и протокол) — EXECUTING
-Plan: 5 of 5
-Status: Phase complete — ready for verification
-Last activity: 2026-10-11 — Phase 05 execution started
+Phase: 06 (Раннер, защита входа и первый живой прогон) — EXECUTING
+Plan: 2 of 11
+Status: Ready to execute
+Last activity: 2026-10-11 — Phase 06 execution started
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -97,6 +97,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 05 P03 | 45min | 3 tasks | 11 files |
 | Phase 05 P04 | 80m | 3 tasks | 12 files |
 | Phase 05 P05 | 1h30m | 3 tasks | 9 files |
+| Phase 06 P01 | 25 min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -166,6 +167,8 @@ Recent decisions affecting current work:
 - [Phase 05]: 05-04: claim освобождает прежнюю потерянную аренду того же раннера (раннер не ведёт две задачи)
 - [Phase 05]: 05-04: finish на окончательной задаче — повтор того же итога 200, иначе job_terminal
 - [Phase 05]: 05-05: Chunk ставит phase=upload, Touch делегирует в Reattach; Reject несёт заголовки; highlights.mp4 удаляется, если вторая транзакция finish done отказала
+- [Phase 06]: Слияние двойников SteamID применяется на каждом ярусе resolve_player; find_player остаётся обёрткой resolve_player(..).ok()
+- [Phase 06]: JOB_ERROR — только строка в wire::fail, в FailCode его нет; Phase::Precheck добавлен аддитивно (ALL = 10)
 
 ### Pending Todos
 
@@ -195,6 +198,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T11:40:18.271Z
-Stopped at: Completed 05-05-PLAN.md
+Last session: 2026-10-11T15:21:27.124Z
+Stopped at: Completed 06-01-PLAN.md
 Resume file: None

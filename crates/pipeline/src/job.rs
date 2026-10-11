@@ -11,7 +11,9 @@ use renderer::TakePlan;
 
 use crate::{
     Artifact, Deadlines, Event, FailCode, Progress, RecordFailure, RecordReport, RecordRequest,
-    RecordState, RunError, Stage, gamedir,
+    RecordState, RunError, Stage,
+    assemble::assemble_stage,
+    gamedir,
     host::{Host, LaunchSpec},
     manifest::{EnvSnapshot, Manifest, RecordJson, TakeStatus},
     precheck::{self, Demo, Inputs, Level, Report, ids, space},
@@ -464,6 +466,103 @@ pub fn all_takes_validated(m: &Manifest, takes: &[TakePlan]) -> bool {
             m.entry(t.index)
                 .is_some_and(|e| e.status == TakeStatus::Validated)
         })
+}
+
+/// «Повторить» (RET-02, RET-03, D-07, D-08): без скачивания, разбора демки и плана — по `record.json` из папки задачи.
+/// Все дубли проверены — сразу склейка, без предпроверки и без игры (RET-03). Иначе — предпроверка, запись всех дублей
+/// заново (прежние уходят в `clips_old_<ts>`) и склейка. Нет данных для повтора — `RETRY_NO_DATA`.
+pub fn resume(host: &dyn Host, spec: &JobSpec, p: &dyn Progress) -> Result<Outcome, RunError> {
+    let cfg = &spec.cfg;
+    let out_dir = spec
+        .out_dir
+        .clone()
+        .ok_or_else(|| retry_no_data("папка задачи неизвестна"))?;
+    p.artifact(&Artifact::OutDir(out_dir.clone()));
+    let rj = RecordJson::load(&out_dir).map_err(|e| retry_no_data(&e))?;
+    if plan_hash(&out_dir, &rj.nonce) != rj.plan_hash {
+        return Err(retry_no_data("скрипты записи в папке задачи изменились"));
+    }
+    let takes = rj.take_plans();
+    let clips = out_dir.join("clips");
+    let mut manifest = Manifest::load(&clips).filter(|m| m.plan_hash == rj.plan_hash);
+    if let Some(m) = manifest.as_mut() {
+        for line in m.reconcile(&clips) {
+            p.log(&line);
+        }
+    }
+    let outcome = |out: PathBuf| Outcome {
+        out_dir: out_dir.clone(),
+        result: out,
+        shots: rj.shots as u32,
+        secs: rj.secs,
+    };
+    if manifest
+        .as_ref()
+        .is_some_and(|m| all_takes_validated(m, &takes))
+    {
+        p.log("все дубли проверены по манифесту — сразу склейка, без предпроверки и игры");
+        p.stage(Stage::Assemble);
+        let out = assemble_stage(
+            host,
+            &out_dir,
+            &takes,
+            &rj.ffmpeg_args,
+            rj.video_secs,
+            deadlines(cfg).ffmpeg_for(rj.video_secs),
+            p,
+        )?;
+        return Ok(outcome(out));
+    }
+    // не все дубли проверены: HLAE нумерует новые дубли «наибольший + 1» и не заполняет пропуски, поэтому
+    // дописать только недостающие нельзя — записываем все заново, прежние уходят в `clips_old_<ts>` (D-07, RET-06)
+    let not_validated = match &manifest {
+        None => "манифест дублей не найден".to_owned(),
+        Some(m) => takes
+            .iter()
+            .filter(|t| {
+                m.entry(t.index)
+                    .is_none_or(|e| e.status != TakeStatus::Validated)
+            })
+            .map(|t| (t.index + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    p.log(&format!("дубли не все проверены: {not_validated} — записываю все заново (новые дубли HLAE нумерует подряд)"));
+    // демка — из record.json, не из скачивания: предпроверка скажет, если её нет (PRECHECK_FAILED)
+    let inputs = precheck_inputs(
+        cfg,
+        Demo::File(rj.demo_path.clone()),
+        spec.last_good.clone(),
+    );
+    let mut report = precheck_stage(host, &inputs, p)?;
+    space_pass(
+        host,
+        &inputs,
+        space::estimate(&takes, rj.frame, rj.demo_len),
+        &mut report,
+        p,
+    )?;
+    record_takes(
+        host,
+        cfg,
+        (spec.job_id, spec.attempt),
+        &out_dir,
+        &rj,
+        Some(&report),
+        p,
+    )?;
+    p.stage(Stage::Assemble);
+    let out = assemble_stage(
+        host,
+        &out_dir,
+        &takes,
+        &rj.ffmpeg_args,
+        rj.video_secs,
+        deadlines(cfg).ffmpeg_for(rj.video_secs),
+        p,
+    )?;
+    last_good(Some(&report), p);
+    Ok(outcome(out))
 }
 
 /// Отпечаток скриптов записи (`highlights.cfg`, `cs2c_*`): совпал — дубли в `clips/` от этого же плана.

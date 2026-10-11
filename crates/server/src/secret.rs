@@ -56,12 +56,18 @@ pub struct Redactor {
 
 impl Redactor {
     pub fn new(secrets: &[&Secret]) -> Self {
-        let exact = secrets
+        let mut exact: Vec<String> = Vec::new();
+        for value in secrets
             .iter()
             .map(|s| s.expose())
             .filter(|v| v.chars().count() >= MIN_SECRET_LEN)
-            .map(str::to_owned)
-            .collect();
+        {
+            exact.push(value.to_owned());
+            // Токен бота bot-api называет рабочую подпапку с `~` вместо `:`: маскируем и эту форму.
+            if value.contains(':') {
+                exact.push(value.replace(':', "~"));
+            }
+        }
         Self {
             exact: Arc::new(exact),
         }
@@ -126,14 +132,15 @@ fn mask_bearer(s: &str) -> String {
     out
 }
 
-/// Токен бота Telegram по форме; покрывает и `bot{цифры}:{секрет}` в адресах Bot API.
+/// Токен бота Telegram по форме; покрывает `bot{цифры}:{секрет}` в адресах Bot API и форму `{цифры}~{секрет}`
+/// (так `telegram-bot-api` называет рабочую подпапку бота).
 fn mask_bot_tokens(s: &str) -> String {
     let bytes = s.as_bytes();
     let secret_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
     let mut out = String::with_capacity(s.len());
     let mut copied = 0;
     let mut search = 0;
-    while let Some(rel) = s[search..].find(':') {
+    while let Some(rel) = s[search..].find([':', '~']) {
         let colon = search + rel;
         let mut start = colon;
         while start > copied && bytes[start - 1].is_ascii_digit() {
@@ -226,6 +233,37 @@ mod tests {
         assert_eq!(r.redact(&short_id), short_id);
         let short_secret = format!("{}:{}", "1".repeat(5), "a".repeat(29));
         assert_eq!(r.redact(&short_secret), short_secret);
+    }
+
+    #[test]
+    fn tilde_form_of_the_bot_token_is_masked() {
+        let secret = Secret::new(BOT.to_owned());
+        let r = Redactor::new(&[&secret]);
+        let tilde = BOT.replace(':', "~");
+        assert_eq!(
+            r.redact(&format!("a {BOT} b /srv/{tilde}/documents/f.dem")),
+            "a *** b /srv/***/documents/f.dem"
+        );
+        // По форме, без точного секрета: чужой токен в рабочей папке тоже маскируется.
+        let foreign = format!("987654321~{}", "Zz9_-".repeat(7));
+        let plain = Redactor::default();
+        assert_eq!(
+            plain.redact(&format!("/var/lib/{foreign}/documents")),
+            "/var/lib/***/documents"
+        );
+        // Пороги те же, что у формы с двоеточием.
+        let short_id = format!("{}~{}", "1".repeat(4), "a".repeat(30));
+        assert_eq!(plain.redact(&short_id), short_id);
+        let short_secret = format!("{}~{}", "1".repeat(5), "a".repeat(29));
+        assert_eq!(plain.redact(&short_secret), short_secret);
+        // Тильда в обычных путях и тексте не трогается.
+        for text in [
+            "~/cs2cinema/out",
+            "C:\\Users\\x~1\\file",
+            "версия ~1.2 или ~ 5",
+        ] {
+            assert_eq!(plain.redact(text), text, "{text}");
+        }
     }
 
     #[test]

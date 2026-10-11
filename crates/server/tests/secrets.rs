@@ -589,3 +589,89 @@ fn chunk_rejections_do_not_leak_the_token() {
         assert_absent(&srv.db_bytes(), secret, "байты server.db после остановки");
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Токен бота в форме с тильдой (SEC-04, План 07-05, Task 2)
+// ---------------------------------------------------------------------------------------------------------
+
+#[test]
+fn bot_token_in_tilde_form_is_masked_everywhere() {
+    use common::{BOT_T0, TestDir};
+    use server::bot::{Bot, BotSettings};
+    use server::clock::ManualClock;
+    use server::tg::fake::FakeTelegram;
+
+    let tilde = BOT.replace(':', "~");
+    let srv = TestServer::start_with(TestOptions {
+        bot_token: Some(BOT.to_owned()),
+        clock: Some(ManualClock::new(BOT_T0)),
+        ..Default::default()
+    });
+    // Рабочая папка фейка названа так же, как bot-api называет подпапку бота: любой путь из `getFile`
+    // содержит токен в форме с `~`.
+    let tg_dir = TestDir::new("tg-tilde");
+    let tg = FakeTelegram::new(tg_dir.path.join(&tilde));
+    let data_dir = srv.dir.path.join("data");
+    let core = srv.running().core().clone();
+    let bot = Bot::new(
+        core.clone(),
+        Arc::new(tg.clone()),
+        srv.running().log().clone(),
+        BotSettings::new(&data_dir, tg.files_dir()),
+    );
+    let friend = 4242;
+    server::users::add_user(
+        core.db(),
+        "Вася",
+        Some(friend),
+        false,
+        core.clock().now_ms(),
+    )
+    .unwrap();
+
+    let bytes = fake_demo(4096);
+    let on_disk = tg.put_document("file-1", "uniq-1", &bytes);
+    // Против холостого теста: токен в форме с `~` действительно есть в пути, который отдаст `getFile`.
+    assert!(
+        on_disk.to_string_lossy().contains(&tilde),
+        "путь файла должен содержать токен с тильдой"
+    );
+    // Редактор сервера маскирует этот путь целиком, как бы он ни попал в текст.
+    let masked = core.redactor().redact(&on_disk.to_string_lossy());
+    assert_absent(masked.as_bytes(), &tilde, "путь файла после redact");
+    assert_absent(
+        masked.as_bytes(),
+        secret_part_of(BOT),
+        "путь файла после redact (секрет)",
+    );
+    let upd = tg.document_update(
+        friend,
+        friend,
+        "file-1",
+        "uniq-1",
+        "match.dem",
+        bytes.len() as u64,
+        Some("s1mple"),
+    );
+    tg.push_update(upd);
+    // Файл пропадает до скачивания: приём падает, и текст ошибки не должен нести путь.
+    std::fs::remove_file(&on_disk).unwrap();
+    bot.step().expect("шаг бота");
+
+    let secret_part = secret_part_of(BOT);
+    let texts = tg.texts_to(friend).join("\n");
+    assert!(
+        !texts.is_empty(),
+        "друг должен получить хоть какой-то ответ"
+    );
+    for form in [BOT, tilde.as_str(), secret_part] {
+        assert_absent(texts.as_bytes(), form, "тексты чата");
+        assert_absent(srv.sink_text().as_bytes(), form, "журнал сервера");
+        assert_absent(&srv.db_bytes(), form, "байты server.db и -wal");
+    }
+}
+
+/// Секретная часть токена бота: всё после двоеточия.
+fn secret_part_of(token: &str) -> &str {
+    token.split_once(':').map_or(token, |(_, secret)| secret)
+}

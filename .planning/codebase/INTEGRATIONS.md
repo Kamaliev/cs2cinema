@@ -42,31 +42,31 @@ last_mapped_at: 2026-10-10
 - Downloaded automatically by `scripts/update_maps.py` (per `README.md`) to extract meshes from a local CS2 install. Not called from Rust code.
 
 **Local game-file access (CS2 install):**
-- Steam library discovery: `crates/app/src/launch.rs` (`find_cs2`) reads `steamapps/libraryfolders.vdf` under common Steam roots (`C:/Program Files (x86)/Steam`, `D:/SteamLibrary`, ...).
-- Reads `steamapps/common/Counter-Strike Global Offensive/game/csgo/...` and `game/bin/win64` paths for installing `highlights.cfg`, `cs2c_NN.cfg`, and `cs2c_NN_K.xml` (see `crates/app/src/launch.rs` lines ~112 and ~160).
+- Steam library discovery: `crates/app/src/settings.rs` (`find_cs2`, `find_hlae`) reads `steamapps/libraryfolders.vdf` under common Steam roots (`C:/Program Files (x86)/Steam`, `D:/SteamLibrary`, ...); the console takes folders from `--cs2`/`--hlae` or `CS2_DIR`/`HLAE_DIR`.
+- Reads `steamapps/common/Counter-Strike Global Offensive/game/csgo/...` and `game/bin/win64` paths; `pipeline::gamedir::install_files` puts `highlights.cfg`, `cs2c_NN.cfg`, and `cs2c_NN_K.xml` there and records them in `installed.json`, so `cleanup_installed`/`recover` can remove exactly our files after a job or a crash.
 - `scripts/update_maps.py` reads `steam.inf` for `ClientVersion` (`README.md`).
 
 ## External Tools (process integrations)
 
 **Counter-Strike 2 (`cs2.exe`):**
-- Launched by HLAE with `-insecure -steam -novid -allow_third_party_software -netconport {port} -windowed -w {w} -h {h} +demo_ui_mode 0 +playdemo {demo}` (`crates/app/src/launch.rs`, `launch`).
-- Commands are sent to the game console over a local TCP netcon socket on `127.0.0.1` (`TcpStream::connect_timeout` in `crates/app/src/launch.rs`, port chosen by binding an ephemeral port, fallback `NETCON_PORT`).
+- Launched by HLAE with `-insecure -steam -novid -allow_third_party_software -netconport {port} -windowed -w {w} -h {h} +demo_ui_mode 0 +playdemo {demo}` (`host::win::WinHost::launch`, `crates/host/src/win/`).
+- Commands are sent to the game console over a local TCP netcon socket on `127.0.0.1` (`crates/host/src/win/netcon.rs`, ephemeral port); console output is also read from `game/csgo/console.log` (`-condebug`, `console_log.rs`).
 - Sends `exec highlights` and other console lines; the command dialect is centralized in `crates/renderer/src/lib.rs` (`Dialect`, `preamble`).
-- Process state: `tasklist` and `taskkill` (Windows) check for and stop `cs2.exe` (`crates/app/src/launch.rs`, around lines 249-290).
+- Process state: the game runs in a Job Object created by `host::win::WinHost` and is tracked by handle (`Liveness`); a foreign `cs2.exe` is only detected (`FOREIGN_GAME_RUNNING`) and never stopped; our own orphans after a crash are removed by process identity (`pipeline::gamedir::kill_orphans`). Earlier versions polled and killed `cs2.exe` with system utilities by name — "было до фазы 4", removed.
 - Demo files: CS2 reads `.dem` only; `.dem.zst` is decompressed by the app/CLI before playback (`README.md`).
 
 **HLAE - advancedfx (`HLAE.exe`, `x64/AfxHookSource2.dll`):**
-- Required for recording. Discovered by `find_hlae` in `crates/app/src/launch.rs` (common paths, drive scan) or set in Settings (`settings.json`). Path check requires `HLAE.exe` and `x64/AfxHookSource2.dll` (`check_paths`).
+- Required for recording. Discovered by `find_hlae` in `crates/app/src/settings.rs` (common paths, drive scan) or set in Settings (`settings.json`) or `--hlae`/`HLAE_DIR` in the console. `pipeline::precheck` requires `HLAE.exe` and `x64/AfxHookSource2.dll`.
 - CLI-side command: `HLAE.exe -customLoader -noGui -autoStart -hookDllPath ... -programPath ...cs2.exe -cmdLine "..."` is documented in `README.md`; the app launches HLAE directly via `Command::new(HLAE.exe)` with `current_dir(hlae_dir)`.
-- Recording: HLAE writes clips through `startmovie` and `mirv_streams settings add ffmpeg cs2c "..."` (`crates/renderer/src/lib.rs`, around line 167). The ffmpeg that HLAE uses is configured in `ffmpeg/ffmpeg.ini` inside the HLAE folder; `hlae_ffmpeg` in `crates/app/src/launch.rs` parses its `Path=` key.
-- Output: clips are written under the result folder's `clips/` (path set by `crates/renderer/src/lib.rs`, `clips/` folder reference at line ~93). Completion is detected by a stable folder/file size (`wait_for_clip` in `crates/app/src/launch.rs`, around line 277).
+- Recording: HLAE writes clips through `startmovie` and `mirv_streams settings add ffmpeg cs2c "..."` (`crates/renderer/src/lib.rs`, around line 167). The ffmpeg that HLAE uses is configured in `ffmpeg/ffmpeg.ini` inside the HLAE folder; `pipeline::precheck::gather::hlae_ffmpeg` parses its `Path=` key.
+- Output: clips are written under the result folder's `clips/` (path set by `crates/renderer/src/lib.rs`). A take is finished by console markers (`pipeline::record::markers`) and then validated (`pipeline::record::verify`, `clips/manifest.json`); the old wait by stable folder size was removed ("было до фазы 4").
 - Download: `https://github.com/advancedfx/advancedfx/releases` (link only; `crates/app/src/settings_page.rs`).
 
 **ffmpeg / ffprobe (7+):**
-- `ffmpeg` runs the assembly graph (`assemble.ffgraph`) through generated `assemble.sh`/`assemble.bat` and via direct `Command::new("ffmpeg")` in `crates/renderer/src/assemble.rs` (lines ~207, ~313), `crates/app/src/app.rs` (~559), `crates/app/src/jobs.rs` (~314).
-- `ffprobe` returns clip durations in `crates/renderer/src/assemble.rs` (~line 121).
-- Presence check: `ffmpeg -version` in `crates/renderer/src/assemble.rs` (~line 299).
-- NVENC check: a short test encode via `nvenc_check` in `crates/app/src/launch.rs` (~line 136); job queue in `crates/app/src/jobs.rs` (~line 107) uses it to choose encoder.
+- `ffmpeg` runs the assembly graph (`assemble.ffgraph`) through generated `assemble.sh`/`assemble.bat` (for manual re-runs) and, in the app and `cs2-cli assemble`, through `pipeline::assemble::assemble_stage` — the only place that starts it, via `Host::run` with a deadline and cancel.
+- `ffprobe` returns clip durations and validates takes (`pipeline::record::verify`), also through `Host::run`.
+- Presence check: part of `pipeline::precheck` (a missing ffmpeg is `PRECHECK_FAILED`, class "окружение").
+- NVENC check: a short test encode via `pipeline::precheck::nvenc_check` (`host::Host::run`); `pipeline::job` uses the result to choose the encoder.
 - Caption font: Arial Bold from `C:\Windows\Fonts` by default, overridable by `CS2CINEMA_FONT` (`crates/pipeline/src/lib.rs`, `crates/cli/src/main.rs`).
 - Install hint: `winget install Gyan.FFmpeg` (`README.md`).
 
@@ -118,7 +118,8 @@ last_mapped_at: 2026-10-10
 
 **Logs:**
 - Job logs are stored in SQLite (`jobs` log via `append_log` in `crates/store/src/lib.rs`) and surfaced in the Jobs page (`crates/app/src/jobs_page.rs`, "Журнал").
-- Stderr/stdout of ffmpeg and HLAE captured through `Command::output` and first-line error extraction (`crates/app/src/launch.rs`, `nvenc_check`).
+- Stderr/stdout of ffmpeg and HLAE captured by `host::Host::run` / the game session (`record.log`, `CmdOutput`) with first-line error extraction (`pipeline::precheck::nvenc_check`, `pipeline::assemble::ffmpeg_error`).
+- Queue summary notification: `host::win::notify` shows a tray balloon "N готово / M упало" (`Shell_NotifyIconW` with `NIF_INFO`) when the queue empties or pauses, so it works while the window is hidden in the tray.
 
 **Analytics:**
 - None.
@@ -154,7 +155,7 @@ last_mapped_at: 2026-10-10
 ## Webhooks & Callbacks
 
 **Incoming:**
-- None. The app does not listen on any public port. The only local listener is the transient `127.0.0.1` ephemeral TCP port used as the CS2 netcon channel (outbound connection from the app to the game; see `crates/app/src/launch.rs`).
+- None. The app does not listen on any public port. The only local listener is the transient `127.0.0.1` ephemeral TCP port used as the CS2 netcon channel (outbound connection from the app to the game; see `crates/host/src/win/netcon.rs`).
 
 **Outgoing:**
 - FACEIT Data API and Downloads API (HTTPS, see above).

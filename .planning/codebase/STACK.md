@@ -9,11 +9,11 @@ last_mapped_at: 2026-10-10
 ## Languages
 
 **Primary:**
-- Rust (stable toolchain, 2021-style workspace, resolver 2) - all application and library code under `crates/*/src/`. Declared workspace members in `Cargo.toml`: `crates/demo`, `crates/highlights`, `crates/director`, `crates/cs2`, `crates/renderer`, `crates/faceit`, `crates/positions`, `crates/geometry`, `crates/pipeline`, `crates/store`, `crates/app`, `crates/cli`.
+- Rust (stable toolchain, 2021-style workspace, resolver 2) - all application and library code under `crates/*/src/`. Declared workspace members in `Cargo.toml`: `crates/demo`, `crates/highlights`, `crates/director`, `crates/cs2`, `crates/renderer`, `crates/faceit`, `crates/positions`, `crates/geometry`, `crates/host`, `crates/pipeline`, `crates/store`, `crates/app`, `crates/cli`.
 
 **Secondary:**
 - PowerShell - `install.ps1` (end-user installer, downloads release zip, verifies SHA-256, updates user PATH, creates Start Menu shortcut).
-- POSIX shell and batch - generated assembly scripts written by `crates/renderer/src/assemble.rs` (`assemble.sh`, `assemble.bat`) per output folder; not hand-maintained source.
+- POSIX shell and batch - generated assembly scripts written by `crates/renderer/src/lib.rs` (`assemble.sh`, `assemble.bat`) per output folder; not hand-maintained source.
 - Python 3.11+ - optional `scripts/update_maps.py` (extracts map geometry from a local CS2 install; not needed for normal runs).
 - Protocol Buffers - `crates/demo/proto/demo.proto` and `crates/demo/proto/events.proto` (CS2 demo message definitions, compiled at build time).
 - Source2 Engine Constants/Text - `highlights.cfg`, `cs2c_NN.cfg`, `cs2c_NN_K.xml` camera paths generated for the CS2 console and HLAE (see `crates/renderer/src/lib.rs`). These are outputs, not source.
@@ -22,7 +22,7 @@ last_mapped_at: 2026-10-10
 ## Runtime
 
 **Environment:**
-- Native binaries, no managed runtime. Primary target is Windows 11 x64 (`cfg(windows)` code paths in `crates/app/src/launch.rs`, `crates/app/src/ui.rs`, `crates/app/src/app.rs`). Linux is built and tested in CI (`.github/workflows/ci.yml`) but the desktop app is Windows-oriented.
+- Native binaries, no managed runtime. Primary target is Windows 11 x64 (`cfg(windows)` code paths in `crates/host/src/win/`, `crates/app/src/ui.rs`, `crates/app/src/app.rs`). Linux is built and tested in CI (`.github/workflows/ci.yml`) but the desktop app is Windows-oriented.
 - Release binaries: `cs2-cli.exe` (crate `cli`) and `cs2cinema.exe` (crate `app`, built with `windows_subsystem = "windows"` in `crates/app/src/main.rs`).
 
 **Package Manager:**
@@ -47,7 +47,8 @@ last_mapped_at: 2026-10-10
 - `geometry` - map mesh loading (AWMH format) and wall geometry (`crates/geometry/src/lib.rs`).
 - `director` - camera director: grenade, rig, shot planning (`crates/director/src/grenade.rs`, `rig.rs`, `lib.rs`).
 - `highlights` - scoring and selection of highlight moments (`crates/highlights/src/lib.rs`).
-- `renderer` - writes HLAE/CS2 scripts and ffmpeg filter graphs (`crates/renderer/src/lib.rs`, `assemble.rs`).
+- `renderer` - writes HLAE/CS2 scripts and ffmpeg filter graphs (`crates/renderer/src/lib.rs`); сама склейка — `pipeline::assemble`.
+- `host` - граница с ОС: процессы, Job Object, сокет консоли игры, уведомление в трее (`crates/host/src/`).
 - `pipeline` - orchestrates demo to plan to render (`crates/pipeline/src/lib.rs`).
 - `faceit` - FACEIT Data API client (`crates/faceit/src/lib.rs`, `stats.rs`).
 - `store` - SQLite persistence (`crates/store/src/lib.rs`).
@@ -78,9 +79,9 @@ last_mapped_at: 2026-10-10
 - `tray-icon` 0.19.3 - Windows tray integration.
 
 **Infrastructure / external binaries (not Cargo crates, invoked as processes):**
-- `ffmpeg` 7+ and `ffprobe` - clip assembly and duration probe. Invoked via `Command::new("ffmpeg")` / `Command::new("ffprobe")` in `crates/renderer/src/assemble.rs`, `crates/app/src/app.rs` (line ~559), `crates/app/src/jobs.rs` (line ~314). NVENC availability check in `crates/app/src/launch.rs` (`nvenc_check`).
-- `HLAE.exe` (advancedfx) with `x64/AfxHookSource2.dll` - records CS2 via `startmovie`. Launched in `crates/app/src/launch.rs` (`launch`), path discovered by `find_hlae`.
-- `tasklist` and `taskkill` (Windows) - checking/stopping `cs2.exe` in `crates/app/src/launch.rs`.
+- `ffmpeg` 7+ and `ffprobe` - clip assembly and duration probe. Started only through `host::Host::run` (deadline + cancel) from `pipeline::assemble` and `pipeline::record::verify`. NVENC availability check: `pipeline::precheck::nvenc_check`.
+- `HLAE.exe` (advancedfx) with `x64/AfxHookSource2.dll` - records CS2 via `startmovie`. Launched by `host::win::WinHost::launch` inside a Job Object, path discovered by `find_hlae` in `crates/app/src/settings.rs` (or `--hlae`/`HLAE_DIR` in the console).
+- Windows API (`windows-sys` 0.61 in `crates/host`, только `cfg(windows)`): Job Object, process handles, `Shell_NotifyIconW` for the tray balloon. The earlier `tasklist`/`taskkill` utilities were removed in phase 4 ("было до фазы 4"); the workspace has no calls to them.
 - `cmd` / `xdg-open` - opening URLs in `crates/app/src/ui.rs`.
 - `git` - queries the latest `awpy-data` release tag in `crates/geometry/src/lib.rs` (line ~293).
 
@@ -117,9 +118,9 @@ last_mapped_at: 2026-10-10
 
 **Runtime (end user):**
 - Windows 11 x64 (release artifacts are `cs2cinema-windows-x64.zip` and `cs2-cli.exe`).
-- CS2 installed through Steam (app looks in `steamapps/common/Counter-Strike Global Offensive`, see `crates/app/src/launch.rs`).
+- CS2 installed through Steam (app looks in `steamapps/common/Counter-Strike Global Offensive`, see `find_cs2` in `crates/app/src/settings.rs`).
 - HLAE 2.192+ with `x64/AfxHookSource2.dll` (`README.md` lists 2.192.7 as tested).
-- NVIDIA GPU with a recent driver for NVENC encoding (optional; software encoding is used otherwise per `crates/app/src/launch.rs`).
+- NVIDIA GPU with a recent driver for NVENC encoding (optional; software encoding is used otherwise per `pipeline::precheck::nvenc_check`).
 - A FACEIT Data API key with Downloads API access for FACEIT features.
 
 **Production / Distribution:**

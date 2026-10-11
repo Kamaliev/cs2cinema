@@ -29,7 +29,7 @@ last_mapped_at: 2026-10-10
 - Impact: Titles or paths containing quotes, commas, `%`, `;` or non-ASCII characters can produce a broken graph that only fails at ffmpeg runtime. The `.bat` output is untested on paths with spaces beyond what the unit test covers (`crates/renderer/src/lib.rs` ~line 665).
 - Fix approach: Centralise escaping in one function with property tests (round-trip through ffmpeg `-filter_complex` in an integration test), and quote all paths in the generated bat.
 
-**Duplicated ffmpeg/ffprobe invocation:**
+**Duplicated ffmpeg/ffprobe invocation:** (ЗАКРЫТО фазами 1 и 4: склейка одна — `pipeline::assemble`, запуск только через `Host::run` с дедлайном; проба NVENC — `pipeline::precheck::nvenc_check`. Текст ниже — было до фазы 4.)
 - Issue: ffmpeg is spawned from at least five places with separate argument sets and separate handling of `-hide_banner`, `no_window`, and error reporting: `crates/app/src/app.rs:559`, `crates/app/src/jobs.rs:314` (`run_ffmpeg`), `crates/app/src/launch.rs:137`, `crates/renderer/src/assemble.rs:121,207,313`, and `crates/cli/src/main.rs`.
 - Impact: Behaviour (progress reporting, error text, window hiding) differs by caller. Fixes must be applied several times.
 - Fix approach: One shared `ffmpeg` runner module in `crates/renderer` used by app, cli and tests.
@@ -49,20 +49,20 @@ last_mapped_at: 2026-10-10
 - Impact: Hard to review; the director crate in particular mixes shot selection, camera rigs and grenade logic.
 - Fix approach: Split `director/src/lib.rs` into `shots.rs`, `selection.rs`, and `plan.rs`; move CLI subcommands into one module each.
 
-**Process and Windows-specific code in the app crate:**
+**Process and Windows-specific code in the app crate:** (ЗАКРЫТО фазами 1–4: процессы и Win32 — только в крейте `host` (`host::Host`, `host::win::WinHost`, фейк для тестов); `crates/app/src/launch.rs` удалён. Текст ниже — было до фазы 4.)
 - Issue: `crates/app/src/launch.rs` contains HLAE launch, `tasklist`/`taskkill` polling, and config-file writing. `crates/app/src/ui.rs:275-281` opens files via `cmd /C start` and `xdg-open`.
 - Impact: Launch logic cannot be exercised without a Windows desktop with CS2 installed.
 - Fix approach: Put process control behind a trait with a fake implementation for tests.
 
 ## Known Bugs and Failure Modes
 
-**Game liveness check defaults to "alive" on error:**
+**Game liveness check defaults to "alive" on error:** (ЗАКРЫТО: живость игры — дескриптор процесса в Job Object и `Liveness` хоста, опроса системными утилитами нет; было до фазы 4.)
 - Symptoms: If `tasklist` fails, `game_alive()` returns `true`, so waiting loops keep polling until the 20-second or other timeout elapses, or indefinitely if the caller has no timeout.
 - Files: `crates/app/src/launch.rs:249-262` (`game_alive`), used by `wait_for_clips` in `crates/app/src/launch.rs` around line 290-320.
 - Trigger: `tasklist` unavailable or blocked by policy.
 - Workaround: Cancel the job from the queue (`crates/app/src/jobs.rs`).
 
-**Killing CS2 kills every instance:**
+**Killing CS2 kills every instance:** (ЗАКРЫТО: хост закрывает только Job Object, который создал сам; чужой `cs2.exe` даёт `FOREIGN_GAME_RUNNING` и остаётся жив; свои сироты после падения убираются по идентичности процесса. Было до фазы 4.)
 - Symptoms: `kill_game()` runs `taskkill /IM cs2.exe /F`, which terminates any running CS2 process, including a player's own unrelated match.
 - Files: `crates/app/src/launch.rs:268-276`.
 - Trigger: Job cancellation or error recovery while the user is playing.
@@ -73,7 +73,7 @@ last_mapped_at: 2026-10-10
 - Files: `crates/cli/tests/pipeline.rs:116`, `crates/pipeline/src/lib.rs`.
 - Trigger: A demo checked out via Git LFS without `git lfs pull`.
 
-**Clip-discovery fragility:**
+**Clip-discovery fragility:** (ЗАКРЫТО фазами 2–3: дубли ищутся по маркерам консоли и проверяются `pipeline::record::verify` / `pipeline::manifest`, а не по времени изменения папки; было до фазы 4.)
 - Symptoms: Clips are matched by directory modification time (`since: SystemTime`) and "stable for N seconds" (3 s after the finish marker, 20 s otherwise). A slow disk or a paused game can produce a truncated or missing take.
 - Files: `crates/app/src/launch.rs` (`wait_for_clips`), `crates/renderer/src/assemble.rs` (`ffprobe` checks).
 - Trigger: Heavy disk load, or HLAE writing a take across a directory rename.
@@ -110,7 +110,7 @@ last_mapped_at: 2026-10-10
 
 ## Performance Bottlenecks
 
-**Fixed-interval polling loops:**
+**Fixed-interval polling loops:** (ЗАКРЫТО в части опроса `tasklist`: процессы не опрашиваются; сессия игры ждёт события с верхней границей `Session::poll`. Было до фазы 4.)
 - Problem: The job worker sleeps 250 ms (`crates/app/src/jobs.rs:218`) and 300 ms (`crates/app/src/jobs.rs:353`); `launch.rs` sleeps 1 s in two loops (lines 193, 312). Each poll of `game_alive` spawns `tasklist`.
 - Files: `crates/app/src/jobs.rs`, `crates/app/src/launch.rs`.
 - Cause: Spawning a process per poll is expensive, and each `tasklist` call takes tens of milliseconds.
@@ -128,14 +128,14 @@ last_mapped_at: 2026-10-10
 - Cause: No streaming; memory grows with match length and player count.
 - Improvement path: Stream by round, or window the position data to the selected shots.
 
-**Synchronous ffmpeg in UI-adjacent paths:**
+**Synchronous ffmpeg in UI-adjacent paths:** (ЗАКРЫТО: ffmpeg запускается только из задачи очереди через `Host::run`; было до фазы 4.)
 - Problem: `crates/app/src/app.rs:559` runs `ffmpeg` directly from the app layer.
 - Files: `crates/app/src/app.rs`.
 - Improvement path: Route all ffmpeg calls through the job queue (`crates/app/src/jobs.rs`), which already has progress reporting.
 
 ## Fragile Areas
 
-**External process orchestration (HLAE, CS2, ffmpeg):**
+**External process orchestration (HLAE, CS2, ffmpeg):** (после фазы 4: оркестровка — `pipeline::record` + `host`, с фейком в тестах; детекторы маркеров по-прежнему зависят от недокументированного вывода игры — это остаётся хрупким местом, закрывается учениями ACC-03. Описание ниже — было до фазы 4.)
 - Files: `crates/app/src/launch.rs`, `crates/app/src/jobs.rs`, `crates/renderer/src/assemble.rs`
 - Why fragile: Depends on HLAE's `AfxHookSource2.dll` layout (`crates/app/src/launch.rs:99`), CS2 console output markers for "take finished", directory names, and `steam.inf` format (`crates/geometry/src/lib.rs:275-279`). Any upstream change breaks recording silently or after a long timeout.
 - Safe modification: Change one detector at a time and run a recording against a real CS2 install (the mocks in `crates/cli/tests/pipeline.rs` do not cover HLAE or CS2).
@@ -153,7 +153,7 @@ last_mapped_at: 2026-10-10
 - Safe modification: Convert `unwrap()` on I/O and parsing to `?` with context; keep `expect` only for invariants.
 - Test coverage: The panic path is not tested.
 
-**Job queue and cancellation:**
+**Job queue and cancellation:** (ЗАКРЫТО фазой 4: отмена идёт через токен в `Host::run` и сессию игры без блокирующих вызовов; прерванные закрытием приложения задачи получают статус «прервана» и докручиваются «Повторить»; очередь — поток `app::queue`. Текст ниже — было до фазы 4.)
 - Files: `crates/app/src/jobs.rs` (373 lines), `crates/store/src/lib.rs` (`add_job`, `next_queued`, `start_job`, `set_stage`, `append_log`)
 - Why fragile: Jobs are persisted to SQLite while a worker thread runs them. Cancellation sets a flag that is checked only inside poll loops (`wait_for_clips` gets `cancelled`), so a job blocked in a synchronous `Command::output()` cannot be cancelled. On startup `reset_running` (`crates/store/src/lib.rs:340`) marks interrupted jobs as `failed`; they are not resumed.
 
@@ -204,7 +204,7 @@ last_mapped_at: 2026-10-10
 
 ## Test Coverage Gaps
 
-**Desktop app (`crates/app`):**
+**Desktop app (`crates/app`):** (частично закрыто фазой 4: автомат очереди `app::queue` и политика `QueuePolicy` покрыты тестами на фейковом хосте; уборка после падения — тесты `pipeline::gamedir`. Текст ниже — было до фазы 4.)
 - What's not tested: Job queue state machine, `wait_for_clips`, `kill_game`, settings persistence, UI layout. Only `crates/app/src/app.rs` contains a single unwrap-style assertion.
 - Files: `crates/app/src/jobs.rs`, `crates/app/src/launch.rs`, `crates/app/src/settings.rs`
 - Risk: Cancellation and polling regressions go unnoticed.

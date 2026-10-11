@@ -27,9 +27,9 @@ cs2cinema — десктопное приложение для Windows (Rust, eg
 
 ## Languages
 
-- Rust (stable toolchain, 2021-style workspace, resolver 2) - all application and library code under `crates/*/src/`. Declared workspace members in `Cargo.toml`: `crates/demo`, `crates/highlights`, `crates/director`, `crates/cs2`, `crates/renderer`, `crates/faceit`, `crates/positions`, `crates/geometry`, `crates/pipeline`, `crates/store`, `crates/app`, `crates/cli`.
+- Rust (stable toolchain, 2021-style workspace, resolver 2) - all application and library code under `crates/*/src/`. Declared workspace members in `Cargo.toml`: `crates/demo`, `crates/highlights`, `crates/director`, `crates/cs2`, `crates/renderer`, `crates/faceit`, `crates/positions`, `crates/geometry`, `crates/host`, `crates/pipeline`, `crates/store`, `crates/app`, `crates/cli`.
 - PowerShell - `install.ps1` (end-user installer, downloads release zip, verifies SHA-256, updates user PATH, creates Start Menu shortcut).
-- POSIX shell and batch - generated assembly scripts written by `crates/renderer/src/assemble.rs` (`assemble.sh`, `assemble.bat`) per output folder; not hand-maintained source.
+- POSIX shell and batch - generated assembly scripts written by `crates/renderer/src/lib.rs` (`assemble.sh`, `assemble.bat`) per output folder; not hand-maintained source.
 - Python 3.11+ - optional `scripts/update_maps.py` (extracts map geometry from a local CS2 install; not needed for normal runs).
 - Protocol Buffers - `crates/demo/proto/demo.proto` and `crates/demo/proto/events.proto` (CS2 demo message definitions, compiled at build time).
 - Source2 Engine Constants/Text - `highlights.cfg`, `cs2c_NN.cfg`, `cs2c_NN_K.xml` camera paths generated for the CS2 console and HLAE (see `crates/renderer/src/lib.rs`). These are outputs, not source.
@@ -37,7 +37,7 @@ cs2cinema — десктопное приложение для Windows (Rust, eg
 
 ## Runtime
 
-- Native binaries, no managed runtime. Primary target is Windows 11 x64 (`cfg(windows)` code paths in `crates/app/src/launch.rs`, `crates/app/src/ui.rs`, `crates/app/src/app.rs`). Linux is built and tested in CI (`.github/workflows/ci.yml`) but the desktop app is Windows-oriented.
+- Native binaries, no managed runtime. Primary target is Windows 11 x64 (`cfg(windows)` code paths in `crates/host/src/win/`, `crates/app/src/ui.rs`, `crates/app/src/app.rs`). Linux is built and tested in CI (`.github/workflows/ci.yml`) but the desktop app is Windows-oriented.
 - Release binaries: `cs2-cli.exe` (crate `cli`) and `cs2cinema.exe` (crate `app`, built with `windows_subsystem = "windows"` in `crates/app/src/main.rs`).
 - Cargo (workspace at `Cargo.toml`).
 - Lockfile: present - `Cargo.lock` at repo root (committed).
@@ -55,7 +55,8 @@ cs2cinema — десктопное приложение для Windows (Rust, eg
 - `geometry` - map mesh loading (AWMH format) and wall geometry (`crates/geometry/src/lib.rs`).
 - `director` - camera director: grenade, rig, shot planning (`crates/director/src/grenade.rs`, `rig.rs`, `lib.rs`).
 - `highlights` - scoring and selection of highlight moments (`crates/highlights/src/lib.rs`).
-- `renderer` - writes HLAE/CS2 scripts and ffmpeg filter graphs (`crates/renderer/src/lib.rs`, `assemble.rs`).
+- `renderer` - writes HLAE/CS2 scripts and ffmpeg filter graphs (`crates/renderer/src/lib.rs`); сама склейка — `pipeline::assemble`.
+- `host` - граница с ОС: процессы, Job Object, сокет консоли игры, уведомление в трее (`crates/host/src/`).
 - `pipeline` - orchestrates demo to plan to render (`crates/pipeline/src/lib.rs`).
 - `faceit` - FACEIT Data API client (`crates/faceit/src/lib.rs`, `stats.rs`).
 - `store` - SQLite persistence (`crates/store/src/lib.rs`).
@@ -79,9 +80,9 @@ cs2cinema — десктопное приложение для Windows (Rust, eg
 - `sha2` 0.10 - SHA-256 in `crates/app` (used for update/verification).
 - `image` 0.25.10 - pulled in transitively (via eframe/egui and rfd stack); not a direct dependency of a workspace crate.
 - `tray-icon` 0.19.3 - Windows tray integration.
-- `ffmpeg` 7+ and `ffprobe` - clip assembly and duration probe. Invoked via `Command::new("ffmpeg")` / `Command::new("ffprobe")` in `crates/renderer/src/assemble.rs`, `crates/app/src/app.rs` (line ~559), `crates/app/src/jobs.rs` (line ~314). NVENC availability check in `crates/app/src/launch.rs` (`nvenc_check`).
-- `HLAE.exe` (advancedfx) with `x64/AfxHookSource2.dll` - records CS2 via `startmovie`. Launched in `crates/app/src/launch.rs` (`launch`), path discovered by `find_hlae`.
-- `tasklist` and `taskkill` (Windows) - checking/stopping `cs2.exe` in `crates/app/src/launch.rs`.
+- `ffmpeg` 7+ and `ffprobe` - clip assembly and duration probe. Started only through `host::Host::run` (deadline + cancel) from `pipeline::assemble` and `pipeline::record::verify`. NVENC availability check: `pipeline::precheck::nvenc_check`.
+- `HLAE.exe` (advancedfx) with `x64/AfxHookSource2.dll` - records CS2 via `startmovie`. Launched by `host::win::WinHost::launch` inside a Job Object, path discovered by `find_hlae` in `crates/app/src/settings.rs` (or `--hlae`/`HLAE_DIR` in the console).
+- Windows API (`windows-sys` 0.61 in `crates/host`, только `cfg(windows)`): Job Object, process handles, `Shell_NotifyIconW` for the tray balloon. The earlier `tasklist`/`taskkill` utilities were removed in phase 4 ("было до фазы 4"); the workspace has no calls to them.
 - `cmd` / `xdg-open` - opening URLs in `crates/app/src/ui.rs`.
 - `git` - queries the latest `awpy-data` release tag in `crates/geometry/src/lib.rs` (line ~293).
 
@@ -110,9 +111,9 @@ cs2cinema — десктопное приложение для Windows (Rust, eg
 - Optional: Python 3.11+ for `scripts/update_maps.py`.
 - Recommended: `ffmpeg` 7+ on `PATH` (`winget install Gyan.FFmpeg`).
 - Windows 11 x64 (release artifacts are `cs2cinema-windows-x64.zip` and `cs2-cli.exe`).
-- CS2 installed through Steam (app looks in `steamapps/common/Counter-Strike Global Offensive`, see `crates/app/src/launch.rs`).
+- CS2 installed through Steam (app looks in `steamapps/common/Counter-Strike Global Offensive`, see `find_cs2` in `crates/app/src/settings.rs`).
 - HLAE 2.192+ with `x64/AfxHookSource2.dll` (`README.md` lists 2.192.7 as tested).
-- NVIDIA GPU with a recent driver for NVENC encoding (optional; software encoding is used otherwise per `crates/app/src/launch.rs`).
+- NVIDIA GPU with a recent driver for NVENC encoding (optional; software encoding is used otherwise per `pipeline::precheck::nvenc_check`).
 - A FACEIT Data API key with Downloads API access for FACEIT features.
 - GitHub Releases on `Kamaliev/cs2cinema`: `release.yml` builds `cs2-cli` and `cs2cinema` on `windows-latest` on tags `v*` and packages `cs2cinema-windows-x64.zip` plus `.sha256`.
 - Installer: `install.ps1` (downloads from `https://github.com/Kamaliev/cs2cinema/releases/latest/download/`, installs to `%LOCALAPPDATA%\cs2cinema`, adds to user PATH).
@@ -212,8 +213,9 @@ cs2cinema — десктопное приложение для Windows (Rust, eg
 
 ## Pattern Overview
 
-- Workspace members are declared in `Cargo.toml` (`crates/demo`, `highlights`, `director`, `cs2`, `renderer`, `faceit`, `positions`, `geometry`, `pipeline`, `store`, `app`, `cli`).
-- Data is transformed in one direction: demo bytes -> `demo::Parsed` -> `cs2::Match` -> `highlights::Highlight` -> `director::Timeline` -> `renderer::Output` files -> HLAE recording -> `renderer::assemble` MP4.
+- Workspace members are declared in `Cargo.toml` (`crates/demo`, `highlights`, `director`, `cs2`, `renderer`, `faceit`, `positions`, `geometry`, `host`, `pipeline`, `store`, `app`, `cli`).
+- Data is transformed in one direction: demo bytes -> `demo::Parsed` -> `cs2::Match` -> `highlights::Highlight` -> `director::Timeline` -> `renderer::Output` files -> HLAE recording (`pipeline::record` over `host::Host`) -> `pipeline::assemble` MP4.
+- Every process, socket and Win32 call goes through `host::Host` (`host::win::WinHost` on Windows, `host::fake::FakeHost` in tests); the game lives in a Job Object and is held by handle, not found by name (since phase 4).
 - Domain types derive `serde::Serialize`/`Deserialize` so intermediate results persist as JSON (`plan.json`, `highlights.cfg`) and as SQLite rows (`crates/store/src/lib.rs`).
 - Long-running work runs on `std::thread::spawn` threads, not an async runtime. No `tokio` dependency is declared in the workspace crates reviewed.
 - Progress and cancellation are injected through the `pipeline::Progress` trait (`crates/pipeline/src/lib.rs:44`), with `pipeline::check` returning early when cancelled; `pipeline::Quiet` is the no-op implementation for the CLI.
@@ -245,25 +247,28 @@ cs2cinema — десктопное приложение для Windows (Rust, eg
 - Contains: `Timeline`, `Shot`, `Segment`, `Camera`, `CamKey`, `ScaleKey`, `Order`, `Density`, `Config`, `Pose`, `PositionSource`, `look_at`.
 - Depends on: `cs2`, `highlights`.
 - Used by: `renderer`, `pipeline`, `positions`, `cli`.
-- Purpose: Serialize a `Timeline` into the files HLAE and ffmpeg consume, and assemble recorded takes.
-- Location: `crates/renderer/src/lib.rs` (`render` at line 149, `Output::write_to`, `record_order`, `ffmpeg_args`, `capture_fps`, `console_safe`), `crates/renderer/src/assemble.rs` (`find_clip`, `assemble`, `ffmpeg_args`, `Options`, `Clip`, `Report`).
+- Purpose: Serialize a `Timeline` into the files HLAE and ffmpeg consume (the assembly itself moved to `pipeline::assemble` in phase 4; `crates/renderer/src/assemble.rs` no longer exists).
+- Location: `crates/renderer/src/lib.rs` (`render`, `Output::write_to`, `record_order`, `ffmpeg_args`, `capture_fps`, `console_safe`).
 - Contains: writers for `plan.json`, `highlights.cfg`, `cs2c_NN.cfg`, `campath_NN.xml`, `assemble.sh`, `assemble.bat`, `assemble.ffgraph`.
 - Depends on: `cs2`, `director`.
-- Used by: `pipeline`, `app` (via `pipeline`), `cli`.
-- Purpose: Single entry for the full flow used by both UIs.
-- Location: `crates/pipeline/src/lib.rs`.
-- Contains: `Stage` enum (`Download, Parse, Positions, Geometry, Plan, Record, Assemble, Done`), `Source` (`File` or `Faceit { link, key, demo_index, dir }`), `analyze`, `plan_player`, `load_positions`, `PlanOptions`, `Plan`, `find_player`, `CANCELLED` sentinel string.
-- Depends on: `demo`, `cs2`, `highlights`, `director`, `renderer`, `faceit`, `positions`, `geometry`.
+- Used by: `pipeline`, `cli`.
+- Purpose: The only crate that starts processes, opens sockets and calls Win32 (`host::Host` trait: launch the game session, run a command with deadline and cancel, `notify`, `now`).
+- Location: `crates/host/src/lib.rs` (trait, `Session`, `Source`, `SessionEvent`), `crates/host/src/win/` (`WinHost` with a Job Object around HLAE/CS2, netcon, `console.log` watcher, `notify.rs` tray balloon via `Shell_NotifyIconW`), `crates/host/src/fake.rs` (`FakeHost`, virtual time), `crates/host/src/unsupported.rs`.
+- Rule: the host reports facts, the caller decides (waits, deadlines, "is it a failure") — policy lives in `pipeline::record`.
+- Used by: `pipeline`, `app`, `cli`.
+- Purpose: Single entry for the full flow used by both UIs: one task from link to `highlights.mp4`.
+- Location: `crates/pipeline/src/lib.rs` (`analyze`, `plan_player`, `load_positions`, `Progress`, `Stage`, `RunError`, `CANCELLED`), `job.rs` (`run_job`, `JobSpec`, `JobConfig`, `Outcome`, precheck/record/resume stages), `record/` (state machine, deadlines, failure classes `FailCode`/`FailClass`, markers), `precheck/` (environment checks, `nvenc_check`), `gamedir.rs` (files installed into the game folder, `installed.json`, cleanup after a crash), `assemble.rs` (`assemble_stage`, the only ffmpeg assembly, via `Host::run` with a deadline), `manifest.rs` (verified takes), `acceptance.rs` (acceptance set and batch naming).
+- Depends on: `demo`, `cs2`, `highlights`, `director`, `renderer`, `faceit`, `positions`, `geometry`, `host`.
 - Used by: `app`, `cli`.
 - Purpose: SQLite application database for montage jobs, FACEIT response cache, and downloaded-demo registry.
-- Location: `crates/store/src/lib.rs`.
-- Contains: `JobKind` (`Plan`, `Record`), `Store` (wraps `rusqlite::Connection` in `Arc<Mutex<...>>`), `next_queued`, `start_job`, `finish_job`, `cancel_job`; `Result<T> = std::result::Result<T, String>`.
+- Location: `crates/store/src/lib.rs`, `crates/store/src/journal.rs` (parsing the job log: attempts and outcomes).
+- Contains: `JobKind` (`Plan`, `Record`), `Store` (wraps `rusqlite::Connection` in `Arc<Mutex<...>>`), `next_queued`, `start_job`, `finish_job`, `cancel_job`, `requeue_auto`, `open_read_only` (used by `cs2-cli acceptance`); columns `auto_retries` and `batch` (migration 5); `Result<T> = std::result::Result<T, String>`.
 - Depends on: `rusqlite`, `serde`. No workspace crates.
-- Used by: `app` only.
+- Used by: `app`, `cli` (read only).
 - Purpose: User interfaces.
-- Location: `crates/app/src/` (egui/eframe desktop UI) and `crates/cli/src/main.rs` (command-line tool, Russian-language usage text).
+- Location: `crates/app/src/` (egui/eframe desktop UI; `queue.rs` is the queue thread) and `crates/cli/src/` (`main.rs`, `record.rs`, `acceptance.rs`; Russian-language usage text).
 - Contains: see Entry Points and STRUCTURE.md.
-- Depends on: `pipeline`, `renderer`, `director`, `cs2`, `highlights`, `store`, `faceit`; `cli` also depends directly on `demo`, `positions`, `geometry`.
+- Depends on: `pipeline`, `host`, `renderer`, `director`, `cs2`, `highlights`, `store`, `faceit`; `cli` also depends directly on `demo`, `positions`, `geometry`.
 - Used by: end users only.
 
 ## Data Flow
@@ -272,7 +277,7 @@ cs2cinema — десктопное приложение для Windows (Rust, eg
 
 ### Desktop job lifecycle (`crates/app`)
 
-### CLI path (`crates/cli/src/main.rs`)
+### CLI path (`crates/cli/src/`)
 
 - Pipeline state is passed by value between stages (`Analysis`, `Plan`, `Timeline`); there is no global pipeline state.
 - Desktop state lives in `App` (`crates/app/src/app.rs:127`) with sub-structs `MatchesState`, `MatchState`, `JobsState`, and `Settings` (`crates/app/src/settings.rs`).
@@ -293,7 +298,7 @@ cs2cinema — десктопное приложение для Windows (Rust, eg
 - Examples: implemented by `positions::Track` (`crates/positions/src/lib.rs`); `director::NoPositions` is the null implementation.
 - Pattern: Trait object passed as `&dyn PositionSource` into `direct_all`, `direct`, and `shoot`.
 - Purpose: Stage/log/cancel callbacks decoupled from the UI.
-- Examples: `pipeline::Quiet` (CLI), `app::jobs::JobReporter` (desktop).
+- Examples: `pipeline::Quiet` (tests), `cli::record::ConsoleProgress` (console), `app::jobs::JobReporter` (desktop).
 - Pattern: `&dyn Progress` threaded through every long operation; `check(p)?` at checkpoints.
 - Purpose: Shared handle to the SQLite database.
 - Examples: `crates/store/src/lib.rs`
@@ -307,30 +312,31 @@ cs2cinema — десктопное приложение для Windows (Rust, eg
 - Location: `crates/app/src/main.rs` (`fn main`, line 19)
 - Triggers: user launches `cs2cinema` executable (`crates/app/Cargo.toml` binary).
 - Responsibilities: builds the eframe window, sets up tray icon (Windows), constructs `app::App::new`.
-- Location: `crates/cli/src/main.rs`
-- Triggers: `cs2-cli <FACEIT link | .dem path> [options]` or `cs2-cli assemble ...`.
+- Location: `crates/cli/src/main.rs` (+ `record.rs`, `acceptance.rs`)
+- Triggers: `cs2-cli <FACEIT link | .dem path> [options]`, `cs2-cli record|retry ...`, `cs2-cli assemble <папка задачи>`, `cs2-cli acceptance check|state|job|set`.
 - Responsibilities: argument parsing, pipeline invocation, plan and file output; CI builds it (`.github/workflows/ci.yml`, `cargo build --release -p cli`).
 - `crates/cli/tests/pipeline.rs`, `crates/positions/tests/real_demo.rs`, and in-file `mod tests` blocks in most library crates. Real-demo tests are skipped unless `CS2_TEST_DEMO` is set (see `.github/workflows/ci.yml`).
 
 ## Architectural Constraints
 
-- **Threading:** Multi-threaded using `std::thread`. The desktop app runs at most one pipeline job at a time because CS2 records only one game instance (`crates/store/src/lib.rs` module doc; `crates/app/src/jobs.rs:63`). UI-side background work (`App::spawn`, `crates/app/src/app.rs:220`) runs in detached threads that report via `Msg`.
+- **Threading:** Multi-threaded using `std::thread`. The desktop app runs at most one pipeline job at a time because CS2 records only one game instance (`crates/store/src/lib.rs` module doc; the queue thread `crates/app/src/queue.rs` takes one task at a time). UI-side background work (`App::spawn`, `crates/app/src/app.rs:220`) runs in detached threads that report via `Msg`.
 - **Global state:** `store::Store` is a shared `Arc<Mutex<Connection>>`. `crates/app/src/main.rs` installs global tray menu and tray-icon event handlers (`MenuEvent::set_event_handler`, `TrayIconEvent::set_event_handler`), which are process-wide.
 - **Circular imports:** None observed. The crate graph is a DAG: `demo` -> `cs2` -> `highlights` -> `director` -> `renderer` -> `pipeline` -> `app`/`cli`, with `positions` and `geometry` feeding `director`/`pipeline`.
-- **External tools:** `ffmpeg` and `ffprobe` must be on `PATH` (`crates/app/src/jobs.rs:314`, `crates/renderer/src/assemble.rs:121`, `:207`); HLAE is launched by path (`crates/app/src/launch.rs:166`); Windows process control uses `tasklist`/`taskkill` (`crates/app/src/launch.rs:254`, `:271`).
+- **External tools:** `ffmpeg` and `ffprobe` must be on `PATH` (checked by `pipeline::precheck`; run through `Host::run` with a deadline in `pipeline::assemble`); HLAE is launched by path through `host::win::WinHost` (the game sits in a Job Object and is tracked by handle). Since phase 4 the app no longer polls or kills processes with system utilities (the old `launch.rs` with `tasklist`/`taskkill` was removed — "было до фазы 4"); a foreign `cs2.exe` is detected and left alone (`FOREIGN_GAME_RUNNING`), only our own orphans are removed by identity.
 - **Network:** FACEIT API and CDN (`crates/faceit`), map geometry fetch from GitHub releases (`crates/geometry/src/lib.rs:292`, `:371`), update check (`crates/app/src/update.rs`).
 - **Platform:** Windows is the primary target. `#![cfg_attr(windows, windows_subsystem = "windows")]` in `crates/app/src/main.rs`; several modules are Windows-only.
 - **Language:** User-facing strings (CLI usage, UI labels, job titles, `Stage::title`) are in Russian; identifiers and code comments mix English and Russian.
 
 ## Anti-Patterns
 
-### Duplicated ffmpeg invocation
+### Duplicated ffmpeg invocation — закрыто (фазы 1–4)
 
-### Record and assemble sequencing outside `pipeline`
+### Record and assemble sequencing outside `pipeline` — закрыто (фаза 4)
 
 ## Error Handling
 
-- Cancellation is an error value: `pipeline::CANCELLED` is matched in `jobs::run_next` to choose `store.cancel_job` over `store.finish_job`.
+- Cancellation is an error value: `pipeline::CANCELLED` is matched in `app::jobs::finish` to choose `store.cancel_job` over `store.finish_job`.
+- Task failures are typed: `pipeline::RunError.fail` carries a `RecordFailure` (`FailCode`, state, hint); `pipeline::record::failure::classify` maps it to `FailClass { Launch, Environment, Other }`, which `app::queue::QueuePolicy` uses for auto-retry and pause.
 - Optional geometry and positions degrade gracefully: `--no-walls`, `--no-flybys`, and `--offline` skip those inputs (`crates/cli/src/main.rs` usage text) and `director::NoPositions` is used instead of `positions::Track`.
 - Job failures are persisted (`store.finish_job(job.id, Err(e))`) and shown in the jobs page (`crates/app/src/jobs_page.rs`).
 

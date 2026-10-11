@@ -71,15 +71,19 @@ cs2cinema/                       # repo root (cargo workspace)
 
 **`crates/renderer/`:**
 - Purpose: Output writers for HLAE and ffmpeg.
-- Key files: `crates/renderer/src/lib.rs` (`render`, `Output`, `Config`, `record_order`, `ffmpeg_args`, `console_safe`), `crates/renderer/src/assemble.rs` (`assemble`, `find_clip`, `ffmpeg_args`, `Options`, `Clip`, `Report`).
+- Key files: `crates/renderer/src/lib.rs` (`render`, `Output`, `Config`, `record_order`, `ffmpeg_args`, `console_safe`). Склейка живёт в `pipeline::assemble`, файла `renderer/src/assemble.rs` больше нет.
+
+**`crates/host/`:**
+- Purpose: Граница с ОС — единственный крейт, который запускает процессы, открывает сокеты и вызывает Win32 (`Host`, `Session`, `win::WinHost` с Job Object, `win::notify`, `fake::FakeHost`, `unsupported`).
+- Key files: `crates/host/src/lib.rs`, `crates/host/src/win/`, `crates/host/src/fake.rs`.
 
 **`crates/pipeline/`:**
 - Purpose: Single entry point shared by the app and CLI.
-- Key files: `crates/pipeline/src/lib.rs` (`Stage`, `Progress`, `Quiet`, `Source`, `analyze`, `plan_player`, `find_player`, `PlanOptions`, `Plan`, `CANCELLED`, `console_name`, `absolute_slash`).
+- Key files: `crates/pipeline/src/lib.rs` (`Stage`, `Progress`, `Quiet`, `Source`, `analyze`, `plan_player`, `find_player`, `PlanOptions`, `Plan`, `CANCELLED`, `console_name`, `absolute_slash`), `crates/pipeline/src/job.rs` (`run_job`, `JobSpec`, `Outcome`), `crates/pipeline/src/gamedir.rs`, `crates/pipeline/src/assemble.rs`, `crates/pipeline/src/manifest.rs`, `crates/pipeline/src/acceptance.rs`, `crates/pipeline/src/record/` (автомат записи, дедлайны, коды сбоев), `crates/pipeline/src/precheck/` (предпроверка окружения, `nvenc_check`).
 
 **`crates/store/`:**
 - Purpose: SQLite persistence.
-- Key files: `crates/store/src/lib.rs` (`Store`, `Job`, `JobKind`, `next_queued`, `start_job`, `finish_job`, `cancel_job`, `demo_path`, `remember_demo`).
+- Key files: `crates/store/src/lib.rs` (`Store`, `Job`, `JobKind`, `next_queued`, `start_job`, `finish_job`, `cancel_job`, `demo_path`, `remember_demo`, `requeue_auto`, `open_read_only`), `crates/store/src/journal.rs` (разбор журнала: попытки и исходы).
 
 **`crates/app/`:**
 - Purpose: Desktop application (eframe/egui, Windows tray).
@@ -87,11 +91,11 @@ cs2cinema/                       # repo root (cargo workspace)
 - Key files:
   - `crates/app/src/main.rs`: `fn main`, window options, tray setup, module declarations.
   - `crates/app/src/app.rs`: `App`, `Page`, `Msg`, `Reporter`, `enqueue`, `cancel_job`, `poll`, sidebar.
-  - `crates/app/src/jobs.rs`: `run_next` (thread spawn), `run` (full job), `record`, `run_ffmpeg`, `JobReporter`.
+  - `crates/app/src/jobs.rs`: `runner` (исполнитель задачи поверх `pipeline::job::run_job`), `job_spec`, `job_config`, `recover_after_crash`, `JobReporter`, `acceptance_jobs`.
+  - `crates/app/src/queue.rs`: поток очереди `cs2cinema-queue` — `Queue`, `QueuePolicy` (авто-повтор, пауза), `PauseReason`, `Summary`; итог очереди уходит в трей (`host::win::notify`).
   - `crates/app/src/jobs_page.rs`: job list UI.
   - `crates/app/src/match_page.rs`: match view UI.
   - `crates/app/src/player.rs`: player view and summary.
-  - `crates/app/src/launch.rs`: HLAE/CS2 launch, process checks (`tasklist`, `taskkill`), NVENC checks.
   - `crates/app/src/settings.rs` and `crates/app/src/settings_page.rs`: settings model and UI.
   - `crates/app/src/status.rs`: busy status and progress bar state.
   - `crates/app/src/ui.rs`: shared widgets and `icon_rgba`, `open` helpers.
@@ -100,7 +104,7 @@ cs2cinema/                       # repo root (cargo workspace)
 
 **`crates/cli/`:**
 - Purpose: Command-line tool `cs2-cli`.
-- Key files: `crates/cli/src/main.rs` (`parse_args`, `Args`, `USAGE`, pipeline and `assemble` subcommand), `crates/cli/tests/pipeline.rs`.
+- Key files: `crates/cli/src/main.rs` (`parse_args`, `Args`, `USAGE`, подкоманда `assemble <папка задачи>`), `crates/cli/src/record.rs` (`record`, `retry`, `ConsoleProgress`), `crates/cli/src/acceptance.rs` (`acceptance check|state|job|set`), `crates/cli/tests/pipeline.rs`, `crates/cli/tests/assemble.rs`.
 
 ## Key File Locations
 
@@ -119,7 +123,9 @@ cs2cinema/                       # repo root (cargo workspace)
 - `crates/pipeline/src/lib.rs`: stage sequence.
 - `crates/director/src/lib.rs`: shot planning.
 - `crates/renderer/src/lib.rs`: output file generation.
-- `crates/app/src/jobs.rs`: desktop job execution.
+- `crates/pipeline/src/job.rs`: `run_job` — задача целиком (общая для окна и консоли).
+- `crates/app/src/queue.rs`: очередь задач в своём потоке.
+- `crates/host/src/`: граница с ОС (`Host`, `win::WinHost`, `win::notify`, `fake::FakeHost`).
 
 **Testing:**
 - Inline `mod tests` in `crates/cs2/src/lib.rs`, `crates/director/src/lib.rs`, `crates/faceit/src/lib.rs`, `crates/geometry/src/lib.rs`, `crates/highlights/src/lib.rs`, `crates/pipeline/src/lib.rs`, `crates/positions/src/lib.rs`, `crates/renderer/src/lib.rs`, `crates/store/src/lib.rs`.
@@ -160,7 +166,7 @@ cs2cinema/                       # repo root (cargo workspace)
 - Tests: inline `mod tests` in `crates/director/src/lib.rs`.
 
 **New output file or HLAE/ffmpeg format:**
-- Implementation: `crates/renderer/src/lib.rs` (`Output`, `render`) for HLAE files; `crates/renderer/src/assemble.rs` for ffmpeg assembly.
+- Implementation: `crates/renderer/src/lib.rs` (`Output`, `render`) for HLAE files; `crates/pipeline/src/assemble.rs` for ffmpeg assembly.
 
 **New demo event or entity field:**
 - Protobuf source: `crates/demo/proto/*.proto` (compiled by `crates/demo/build.rs`).
@@ -172,7 +178,7 @@ cs2cinema/                       # repo root (cargo workspace)
 
 **New background job type:**
 - Store: add a `JobKind` variant and SQL handling in `crates/store/src/lib.rs`.
-- Execution: `crates/app/src/jobs.rs` (`run`).
+- Execution: `crates/app/src/jobs.rs` (`runner`, `job_spec`) поверх `pipeline::job::run_job`; порядок и политика — `crates/app/src/queue.rs`.
 - UI: `crates/app/src/jobs_page.rs`.
 
 **New CLI option:**

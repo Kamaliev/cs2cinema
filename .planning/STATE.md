@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 07
 current_phase_name: Telegram-бот и доставка
 status: executing
-stopped_at: Completed 07-08-PLAN.md
-last_updated: "2026-10-11T21:02:46.474Z"
+stopped_at: Completed 07-09-PLAN.md
+last_updated: "2026-10-11T21:14:51.093Z"
 last_activity: 2026-10-12
 last_activity_desc: Phase 07 execution started
-state_head: 48cbd9cb8118be7942571008665d1d905010c10f
+state_head: cc0fd50f5c38d85916421de411713a9c9e7e260e
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 27
-  completed_plans: 25
+  completed_plans: 26
   percent: 40
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 07 (Telegram-бот и доставка) — EXECUTING
-Plan: 9 of 11
+Plan: 10 of 11
 Status: Ready to execute
 Last activity: 2026-10-12 — Phase 07 execution started
 
@@ -118,6 +118,7 @@ Progress: [████░░░░░░] 40%
 | Phase 07 P10 | ~40min | 3 tasks | 9 files |
 | Phase 07 P07 | 75min | 3 tasks | 10 files |
 | Phase 07 P08 | 35min | 3 tasks | 5 files |
+| Phase 07 P09 | 40min | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -224,6 +225,8 @@ Recent decisions affecting current work:
 - [Phase 07]: 07-07: голый id матча тоже считается попыткой ссылки и получает объяснение с примером; Task.demo всегда remote/srv{id}.dem, FACEIT-демку кладёт исполнитель
 - [Phase 07]: 07-07: наружу из раннера идут фиксированные фразы FACEIT_FETCH_FAILED; ключ FACEIT только из FACEIT_API_KEY у раннера
 - [Phase 07]: 07-08: заглушённый чат (403) глушит все строки tg_jobs чата; первое сообщение статуса после постановки идёт через notify::push_now и считается в частоте правок; /retry только владельцу, несуществующий номер отвечает как чужой
+- [Phase 07]: 07-09: исход доставки и отчёт о сбое делят final_reported_ms; /resend снимает отметку и разглушает чат; повторяется только запрос, который точно не ушёл
+- [Phase 07]: 07-09: /resend чужой или несуществующей задачи отвечает «Это не ваша задача.» — наличие чужих задач не раскрывается; админ чужой ролик не получает
 
 ### Pending Todos
 
@@ -253,6 +256,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T21:02:46.353Z
-Stopped at: Completed 07-08-PLAN.md
+Last session: 2026-10-11T21:14:50.970Z
+Stopped at: Completed 07-09-PLAN.md
 Resume file: None

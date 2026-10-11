@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 06
 current_phase_name: Раннер, защита входа и первый живой прогон
 status: executing
-stopped_at: Completed 06-07-PLAN.md
-last_updated: "2026-10-11T16:15:10.988Z"
+stopped_at: Completed 06-08-PLAN.md
+last_updated: "2026-10-11T16:34:52.266Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 06 execution started
-state_head: a04806af9534ec076f98927de52aad80ef525102
+state_head: 3a6820d999c767d26130ab625198cd5b38102229
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 16
-  completed_plans: 12
+  completed_plans: 13
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 06 (Раннер, защита входа и первый живой прогон) — EXECUTING
-Plan: 8 of 11
+Plan: 9 of 11
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 06 execution started
 
@@ -104,6 +104,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 06 P05 | 25min | 2 tasks | 9 files |
 | Phase 06 P06 | 55min | 2 tasks | 5 files |
 | Phase 06 P07 | 40 min | 2 tasks | 6 files |
+| Phase 06 P08 | 70min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -186,6 +187,10 @@ Recent decisions affecting current work:
 - [Phase 06]: Тексты PLAYER_AMBIGUOUS и PLAYER_NOT_FOUND родитель собирает сам из очищенных кандидатов ребёнка
 - [Phase 06]: Не запустившийся ребёнок (Spawn и прочее, кроме таймаута и отмены) даёт PRECHECK_FAILED, а не BAD_DEMO
 - [Phase 06]: Недоступный файл демки остаётся строкой с путём без типизации: это неисправность вызывающего
+- [Phase 06]: Uplink::start принимает Timing вместо двух Duration: семь аргументов укладываются в лимит clippy
+- [Phase 06]: Токен отозван (401): раннер останавливается с сообщением, задача остаётся в состоянии; stale_epoch и job_terminal бросают задачу без finish
+- [Phase 06]: Остановка раннера не отмена: серверная отмена важнее локальной остановки, при одной остановке задача остаётся в Executing
+- [Phase 06]: Строка эскалации мягкой отмены пишется один раз через inner.log; пульс не запускается на этапе Reporting
 
 ### Pending Todos
 
@@ -215,6 +220,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T16:15:10.882Z
-Stopped at: Completed 06-07-PLAN.md
+Last session: 2026-10-11T16:34:52.151Z
+Stopped at: Completed 06-08-PLAN.md
 Resume file: None

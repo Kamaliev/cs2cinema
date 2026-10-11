@@ -27,7 +27,7 @@ use wire::{
     Phase, ReleaseRequest, fail,
 };
 
-pub use exec::{Executor, Task};
+pub use exec::{Executor, InspectSettings, PipelineExecutor, Task};
 pub use link::{Link, LinkError, Token};
 pub use policy::{Disposition, Flags, PausePolicy, PauseReason, dispose, failure_of};
 pub use state::{HeldJob, ResultFile, RunnerState, Stage};

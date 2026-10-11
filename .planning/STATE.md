@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 05
 current_phase_name: Ядро сервера и протокол
 status: executing
-stopped_at: Completed 05-01-PLAN.md
-last_updated: "2026-10-11T10:50:51.180Z"
+stopped_at: Completed 05-02-PLAN.md
+last_updated: "2026-10-11T11:00:01.356Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 05 execution started
-state_head: 087094e05a509d06e09cd7eb72eb8780e9eab978
+state_head: 5d97669a07cf74c4afa1b819e185282884aec7a4
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 5
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 05 (Ядро сервера и протокол) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 05 execution started
 
@@ -93,6 +93,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 04 P10 | 35min | 3 tasks | 9 files |
 | Phase 04 P11 | n/a | 2 tasks | 7 files |
 | Phase 05 P01 | 35min | 3 tasks | 20 files |
+| Phase 05 P02 | 40min | 2 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -155,6 +156,8 @@ Recent decisions affecting current work:
 - [Phase 04]: 04-10: acceptance check/state/job читают базу только Store::open_read_only; ничего не удаляют и не завершают
 - [Phase 04]: 04-11: учения D1-D6 не проводились, приняты по указанию автора без улик; ACC-03 остаётся Pending, A1/A3/кириллица в трее не проверены
 - [Phase 05]: Настройки сервера — JSON-файл без крейта toml; время в базе — unix-мс по часам сервера; пути хранилища только из целых id
+- [Phase 05]: tiny_http 0.12 подтверждён как HTTP-стек (D-01): тесты протокола проходят, axum не нужен
+- [Phase 05]: http::start_with_flag: общий флаг остановки у Ctx и HttpServer; Core::claim без фильтра max_grants (потолок — в плане аренд)
 
 ### Pending Todos
 
@@ -184,6 +187,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T10:50:51.150Z
-Stopped at: Completed 05-01-PLAN.md
+Last session: 2026-10-11T11:00:01.327Z
+Stopped at: Completed 05-02-PLAN.md
 Resume file: None

@@ -3,6 +3,7 @@
 //! Пути строятся только из целых идентификаторов задач; имя файла пользователя в путь не попадает
 //! (оно хранится в базе как данные для показа).
 
+use crate::core::FileRow;
 use crate::{Result, hex};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -341,6 +342,47 @@ impl Blobs {
         }
         out
     }
+
+    /// Кладёт демку задачи `to_job` как жёсткую ссылку на демку задачи `from_job` — без повторной загрузки и
+    /// без второй копии на диске. Если ссылку сделать нельзя (другая файловая система, нет прав), файл
+    /// копируется с подсчётом SHA-256. В обоих случаях размер и хеш обязаны совпасть с `known` (строка `files`
+    /// исходной демки), иначе новый файл удаляется и возвращается ошибка.
+    ///
+    /// У файла демки может быть несколько ссылок: уборщик (фаза 9) удаляет путь задачи, а не содержимое, и
+    /// не должен считать место свободным, пока жива хотя бы одна ссылка.
+    pub fn link_demo(&self, from_job: i64, to_job: i64, known: &FileRow) -> Result<Ingested> {
+        let src = self.demo_path(from_job);
+        let dst = self.demo_path(to_job);
+        let dir = dst.parent().expect("путь демки всегда с родителем");
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if std::fs::hard_link(&src, &dst).is_ok() {
+            let size = std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(u64::MAX);
+            if size == known.size {
+                return Ok(Ingested {
+                    size,
+                    sha256: known.sha256.clone(),
+                });
+            }
+            let _ = std::fs::remove_file(&dst);
+            return Err(format!(
+                "демка задачи #{from_job} на диске имеет другой размер, чем записано в базе"
+            ));
+        }
+        let part = dir.join("demo.part");
+        let got = copy_hashed(&src, &part, known.size).and_then(|r| {
+            if r.sha256 != known.sha256 || r.size != known.size {
+                return Err(format!(
+                    "демка задачи #{from_job} на диске не совпадает с записанной в базе"
+                ));
+            }
+            std::fs::rename(&part, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+            Ok(r)
+        });
+        if got.is_err() {
+            let _ = std::fs::remove_file(&part);
+        }
+        got
+    }
 }
 
 fn copy_hashed(src: &Path, part: &Path, max_bytes: u64) -> Result<Ingested> {
@@ -440,6 +482,77 @@ mod tests {
             !blobs.demo_path(8).exists()
                 && !blobs.demo_path(8).with_file_name("demo.part").exists()
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn known_of(blobs: &Blobs, job: i64) -> FileRow {
+        let bytes = std::fs::read(blobs.demo_path(job)).unwrap();
+        FileRow {
+            rel_path: demo_rel(job),
+            size: bytes.len() as u64,
+            sha256: hex(&Sha256::digest(&bytes)),
+        }
+    }
+
+    #[test]
+    fn link_demo_makes_a_hard_link_not_a_copy() {
+        let d = dir("link");
+        let src = d.join("src.dem");
+        std::fs::write(&src, b"PBDEMS2\0abc").unwrap();
+        let blobs = Blobs::new(d.join("blobs"));
+        blobs.ingest_demo(1, &src, 1024).unwrap();
+        let known = known_of(&blobs, 1);
+        let got = blobs.link_demo(1, 2, &known).unwrap();
+        assert_eq!((got.size, &got.sha256), (known.size, &known.sha256));
+        assert_eq!(std::fs::read(blobs.demo_path(2)).unwrap(), b"PBDEMS2\0abc");
+        // Одно содержимое под двумя именами: дописанный в исходник байт виден и по новому пути.
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(blobs.demo_path(1))
+            .unwrap();
+        f.write_all(b"!").unwrap();
+        drop(f);
+        assert_eq!(std::fs::metadata(blobs.demo_path(2)).unwrap().len(), 12);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn link_demo_copies_when_the_link_cannot_be_made_and_checks_the_hash() {
+        let d = dir("linkcopy");
+        let src = d.join("src.dem");
+        std::fs::write(&src, b"PBDEMS2\0abc").unwrap();
+        let blobs = Blobs::new(d.join("blobs"));
+        blobs.ingest_demo(1, &src, 1024).unwrap();
+        let known = known_of(&blobs, 1);
+        // Путь назначения занят старым файлом: ссылка не создаётся, файл копируется и заменяет его.
+        std::fs::create_dir_all(blobs.demo_path(2).parent().unwrap()).unwrap();
+        std::fs::write(blobs.demo_path(2), b"stale").unwrap();
+        let got = blobs.link_demo(1, 2, &known).unwrap();
+        assert_eq!(got.sha256, known.sha256);
+        assert_eq!(std::fs::read(blobs.demo_path(2)).unwrap(), b"PBDEMS2\0abc");
+        assert!(!blobs.demo_path(2).with_file_name("demo.part").exists());
+
+        // Хеш в базе не сходится с файлом: копия не остаётся.
+        let wrong = FileRow {
+            sha256: "0".repeat(64),
+            ..known.clone()
+        };
+        std::fs::create_dir_all(blobs.demo_path(3).parent().unwrap()).unwrap();
+        std::fs::write(blobs.demo_path(3), b"stale").unwrap();
+        let e = blobs.link_demo(1, 3, &wrong).unwrap_err();
+        assert!(e.contains("не совпадает"), "{e}");
+        assert!(!blobs.demo_path(3).with_file_name("demo.part").exists());
+
+        // Размер в базе не сходится с файлом при жёсткой ссылке: ссылка убирается.
+        let short = FileRow {
+            size: 3,
+            ..known.clone()
+        };
+        let e = blobs.link_demo(1, 4, &short).unwrap_err();
+        assert!(e.contains("другой размер"), "{e}");
+        assert!(!blobs.demo_path(4).exists());
+        // Исходного файла нет совсем.
+        assert!(blobs.link_demo(99, 5, &known).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 

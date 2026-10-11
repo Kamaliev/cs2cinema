@@ -198,6 +198,44 @@ fn is_steam64(s: &str) -> bool {
     s.len() == 17 && s.starts_with("7656") && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Ключ игрока для поиска дублей: SteamID64 как есть, иначе имя без пробелов по краям, в нижнем регистре и с
+/// сериями пробелов, сжатыми в один.
+pub fn player_key(player: &str) -> String {
+    let p = player.trim();
+    if is_steam64(p) {
+        return p.to_owned();
+    }
+    p.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Состояния «задача ещё не закончена» для лимитов бота.
+const ACTIVE_STATES: &str = "('receiving','queued','assigned','running','uploading')";
+/// Состояния, в которых задача считается дублем: активные и готовая.
+const DEDUP_STATES: &str = "('receiving','queued','assigned','running','uploading','done')";
+
+/// Сколько задач не закончилось у пользователя и во всей очереди.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveCounts {
+    pub user: i64,
+    pub total: i64,
+}
+
+/// Ключ поиска дубля: тот же файл (по SHA-256) или тот же матч FACEIT и тот же игрок (`player_key`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DedupKey {
+    File { sha256: String, player_key: String },
+    Faceit { link: String, player_key: String },
+}
+
+fn query_jobs(c: &Connection, sql: &str, arg: &str) -> Result<Vec<JobRow>> {
+    let mut st = c.prepare(sql).map_err(db_err)?;
+    let rows = st.query_map([arg], job_from_row).map_err(db_err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+}
+
 impl Core {
     pub fn open(opts: CoreOptions) -> Result<Core> {
         let db = Db::open(&opts.data_dir.join("server.db"))?;
@@ -350,6 +388,211 @@ impl Core {
         let id = self.begin_receive(s)?;
         let got = self.finish_receive(id, src)?;
         Ok((id, got))
+    }
+
+    /// Новая задача на демке другой задачи (второй игрок той же демки, повтор): файл берётся жёсткой ссылкой
+    /// (`Blobs::link_demo`, копирование — запасной путь), FACEIT — та же ссылка без файла. Задача получает
+    /// `queued` только когда файл на месте, чтобы раннер не получил задачу без демки.
+    pub fn submit_from(&self, demo_job_id: i64, s: &Submit) -> Result<i64> {
+        let player = self.redactor.clean(s.player.trim(), 64);
+        if player.is_empty() {
+            return Err("не указан игрок".to_owned());
+        }
+        let (src, known) = self.db.read(|c| {
+            Ok::<_, String>((job_by_id(c, demo_job_id)?, demo_by_job(c, demo_job_id)?))
+        })?;
+        let gone = || format!("демки задачи #{demo_job_id} больше нет — пришлите файл заново");
+        let src = src.ok_or_else(gone)?;
+        let steam = is_steam64(&player).then(|| player.clone());
+        let by = self.redactor.clean(&s.requested_by, 64);
+        let orig = if s.orig_name.trim().is_empty() {
+            src.orig_name.clone()
+        } else {
+            self.redactor.clean(&s.orig_name, 120)
+        };
+        let now = self.clock.now_ms();
+
+        if src.source_kind == "faceit" {
+            let match_id = src
+                .faceit_link
+                .as_deref()
+                .and_then(wire::faceit::room_match_id)
+                .ok_or_else(gone)?;
+            let canonical = wire::faceit::canonical_url(&match_id);
+            let id = self.db.write(|tx| {
+                tx.execute(
+                    "INSERT INTO jobs(user_id, requested_by, state, source_kind, orig_name, faceit_link, player_steam, player_name, created_at, updated_at)
+                     VALUES (?1, ?2, 'queued', 'faceit', ?3, ?4, ?5, ?6, ?7, ?7)",
+                    params![s.user_id, by, orig, canonical, steam, player, now],
+                )
+                .map_err(db_err)?;
+                Ok::<i64, String>(tx.last_insert_rowid())
+            })?;
+            self.wake();
+            return Ok(id);
+        }
+
+        let known = known.ok_or_else(gone)?;
+        let id = self.db.write(|tx| {
+            tx.execute(
+                "INSERT INTO jobs(user_id, requested_by, state, source_kind, orig_name, player_steam, player_name, created_at, updated_at)
+                 VALUES (?1, ?2, 'receiving', 'file', ?3, ?4, ?5, ?6, ?6)",
+                params![s.user_id, by, orig, steam, player, now],
+            )
+            .map_err(db_err)?;
+            Ok::<i64, String>(tx.last_insert_rowid())
+        })?;
+        match self.blobs.link_demo(demo_job_id, id, &known) {
+            Ok(got) => {
+                let now = self.clock.now_ms();
+                self.db.write(|tx| {
+                    let before =
+                        job_by_id(tx, id)?.ok_or_else(|| format!("нет задачи #{id}"))?;
+                    let d = rules::decide(&before, &Event::Received, now, &self.limits)
+                        .map_err(|r| r.message)?;
+                    apply(tx, &before, &d.job, now)?;
+                    tx.execute(
+                        "INSERT INTO files(job_id, kind, rel_path, size, sha256, created_at) VALUES (?1, 'demo', ?2, ?3, ?4, ?5)",
+                        params![id, demo_rel(id), got.size as i64, got.sha256, now],
+                    )
+                    .map_err(db_err)?;
+                    Ok::<(), String>(())
+                })?;
+                self.wake();
+                Ok(id)
+            }
+            Err(e) => {
+                let now = self.clock.now_ms();
+                let ev = Event::ReceiveFailed {
+                    message: self.redactor.clean(
+                        &format!("не удалось взять демку задачи #{demo_job_id}: {e}"),
+                        2000,
+                    ),
+                };
+                self.db.write(|tx| {
+                    if let Some(before) = job_by_id(tx, id)?
+                        && let Ok(d) = rules::decide(&before, &ev, now, &self.limits)
+                    {
+                        apply(tx, &before, &d.job, now)?;
+                    }
+                    Ok::<(), String>(())
+                })?;
+                Err(gone())
+            }
+        }
+    }
+
+    /// Повтор задачи, закончившейся сбоем или отменой: тот же игрок, тот же пользователь, та же демка (или ссылка
+    /// FACEIT), заказчик — `requested_by`. Задача в другом состоянии повторяться не может.
+    pub fn resubmit(&self, job_id: i64, requested_by: &str) -> Result<i64> {
+        let src = self
+            .job(job_id)?
+            .ok_or_else(|| format!("нет задачи #{job_id}"))?;
+        if !matches!(src.state, JobState::Failed | JobState::Cancelled) {
+            return Err(format!(
+                "задачу #{job_id} нельзя повторить: она не закончилась сбоем или отменой"
+            ));
+        }
+        self.submit_from(
+            job_id,
+            &Submit {
+                player: src.player_name.clone(),
+                user_id: src.user_id,
+                requested_by: requested_by.to_owned(),
+                orig_name: src.orig_name.clone(),
+            },
+        )
+    }
+
+    /// Сколько задач пользователя и всей очереди ещё не закончились.
+    pub fn active_counts(&self, user_id: i64) -> Result<ActiveCounts> {
+        self.db.read(|c| {
+            let sql = |extra: &str| {
+                format!("SELECT COUNT(*) FROM jobs WHERE state IN {ACTIVE_STATES}{extra}")
+            };
+            let user = c
+                .query_row(&sql(" AND user_id = ?1"), [user_id], |r| r.get(0))
+                .map_err(db_err)?;
+            let total = c.query_row(&sql(""), [], |r| r.get(0)).map_err(db_err)?;
+            Ok(ActiveCounts { user, total })
+        })
+    }
+
+    /// Самая свежая задача с таким ключом среди активных и готовых. Упавшая и отменённая дублем не считаются:
+    /// повтор после сбоя разрешён.
+    pub fn find_duplicate(&self, key: &DedupKey) -> Result<Option<JobRow>> {
+        let (rows, wanted): (Vec<JobRow>, &str) = match key {
+            DedupKey::File { sha256, player_key } => (
+                self.db.read(|c| {
+                    query_jobs(
+                        c,
+                        &format!(
+                            "SELECT {JOB_COLUMNS} FROM jobs WHERE id IN (SELECT job_id FROM files WHERE kind = 'demo' AND sha256 = ?1) \
+                             AND state IN {DEDUP_STATES} ORDER BY id DESC"
+                        ),
+                        sha256,
+                    )
+                })?,
+                player_key,
+            ),
+            DedupKey::Faceit { link, player_key } => {
+                let link = wire::faceit::room_match_id(link)
+                    .map(|id| wire::faceit::canonical_url(&id))
+                    .unwrap_or_else(|| link.clone());
+                (
+                    self.db.read(|c| {
+                        query_jobs(
+                            c,
+                            &format!(
+                                "SELECT {JOB_COLUMNS} FROM jobs WHERE source_kind = 'faceit' AND faceit_link = ?1 \
+                                 AND state IN {DEDUP_STATES} ORDER BY id DESC"
+                            ),
+                            &link,
+                        )
+                    })?,
+                    player_key,
+                )
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .find(|j| player_key(&j.player_name) == wanted))
+    }
+
+    /// Сколько задач обгонит эта: для `queued` — задачи в очереди с меньшим id плюс выданные раннеру и ведущиеся;
+    /// для любого другого состояния — 0.
+    pub fn jobs_ahead(&self, job_id: i64) -> Result<i64> {
+        self.db.read(|c| {
+            let Some(job) = job_by_id(c, job_id)? else {
+                return Ok(0);
+            };
+            if job.state != JobState::Queued {
+                return Ok(0);
+            }
+            c.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE (state = 'queued' AND id < ?1) \
+                 OR state IN ('assigned','running','uploading')",
+                [job_id],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
+        })
+    }
+
+    /// Есть ли раннер, который выходил на связь недавно: неотозванный, `last_seen_at` не старше
+    /// `longpoll + lease_ttl` (раннер в long-poll молчит до `longpoll_secs`, аренда живёт `lease_ttl`).
+    pub fn runner_online(&self) -> Result<bool> {
+        let window = self.limits.longpoll_secs as i64 * 1000 + self.limits.lease_ttl_ms;
+        let since = self.clock.now_ms() - window;
+        self.db.read(|c| {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runners WHERE revoked_at IS NULL AND last_seen_at >= ?1)",
+                [since],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n != 0)
+            .map_err(db_err)
+        })
     }
 
     /// Все задачи по возрастанию id.

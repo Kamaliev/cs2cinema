@@ -442,4 +442,72 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    #[test]
+    fn upload_guard_is_exclusive_per_job_and_epoch_and_released_on_drop() {
+        let blobs = Blobs::new(dir("guard").join("blobs"));
+        let a = blobs.lock_upload(1, 1).expect("первая охрана");
+        assert!(blobs.lock_upload(1, 1).is_none(), "та же пара занята");
+        assert!(blobs.lock_upload(1, 2).is_some(), "другая эпоха свободна");
+        assert!(blobs.lock_upload(2, 1).is_some(), "другая задача свободна");
+        drop(a);
+        assert!(blobs.lock_upload(1, 1).is_some(), "охрана снята в Drop");
+    }
+
+    #[test]
+    fn short_body_keeps_the_written_bytes_and_finalize_checks_size_then_sha() {
+        let d = dir("append");
+        let blobs = Blobs::new(d.join("blobs"));
+        let guard = blobs.lock_upload(3, 1).unwrap();
+        // Обрыв: заявлено 10 байт, пришло 4 и чистый EOF.
+        let got = blobs.append_chunk(&guard, 0, 10, &mut &b"abcd"[..]);
+        assert_eq!((got.got, got.error), (4, None));
+        assert_eq!(blobs.part_len(3, 1).unwrap(), 4);
+        // Смещение, не совпавшее с длиной файла под охраной, ничего не пишет.
+        let bad = blobs.append_chunk(&guard, 0, 3, &mut &b"xyz"[..]);
+        assert_eq!(bad.got, 0);
+        assert!(bad.error.is_some());
+        assert_eq!(blobs.part_len(3, 1).unwrap(), 4);
+        let got = blobs.append_chunk(&guard, 4, 3, &mut &b"efg"[..]);
+        assert_eq!((got.got, got.error), (3, None));
+        drop(guard);
+
+        assert_eq!(
+            blobs.finalize_result(3, 1, 8, "00").unwrap(),
+            Finalized::SizeMismatch { actual: 7 }
+        );
+        let wrong = hex(&Sha256::digest(b"other"));
+        assert_eq!(
+            blobs.finalize_result(3, 1, 7, &wrong).unwrap(),
+            Finalized::ShaMismatch
+        );
+        assert!(!blobs.result_part(3, 1).exists(), "неверный .part удалён");
+        let guard = blobs.lock_upload(3, 1).unwrap();
+        blobs.append_chunk(&guard, 0, 7, &mut &b"abcdefg"[..]);
+        let right = hex(&Sha256::digest(b"abcdefg"));
+        assert_eq!(
+            blobs.finalize_result(3, 1, 7, &right).unwrap(),
+            Finalized::Ok
+        );
+        assert_eq!(std::fs::read(blobs.result_path(3)).unwrap(), b"abcdefg");
+        assert!(!blobs.result_part(3, 1).exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn demo_range_is_clamped_to_the_file_and_to_the_chunk_size() {
+        let d = dir("range");
+        let blobs = Blobs::new(d.join("blobs"));
+        std::fs::create_dir_all(blobs.demo_path(4).parent().unwrap()).unwrap();
+        std::fs::write(blobs.demo_path(4), vec![1u8; 100]).unwrap();
+        let (mut r, len, size) = blobs.open_demo_range(4, 90, None).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!((len, size, buf.len()), (10, 100, 10));
+        let (_, len, _) = blobs.open_demo_range(4, 0, Some(9)).unwrap();
+        assert_eq!(len, 10);
+        let (_, len, _) = blobs.open_demo_range(4, 0, Some(5000)).unwrap();
+        assert_eq!(len, 100);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

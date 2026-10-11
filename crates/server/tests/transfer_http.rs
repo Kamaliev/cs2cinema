@@ -484,3 +484,244 @@ fn late_upload_after_cancel_is_refused_and_parts_are_deleted() {
     assert_eq!(code, 409, "{body}");
     assert!(parts_in(&srv, second).is_empty());
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Демка по Range и поведение tiny_http (Task 3)
+// ---------------------------------------------------------------------------------------------------------
+
+/// Демка 20 МиБ, выданная раннеру (эпоха 1): id, токен и описание демки из выдачи.
+fn demo_job(srv: &TestServer) -> (i64, String, wire::DemoInfo) {
+    let id = srv.submit(&fake_demo(20 * MIB), "s1mple");
+    let token = srv.add_runner("a");
+    let (status, got) = srv.claim(&token, 0);
+    assert_eq!(status, 200);
+    let a = got.unwrap();
+    assert_eq!((a.job_id, a.epoch), (id, 1));
+    assert_eq!(a.demo.size, 20 * MIB as u64);
+    (id, token, a.demo)
+}
+
+#[test]
+fn demo_downloads_in_ranges_and_matches_its_sha256() {
+    let srv = TestServer::start();
+    let (id, token, demo) = demo_job(&srv);
+    let size = demo.size;
+
+    let (status, headers) = srv.head_demo(&token, id, 1);
+    let h = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(status, 200);
+    assert_eq!(h("content-length"), Some("20971520".to_owned()));
+    assert_eq!(h("etag"), Some(format!("\"{}\"", demo.sha256)));
+    assert_eq!(h("accept-ranges"), Some("bytes".to_owned()));
+    assert_eq!(h("transfer-encoding"), None);
+
+    // Раннер повторяет запросы с нового смещения, пока не получит всё.
+    let mut whole = Vec::new();
+    let mut lens = Vec::new();
+    while (whole.len() as u64) < size {
+        let off = whole.len() as u64;
+        let r = srv.get_range(&token, id, 1, Some(&format!("bytes={off}-")));
+        assert_eq!(r.status, 206, "смещение {off}");
+        let last = off + r.body.len() as u64 - 1;
+        assert_eq!(
+            r.header("content-range"),
+            Some(format!("bytes {off}-{last}/{size}").as_str())
+        );
+        assert_eq!(
+            r.header("content-length"),
+            Some(r.body.len().to_string().as_str()),
+            "настоящий Content-Length"
+        );
+        assert_eq!(r.header("transfer-encoding"), None, "без chunked");
+        assert_eq!(
+            r.header("etag"),
+            Some(format!("\"{}\"", demo.sha256).as_str())
+        );
+        assert!(r.body.len() as u64 <= CHUNK_SIZE);
+        lens.push(r.body.len());
+        whole.extend_from_slice(&r.body);
+    }
+    assert_eq!(lens, vec![8 * MIB, 8 * MIB, 4 * MIB]);
+    assert_eq!(
+        sha256_hex(&whole),
+        demo.sha256,
+        "склейка совпала с SHA-256 из выдачи"
+    );
+    assert!(whole == fake_demo(20 * MIB));
+}
+
+#[test]
+fn small_and_open_ranges_follow_the_protocol() {
+    let srv = TestServer::start();
+    let (id, token, _) = demo_job(&srv);
+    let all = fake_demo(20 * MIB);
+
+    let r = srv.get_range(&token, id, 1, Some("bytes=0-99"));
+    assert_eq!(r.status, 206);
+    assert_eq!(r.body.len(), 100);
+    assert_eq!(r.header("content-range"), Some("bytes 0-99/20971520"));
+    assert!(r.body == all[..100]);
+
+    let r = srv.get_range(&token, id, 1, Some("bytes=10-19"));
+    assert_eq!((r.status, r.body.len()), (206, 10));
+    assert!(r.body == all[10..20]);
+
+    // Без Range - первый кусок; конец за пределом куска и файла обрезается.
+    let r = srv.get_range(&token, id, 1, None);
+    assert_eq!((r.status, r.body.len()), (206, 8 * MIB));
+    assert_eq!(r.header("content-range"), Some("bytes 0-8388607/20971520"));
+    let r = srv.get_range(&token, id, 1, Some("bytes=20971000-99999999999"));
+    assert_eq!((r.status, r.body.len()), (206, 520));
+    assert_eq!(
+        r.header("content-range"),
+        Some("bytes 20971000-20971519/20971520")
+    );
+
+    // Не те единицы и обратный отрезок - 400.
+    for bad in [
+        "items=1-2",
+        "bytes=5-2",
+        "bytes=-5",
+        "bytes=1-2,5-6",
+        "bytes=a-",
+    ] {
+        let r = srv.get_range(&token, id, 1, Some(bad));
+        assert_eq!(r.status, 400, "{bad}");
+        assert!(
+            String::from_utf8_lossy(&r.body).contains("поддерживается только Range"),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn range_past_the_end_is_416() {
+    let srv = TestServer::start();
+    let (id, token, _) = demo_job(&srv);
+    for range in ["bytes=20971520-", "bytes=99999999999-"] {
+        let r = srv.get_range(&token, id, 1, Some(range));
+        assert_eq!(r.status, 416, "{range}");
+        assert_eq!(r.header("content-range"), Some("bytes */20971520"));
+        assert!(String::from_utf8_lossy(&r.body).contains("range_not_satisfiable"));
+    }
+    assert_eq!(
+        srv.get_range(&token, id, 1, Some("bytes=20971519-")).status,
+        206
+    );
+}
+
+#[test]
+fn demo_needs_the_current_epoch() {
+    let srv = clocked();
+    let clock = srv.clock();
+    let id = srv.submit(&fake_demo(MIB), "s1mple");
+    let token = srv.add_runner("a");
+    let (status, got) = srv.claim(&token, 0);
+    assert_eq!(status, 200);
+    assert_eq!(got.unwrap().epoch, 1);
+
+    for epoch in [0, 2] {
+        let r = srv.get_range(&token, id, epoch, None);
+        assert_eq!(r.status, 409, "эпоха {epoch}");
+        assert!(String::from_utf8_lossy(&r.body).contains("stale_epoch"));
+        assert_eq!(srv.head_demo(&token, id, epoch).0, 409);
+    }
+    // Чужой раннер с верной эпохой тоже не скачивает.
+    let other = srv.add_runner("b");
+    assert_eq!(srv.get_range(&other, id, 1, None).status, 409);
+
+    // Скачивание продлевает аренду и не двигает состояние.
+    clock.advance(Duration::from_secs(20));
+    let r = srv.get_range(&token, id, 1, Some("bytes=0-9"));
+    assert_eq!(r.status, 206);
+    let job = srv.job(id);
+    assert_eq!(job.state, JobState::Assigned);
+    assert_eq!(job.lease_until, Some(T0 + 20_000 + 45_000));
+}
+
+#[test]
+fn expect_continue_upload_works_and_a_rejected_one_gets_no_continue() {
+    let srv = TestServer::start();
+    let (id, token) = running_job(&srv);
+    let data = result_bytes(1024);
+
+    // Верное смещение: сервер присылает 100 Continue, после тела - 204.
+    let mut conn = raw_request(srv.addr());
+    conn.write_all(
+        raw_put_head(
+            &token,
+            id,
+            1,
+            0,
+            &format!("Expect: 100-continue\r\nContent-Length: {}\r\n", data.len()),
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let first = read_status_line(&mut conn);
+    assert!(first.starts_with("HTTP/1.1 100"), "{first}");
+    // Заголовки промежуточного ответа читаются до пустой строки: тело клиент шлёт только после них.
+    let _ = common::read_headers(&mut conn);
+    conn.write_all(&data).unwrap();
+    let reply = read_reply(&mut conn, false);
+    assert_eq!(reply.status(), 204, "{}", reply.status_line);
+    assert_eq!(reply.header("upload-offset"), Some("1024"));
+
+    // Неверное смещение: первая же строка - 409, 100 Continue не было.
+    let mut conn = raw_request(srv.addr());
+    conn.write_all(
+        raw_put_head(
+            &token,
+            id,
+            1,
+            5,
+            &format!("Expect: 100-continue\r\nContent-Length: {}\r\n", data.len()),
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let first = read_status_line(&mut conn);
+    assert!(first.contains(" 409 "), "отказ без 100 Continue: {first}");
+    drop(conn);
+
+    // Слишком большой кусок с Expect - тоже сразу отказ.
+    let mut conn = raw_request(srv.addr());
+    conn.write_all(
+        raw_put_head(
+            &token,
+            id,
+            1,
+            1024,
+            &format!(
+                "Expect: 100-continue\r\nContent-Length: {}\r\n",
+                CHUNK_SIZE + 1
+            ),
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let first = read_status_line(&mut conn);
+    assert!(first.contains(" 413 "), "{first}");
+}
+
+#[test]
+fn eight_mebibyte_put_and_a_response_over_32_kib_keep_their_content_length() {
+    // Поведение tiny_http из спайка D-01 в одном месте: PUT ровно 8 МиБ принимается, а ответ больше порога
+    // chunked (32 КиБ) всё равно идёт с настоящим Content-Length.
+    let srv = TestServer::start();
+    let (id, token, _) = demo_job(&srv);
+    let r = srv.get_range(&token, id, 1, Some("bytes=0-65535"));
+    assert_eq!((r.status, r.body.len()), (206, 65536));
+    assert_eq!(r.header("content-length"), Some("65536"));
+    assert_eq!(r.header("transfer-encoding"), None);
+    let progress = srv.progress(&token, id, &record(1, 1));
+    assert_eq!(progress.0, 200);
+    let data = result_bytes(8 * MIB);
+    let (code, off, body) = srv.put_chunk(&token, id, 1, 0, &data);
+    assert_eq!((code, off), (204, Some(8 * MIB as u64)), "{body}");
+}

@@ -501,3 +501,91 @@ fn the_check_itself_catches_a_leak() {
     // Пустая игла тоже отвергается, а не «находится» везде.
     assert!(std::panic::catch_unwind(|| assert_absent(b"x", "", "пустая игла")).is_err());
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Отказы при передаче кусков (SEC-04, План 05-05, Task 2)
+// ---------------------------------------------------------------------------------------------------------
+
+#[test]
+fn chunk_rejections_do_not_leak_the_token() {
+    use common::{raw_request, read_reply, result_bytes};
+    use std::io::Write;
+
+    let mut srv = TestServer::start_with(TestOptions {
+        bot_token: Some(BOT.to_owned()),
+        ..Default::default()
+    });
+    let t = srv.add_runner("alpha");
+    let id = srv.submit(&fake_demo(4096), "s1mple");
+    let (status, got) = srv.claim(&t, 0);
+    assert_eq!(status, 200);
+    let epoch = got.expect("выдача").epoch;
+    let (st, body) = srv.progress(&t, id, &progress(epoch, 1, Phase::Record));
+    assert_eq!(st, 200, "{body}");
+
+    // Токены раннера и бота кладутся и в Authorization, и в query: путь в журнал идёт без query.
+    let head = |len: u64, offset: u64| {
+        format!(
+            "PUT /v1/jobs/{id}/result?token={t}&bot={BOT} HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer {t}\r\nX-Epoch: {epoch}\r\nUpload-Offset: {offset}\r\nContent-Length: {len}\r\n\r\n"
+        )
+    };
+    let mut sent = String::new();
+    let mut received: Vec<u8> = Vec::new();
+    let mut keep = |r: &common::RawReply| {
+        received.extend_from_slice(r.status_line.as_bytes());
+        for (k, v) in &r.headers {
+            received.extend_from_slice(format!("\n{k}: {v}").as_bytes());
+        }
+        received.extend_from_slice(&r.body);
+    };
+
+    // 1. Слишком большой кусок: отказ до тела.
+    let too_big = head(wire::CHUNK_SIZE + 1, 0);
+    sent.push_str(&too_big);
+    let mut conn = raw_request(srv.addr());
+    conn.write_all(too_big.as_bytes()).unwrap();
+    let reply = read_reply(&mut conn, false);
+    assert_eq!(reply.status(), 413, "{}", reply.status_line);
+    keep(&reply);
+    drop(conn);
+
+    // 2. Оборванный кусок: заявлено 1 МиБ, прислано полмебибайта.
+    let data = result_bytes(1024 * 1024);
+    let aborted = head(data.len() as u64, 0);
+    sent.push_str(&aborted);
+    let mut conn = raw_request(srv.addr());
+    conn.write_all(aborted.as_bytes()).unwrap();
+    conn.write_all(&data[..data.len() / 2]).unwrap();
+    conn.shutdown(std::net::Shutdown::Write).unwrap();
+    let reply = read_reply(&mut conn, false);
+    assert_eq!(reply.status(), 400, "{}", reply.status_line);
+    keep(&reply);
+    assert!(
+        srv.sink_text().contains("оборван"),
+        "обрыв дошёл до обработчика"
+    );
+
+    // 3. Кусок с чужим смещением.
+    let wrong = head(1024, 777);
+    sent.push_str(&wrong);
+    let mut conn = raw_request(srv.addr());
+    conn.write_all(wrong.as_bytes()).unwrap();
+    conn.write_all(&data[..1024]).unwrap();
+    let reply = read_reply(&mut conn, false);
+    assert_eq!(reply.status(), 409, "{}", reply.status_line);
+    keep(&reply);
+    drop(conn);
+
+    // Против холостого теста: оба токена действительно были во входе.
+    assert!(sent.contains(&t) && sent.contains(BOT));
+    assert_absent(&received, &t, "ответы на отказанные куски (токен раннера)");
+    assert_absent(&received, BOT, "ответы на отказанные куски (токен бота)");
+    for secret in [t.as_str(), BOT] {
+        assert_absent(srv.sink_text().as_bytes(), secret, "журнал сервера");
+        assert_absent(&srv.db_bytes(), secret, "байты server.db и -wal");
+    }
+    srv.stop();
+    for secret in [t.as_str(), BOT] {
+        assert_absent(&srv.db_bytes(), secret, "байты server.db после остановки");
+    }
+}

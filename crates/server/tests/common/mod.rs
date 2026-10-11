@@ -550,3 +550,45 @@ pub fn raw_put_head(token: &str, job_id: i64, epoch: i64, offset: u64, extra: &s
         "PUT /v1/jobs/{job_id}/result HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer {token}\r\nX-Epoch: {epoch}\r\nUpload-Offset: {offset}\r\n{extra}\r\n"
     )
 }
+
+/// Ответ, прочитанный из сырого соединения: строка статуса, заголовки и тело по `Content-Length`.
+pub struct RawReply {
+    pub status_line: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl RawReply {
+    pub fn status(&self) -> u16 {
+        self.status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Читает полный ответ; для `HEAD` тело не читается.
+pub fn read_reply(s: &mut std::net::TcpStream, head_request: bool) -> RawReply {
+    let status_line = read_status_line(s);
+    let headers = read_headers(s);
+    let len = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; if head_request { 0 } else { len }];
+    std::io::Read::read_exact(s, &mut body).expect("тело ответа");
+    RawReply {
+        status_line,
+        headers,
+        body,
+    }
+}

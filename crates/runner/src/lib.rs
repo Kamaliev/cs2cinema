@@ -365,6 +365,8 @@ impl Runner {
     fn start_pause(&mut self, reason: PauseReason) {
         self.log.line(&reason.to_string());
         self.pause_hello = None;
+        // Enter, нажатый до паузы, не считается её снятием (иначе защита от круга «неисправность - повтор» обходится)
+        self.resume.store(false, Ordering::SeqCst);
         self.paused = Some(reason);
     }
 

@@ -74,15 +74,27 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Запись скачиваемой демки: в файл и в хеш одновременно.
+/// Начало ошибки записи демки на диск: это не сбой связи, повторять его бесполезно (`Runner::fetch` закрывает
+/// задачу, а не ждёт сеть).
+pub const DISK_ERROR: &str = "ошибка записи демки на диск";
+
+/// Запись скачиваемой демки: в файл и в хеш одновременно. Ошибка записи запоминается, чтобы отличить её от
+/// ошибки чтения сети: `io::copy` возвращает обе одинаково.
 struct HashingFile<'a> {
     file: &'a mut File,
     hasher: &'a mut Sha256,
+    write_error: Option<String>,
 }
 
 impl Write for HashingFile<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.file.write(buf)?;
+        let n = match self.file.write(buf) {
+            Ok(n) => n,
+            Err(e) => {
+                self.write_error = Some(e.to_string());
+                return Err(e);
+            }
+        };
         self.hasher.update(&buf[..n]);
         Ok(n)
     }
@@ -231,10 +243,13 @@ pub fn download_demo(
             let mut sink = HashingFile {
                 file: &mut file,
                 hasher: &mut hasher,
+                write_error: None,
             };
-            let got = link
-                .demo_range(job_id, epoch, have, &mut sink)
-                .map_err(|e| format!("задача #{job_id}: скачивание демки: {e}"))?;
+            let got = link.demo_range(job_id, epoch, have, size - have, &mut sink);
+            if let Some(e) = sink.write_error.take() {
+                return Err(format!("{DISK_ERROR}: {e}"));
+            }
+            let got = got.map_err(|e| format!("задача #{job_id}: скачивание демки: {e}"))?;
             if got == 0 {
                 return Err(format!(
                     "задача #{job_id}: сервер прислал пустой кусок демки"
@@ -242,8 +257,8 @@ pub fn download_demo(
             }
             have += got;
         }
-        file.flush().map_err(|e| format!("запись демки: {e}"))?;
-        file.sync_all().map_err(|e| format!("запись демки: {e}"))?;
+        file.flush().map_err(|e| format!("{DISK_ERROR}: {e}"))?;
+        file.sync_all().map_err(|e| format!("{DISK_ERROR}: {e}"))?;
         drop(file);
         let sha = hex(&hasher.finalize());
         if have == size && size > 0 && sha.eq_ignore_ascii_case(sha256) {

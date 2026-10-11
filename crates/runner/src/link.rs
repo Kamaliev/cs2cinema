@@ -3,7 +3,7 @@
 //! Перенаправления запрещены (токен не должен уйти на чужой адрес), общего таймаута у агента нет: срок ответа
 //! задаётся на каждый запрос отдельно, потому что `claim` ждёт задачу десятки секунд, а кусок файла — минуты.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -285,11 +285,13 @@ impl Link {
     }
 
     /// `GET /v1/jobs/{id}/demo` с `Range: bytes={offset}-`: тело потоком в `out`, возвращает число байт.
+    /// Читается не больше `max` байт: сервер или прокси, приславший лишнее, не заполнит диск.
     pub fn demo_range(
         &self,
         job_id: i64,
         epoch: i64,
         offset: u64,
+        max: u64,
         out: &mut dyn Write,
     ) -> Result<u64, LinkError> {
         let rq = self
@@ -308,7 +310,7 @@ impl Link {
                 resp.status().as_u16()
             )));
         }
-        let mut reader = resp.body_mut().as_reader();
+        let mut reader = resp.body_mut().as_reader().take(max);
         std::io::copy(&mut reader, out).map_err(|e| self.net(format!("чтение демки: {e}")))
     }
 

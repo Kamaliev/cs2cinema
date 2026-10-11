@@ -747,7 +747,24 @@ impl Runner {
         let end = {
             let log = |m: &str| self.log.line(m);
             let stop = self.stopper();
-            transfer::download_demo(&self.link, &job, &stop, &log)?
+            match transfer::download_demo(&self.link, &job, &stop, &log) {
+                Ok(end) => end,
+                // Диск не пишется: сеть тут ни при чём, повтор не поможет. Задача закрывается понятной причиной.
+                Err(e) if e.starts_with(transfer::DISK_ERROR) => {
+                    let failure = Failure {
+                        code: fail::JOB_ERROR.to_owned(),
+                        message: format!("{e} (проверьте свободное место на диске раннера)"),
+                        ..Default::default()
+                    };
+                    self.log.line(&format!(
+                        "задача #{}: {}",
+                        job.server_job_id, failure.message
+                    ));
+                    self.fail_job(failure)?;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            }
         };
         match end {
             TransferEnd::Done(()) => {

@@ -199,19 +199,8 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
 
     let hcfg = highlights::Config::default();
     let hero = match &args.player {
-        Some(name) => {
-            let want = name.to_lowercase();
-            let p = m
-                .players
-                .iter()
-                .find(|p| p.name.to_lowercase() == want)
-                .or_else(|| m.players.iter().find(|p| p.name.to_lowercase().contains(&want)))
-                .ok_or_else(|| {
-                    let names: Vec<&str> = m.players.iter().map(|p| p.name.as_str()).collect();
-                    format!("игрок «{name}» не найден; в матче: {}", names.join(", "))
-                })?;
-            Some(p.id)
-        }
+        // тот же строгий выбор, что и у задачи: неоднозначный ник не угадывается
+        Some(name) => Some(pipeline::resolve_player(&m, None, name).map_err(|e| e.into_run_error().message)?),
         None => None,
     };
     let found = match hero {

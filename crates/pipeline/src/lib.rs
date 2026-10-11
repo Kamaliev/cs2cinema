@@ -173,6 +173,10 @@ pub fn analyze_with(src: &Source, limits: &demo::DemoLimits, p: &dyn Progress) -
     check(p)?;
     p.stage(Stage::Parse);
     p.log("разбираю демку…");
+    // файла нет или он недоступен — неисправность вызывающего, а не демки: строка с путём, как раньше
+    if let Err(e) = std::fs::metadata(&demo_path) {
+        return Err(format!("{}: {e}", demo_path.display()).into());
+    }
     let data = demo::read_demo_limited(&demo_path, limits).map_err(|e| match e {
         demo::DemoError::TooLarge { .. } => precheck_failure(FailCode::DemoTooLarge, record::failure::msg_demo_too_large(&e.to_string())),
         demo::DemoError::Bad(_) => bad_demo(&e.to_string()),

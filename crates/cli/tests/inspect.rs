@@ -113,3 +113,112 @@ fn analyze_with_types_a_garbage_file_as_bad_demo() {
         .expect("мусор не демка");
     assert_eq!(e.fail.map(|f| f.code), Some(FailCode::BadDemo));
 }
+
+const MIB: usize = 1024 * 1024;
+
+#[test]
+fn bomb_through_the_child_is_demo_too_large() {
+    let bomb = write("bomb", "bomb.dem.zst", &demo::synth::zstd_bomb(8 * MIB));
+    assert!(std::fs::metadata(&bomb).unwrap().len() < MIB as u64, "бомба должна быть крошечной на диске");
+    let rep = one_json_line(&inspect(&bomb, &["--player", "x", "--max-unpacked-mib", "1", "--no-flybys"]));
+    assert_eq!((rep.ok, rep.code.as_str()), (false, "DEMO_TOO_LARGE"), "{rep:?}");
+}
+
+#[test]
+fn file_over_the_limit_through_the_child_is_demo_too_large() {
+    let big = write("big", "big.dem", &vec![0u8; 2 * MIB]);
+    let rep = one_json_line(&inspect(&big, &["--max-file-mib", "1", "--no-flybys"]));
+    assert_eq!((rep.ok, rep.code.as_str()), (false, "DEMO_TOO_LARGE"), "{rep:?}");
+}
+
+#[test]
+fn garbage_file_through_the_child_is_bad_demo() {
+    let hello = write("hello", "hello.dem", b"hello");
+    let rep = one_json_line(&inspect(&hello, &["--player", "x", "--no-flybys"]));
+    assert_eq!((rep.ok, rep.code.as_str()), (false, "BAD_DEMO"), "{rep:?}");
+
+    let missing = dir("missing").join("нет-такого.dem");
+    let rep = one_json_line(&inspect(&missing, &["--no-flybys"]));
+    assert_eq!(rep.code, "BAD_DEMO", "{rep:?}");
+}
+
+/// Детерминированный LCG, как в `demo/tests/hostile.rs`: позиции и маски без новых зависимостей.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+}
+
+/// Один запуск ребёнка на испорченных байтах: меньше 30 с, одна JSON-строка, допустимый исход.
+fn mutant_answers(label: &str, bytes: &[u8]) {
+    let path = write("mutants", "m.dem", bytes);
+    let started = std::time::Instant::now();
+    let out = inspect(&path, &["--player", "s1mple", "--secs", "25", "--no-flybys"]);
+    assert!(started.elapsed().as_secs() < 30, "{label}: ребёнок работал слишком долго");
+    let rep = one_json_line(&out);
+    let allowed = ["BAD_DEMO", "PLAYER_NOT_FOUND", "PLAYER_AMBIGUOUS", "NO_HIGHLIGHTS"];
+    assert!(rep.ok || allowed.contains(&rep.code.as_str()), "{label}: неожиданный код {rep:?}");
+}
+
+#[test]
+fn mutated_demos_through_the_child_answer_with_one_json_line() {
+    let demo = synthetic();
+    let step = (demo.len() / 20).max(1);
+    for cut in (0..demo.len()).step_by(step).take(20) {
+        mutant_answers(&format!("усечение до {cut}"), &demo[..cut]);
+    }
+    let mut rng = Lcg(0x5EED_CAFE);
+    for n in 0..50 {
+        let pos = rng.next() as usize % demo.len();
+        let mask = (rng.next() % 255) as u8 + 1;
+        let mut copy = demo.clone();
+        copy[pos] ^= mask;
+        mutant_answers(&format!("вариант {n}: байт {pos} ^ {mask:#x}"), &copy);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn child_over_the_memory_limit_becomes_bad_demo_for_the_parent() {
+    // 200 МиБ нулей после распаковки при потолке памяти ребёнка 64 МиБ: потолок распаковки (2 ГиБ) не сработает,
+    // сработает только Job Object
+    let bomb = write("mem", "mem.dem.zst", &demo::synth::zstd_bomb(200 * MIB));
+    let mut args = parent_args(&bomb, "x");
+    args.limits.demo.max_unpacked = 2048 * MIB as u64;
+    args.limits.mem_bytes = 64 * MIB as u64;
+    args.limits.secs = 60;
+
+    // сам ребёнок упирается в лимит: либо ловит отказ выделения и отвечает BAD_DEMO, либо умирает без ответа
+    let direct = Command::new(EXE)
+        .arg("inspect")
+        .arg(&bomb)
+        .args(["--max-unpacked-mib", "2048", "--mem-mib", "64", "--secs", "60", "--no-flybys"])
+        .output()
+        .unwrap();
+    if direct.status.code() == Some(0) {
+        let rep = one_json_line(&direct);
+        assert_eq!((rep.ok, rep.code.as_str()), (false, "BAD_DEMO"), "{rep:?}");
+        assert!(rep.peak_mem_bytes <= 64 * MIB as u64, "пик памяти выше лимита: {rep:?}");
+    }
+
+    let host = pipeline::host::default_host();
+    let e = pipeline::inspect::preflight(&*host, Path::new(EXE), &args, &|| false).expect_err("ребёнок упёрся в лимит памяти");
+    let fail = e.fail.expect("типизированный сбой");
+    assert_eq!(fail.code, FailCode::BadDemo);
+    assert!(e.message.contains("не уложился в память или время") || e.message.contains("out of memory"), "{}", e.message);
+}
+
+#[test]
+fn cli_player_flag_refuses_an_ambiguous_nick() {
+    let demo = write("cli-player", "match.dem", &synthetic());
+    let bad = Command::new(EXE).arg(&demo).args(["--player", "mple", "--list"]).output().unwrap();
+    assert_eq!(bad.status.code(), Some(1), "stdout: {}", String::from_utf8_lossy(&bad.stdout));
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(err.contains("подходит нескольким игрокам"), "{err}");
+
+    let good = Command::new(EXE).arg(&demo).args(["--player", "s1mple", "--list"]).output().unwrap();
+    assert_eq!(good.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&good.stderr));
+}

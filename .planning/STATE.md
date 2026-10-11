@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 05
 current_phase_name: Ядро сервера и протокол
 status: executing
-stopped_at: Completed 05-03-PLAN.md
-last_updated: "2026-10-11T11:11:43.146Z"
+stopped_at: Completed 05-04-PLAN.md
+last_updated: "2026-10-11T11:26:19.994Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 05 execution started
-state_head: 44b90459af49a9c04befa97fb3769e64afb2eb63
+state_head: af012d1ee76b18d54fce678259b69cf37d6a41ef
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 5
-  completed_plans: 3
+  completed_plans: 4
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 05 (Ядро сервера и протокол) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 05 execution started
 
@@ -95,6 +95,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 05 P01 | 35min | 3 tasks | 20 files |
 | Phase 05 P02 | 40min | 2 tasks | 12 files |
 | Phase 05 P03 | 45min | 3 tasks | 11 files |
+| Phase 05 P04 | 80m | 3 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -160,6 +161,9 @@ Recent decisions affecting current work:
 - [Phase 05]: tiny_http 0.12 подтверждён как HTTP-стек (D-01): тесты протокола проходят, axum не нужен
 - [Phase 05]: http::start_with_flag: общий флаг остановки у Ctx и HttpServer; Core::claim без фильтра max_grants (потолок — в плане аренд)
 - [Phase 05]: 05-03: срок аренды <= now считается истёкшим; last_seq/phase/take сбрасываются при новой выдаче; потеря аренды обратима и не считается сбоем
+- [Phase 05]: 05-04: итог done по HTTP не принимается до 05-05; FinishKind::Done и таблица переходов готовы
+- [Phase 05]: 05-04: claim освобождает прежнюю потерянную аренду того же раннера (раннер не ведёт две задачи)
+- [Phase 05]: 05-04: finish на окончательной задаче — повтор того же итога 200, иначе job_terminal
 
 ### Pending Todos
 
@@ -189,6 +193,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T11:11:43.117Z
-Stopped at: Completed 05-03-PLAN.md
+Last session: 2026-10-11T11:26:19.960Z
+Stopped at: Completed 05-04-PLAN.md
 Resume file: None

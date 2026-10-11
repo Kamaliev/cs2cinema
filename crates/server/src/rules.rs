@@ -17,7 +17,7 @@ pub const RECEIVING_STALE_MS: i64 = 30 * 60 * 1000;
 /// Вид итога, который раннер сообщает в `finish`. `Failure` приходит уже очищенным (`Core::sanitize_failure`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum FinishKind {
-    /// Результат загружен и проверен (проверку файла делает `Core` до вызова; загрузка — план 05-05).
+    /// Результат загружен и проверен (размер и SHA-256 файла проверяет `Core::finish_done` до записи состояния).
     Done,
     Failed(Failure),
     Cancelled,
@@ -59,6 +59,12 @@ pub enum Event {
         epoch: i64,
         counts: bool,
     },
+    /// Раннер прислал кусок результата: `assigned|running` -> `uploading`, аренда продлевается (загрузка - признак
+    /// жизни раннера); потерянная аренда возвращается.
+    Chunk { runner_id: i64, epoch: i64 },
+    /// `HEAD` результата и скачивание демки: аренда продлевается без смены состояния; потерянная аренда
+    /// возвращается по сохранённому этапу (как `Reattach`).
+    Touch { runner_id: i64, epoch: i64 },
     /// Раннер сообщает итог: сбой, отмену или готовый результат.
     Finish {
         runner_id: i64,
@@ -256,6 +262,34 @@ pub fn decide(job: &JobRow, ev: &Event, now_ms: i64, limits: &Limits) -> Result<
                 discard_parts: true,
             })
         }
+        Event::Chunk { runner_id, epoch } => {
+            if job.state.is_terminal() {
+                return Err(terminal());
+            }
+            let lost = job.state == JobState::Queued && job.lease_lost;
+            if !(job.state.is_leased() || lost) || !fenced(job, *runner_id, *epoch) {
+                return Err(stale());
+            }
+            let mut j = job.clone();
+            j.state = JobState::Uploading;
+            j.lease_until = Some(now_ms + limits.lease_ttl_ms);
+            j.lease_lost = false;
+            j.phase = Phase::Upload.as_str().to_owned();
+            Ok(Decision {
+                job: j,
+                reattached: lost,
+                discard_parts: false,
+            })
+        }
+        Event::Touch { runner_id, epoch } => decide(
+            job,
+            &Event::Reattach {
+                runner_id: *runner_id,
+                epoch: *epoch,
+            },
+            now_ms,
+            limits,
+        ),
         Event::Reattach { runner_id, epoch } => {
             if job.state.is_terminal() {
                 return Err(terminal());

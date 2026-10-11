@@ -742,6 +742,50 @@ fn every_state_and_event_pair_matches_the_transition_table() {
             ),
         ),
         (
+            "chunk своего",
+            Event::Chunk {
+                runner_id: OWN.runner,
+                epoch: OWN.epoch,
+            },
+            plain,
+            cells(
+                "!stale_epoch !stale_epoch S:uploading S:uploading S:uploading S:uploading !job_terminal !job_terminal !job_terminal",
+            ),
+        ),
+        (
+            "chunk чужого",
+            Event::Chunk {
+                runner_id: FOREIGN.runner,
+                epoch: FOREIGN.epoch,
+            },
+            plain,
+            cells(
+                "!stale_epoch !stale_epoch !stale_epoch !stale_epoch !stale_epoch !stale_epoch !job_terminal !job_terminal !job_terminal",
+            ),
+        ),
+        (
+            "touch своего",
+            Event::Touch {
+                runner_id: OWN.runner,
+                epoch: OWN.epoch,
+            },
+            plain,
+            cells(
+                "!stale_epoch !stale_epoch S:assigned S:assigned S:running S:uploading !job_terminal !job_terminal !job_terminal",
+            ),
+        ),
+        (
+            "touch чужого",
+            Event::Touch {
+                runner_id: FOREIGN.runner,
+                epoch: FOREIGN.epoch,
+            },
+            plain,
+            cells(
+                "!stale_epoch !stale_epoch !stale_epoch !stale_epoch !stale_epoch !stale_epoch !job_terminal !job_terminal !job_terminal",
+            ),
+        ),
+        (
             "recover",
             Event::Recover {
                 grace_until: T0 + 90_000,
@@ -854,7 +898,7 @@ fn every_state_and_event_pair_matches_the_transition_table() {
             pairs += 1;
         }
     }
-    assert_eq!(pairs, 21 * 9, "таблица охватывает все пары");
+    assert_eq!(pairs, 25 * 9, "таблица охватывает все пары");
 }
 
 #[test]

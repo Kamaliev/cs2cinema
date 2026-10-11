@@ -3,7 +3,7 @@
 //! Правило: копирование и хеширование файлов идут вне мьютекса базы, затем одна короткая транзакция.
 
 use crate::Result;
-use crate::blobs::{Blobs, Ingested, demo_rel, sniff_demo};
+use crate::blobs::{Blobs, Finalized, Ingested, demo_rel, result_rel, sniff_demo};
 use crate::clock::Clock;
 use crate::db::{Db, db_err};
 use crate::rules::{self, Event, FinishKind};
@@ -61,6 +61,8 @@ pub struct Reject {
     pub message: String,
     pub offset: Option<u64>,
     pub detail: Option<String>,
+    /// Дополнительные заголовки ответа (`Retry-After`, `Content-Range`).
+    pub headers: Vec<(&'static str, String)>,
 }
 
 impl Reject {
@@ -70,6 +72,7 @@ impl Reject {
             message: message.into(),
             offset: None,
             detail: None,
+            headers: Vec::new(),
         }
     }
 }
@@ -82,6 +85,7 @@ impl From<String> for Reject {
             message: "внутренняя ошибка сервера".to_owned(),
             offset: None,
             detail: Some(detail),
+            headers: Vec::new(),
         }
     }
 }
@@ -639,6 +643,9 @@ impl Core {
         req: &FinishRequest,
     ) -> std::result::Result<Finished, Reject> {
         let kind = match &req.outcome {
+            Outcome::Done { size, sha256 } => {
+                return self.finish_done(runner_id, job_id, req.epoch, *size, sha256);
+            }
             Outcome::Failed(f) => FinishKind::Failed(self.sanitize_failure(f)),
             Outcome::Cancelled => FinishKind::Cancelled,
             Outcome::Unknown => {
@@ -672,6 +679,189 @@ impl Core {
             reply: FinishReply { state },
             discard_error,
         })
+    }
+
+    /// Итог `done` (SRV-06): результат становится файлом задачи только после совпадения размера и SHA-256.
+    /// Порядок: пробное решение автомата без записи -> проверка файла вне мьютекса базы под охраной загрузки ->
+    /// вторая транзакция с повторным решением и строкой `files` (сравнение-и-запись: если задачу отменили, пока шёл хеш,
+    /// готовый файл удаляется и раннер получает отказ).
+    fn finish_done(
+        &self,
+        runner_id: i64,
+        job_id: i64,
+        epoch: i64,
+        size: u64,
+        sha256: &str,
+    ) -> std::result::Result<Finished, Reject> {
+        let sha = sha256.to_ascii_lowercase();
+        if size == 0 || size > self.limits.max_result_bytes {
+            return Err(Reject::new(
+                codes::BAD_REQUEST,
+                format!(
+                    "размер результата должен быть от 1 байта до {} МиБ",
+                    self.limits.max_result_bytes / MIB
+                ),
+            ));
+        }
+        if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Reject::new(
+                codes::BAD_REQUEST,
+                "sha256 результата должен быть из 64 шестнадцатеричных знаков",
+            ));
+        }
+        let ev = Event::Finish {
+            runner_id,
+            epoch,
+            kind: FinishKind::Done,
+        };
+
+        // Проверка 1: пробное решение без записи. Задача уже `done` у этого раннера и этой эпохи — повтор идемпотентен,
+        // если принятый файл тот же.
+        let now = self.clock.now_ms();
+        let repeat = self.db.read(|c| {
+            let before = job_by_id(c, job_id)?.ok_or_else(not_found)?;
+            rules::decide(&before, &ev, now, &self.limits)?;
+            if before.state != JobState::Done {
+                return Ok::<bool, Reject>(false);
+            }
+            match result_by_job(c, job_id)? {
+                Some(f) if f.sha256 == sha && f.size == size => Ok(true),
+                _ => Err(Reject::new(codes::JOB_TERMINAL, "задача уже завершена")),
+            }
+        })?;
+        if repeat {
+            return Ok(Finished {
+                reply: FinishReply {
+                    state: JobState::Done,
+                },
+                discard_error: None,
+            });
+        }
+
+        // Файл: вне мьютекса базы, под охраной загрузки этой эпохи.
+        let Some(_guard) = self.blobs.lock_upload(job_id, epoch) else {
+            return Err(Reject::new(
+                codes::UPLOAD_BUSY,
+                "идёт загрузка куска этой задачи: повторите итог чуть позже",
+            ));
+        };
+        match self.blobs.finalize_result(job_id, epoch, size, &sha)? {
+            Finalized::Ok => {}
+            Finalized::SizeMismatch { actual } => {
+                let mut r = Reject::new(
+                    codes::OFFSET_MISMATCH,
+                    format!("размер результата {actual}, а не {size}: догрузите недостающее"),
+                );
+                r.offset = Some(actual);
+                return Err(r);
+            }
+            Finalized::ShaMismatch => {
+                return Err(Reject::new(
+                    codes::SHA256_MISMATCH,
+                    "SHA-256 результата не совпал: загрузите результат заново с нуля",
+                ));
+            }
+        }
+
+        // Транзакция 2: повторное решение (задачу могли отменить или выдать заново) и строка файла.
+        let now = self.clock.now_ms();
+        let committed = self.db.write(|tx| {
+            let before = job_by_id(tx, job_id)?.ok_or_else(not_found)?;
+            let d = rules::decide(&before, &ev, now, &self.limits)?;
+            apply(tx, &before, &d.job, now)?;
+            tx.execute(
+                "INSERT INTO files(job_id, kind, rel_path, size, sha256, created_at) VALUES (?1, 'result', ?2, ?3, ?4, ?5)",
+                params![job_id, result_rel(job_id), size as i64, sha, now],
+            )
+            .map_err(db_err)?;
+            Ok::<JobState, Reject>(d.job.state)
+        });
+        let state = match committed {
+            Ok(s) => s,
+            Err(rej) => {
+                // Такой файл не становится результатом: убираем его, если задача не закрыта другой записью.
+                let closed = matches!(self.job(job_id), Ok(Some(j)) if j.state == JobState::Done);
+                if !closed {
+                    let _ = self.blobs.remove_result(job_id);
+                }
+                return Err(rej);
+            }
+        };
+        let discard_error = self
+            .blobs
+            .discard_parts(job_id)
+            .err()
+            .map(|e| format!("задача #{job_id}: не удалось удалить куски результата: {e}"));
+        Ok(Finished {
+            reply: FinishReply { state },
+            discard_error,
+        })
+    }
+
+    /// Загрузка куска результата: ограждение эпохой, `-> uploading` и продление аренды. Отказ окончательной
+    /// задаче сопровождается уборкой её недозагруженных кусков (между отказом и удалением мог дописаться кусок).
+    pub fn touch_upload(
+        &self,
+        runner_id: i64,
+        job_id: i64,
+        epoch: i64,
+    ) -> std::result::Result<(), Reject> {
+        let now = self.clock.now_ms();
+        let ev = Event::Chunk { runner_id, epoch };
+        let out = self.db.write(|tx| {
+            let before = job_by_id(tx, job_id)?.ok_or_else(not_found)?;
+            let d = rules::decide(&before, &ev, now, &self.limits)?;
+            apply(tx, &before, &d.job, now)?;
+            Ok::<(), Reject>(())
+        });
+        if let Err(r) = &out
+            && r.code == codes::JOB_TERMINAL
+        {
+            let _ = self.blobs.discard_parts(job_id);
+        }
+        out
+    }
+
+    /// `HEAD` результата и скачивание демки: ограждение эпохой и продление аренды без смены состояния.
+    pub fn touch(
+        &self,
+        runner_id: i64,
+        job_id: i64,
+        epoch: i64,
+    ) -> std::result::Result<JobRow, Reject> {
+        let now = self.clock.now_ms();
+        let ev = Event::Touch { runner_id, epoch };
+        self.db.write(|tx| {
+            let before = job_by_id(tx, job_id)?.ok_or_else(not_found)?;
+            let d = rules::decide(&before, &ev, now, &self.limits)?;
+            apply(tx, &before, &d.job, now)?;
+            Ok::<JobRow, Reject>(d.job)
+        })
+    }
+
+    /// Сколько байт результата сервер уже принял в эту эпоху (для `HEAD`): после ограждения - длина `.part`.
+    pub fn result_offset(
+        &self,
+        runner_id: i64,
+        job_id: i64,
+        epoch: i64,
+    ) -> std::result::Result<u64, Reject> {
+        self.touch(runner_id, job_id, epoch)?;
+        self.blobs
+            .part_len(job_id, epoch)
+            .map_err(|e| Reject::from(format!("задача #{job_id}: длина .part: {e}")))
+    }
+
+    /// Демка задачи для скачивания раннером: ограждение, продление аренды и строка файла (нет демки - 404).
+    pub fn demo_for(
+        &self,
+        runner_id: i64,
+        job_id: i64,
+        epoch: i64,
+    ) -> std::result::Result<FileRow, Reject> {
+        self.touch(runner_id, job_id, epoch)?;
+        self.demo_file(job_id)?
+            .ok_or_else(|| Reject::new(codes::NOT_FOUND, "у задачи нет демки"))
     }
 
     /// Прогресс раннера (он же heartbeat): продлевает аренду и двигает состояние. Возвращает ответ и признак того,
@@ -901,6 +1091,17 @@ fn expire_leases(tx: &rusqlite::Transaction<'_>, now: i64, limits: &Limits) -> R
         }
     }
     Ok(out)
+}
+
+/// Принятый результат задачи (строка `files` с `kind = 'result'`, не удалённая).
+fn result_by_job(c: &Connection, job_id: i64) -> Result<Option<FileRow>> {
+    c.query_row(
+        "SELECT rel_path, size, sha256 FROM files WHERE job_id = ?1 AND kind = 'result' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
+        [job_id],
+        |r| Ok(FileRow { rel_path: r.get(0)?, size: r.get::<_, i64>(1)? as u64, sha256: r.get(2)? }),
+    )
+    .optional()
+    .map_err(db_err)
 }
 
 fn demo_by_job(c: &Connection, job_id: i64) -> Result<Option<FileRow>> {

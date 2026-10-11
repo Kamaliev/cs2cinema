@@ -308,3 +308,245 @@ pub fn fake_demo(size: usize) -> Vec<u8> {
     }
     bytes
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Передача файлов кусками (05-05)
+// ---------------------------------------------------------------------------------------------------------
+
+/// Ответ на скачивание куска демки: статус, заголовки и байты тела.
+pub struct RangeResp {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl RangeResp {
+    /// Значение заголовка без учёта регистра имени.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// SHA-256 строчными шестнадцатеричными знаками.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    server::hex(&Sha256::digest(bytes))
+}
+
+/// Детерминированные байты результата: не повторяются на границах кусков.
+pub fn result_bytes(size: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size);
+    let mut x = 0x9E37_79B9u32;
+    while out.len() < size {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        out.push((x >> 24) as u8);
+    }
+    out
+}
+
+fn upload_offset_of(resp: &ureq::http::Response<ureq::Body>) -> Option<u64> {
+    resp.headers()
+        .get("upload-offset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+}
+
+impl TestServer {
+    /// `PUT /v1/jobs/{id}/result` на готовом клиенте (соединение можно переиспользовать):
+    /// статус, заголовок `Upload-Offset` и тело ответа.
+    pub fn put_chunk_on(
+        &self,
+        agent: &ureq::Agent,
+        token: &str,
+        job_id: i64,
+        epoch: i64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> (u16, Option<u64>, String) {
+        let mut resp = agent
+            .put(&self.url(&wire::paths::job(job_id, "result")))
+            .header("Authorization", &format!("Bearer {token}"))
+            .header(wire::headers::EPOCH, &epoch.to_string())
+            .header(wire::headers::UPLOAD_OFFSET, &offset.to_string())
+            .send(bytes)
+            .expect("PUT куска");
+        let status = resp.status().as_u16();
+        let off = upload_offset_of(&resp);
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        (status, off, body)
+    }
+
+    pub fn put_chunk(
+        &self,
+        token: &str,
+        job_id: i64,
+        epoch: i64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> (u16, Option<u64>, String) {
+        self.put_chunk_on(&agent(), token, job_id, epoch, offset, bytes)
+    }
+
+    /// `HEAD /v1/jobs/{id}/result` на готовом клиенте: статус и `Upload-Offset`.
+    pub fn head_offset_on(
+        &self,
+        agent: &ureq::Agent,
+        token: &str,
+        job_id: i64,
+        epoch: i64,
+    ) -> (u16, Option<u64>) {
+        let resp = agent
+            .head(&self.url(&wire::paths::job(job_id, "result")))
+            .header("Authorization", &format!("Bearer {token}"))
+            .header(wire::headers::EPOCH, &epoch.to_string())
+            .call()
+            .expect("HEAD результата");
+        (resp.status().as_u16(), upload_offset_of(&resp))
+    }
+
+    pub fn head_offset(&self, token: &str, job_id: i64, epoch: i64) -> (u16, Option<u64>) {
+        self.head_offset_on(&agent(), token, job_id, epoch)
+    }
+
+    /// `GET /v1/jobs/{id}/demo` с необязательным `Range`.
+    pub fn get_range(
+        &self,
+        token: &str,
+        job_id: i64,
+        epoch: i64,
+        range: Option<&str>,
+    ) -> RangeResp {
+        let mut rq = agent()
+            .get(&self.url(&wire::paths::job(job_id, "demo")))
+            .header("Authorization", &format!("Bearer {token}"))
+            .header(wire::headers::EPOCH, &epoch.to_string());
+        if let Some(r) = range {
+            rq = rq.header("Range", r);
+        }
+        let mut resp = rq.call().expect("GET демки");
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
+            .collect();
+        let body = resp
+            .body_mut()
+            .with_config()
+            .limit(64 * 1024 * 1024)
+            .read_to_vec()
+            .unwrap_or_default();
+        RangeResp {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    /// `HEAD /v1/jobs/{id}/demo`: статус и заголовки.
+    pub fn head_demo(&self, token: &str, job_id: i64, epoch: i64) -> (u16, Vec<(String, String)>) {
+        let resp = agent()
+            .head(&self.url(&wire::paths::job(job_id, "demo")))
+            .header("Authorization", &format!("Bearer {token}"))
+            .header(wire::headers::EPOCH, &epoch.to_string())
+            .call()
+            .expect("HEAD демки");
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
+            .collect();
+        (resp.status().as_u16(), headers)
+    }
+
+    /// Итог `done` с размером и SHA-256: статус и тело ответа.
+    pub fn finish_done(
+        &self,
+        token: &str,
+        job_id: i64,
+        epoch: i64,
+        size: u64,
+        sha256: &str,
+    ) -> (u16, String) {
+        self.finish(
+            token,
+            job_id,
+            &FinishRequest {
+                epoch,
+                outcome: wire::Outcome::Done {
+                    size,
+                    sha256: sha256.to_owned(),
+                },
+            },
+        )
+    }
+
+    /// Адрес сервера для сырого соединения.
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.running().addr()
+    }
+
+    /// Папка результата задачи на диске.
+    pub fn results_dir(&self, job_id: i64) -> PathBuf {
+        self.dir
+            .path
+            .join("data")
+            .join("blobs")
+            .join("results")
+            .join(job_id.to_string())
+    }
+}
+
+/// Сырое TCP-соединение с таймаутом чтения 10 с: для запросов, которые `ureq` не умеет (обрыв, `Expect`).
+pub fn raw_request(addr: std::net::SocketAddr) -> std::net::TcpStream {
+    let s = std::net::TcpStream::connect(addr).expect("соединение с сервером");
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+    s
+}
+
+/// Читает строку до `\n` побайтово, чтобы не забрать лишнего из потока; `\r` в конце отбрасывается.
+pub fn read_line(s: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    while let Ok(1) = s.read(&mut b) {
+        if b[0] == b'\n' {
+            break;
+        }
+        line.push(b[0]);
+    }
+    String::from_utf8_lossy(&line)
+        .trim_end_matches('\r')
+        .to_owned()
+}
+
+/// Первая строка ответа, например `HTTP/1.1 204 No Content`.
+pub fn read_status_line(s: &mut std::net::TcpStream) -> String {
+    read_line(s)
+}
+
+/// Читает заголовки ответа до пустой строки (после строки статуса) в виде пар «имя, значение».
+pub fn read_headers(s: &mut std::net::TcpStream) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    loop {
+        let line = read_line(s);
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            out.push((k.trim().to_owned(), v.trim().to_owned()));
+        }
+    }
+    out
+}
+
+/// Заголовки сырого `PUT` куска результата; `extra` — готовые строки с `\r\n` на конце.
+pub fn raw_put_head(token: &str, job_id: i64, epoch: i64, offset: u64, extra: &str) -> String {
+    format!(
+        "PUT /v1/jobs/{job_id}/result HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer {token}\r\nX-Epoch: {epoch}\r\nUpload-Offset: {offset}\r\n{extra}\r\n"
+    )
+}

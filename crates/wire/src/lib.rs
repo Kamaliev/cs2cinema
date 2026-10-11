@@ -322,11 +322,16 @@ pub struct Failure {
     pub elapsed_ms: u64,
 }
 
-/// Итог задачи, который сообщает раннер. Итог `done` с размером и SHA-256 результата описывает загрузка результата
-/// (план 05-05); до неё он читается как `Unknown`, как и любой итог от более новой стороны протокола.
+/// Итог задачи, который сообщает раннер. Незнакомый итог от более новой стороны протокола читается как `Unknown`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outcome {
+    /// Результат загружен целиком: размер и SHA-256 всего файла. Сервер пересчитывает хеш сам и принимает файл
+    /// только при совпадении обоих значений.
+    Done {
+        size: u64,
+        sha256: String,
+    },
     Failed(Failure),
     Cancelled,
     #[serde(other)]
@@ -576,6 +581,26 @@ mod tests {
             .unwrap(),
             r#"{"state":"failed"}"#
         );
+    }
+
+    #[test]
+    fn done_outcome_round_trips() {
+        let done = FinishRequest {
+            epoch: 2,
+            outcome: Outcome::Done {
+                size: 17_825_792,
+                sha256: "ab".repeat(32),
+            },
+        };
+        let json = serde_json::to_string(&done).unwrap();
+        assert!(json.contains(r#""kind":"done""#), "{json}");
+        assert!(json.contains(r#""size":17825792"#), "{json}");
+        assert_eq!(serde_json::from_str::<FinishRequest>(&json).unwrap(), done);
+        // Без размера или хеша итог `done` не читается: Unknown не должен молча принять неполный итог.
+        let bad = serde_json::from_str::<FinishRequest>(
+            r#"{"epoch":1,"outcome":{"kind":"done","size":5}}"#,
+        );
+        assert!(bad.is_err(), "итог done без sha256 не разбирается");
     }
 
     #[test]

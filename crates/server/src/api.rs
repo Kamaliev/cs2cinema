@@ -9,11 +9,12 @@ use crate::core::{Core, Reject};
 use crate::log::Log;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::io::Read;
+use std::fs::File;
+use std::io::{Read, Take};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tiny_http::{Header, Method, Request, Response};
+use tiny_http::{Header, Method, Request, Response, StatusCode};
 use wire::{
     ApiError, ClaimRequest, FinishRequest, HelloRequest, Outcome, ProgressRequest, ReleaseRequest,
     codes,
@@ -30,10 +31,15 @@ pub struct Ctx {
     pub shutdown: Arc<AtomicBool>,
 }
 
-/// Готовый ответ: статус и необязательное JSON-тело.
+/// Готовый ответ: статус, заголовки и необязательное тело (JSON, кусок файла или только длина для `HEAD`).
 struct Reply {
     status: u16,
     body: Option<String>,
+    headers: Vec<(&'static str, String)>,
+    /// Кусок файла: читатель и его длина (ответ 206 на скачивание демки).
+    file: Option<(Take<File>, usize)>,
+    /// `HEAD`: пустое тело с `Content-Length` настоящего файла.
+    head_len: Option<usize>,
 }
 
 impl Reply {
@@ -41,16 +47,28 @@ impl Reply {
         let body = serde_json::to_string(value)
             .map_err(|e| Reject::from(format!("сериализация ответа: {e}")))?;
         Ok(Reply {
-            status,
             body: Some(body),
+            ..Reply::bare(status)
         })
     }
 
-    fn no_content() -> Reply {
+    fn bare(status: u16) -> Reply {
         Reply {
-            status: 204,
+            status,
             body: None,
+            headers: Vec::new(),
+            file: None,
+            head_len: None,
         }
+    }
+
+    fn no_content() -> Reply {
+        Reply::bare(204)
+    }
+
+    fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Reply {
+        self.headers.push((name, value.into()));
+        self
     }
 }
 
@@ -107,13 +125,19 @@ fn route(
     match (method, path) {
         (Method::Post, wire::paths::CLAIM) => claim(ctx, rq, trace),
         (Method::Post, wire::paths::HELLO) => hello(ctx, rq, trace),
-        (Method::Post, p) if p.starts_with("/v1/jobs/") => job_action(ctx, rq, p, trace),
+        (_, p) if p.starts_with("/v1/jobs/") => job_action(ctx, rq, method, p, trace),
         _ => Err(Reject::new(codes::NOT_FOUND, "нет такого адреса")),
     }
 }
 
-/// `POST /v1/jobs/{id}/{действие}`: id — целое больше нуля, иначе 404; токен проверяется до чтения тела.
-fn job_action(ctx: &Ctx, rq: &mut Request, path: &str, trace: &mut Trace) -> Result<Reply, Reject> {
+/// `/v1/jobs/{id}/{действие}`: id — целое больше нуля, иначе 404; токен проверяется до чтения тела.
+fn job_action(
+    ctx: &Ctx,
+    rq: &mut Request,
+    method: &Method,
+    path: &str,
+    trace: &mut Trace,
+) -> Result<Reply, Reject> {
     let not_found = || Reject::new(codes::NOT_FOUND, "нет такого адреса");
     let rest = path.strip_prefix("/v1/jobs/").ok_or_else(not_found)?;
     let (id, action) = rest.split_once('/').ok_or_else(not_found)?;
@@ -122,10 +146,14 @@ fn job_action(ctx: &Ctx, rq: &mut Request, path: &str, trace: &mut Trace) -> Res
         .ok()
         .filter(|n| *n > 0)
         .ok_or_else(not_found)?;
-    match action {
-        "progress" => progress(ctx, rq, job_id, trace),
-        "release" => release(ctx, rq, job_id, trace),
-        "finish" => finish(ctx, rq, job_id, trace),
+    match (method, action) {
+        (Method::Post, "progress") => progress(ctx, rq, job_id, trace),
+        (Method::Post, "release") => release(ctx, rq, job_id, trace),
+        (Method::Post, "finish") => finish(ctx, rq, job_id, trace),
+        (Method::Head, "result") => head_result(ctx, rq, job_id, trace),
+        (Method::Put, "result") => put_result(ctx, rq, job_id, trace),
+        (Method::Head, "demo") => head_demo(ctx, rq, job_id, trace),
+        (Method::Get, "demo") => get_demo(ctx, rq, job_id, trace),
         _ => Err(not_found()),
     }
 }
@@ -184,6 +212,199 @@ fn finish(ctx: &Ctx, rq: &mut Request, job_id: i64, trace: &mut Trace) -> Result
         runner.name
     ));
     Reply::json(200, &done.reply)
+}
+
+/// Заголовок как целое число; нет или не число — 400.
+fn header_number<T: std::str::FromStr>(rq: &Request, name: &str) -> Result<T, Reject> {
+    rq.headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .and_then(|h| h.value.as_str().trim().parse::<T>().ok())
+        .ok_or_else(|| {
+            Reject::new(
+                codes::BAD_REQUEST,
+                format!("нужен заголовок {name} с целым числом"),
+            )
+        })
+}
+
+/// `HEAD /v1/jobs/{id}/result`: сколько байт результата сервер уже принял в эту эпоху.
+fn head_result(
+    ctx: &Ctx,
+    rq: &mut Request,
+    job_id: i64,
+    trace: &mut Trace,
+) -> Result<Reply, Reject> {
+    let runner = authenticate(ctx, rq)?;
+    trace.runner = Some(runner.name.clone());
+    let epoch: i64 = header_number(rq, wire::headers::EPOCH)?;
+    let offset = ctx.core.result_offset(runner.id, job_id, epoch)?;
+    Ok(Reply::bare(200).with_header(wire::headers::UPLOAD_OFFSET, offset.to_string()))
+}
+
+/// `PUT /v1/jobs/{id}/result`: один кусок результата не больше `CHUNK_SIZE`, дописывается в `.part` эпохи.
+///
+/// Порядок проверок важен (Pitfall 3 исследования): всё, что отвергает запрос, идёт до чтения тела, поэтому
+/// `100 Continue` отвергнутому запросу не отправляется, а тело не принимается зря.
+fn put_result(
+    ctx: &Ctx,
+    rq: &mut Request,
+    job_id: i64,
+    trace: &mut Trace,
+) -> Result<Reply, Reject> {
+    let runner = authenticate(ctx, rq)?;
+    trace.runner = Some(runner.name.clone());
+    let epoch: i64 = header_number(rq, wire::headers::EPOCH)?;
+    let offset: u64 = header_number(rq, wire::headers::UPLOAD_OFFSET)?;
+    let len = match rq.body_length() {
+        None => {
+            return Err(Reject::new(
+                codes::LENGTH_REQUIRED,
+                "нужен Content-Length: кусок без длины или chunked не принимается",
+            ));
+        }
+        Some(0) => return Err(Reject::new(codes::BAD_REQUEST, "пустой кусок")),
+        Some(n) if n as u64 > wire::CHUNK_SIZE => {
+            return Err(Reject::new(
+                codes::TOO_LARGE,
+                format!("кусок больше {} МиБ", wire::CHUNK_SIZE / (1024 * 1024)),
+            ));
+        }
+        Some(n) => n as u64,
+    };
+    // Ограждение эпохой, `-> uploading` и продление аренды.
+    ctx.core.touch_upload(runner.id, job_id, epoch)?;
+    let Some(guard) = ctx.core.blobs().lock_upload(job_id, epoch) else {
+        let mut busy = Reject::new(
+            codes::UPLOAD_BUSY,
+            "кусок этой задачи уже принимается: повторите через секунду",
+        );
+        busy.headers
+            .push((wire::headers::RETRY_AFTER, "1".to_owned()));
+        return Err(busy);
+    };
+    let actual = ctx
+        .core
+        .blobs()
+        .part_len(job_id, epoch)
+        .map_err(|e| Reject::from(format!("задача #{job_id}: длина .part: {e}")))?;
+    if offset != actual {
+        // Смещение никогда не «перематывается»: отказ и для меньшего, и для большего, тело не читается.
+        let mut r = Reject::new(
+            codes::OFFSET_MISMATCH,
+            format!("сервер принял {actual} байт, а не {offset}: продолжайте с {actual}"),
+        );
+        r.offset = Some(actual);
+        return Err(r);
+    }
+    let max = ctx.core.limits().max_result_bytes;
+    if offset.checked_add(len).is_none_or(|end| end > max) {
+        return Err(Reject::new(
+            codes::TOO_LARGE,
+            format!("результат больше {} МиБ", max / (1024 * 1024)),
+        ));
+    }
+    // Только теперь читается тело: `100 Continue` уйдёт лишь принятому запросу.
+    let got = ctx
+        .core
+        .blobs()
+        .append_chunk(&guard, offset, len, rq.as_reader());
+    if got.got != len {
+        // Обрыв выглядит как чистый EOF (Pitfall 1) или как ошибка чтения: принятые байты остались на диске,
+        // следующий `HEAD` покажет настоящее смещение.
+        ctx.log.warn(&format!(
+            "кусок задачи #{job_id} оборван: принято {} из {len} байт",
+            got.got
+        ));
+        let mut r = Reject::new(
+            codes::BAD_REQUEST,
+            "кусок оборван: узнайте смещение через HEAD",
+        );
+        r.detail = got.error;
+        return Err(r);
+    }
+    if let Some(e) = got.error {
+        return Err(Reject::from(format!("задача #{job_id}: запись куска: {e}")));
+    }
+    ctx.core.touch_upload(runner.id, job_id, epoch)?;
+    Ok(Reply::no_content().with_header(wire::headers::UPLOAD_OFFSET, (offset + len).to_string()))
+}
+
+/// `HEAD /v1/jobs/{id}/demo`: размер и SHA-256 демки; аренда продлевается.
+fn head_demo(ctx: &Ctx, rq: &mut Request, job_id: i64, trace: &mut Trace) -> Result<Reply, Reject> {
+    let runner = authenticate(ctx, rq)?;
+    trace.runner = Some(runner.name.clone());
+    let epoch: i64 = header_number(rq, wire::headers::EPOCH)?;
+    let demo = ctx.core.demo_for(runner.id, job_id, epoch)?;
+    let mut reply = Reply::bare(200)
+        .with_header("ETag", format!("\"{}\"", demo.sha256))
+        .with_header("Accept-Ranges", "bytes")
+        .with_header("Content-Type", "application/octet-stream");
+    reply.head_len = Some(usize::try_from(demo.size).unwrap_or(usize::MAX));
+    Ok(reply)
+}
+
+/// Разбор `Range`: только `bytes=N-` и `bytes=N-M` (`M >= N`); без заголовка — с начала файла.
+fn parse_range(rq: &Request) -> Result<(u64, Option<u64>), Reject> {
+    let bad = || {
+        Reject::new(
+            codes::BAD_REQUEST,
+            "поддерживается только Range: bytes=N- или bytes=N-M",
+        )
+    };
+    let Some(h) = rq.headers().iter().find(|h| h.field.equiv("Range")) else {
+        return Ok((0, None));
+    };
+    let spec = h
+        .value
+        .as_str()
+        .trim()
+        .strip_prefix("bytes=")
+        .ok_or_else(bad)?;
+    let (a, b) = spec.split_once('-').ok_or_else(bad)?;
+    let start = a.parse::<u64>().map_err(|_| bad())?;
+    if b.is_empty() {
+        return Ok((start, None));
+    }
+    let end = b.parse::<u64>().map_err(|_| bad())?;
+    if end < start {
+        return Err(bad());
+    }
+    Ok((start, Some(end)))
+}
+
+/// `GET /v1/jobs/{id}/demo`: кусок демки по `Range`. На один ответ приходится не больше `CHUNK_SIZE` байт,
+/// раннер повторяет запросы с нового смещения; `Content-Length` настоящий (без chunked, Pitfall 5).
+fn get_demo(ctx: &Ctx, rq: &mut Request, job_id: i64, trace: &mut Trace) -> Result<Reply, Reject> {
+    let runner = authenticate(ctx, rq)?;
+    trace.runner = Some(runner.name.clone());
+    let epoch: i64 = header_number(rq, wire::headers::EPOCH)?;
+    let (start, end) = parse_range(rq)?;
+    let demo = ctx.core.demo_for(runner.id, job_id, epoch)?;
+    if start >= demo.size {
+        let mut r = Reject::new(
+            codes::RANGE_NOT_SATISFIABLE,
+            format!("смещение {start} за концом файла ({} байт)", demo.size),
+        );
+        r.headers
+            .push(("Content-Range", format!("bytes */{}", demo.size)));
+        return Err(r);
+    }
+    let (reader, len, size) = ctx
+        .core
+        .blobs()
+        .open_demo_range(job_id, start, end)
+        .map_err(|e| Reject::from(format!("задача #{job_id}: чтение демки: {e}")))?;
+    let mut reply = Reply::bare(206)
+        .with_header(
+            "Content-Range",
+            format!("bytes {start}-{}/{size}", start + len - 1),
+        )
+        .with_header("ETag", format!("\"{}\"", demo.sha256))
+        .with_header("Accept-Ranges", "bytes")
+        .with_header("Content-Type", "application/octet-stream");
+    reply.file = Some((reader, usize::try_from(len).unwrap_or(usize::MAX)));
+    Ok(reply)
 }
 
 /// `POST /v1/runner/hello`: раннер представляется и сверяет удерживаемые задачи. Версия протокола проверяется
@@ -344,16 +565,43 @@ fn header(name: &str, value: &str) -> Option<Header> {
 }
 
 fn respond(rq: Request, reply: Reply) {
-    let _ = match reply.body {
-        Some(body) => {
-            let mut r = Response::from_string(body).with_status_code(reply.status);
-            if let Some(h) = header("Content-Type", "application/json") {
-                r = r.with_header(h);
-            }
-            rq.respond(r)
+    let extra: Vec<Header> = reply
+        .headers
+        .iter()
+        .filter_map(|(k, v)| header(k, v))
+        .collect();
+    // Ответы с файлом и на `HEAD` идут с настоящим `Content-Length`: без порога chunked ответ больше 32 КиБ
+    // ушёл бы частями и длина пропала бы (Pitfall 5).
+    if let Some((reader, len)) = reply.file {
+        let r = Response::new(StatusCode(reply.status), extra, reader, Some(len), None)
+            .with_chunked_threshold(usize::MAX);
+        let _ = rq.respond(r);
+    } else if let Some(len) = reply.head_len {
+        let r = Response::new(
+            StatusCode(reply.status),
+            extra,
+            std::io::empty(),
+            Some(len),
+            None,
+        )
+        .with_chunked_threshold(usize::MAX);
+        let _ = rq.respond(r);
+    } else if let Some(body) = reply.body {
+        let mut r = Response::from_string(body).with_status_code(reply.status);
+        if let Some(h) = header("Content-Type", "application/json") {
+            r = r.with_header(h);
         }
-        None => rq.respond(Response::empty(reply.status)),
-    };
+        for h in extra {
+            r = r.with_header(h);
+        }
+        let _ = rq.respond(r);
+    } else {
+        let mut r = Response::empty(reply.status);
+        for h in extra {
+            r = r.with_header(h);
+        }
+        let _ = rq.respond(r);
+    }
 }
 
 /// Ответ 200/201/… с JSON-телом.
@@ -380,6 +628,11 @@ pub fn respond_error(rq: Request, rej: &Reject) {
         && let Some(h) = header(wire::headers::UPLOAD_OFFSET, &off.to_string())
     {
         r = r.with_header(h);
+    }
+    for (name, value) in &rej.headers {
+        if let Some(h) = header(name, value) {
+            r = r.with_header(h);
+        }
     }
     let _ = rq.respond(r);
 }

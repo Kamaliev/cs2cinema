@@ -5,15 +5,21 @@
 
 use crate::{Result, hex};
 use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::{Read, Write};
+use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Take, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 const COPY_BUF: usize = 1024 * 1024;
+/// Буфер дописывания куска результата: 64 КиБ.
+const CHUNK_BUF: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct Blobs {
     root: PathBuf,
+    /// Загрузки, которые идут сейчас: пара `(задача, эпоха)` на каждую. Общий для всех клонов `Blobs`.
+    uploads: Arc<Mutex<HashSet<(i64, i64)>>>,
 }
 
 /// Итог приёма файла.
@@ -26,6 +32,56 @@ pub struct Ingested {
 /// Путь демки задачи относительно папки данных (так он хранится в `files.rel_path`).
 pub fn demo_rel(job_id: i64) -> String {
     format!("blobs/incoming/{job_id}/demo")
+}
+
+/// Путь результата задачи относительно папки данных (так он хранится в `files.rel_path`).
+pub fn result_rel(job_id: i64) -> String {
+    format!("blobs/results/{job_id}/highlights.mp4")
+}
+
+/// Охрана загрузки: пока она жива, другой кусок той же пары `(задача, эпоха)` не принимается.
+/// Снимается в `Drop`, в том числе при панике обработчика.
+pub struct UploadGuard {
+    uploads: Arc<Mutex<HashSet<(i64, i64)>>>,
+    key: (i64, i64),
+}
+
+impl UploadGuard {
+    pub fn job_id(&self) -> i64 {
+        self.key.0
+    }
+
+    pub fn epoch(&self) -> i64 {
+        self.key.1
+    }
+}
+
+impl Drop for UploadGuard {
+    fn drop(&mut self) {
+        self.uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
+}
+
+/// Итог дописывания куска: сколько байт записано на диск и чем закончилось чтение тела.
+/// Принятые байты остаются на диске и при ошибке: загрузка продолжится с настоящего смещения.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Appended {
+    pub got: u64,
+    pub error: Option<String>,
+}
+
+/// Итог проверки готового результата.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Finalized {
+    /// Размер и SHA-256 совпали, файл переименован в `highlights.mp4`.
+    Ok,
+    /// Длина `.part` не равна заявленному размеру.
+    SizeMismatch { actual: u64 },
+    /// SHA-256 не совпал, `.part` удалён.
+    ShaMismatch,
 }
 
 /// Проверка по первым байтам: демка CS2 (`PBDEMS2\0`) или zstd-архив.
@@ -56,7 +112,10 @@ pub fn sniff_demo(path: &Path) -> Result<()> {
 
 impl Blobs {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            uploads: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
 
     pub fn demo_path(&self, job_id: i64) -> PathBuf {
@@ -69,6 +128,181 @@ impl Blobs {
     /// Папка результата задачи: `{root}/results/{id}`.
     pub fn results_dir(&self, job_id: i64) -> PathBuf {
         self.root.join("results").join(job_id.to_string())
+    }
+
+    /// Путь недозагруженного результата: своя `.part` у каждой эпохи, чужая эпоха её не портит.
+    pub fn result_part(&self, job_id: i64, epoch: i64) -> PathBuf {
+        self.results_dir(job_id).join(format!("{epoch}.part"))
+    }
+
+    /// Путь готового результата задачи.
+    pub fn result_path(&self, job_id: i64) -> PathBuf {
+        self.results_dir(job_id).join("highlights.mp4")
+    }
+
+    /// Сколько байт результата уже лежит на диске: длина `.part` — единственная правда о смещении.
+    pub fn part_len(&self, job_id: i64, epoch: i64) -> std::io::Result<u64> {
+        match std::fs::metadata(self.result_part(job_id, epoch)) {
+            Ok(m) => Ok(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Занимает загрузку `(задача, эпоха)`; уже занята — `None`.
+    pub fn lock_upload(&self, job_id: i64, epoch: i64) -> Option<UploadGuard> {
+        let key = (job_id, epoch);
+        let fresh = self
+            .uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key);
+        fresh.then(|| UploadGuard {
+            uploads: self.uploads.clone(),
+            key,
+        })
+    }
+
+    /// Дописывает в `.part` до `len` байт из тела запроса. Длина файла заново сверяется со `offset` под охраной.
+    /// Конец тела раньше `len` (обрыв выглядит как чистый EOF) и ошибка чтения не теряют записанное: вернётся
+    /// `Appended { got, .. }`, а вызывающий сравнит `got` с `len`.
+    pub fn append_chunk(
+        &self,
+        guard: &UploadGuard,
+        offset: u64,
+        len: u64,
+        body: &mut dyn Read,
+    ) -> Appended {
+        let (job_id, epoch) = guard.key;
+        let fail = |got: u64, e: String| Appended {
+            got,
+            error: Some(e),
+        };
+        let dir = self.results_dir(job_id);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return fail(0, format!("{}: {e}", dir.display()));
+        }
+        let part = self.result_part(job_id, epoch);
+        let mut file = match OpenOptions::new().create(true).append(true).open(&part) {
+            Ok(f) => f,
+            Err(e) => return fail(0, format!("{}: {e}", part.display())),
+        };
+        match file.metadata() {
+            Ok(m) if m.len() == offset => {}
+            Ok(m) => {
+                return fail(
+                    0,
+                    format!("длина {} байт, а не {offset}: файл изменился", m.len()),
+                );
+            }
+            Err(e) => return fail(0, format!("{}: {e}", part.display())),
+        }
+        let mut buf = vec![0u8; CHUNK_BUF];
+        let mut got = 0u64;
+        let mut error = None;
+        while got < len {
+            let want = (len - got).min(CHUNK_BUF as u64) as usize;
+            match body.read(&mut buf[..want]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Err(e) = file.write_all(&buf[..n]) {
+                        error = Some(format!("{}: {e}", part.display()));
+                        break;
+                    }
+                    got += n as u64;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    error = Some(format!("чтение тела: {e}"));
+                    break;
+                }
+            }
+        }
+        if let Err(e) = file.sync_data() {
+            error.get_or_insert(format!("{}: {e}", part.display()));
+        }
+        Appended { got, error }
+    }
+
+    /// Проверяет `.part` эпохи и делает её результатом задачи: длина, затем SHA-256 потоком, затем `rename`.
+    /// Неверный SHA-256 удаляет `.part` (догружать к испорченному файлу нечего). Базу при этом не держат.
+    pub fn finalize_result(
+        &self,
+        job_id: i64,
+        epoch: i64,
+        size: u64,
+        sha256: &str,
+    ) -> Result<Finalized> {
+        let part = self.result_part(job_id, epoch);
+        let actual = self
+            .part_len(job_id, epoch)
+            .map_err(|e| format!("{}: {e}", part.display()))?;
+        if actual != size {
+            return Ok(Finalized::SizeMismatch { actual });
+        }
+        // Файл закрывается до `rename`: на Windows открытый файл не переименовать.
+        let digest = {
+            let mut f = File::open(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+            let mut hasher = Sha256::new();
+            let mut buf = vec![0u8; COPY_BUF];
+            loop {
+                let n = f
+                    .read(&mut buf)
+                    .map_err(|e| format!("{}: {e}", part.display()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            hex(&hasher.finalize())
+        };
+        if !digest.eq_ignore_ascii_case(sha256) {
+            std::fs::remove_file(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+            return Ok(Finalized::ShaMismatch);
+        }
+        // `sync_all` на Windows требует права записи, поэтому файл открывается на запись (без усечения).
+        OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| format!("{}: {e}", part.display()))?;
+        let dst = self.result_path(job_id);
+        // Остаток прежней неудачной попытки: на Windows `rename` поверх существующего файла не работает.
+        match std::fs::remove_file(&dst) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", dst.display())),
+        }
+        std::fs::rename(&part, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+        Ok(Finalized::Ok)
+    }
+
+    /// Удаляет готовый результат задачи (задачу отменили, пока считался хеш); нет файла — не ошибка.
+    pub fn remove_result(&self, job_id: i64) -> std::io::Result<()> {
+        match std::fs::remove_file(self.result_path(job_id)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// Открывает кусок демки для отдачи: длина = `min(end, size - 1, start + CHUNK_SIZE - 1) - start + 1`.
+    /// Вызывающий проверил `start < size` заранее. Возвращает читатель, длину куска и размер всего файла.
+    pub fn open_demo_range(
+        &self,
+        job_id: i64,
+        start: u64,
+        end_incl: Option<u64>,
+    ) -> std::io::Result<(Take<File>, u64, u64)> {
+        use std::io::{Seek, SeekFrom};
+        let mut f = File::open(self.demo_path(job_id))?;
+        let size = f.metadata()?.len();
+        let last = end_incl
+            .unwrap_or(u64::MAX)
+            .min(size.saturating_sub(1))
+            .min(start.saturating_add(wire::CHUNK_SIZE - 1));
+        let len = last.saturating_sub(start) + 1;
+        f.seek(SeekFrom::Start(start))?;
+        Ok((f.take(len), len, size))
     }
 
     /// Удаляет недозагруженные куски `*.part` результата задачи и возвращает их число; папки нет — `Ok(0)`.

@@ -5,10 +5,13 @@
 //! `KILL_ON_JOB_CLOSE` здесь нет, иначе закрытие последнего handle убило бы сам процесс.
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SetErrorMode,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectExtendedLimitInformation, SetInformationJobObject,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -17,7 +20,6 @@ use crate::HostError;
 
 /// Job Object, в который процесс поместил сам себя. Handle живёт до конца процесса.
 pub struct Guard {
-    #[allow(dead_code)]
     handle: HANDLE,
 }
 
@@ -71,4 +73,31 @@ pub fn limit_self_memory(bytes: u64) -> Result<Guard, HostError> {
         )));
     }
     Ok(Guard { handle })
+}
+
+impl Guard {
+    /// Пиковая память процесса за всё время жизни (`PeakProcessMemoryUsed`); `None`, если запрос не удался.
+    pub fn peak_bytes(&self) -> Option<u64> {
+        // SAFETY: структура состоит из целых чисел и указателей, нулевое значение для неё корректно.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: handle валиден всё время жизни `Guard`; указатель и длина описывают живую структуру `info`.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                (&raw mut info).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(info.PeakProcessMemoryUsed as u64)
+    }
+}
+
+/// Подавляет диалоги Windows об ошибках (`SEM_FAILCRITICALERRORS`, `SEM_NOGPFAULTERRORBOX`), чтобы
+/// аварийно умерший разбор не повис на окне, которое некому закрыть.
+pub fn quiet_crash_dialogs() {
+    // SAFETY: SetErrorMode принимает набор флагов и не работает с указателями; побочный эффект —
+    // режим ошибок текущего процесса.
+    unsafe { SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX) };
 }

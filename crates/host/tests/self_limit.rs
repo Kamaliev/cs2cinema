@@ -99,7 +99,7 @@ fn peak_memory_is_reported_after_allocation() {
     assert_eq!(code, Some(0), "{out}");
     let peak: u64 = out
         .lines()
-        .find_map(|l| l.strip_prefix("peak="))
+        .find_map(|l| l.split_once("peak=").map(|(_, v)| v))
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or_else(|| panic!("в выводе нет peak=: {out}"));
     assert!(peak >= 100 * MIB, "пик {peak} меньше 100 МиБ");
@@ -109,5 +109,8 @@ fn peak_memory_is_reported_after_allocation() {
 fn limited_process_cannot_spawn_children() {
     let (code, out, _) = run_child("spawn");
     assert_eq!(code, Some(0), "{out}");
-    assert!(out.contains("spawn refused"), "порождение не отвергнуто: {out}");
+    assert!(
+        out.contains("spawn refused"),
+        "порождение не отвергнуто: {out}"
+    );
 }

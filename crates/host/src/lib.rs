@@ -393,7 +393,6 @@ pub fn console_line_ok(line: &str) -> bool {
 /// гарантирует, что лимит действует всё время жизни процесса.
 pub struct SelfLimit {
     #[cfg(windows)]
-    #[allow(dead_code)]
     guard: win::sandbox::Guard,
 }
 
@@ -415,6 +414,26 @@ pub fn limit_self_memory(bytes: u64) -> Result<SelfLimit, HostError> {
     }
 }
 
+impl SelfLimit {
+    /// Пиковая память процесса в байтах — для калибровки лимитов; вне Windows и при сбое запроса `None`.
+    pub fn peak_bytes(&self) -> Option<u64> {
+        #[cfg(windows)]
+        {
+            self.guard.peak_bytes()
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+}
+
+/// Подавляет аварийные диалоги Windows в текущем процессе; вне Windows ничего не делает.
+pub fn quiet_crash_dialogs() {
+    #[cfg(windows)]
+    win::sandbox::quiet_crash_dialogs();
+}
+
 /// Хост по умолчанию: `WinHost` на Windows, на остальных платформах — заглушка `UnsupportedHost`.
 pub fn default_host() -> Box<dyn Host> {
     #[cfg(windows)]
@@ -430,6 +449,12 @@ pub fn default_host() -> Box<dyn Host> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn limit_self_memory_is_unsupported_off_windows() {
+        assert!(matches!(limit_self_memory(1), Err(HostError::Unsupported)));
+    }
 
     #[test]
     fn console_line_rejects_breaks_and_empty() {

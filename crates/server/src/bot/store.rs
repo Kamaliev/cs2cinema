@@ -474,6 +474,32 @@ pub fn promote_done(db: &Db, now_ms: i64) -> Result<usize> {
     })
 }
 
+/// Доставка снова в очередь по просьбе владельца (`/resend`): `uncertain`, `failed` или `sent` → `pending`,
+/// счётчик попыток с нуля, чат разглушается (человек только что написал боту, значит чат открыт), отметка
+/// «другу сказано» снимается, чтобы исход новой отправки получил своё сообщение. `false` — доставка в другом
+/// состоянии (отправляется прямо сейчас), ничего не менялось.
+pub fn requeue_delivery(db: &Db, job_id: i64, now_ms: i64) -> Result<bool> {
+    db.write(|tx| {
+        let n = tx
+            .execute(
+                "UPDATE tg_jobs SET delivery = 'pending', delivery_attempts = 0, next_try_ms = 0, muted = 0,
+                 final_reported_ms = NULL, delivery_error = NULL, updated_at = ?2
+                 WHERE job_id = ?1 AND delivery IN ('uncertain','failed','sent')",
+                params![job_id, now_ms],
+            )
+            .map_err(db_err)?;
+        if n == 1 {
+            tx.execute(
+                "UPDATE tg_jobs SET muted = 0, updated_at = ?2
+                 WHERE chat_id = (SELECT chat_id FROM tg_jobs WHERE job_id = ?1)",
+                params![job_id, now_ms],
+            )
+            .map_err(db_err)?;
+        }
+        Ok(n == 1)
+    })
+}
+
 /// Восстановление после перезапуска: `downloading` → `pending`, `sending` → `uncertain`.
 /// Возвращает числа переведённых строк входящих и доставок.
 pub fn recover(db: &Db, now_ms: i64) -> Result<(usize, usize)> {

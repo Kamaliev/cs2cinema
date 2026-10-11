@@ -1,4 +1,4 @@
-//! Команды бота: `/start`, `/help`, `/player`, ход задач (`/status`, `/queue`), управление ими (`/cancel`, `/retry`)
+//! Команды бота: `/start`, `/help`, `/player`, ход задач (`/status`, `/queue`), управление ими (`/cancel`, `/retry`, `/resend`)
 //! и белый список (`/adduser`, `/removeuser`, `/users`).
 //!
 //! Роль берётся только из базы (`User::role`). Команды админа проверяют её до любого изменения; `/adduser`
@@ -6,7 +6,7 @@
 
 use super::ingest::{self, ACTIVE_STATES, ahead_phrase};
 use super::store::{self, NewTgJob};
-use super::{Bot, notify};
+use super::{Bot, deliver, notify};
 use crate::core::is_steam64;
 use crate::users::{self, User};
 use wire::{CancelMode, JobState};
@@ -18,6 +18,7 @@ const REMOVEUSER_FORMAT: &str = "Формат: /removeuser Telegram-ID. Напр
 const PLAYER_FORMAT: &str = "Формат: /player ник или SteamID64 (17 цифр). Например: /player s1mple";
 const CANCEL_FORMAT: &str = "Формат: /cancel [номер задачи]. Например: /cancel 12";
 const RETRY_FORMAT: &str = "Формат: /retry [номер задачи]. Например: /retry 12";
+const RESEND_FORMAT: &str = "Формат: /resend [номер задачи]. Например: /resend 12";
 const NOT_YOURS: &str = "Это не ваша задача.";
 
 /// Разбирает `/команда@имя_бота аргументы` в пару «команда без слеша в нижнем регистре, аргументы».
@@ -43,6 +44,7 @@ pub fn menu() -> Vec<(String, String)> {
         ("queue", "Очередь"),
         ("cancel", "Отменить задачу"),
         ("retry", "Повторить задачу"),
+        ("resend", "Прислать ролик ещё раз"),
         ("adduser", "Добавить друга (админ)"),
         ("removeuser", "Убрать друга (админ)"),
         ("users", "Список друзей (админ)"),
@@ -119,6 +121,7 @@ fn help_text(user: &User) -> String {
          /queue — очередь и моё место в ней\n\
          /cancel [номер] — отменить задачу\n\
          /retry [номер] — повторить упавшую или отменённую задачу\n\
+         /resend [номер] — прислать готовый ролик ещё раз\n\
          /start — как пользоваться\n\
          /help — эта справка",
     );
@@ -394,6 +397,23 @@ fn retry_cmd(bot: &Bot, user: &User, chat_id: i64, args: &str) -> String {
     String::new()
 }
 
+/// `/resend [N]`: прислать ролик своей готовой задачи ещё раз; без номера — последней готовой. Остальное решает
+/// `deliver::resend`: владелец, состояние доставки, предупреждение о возможном дубле.
+fn resend_cmd(bot: &Bot, user: &User, args: &str) -> String {
+    let job = match target_job(
+        bot,
+        user,
+        args,
+        "('done')",
+        "У вас нет готовых задач — отправлять нечего.",
+        RESEND_FORMAT,
+    ) {
+        Ok(j) => j,
+        Err(text) => return text,
+    };
+    deliver::resend(bot, user, job.id)
+}
+
 /// Выполняет команду и отвечает в чат.
 pub fn handle(bot: &Bot, user: &User, chat_id: i64, text: &str) {
     let (cmd, args) = parse(text);
@@ -405,6 +425,7 @@ pub fn handle(bot: &Bot, user: &User, chat_id: i64, text: &str) {
         "queue" => notify::queue_reply(bot, user),
         "cancel" => cancel_cmd(bot, user, chat_id, &args),
         "retry" => retry_cmd(bot, user, chat_id, &args),
+        "resend" => resend_cmd(bot, user, &args),
         "adduser" | "removeuser" | "users" if !is_admin(user) => ADMIN_ONLY.to_owned(),
         "adduser" => adduser_cmd(bot, &args),
         "removeuser" => removeuser_cmd(bot, &args),

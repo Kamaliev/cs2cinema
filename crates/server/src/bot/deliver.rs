@@ -4,10 +4,15 @@
 //! Слепого повтора нет: если запрос мог дойти (тайм-аут или обрыв после начала отправки), доставка
 //! `uncertain`, и решает человек. После перезапуска `sending` тоже становится `uncertain` (`Bot::recover`).
 
-use super::{Bot, SendAs, store};
+use super::store::{self, TgJob};
+use super::{Bot, SendAs};
 use crate::Result;
-use crate::tg::InputFile;
+use crate::tg::{InputFile, Sent, TgError};
+use crate::users::User;
 use std::path::Path;
+use wire::JobState;
+
+const NOT_YOURS: &str = "Это не ваша задача.";
 
 /// URI `file:///…` для процесса `telegram-bot-api`: `\` → `/`, у пути без начального `/` (диск Windows)
 /// добавляется `/`, всё вне `[A-Za-z0-9-_.~/:]` кодируется как `%XX` (остаток после `file:/` декодируется).
@@ -72,14 +77,8 @@ pub fn deliver_once(bot: &Bot) -> Result<bool> {
             .join("highlights.mp4"),
     );
     let video = InputFile::Local(uri);
-    let caption = bot
-        .core()
-        .redactor()
-        .clean(&format!("Задача #{id} — игрок {player}"), 1000);
-    let sent = match bot.settings().send_as {
-        SendAs::Video => bot.tg().send_video(tj.chat_id, &video, &caption),
-        SendAs::Document => bot.tg().send_document(tj.chat_id, &video, &caption),
-    };
+    let caption = caption_for(bot, id, &player);
+    let sent = send(bot, tj.chat_id, &video, &caption);
     let done_at = bot.now_ms();
     match sent {
         Ok(s) => {
@@ -98,9 +97,182 @@ pub fn deliver_once(bot: &Bot) -> Result<bool> {
             bot.log().warn(&format!(
                 "бот: отправка ролика задачи #{id} — {state}: {text}"
             ));
+            // Запрос мог дойти: слепого повтора нет, решает друг (T-07-35).
+            if e.maybe_delivered() {
+                tell(
+                    bot,
+                    &tj,
+                    &format!(
+                        "Не уверен, что ролик задачи #{id} дошёл. Если его нет в чате — отправьте /resend {id}"
+                    ),
+                );
+            }
         }
     }
     Ok(true)
+}
+
+/// Подпись под роликом: номер задачи и игрок.
+fn caption_for(bot: &Bot, id: i64, player: &str) -> String {
+    bot.core()
+        .redactor()
+        .clean(&format!("Задача #{id} — игрок {player}"), 1000)
+}
+
+/// Отправка роликом или документом по настройке оператора.
+fn send(
+    bot: &Bot,
+    chat_id: i64,
+    file: &InputFile,
+    caption: &str,
+) -> std::result::Result<Sent, TgError> {
+    match bot.settings().send_as {
+        SendAs::Video => bot.tg().send_video(chat_id, file, caption),
+        SendAs::Document => bot.tg().send_document(chat_id, file, caption),
+    }
+}
+
+/// Одно сообщение другу про исход доставки. Право его отправить занимает отметка `final_reported_ms` (как у
+/// «отменена»): повторный вызов молчит. Если сообщение точно не ушло, отметка снимается и можно повторить;
+/// заглушённому чату не пишем, `403` глушит его.
+fn tell(bot: &Bot, tj: &TgJob, text: &str) {
+    if tj.muted {
+        return;
+    }
+    let db = bot.core().db();
+    match store::claim_final(db, tj.job_id, bot.now_ms()) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            bot.log()
+                .warn(&format!("бот: не удалось занять сообщение о доставке: {e}"));
+            return;
+        }
+    }
+    let clean = bot.core().redactor().clean(text, 4000);
+    match bot.tg().send_message(tj.chat_id, &clean) {
+        Ok(_) => {}
+        Err(e) => {
+            if e.is_forbidden() {
+                let _ = store::mute_chat(db, tj.chat_id, bot.now_ms());
+            } else if !e.maybe_delivered() {
+                let _ = store::unclaim_final(db, tj.job_id);
+            }
+            bot.log().warn(&format!(
+                "бот: сообщение о доставке задачи #{} не отправлено: {}",
+                tj.job_id,
+                bot.core().redactor().clean(&e.to_string(), 200)
+            ));
+        }
+    }
+}
+
+/// `/resend N`: отправляет ролик своей готовой задачи ещё раз и возвращает ответ для чата (пустой — отвечать
+/// нечего, сам ролик и есть ответ).
+///
+/// - доставленный (`sent`) уходит сразу по `file_id` Telegram, без повторной загрузки файла (вызов быстрый, поэтому
+///   его можно сделать в потоке опроса);
+/// - неясный или не ушедший (`uncertain`, `failed`) возвращается в `pending` с нуля, и отправку с файла делает
+///   `deliver_once` вне потока опроса; дубль возможен, о чём сказано заранее;
+/// - ещё отправляемый ролик не трогаем.
+pub fn resend(bot: &Bot, user: &User, job_id: i64) -> String {
+    let job = match bot.core().job(job_id) {
+        Ok(Some(j)) => j,
+        // Несуществующий номер отвечает так же, как чужой: наличие чужих задач не раскрываем.
+        Ok(None) => return NOT_YOURS.to_owned(),
+        Err(e) => return format!("Не удалось получить задачу: {e}"),
+    };
+    let id = job.id;
+    if job.user_id != Some(user.id) {
+        return NOT_YOURS.to_owned();
+    }
+    match job.state {
+        JobState::Done => {}
+        JobState::Failed | JobState::Cancelled => {
+            return format!("У задачи #{id} нет ролика. Повторить задачу: /retry {id}");
+        }
+        _ => return format!("Ролик задачи #{id} ещё не готов."),
+    }
+    let tj = match store::tg_job(bot.core().db(), id) {
+        Ok(Some(tj)) => tj,
+        Ok(None) => {
+            return format!("Задача #{id} поставлена не через бота — ролик отсюда не отправить.");
+        }
+        Err(e) => return format!("Не удалось получить доставку: {e}"),
+    };
+    match tj.delivery.as_str() {
+        "sent" => {
+            if let Some(file_id) = tj.result_file_id.clone() {
+                match resend_by_id(bot, &tj, &job.player_name, &file_id) {
+                    ByIdOutcome::Reply(text) => return text,
+                    // Telegram не принял `file_id`: отправляем с файла.
+                    ByIdOutcome::FromFile => {}
+                }
+            }
+        }
+        "uncertain" | "failed" => {}
+        _ => return format!("Ролик задачи #{id} уже отправляется."),
+    }
+    match store::requeue_delivery(bot.core().db(), id, bot.now_ms()) {
+        Ok(true) => {
+            format!("Отправляю ещё раз; если ролик уже пришёл, дубль — нормально. Задача #{id}.")
+        }
+        Ok(false) => format!("Ролик задачи #{id} уже отправляется."),
+        Err(e) => format!("Не удалось поставить отправку заново: {e}"),
+    }
+}
+
+enum ByIdOutcome {
+    Reply(String),
+    FromFile,
+}
+
+/// Повторная отправка по `file_id`: новое сообщение, `result_message_id` обновляется.
+fn resend_by_id(bot: &Bot, tj: &TgJob, player: &str, file_id: &str) -> ByIdOutcome {
+    let id = tj.job_id;
+    let caption = caption_for(bot, id, player);
+    match send(
+        bot,
+        tj.chat_id,
+        &InputFile::Id(file_id.to_owned()),
+        &caption,
+    ) {
+        Ok(s) => {
+            let new_id = s.file_id.as_deref().unwrap_or(file_id);
+            if let Err(e) = store::mark_sent(
+                bot.core().db(),
+                id,
+                s.message_id,
+                Some(new_id),
+                bot.now_ms(),
+            ) {
+                bot.log().warn(&format!(
+                    "бот: повторная отправка задачи #{id} не записана: {e}"
+                ));
+            }
+            bot.log().info(&format!(
+                "бот: ролик задачи #{id} отправлен повторно по file_id"
+            ));
+            ByIdOutcome::Reply(String::new())
+        }
+        Err(TgError::Api { code: 400, .. }) => ByIdOutcome::FromFile,
+        Err(e) if e.maybe_delivered() => ByIdOutcome::Reply(format!(
+            "Не уверен, что ролик задачи #{id} дошёл ещё раз. Если его нет в чате — отправьте /resend {id} снова."
+        )),
+        Err(e) => {
+            if e.is_forbidden() {
+                let _ = store::mute_chat(bot.core().db(), tj.chat_id, bot.now_ms());
+            }
+            bot.log().warn(&format!(
+                "бот: повторная отправка задачи #{id} не удалась: {}",
+                bot.core().redactor().clean(&e.to_string(), 200)
+            ));
+            ByIdOutcome::Reply(format!(
+                "Не получилось отправить ролик задачи #{id} ещё раз ({}). Попробуйте позже: /resend {id}",
+                bot.core().redactor().clean(&e.to_string(), 200)
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

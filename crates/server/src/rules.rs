@@ -200,13 +200,24 @@ pub fn decide(job: &JobRow, ev: &Event, now_ms: i64, limits: &Limits) -> Result<
                 return Err(stale());
             }
             let mut j = job.clone();
-            j.state = JobState::Queued;
             j.runner_id = None;
             j.lease_until = None;
             j.lease_lost = false;
             j.phase = String::new();
             j.take_n = None;
             j.take_m = None;
+            if job.cancel_requested != CancelMode::NotRequested {
+                // Раннер вернул задачу, а отмена уже запрошена: задача окончена, в очередь она не возвращается (WR-01).
+                // Число выдач не трогаем: отменённую задачу никто больше не выдаёт.
+                j.state = JobState::Cancelled;
+                j.finished_at = Some(now_ms);
+                return Ok(Decision {
+                    job: j,
+                    reattached: false,
+                    discard_parts: true,
+                });
+            }
+            j.state = JobState::Queued;
             if !*counts {
                 j.grants = (j.grants - 1).max(0);
             }
@@ -593,6 +604,49 @@ mod tests {
             counts: false,
         };
         assert_eq!(decide(&job, &ev, NOW, &limits).unwrap().job.grants, 0);
+    }
+
+    #[test]
+    fn release_of_a_job_with_a_requested_cancel_cancels_it() {
+        let limits = Limits::default();
+        for mode in [CancelMode::Soft, CancelMode::Force] {
+            for counts in [true, false] {
+                let mut job = row(JobState::Running);
+                job.cancel_requested = mode;
+                job.phase = "record".to_owned();
+                let ev = Event::Release {
+                    runner_id: 7,
+                    epoch: 1,
+                    counts,
+                };
+                let d = decide(&job, &ev, NOW, &limits).unwrap();
+                assert_eq!(d.job.state, JobState::Cancelled, "{mode:?} counts={counts}");
+                assert_eq!(d.job.finished_at, Some(NOW));
+                assert_eq!((d.job.runner_id, d.job.lease_until), (None, None));
+                assert!(!d.job.lease_lost);
+                assert!(d.discard_parts);
+                assert_eq!(d.job.grants, job.grants, "число выдач не меняется");
+            }
+        }
+        // Чужая эпоха по-прежнему stale, окончательная задача — terminal.
+        let mut job = row(JobState::Running);
+        job.cancel_requested = CancelMode::Soft;
+        let other = Event::Release {
+            runner_id: 7,
+            epoch: 2,
+            counts: true,
+        };
+        assert_eq!(
+            decide(&job, &other, NOW, &limits).unwrap_err().code,
+            codes::STALE_EPOCH
+        );
+        let done = row(JobState::Done);
+        let ev = Event::Release {
+            runner_id: 7,
+            epoch: 1,
+            counts: true,
+        };
+        assert!(decide(&done, &ev, NOW, &limits).is_err());
     }
 
     #[test]

@@ -565,6 +565,7 @@ impl Core {
 
     /// Раннер возвращает задачу в очередь (`release`): окружение не готово, раннер уходит и т. п.
     /// `counts = false` возвращает и одну выдачу. Возврат чужой выдачи — `stale_epoch`.
+    /// Запрошенная отмена превращает возврат в отмену: задача становится `cancelled` и в очередь не возвращается.
     pub fn release(
         &self,
         runner_id: i64,
@@ -577,12 +578,16 @@ impl Core {
             epoch: req.epoch,
             counts: req.counts,
         };
-        self.db.write(|tx| {
+        let discard = self.db.write(|tx| {
             let before = job_by_id(tx, job_id)?.ok_or_else(not_found)?;
             let d = rules::decide(&before, &ev, now, &self.limits)?;
             apply(tx, &before, &d.job, now)?;
-            Ok::<(), Reject>(())
+            Ok::<bool, Reject>(d.discard_parts)
         })?;
+        if discard {
+            // Как в `cancel`: не удалось убрать недозагруженные куски — остатки уберёт `recover`.
+            let _ = self.blobs.discard_parts(job_id);
+        }
         self.wake();
         Ok(())
     }

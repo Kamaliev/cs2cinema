@@ -563,3 +563,33 @@ fn finish_validates_the_outcome_and_cleans_the_failure_fields() {
     assert!(message.starts_with("ab"), "управляющий символ удалён");
     assert_eq!(job.fail_tail.as_deref(), Some("xy"));
 }
+
+#[test]
+fn cancelled_leased_job_released_by_the_runner_is_not_issued_again() {
+    let srv = clocked();
+    let id = srv.submit(&fake_demo(4096), "s1mple");
+    let first = srv.add_runner("a");
+    let second = srv.add_runner("b");
+    assert_eq!(srv.claim(&first, 0).0, 200);
+    let grants = srv.job(id).grants;
+
+    // Оператор отменяет выданную задачу: она остаётся у раннера с флагом отмены.
+    srv.running().core().cancel(id, false).unwrap();
+    assert_eq!(srv.job(id).state, JobState::Assigned);
+
+    // Раннер возвращает её без списания выдачи: задача окончена, а не снова в очереди.
+    let rel = ReleaseRequest {
+        epoch: 1,
+        reason: "окружение не готово".to_owned(),
+        counts: false,
+    };
+    let (status, body) = srv.release(&first, id, &rel);
+    assert_eq!(status, 204, "{body}");
+    let job = srv.job(id);
+    assert_eq!(job.state, JobState::Cancelled);
+    assert_eq!(job.grants, grants, "число выдач не меняется");
+
+    assert_eq!(srv.claim(&first, 0).0, 204);
+    assert_eq!(srv.claim(&second, 0).0, 204);
+    assert_eq!(srv.job(id).grants, grants);
+}

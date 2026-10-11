@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 06
 current_phase_name: Раннер, защита входа и первый живой прогон
 status: executing
-stopped_at: Completed 06-09-PLAN.md
-last_updated: "2026-10-11T16:46:49.500Z"
+stopped_at: Completed 06-10-PLAN.md
+last_updated: "2026-10-11T17:05:14.068Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 06 execution started
-state_head: f231193109963870c459100b92110b2bc8cf913b
+state_head: 6beb5fe21d13665bda6484bea23ba2d2d6a94d1e
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 16
-  completed_plans: 14
+  completed_plans: 15
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 06 (Раннер, защита входа и первый живой прогон) — EXECUTING
-Plan: 10 of 11
+Plan: 11 of 11
 Status: Ready to execute
 Last activity: 2026-10-11 — Phase 06 execution started
 
@@ -106,6 +106,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 06 P07 | 40 min | 2 tasks | 6 files |
 | Phase 06 P08 | 70min | 2 tasks | 7 files |
 | Phase 06 P09 | 60 min | 3 tasks | 9 files |
+| Phase 06 P10 | 75min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -194,6 +195,9 @@ Recent decisions affecting current work:
 - [Phase 06]: Строка эскалации мягкой отмены пишется один раз через inner.log; пульс не запускается на этапе Reporting
 - [Phase 06]: 06-09: release всегда засчитывает выдачу (counts = true, D-02 буквально); потолок — TOO_MANY_GRANTS сервера, пауза раннера — после двух одинаковых сбоев окружения или запуска
 - [Phase 06]: 06-09: отмена сервера проверяется до release (обход WR-01), решение о release пишется в runner_state.json (pending_release) и повторяется после перезапуска
+- [Phase 06]: 06-10: сверка SHA-256 результата перед загрузкой только при sha_retries == 0; после отказа сервера решает сервер
+- [Phase 06]: 06-10: Runner::run возвращает Result — Err при отклонённом токене и несовпадении протокола (код выхода cs2-cli runner 1)
+- [Phase 06]: 06-10: токен раннера только печатные ASCII-знаки (не-ASCII в Authorization давал вечные повторы)
 
 ### Pending Todos
 
@@ -223,6 +227,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T16:46:49.385Z
-Stopped at: Completed 06-09-PLAN.md
+Last session: 2026-10-11T17:05:13.947Z
+Stopped at: Completed 06-10-PLAN.md
 Resume file: None

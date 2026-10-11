@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 pub use host;
 pub mod assemble;
 pub mod gamedir;
+pub mod job;
 pub mod manifest;
 pub mod precheck;
 pub mod record;
@@ -82,6 +83,22 @@ pub trait Progress: Sync {
     fn event(&self, e: &record::Event) {
         self.log(&e.to_string())
     }
+    /// Итог шага, который вызывающий может сохранить: демка, папка задачи, отчёт предпроверки, пара удачной
+    /// записи. `Quiet` и консоль его игнорируют; приложение кладёт в свою базу.
+    fn artifact(&self, _a: &Artifact) {}
+}
+
+/// Итог шага задачи для вызывающего (см. `Progress::artifact`): `pipeline` ничего не знает о том, куда это сохранят.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Artifact {
+    /// Скачанная демка матча FACEIT: id матча и путь к файлу.
+    Demo { match_id: String, path: PathBuf },
+    /// Папка результата задачи: известна после разбора демки (или из прошлой попытки при повторе).
+    OutDir(PathBuf),
+    /// Отчёт предпроверки в JSON; `passed` — нет ли в нём ошибок уровня `fail`.
+    Precheck { json: String, passed: bool },
+    /// Пара «сборка CS2 / версия HLAE» удачной записи.
+    LastGood { cs2_build: String, hlae_version: String },
 }
 
 /// Сообщение об отмене — по нему окно отличает отмену от ошибки.

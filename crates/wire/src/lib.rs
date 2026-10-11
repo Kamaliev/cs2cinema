@@ -183,6 +183,8 @@ pub mod fail {
     pub const RESULT_INVALID: &str = "RESULT_INVALID";
     /// Источник задачи раннер не берёт.
     pub const UNSUPPORTED_SOURCE: &str = "UNSUPPORTED_SOURCE";
+    /// Раннер не смог скачать демку FACEIT по ссылке задачи (нет ключа, нет демки у матча, отказ API или сети).
+    pub const FACEIT_FETCH_FAILED: &str = "FACEIT_FETCH_FAILED";
     /// Исполнитель раннера вернул ошибку без кода или упал.
     pub const JOB_ERROR: &str = "JOB_ERROR";
 
@@ -212,6 +214,7 @@ pub mod fail {
         JOB_ERROR,
         TOO_MANY_GRANTS,
         RECEIVE_FAILED,
+        FACEIT_FETCH_FAILED,
     ];
 }
 
@@ -581,7 +584,22 @@ mod tests {
         ] {
             assert!(fail::KNOWN.contains(&code), "{code} не в KNOWN");
         }
-        assert_eq!(fail::KNOWN.len(), 24);
+        assert_eq!(fail::KNOWN.len(), 25);
+    }
+
+    #[test]
+    fn known_codes_include_faceit_fetch_failed() {
+        assert_eq!(fail::FACEIT_FETCH_FAILED, "FACEIT_FETCH_FAILED");
+        assert!(fail::KNOWN.contains(&fail::FACEIT_FETCH_FAILED));
+        assert_eq!(fail::KNOWN.len(), 25);
+        let mut sorted = fail::KNOWN.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 25, "повторов нет");
+        assert!(fail::KNOWN.iter().all(|c| {
+            c.chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        }));
     }
 
     #[test]

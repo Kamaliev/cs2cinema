@@ -17,4 +17,5 @@ members = [
     "crates/cli",
     "crates/wire",
     "crates/server",
+    "crates/runner",
 ]

@@ -13,6 +13,7 @@ use std::{
 };
 pub use command::{
     Command,
+    MAX_COMMAND_UNPACKED,
     read_command
 };
 

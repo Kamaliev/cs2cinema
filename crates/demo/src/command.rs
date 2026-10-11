@@ -10,9 +10,25 @@ pub struct Command<'a> {
 }
 
 
+/// Одна команда демки не может разворачиваться больше чем в 128 МиБ: `decompress_vec`
+/// выделяет заявленный в snappy-заголовке размер сразу.
+pub const MAX_COMMAND_UNPACKED: usize = 128 << 20;
+
 impl<'a> Command<'a> {
     pub fn decode_payload(&self) -> io::Result<Vec<u8>> {
         if self.compressed {
+            let claimed = snap::raw::decompress_len(self.payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if claimed > MAX_COMMAND_UNPACKED {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "команда демки заявляет {} МиБ после распаковки — больше лимита {} МиБ",
+                        claimed >> 20,
+                        MAX_COMMAND_UNPACKED >> 20
+                    ),
+                ));
+            }
             snap::raw::Decoder::new().decompress_vec(self.payload).map_err(
                 |e| io::Error::new(io::ErrorKind::InvalidData, e),
             )

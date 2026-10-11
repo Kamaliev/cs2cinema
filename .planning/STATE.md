@@ -4,17 +4,17 @@ milestone: v1.1
 milestone_name: Сервер и Telegram-бот
 current_phase: 05
 current_phase_name: Ядро сервера и протокол
-status: executing
-stopped_at: Completed 05-04-PLAN.md
-last_updated: "2026-10-11T11:26:19.994Z"
+status: verifying
+stopped_at: Completed 05-05-PLAN.md
+last_updated: "2026-10-11T11:40:18.305Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 05 execution started
-state_head: af012d1ee76b18d54fce678259b69cf37d6a41ef
+state_head: 985235afaa900a5042dc4dcda36972a41b80b184
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 5
-  completed_plans: 4
+  completed_plans: 5
   percent: 0
 ---
 
@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 
 Phase: 05 (Ядро сервера и протокол) — EXECUTING
 Plan: 5 of 5
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-10-11 — Phase 05 execution started
 
 Progress: [░░░░░░░░░░] 0%
@@ -96,6 +96,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 05 P02 | 40min | 2 tasks | 12 files |
 | Phase 05 P03 | 45min | 3 tasks | 11 files |
 | Phase 05 P04 | 80m | 3 tasks | 12 files |
+| Phase 05 P05 | 1h30m | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -164,6 +165,7 @@ Recent decisions affecting current work:
 - [Phase 05]: 05-04: итог done по HTTP не принимается до 05-05; FinishKind::Done и таблица переходов готовы
 - [Phase 05]: 05-04: claim освобождает прежнюю потерянную аренду того же раннера (раннер не ведёт две задачи)
 - [Phase 05]: 05-04: finish на окончательной задаче — повтор того же итога 200, иначе job_terminal
+- [Phase 05]: 05-05: Chunk ставит phase=upload, Touch делегирует в Reattach; Reject несёт заголовки; highlights.mp4 удаляется, если вторая транзакция finish done отказала
 
 ### Pending Todos
 
@@ -193,6 +195,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T11:26:19.960Z
-Stopped at: Completed 05-04-PLAN.md
+Last session: 2026-10-11T11:40:18.271Z
+Stopped at: Completed 05-05-PLAN.md
 Resume file: None

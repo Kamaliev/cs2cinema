@@ -530,6 +530,27 @@ impl Runner {
         self.persist()
     }
 
+    /// Удаляет скачанную демку (и недокачанную) внутри рабочей папки раннера: сервер хранит её сам.
+    fn remove_demo(&self, job: &HeldJob) {
+        for p in [job.demo_path.clone(), job.demo_path.with_extension("dem.part")] {
+            if p.starts_with(&self.cfg.dir) {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+
+    /// Задача закрыта сервером с принятым результатом: демка, ролик и папка с сырыми дублями больше не нужны,
+    /// иначе автономный раннер заполнит диск. Папка удаляется только внутри рабочей папки раннера.
+    fn remove_finished(&self, job: &HeldJob) {
+        self.remove_files(job);
+        if let Some(dir) = &job.out_dir
+            && dir.starts_with(&self.cfg.dir)
+            && dir != &self.cfg.dir
+        {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
     /// Удаляет демку и результат задачи, но только внутри рабочей папки раннера.
     fn remove_files(&self, job: &HeldJob) {
         let mut paths = vec![
@@ -962,6 +983,7 @@ impl Runner {
         match end {
             TransferEnd::Done(state) => {
                 self.log.line(&format!("задача #{id}: {}", state.as_str()));
+                self.remove_finished(&held);
                 self.persist()?;
                 Ok(Some(Tick::Settled { job_id: id, state }))
             }
@@ -1054,6 +1076,9 @@ impl Runner {
                         "задача #{id}: отменена, файлы задачи удалены из outbox"
                     ));
                     self.remove_files(&held);
+                } else {
+                    // Сбой: ролик и папка дублей остаются уликой, демка скачивается с сервера заново.
+                    self.remove_demo(&held);
                 }
                 self.state.job = None;
                 self.persist()?;

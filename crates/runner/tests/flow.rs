@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{Scenario, ScriptedExecutor, Stand, fake_demo, result_bytes, sha256_hex};
+use common::{Scenario, ScriptedExecutor, Stand, fake_demo, result_bytes};
 use pipeline::{FailCode, RecordState};
 use runner::{Runner, Tick};
 use wire::JobState;
@@ -40,10 +40,8 @@ fn submitted_demo_reaches_done_through_the_runner() {
         task.demo
     );
     assert!(task.demo.starts_with(stand.runner_dir()), "{:?}", task.demo);
-    assert_eq!(
-        sha256_hex(&std::fs::read(&task.demo).unwrap()),
-        sha256_hex(&demo)
-    );
+    // Принятая сервером задача освобождает диск: демка раннера удалена (WR-03).
+    assert!(!task.demo.exists(), "демка осталась после принятого результата");
     assert_eq!(task.hero_name, "s1mple");
     assert_eq!(task.job_id, id);
     assert!(!task.resume);

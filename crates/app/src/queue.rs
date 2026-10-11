@@ -54,6 +54,38 @@ pub enum PauseReason {
     Cancelled,
     /// При запуске приложения нашлась задача, прерванная его закрытием.
     Interrupted,
+    /// Несколько задач подряд упали с одним кодом: дальше очередь только прожигает задачи (DIF-03, DC-5).
+    Repeated { code: String, class: FailClass, jobs: u32, message: String, hint: String },
+}
+
+/// Сколько символов сообщения о сбое попадает в причину паузы: в нём бывают строки консоли игры.
+const PAUSE_MESSAGE_MAX: usize = 200;
+
+/// Текст причины паузы: баннер дописывает к нему число ждущих задач, уведомление в трее показывает как есть.
+pub fn pause_text(reason: &PauseReason) -> String {
+    match reason {
+        PauseReason::Cancelled => "Очередь на паузе после отмены".to_owned(),
+        PauseReason::Interrupted => "Очередь на паузе: задача прервана закрытием приложения".to_owned(),
+        PauseReason::Repeated { code, class, jobs, message, hint } => {
+            let n = ui::plural(*jobs as usize, "задача", "задачи", "задач");
+            let hint = if hint.is_empty() { String::new() } else { format!(" {hint}") };
+            format!(
+                "Очередь на паузе: {n} подряд упали с кодом {code} ({}). Последняя: {}.{hint} Исправьте причину и нажмите «Продолжить»",
+                class.title(),
+                message.trim_end_matches('.')
+            )
+        }
+    }
+}
+
+/// Сообщение сбоя для причины паузы: без управляющих символов, секретов и пути профиля, не длиннее `PAUSE_MESSAGE_MAX`.
+fn short_message(message: &str) -> String {
+    let clean = pipeline::record::log::clean(message);
+    if clean.chars().count() <= PAUSE_MESSAGE_MAX {
+        return clean;
+    }
+    let cut: String = clean.chars().take(PAUSE_MESSAGE_MAX - 1).collect();
+    format!("{}…", cut.trim_end())
 }
 
 /// Что окно видит в очереди: выполняемая задача с токеном отмены, пауза с причиной и «пауза для машины» перед авто-повтором.
@@ -116,21 +148,57 @@ pub enum Verdict {
 
 /// Политика очереди без присмотра (DIF-03, DIF-04). Чистая: решает по итогам задач, ни часов, ни базы.
 #[derive(Default)]
-pub struct QueuePolicy;
+pub struct QueuePolicy {
+    /// Серия итоговых сбоев с одним кодом и классом: код, класс, сколько подряд.
+    streak: Option<(String, FailClass, u32)>,
+}
 
 impl QueuePolicy {
     /// Что делать после задачи. `auto_retries_done` — сколько авто-повторов эта задача уже получила до текущей попытки.
     pub fn after(&mut self, auto_retries_done: u32, f: &Finished) -> Verdict {
         match f {
-            Finished::Done => Verdict::Next,
-            Finished::Cancelled => Verdict::Pause(PauseReason::Cancelled),
-            Finished::Failed { code: Some(code), state: Some(state), .. }
-                if classify(*code, *state) == FailClass::Launch && auto_retries_done < AUTO_RETRY_BUDGET =>
-            {
-                Verdict::AutoRetry
+            Finished::Done => {
+                self.streak = None;
+                Verdict::Next
             }
-            Finished::Failed { .. } => Verdict::Next,
+            Finished::Cancelled => {
+                self.streak = None;
+                Verdict::Pause(PauseReason::Cancelled)
+            }
+            Finished::Failed { code: Some(code), state: Some(state), message, hint, .. } => {
+                let class = classify(*code, *state);
+                match class {
+                    // первый сбой запуска задачи ещё не итог: серию не трогаем
+                    FailClass::Launch if auto_retries_done < AUTO_RETRY_BUDGET => Verdict::AutoRetry,
+                    // DC-5b: сбой запуска, у которого авто-повтор уже израсходован, считается как сбой окружения;
+                    // отключается удалением `FailClass::Launch` из этого образца
+                    FailClass::Environment | FailClass::Launch => self.count(code.as_str(), class, message, hint),
+                    FailClass::Other => {
+                        self.streak = None;
+                        Verdict::Next
+                    }
+                }
+            }
+            Finished::Failed { .. } => {
+                self.streak = None;
+                Verdict::Next
+            }
         }
+    }
+
+    /// Итоговый сбой «окружения» (или «запуска» без бюджета): продолжает серию с тем же кодом и классом, иначе начинает новую.
+    /// Две подряд — пауза, серия после неё начинается заново.
+    fn count(&mut self, code: &str, class: FailClass, message: &str, hint: &str) -> Verdict {
+        let n = match &self.streak {
+            Some((c, k, n)) if c == code && *k == class => n + 1,
+            _ => 1,
+        };
+        if n < 2 {
+            self.streak = Some((code.to_owned(), class, n));
+            return Verdict::Next;
+        }
+        self.streak = None;
+        Verdict::Pause(PauseReason::Repeated { code: code.to_owned(), class, jobs: n, message: short_message(message), hint: hint.to_owned() })
     }
 }
 
@@ -698,5 +766,101 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("highlights.mp4")).unwrap(), b"new", "ролик склеен");
         assert!(!dir.join("installed.json").exists(), "папка игры убрана после записи");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn failed_with(code: FailCode, state: RecordState, message: &str, hint: &str) -> Finished {
+        Finished::Failed { id: 1, code: Some(code), state: Some(state), message: message.into(), hint: hint.into() }
+    }
+
+    #[test]
+    fn two_equal_environment_failures_in_a_row_pause_the_queue() {
+        let mut p = QueuePolicy::default();
+        let precheck = |m: &str, h: &str| failed_with(FailCode::PrecheckFailed, RecordState::Precheck, m, h);
+        assert_eq!(p.after(0, &precheck("первое", "подсказка 1")), Verdict::Next);
+        assert_eq!(
+            p.after(0, &precheck("второе", "подсказка 2")),
+            Verdict::Pause(PauseReason::Repeated {
+                code: "PRECHECK_FAILED".into(),
+                class: FailClass::Environment,
+                jobs: 2,
+                message: "второе".into(),
+                hint: "подсказка 2".into()
+            })
+        );
+        assert_eq!(p.after(0, &precheck("третье", "")), Verdict::Next, "после паузы серия начинается заново");
+    }
+
+    #[test]
+    fn the_streak_is_broken_by_another_code_a_success_a_cancel_or_another_class() {
+        let precheck = failed(1, FailCode::PrecheckFailed, RecordState::Precheck);
+        let foreign = failed(1, FailCode::ForeignGameRunning, RecordState::Precheck);
+        let hlae = failed(1, FailCode::HlaeError, RecordState::Take);
+        let mut p = QueuePolicy::default();
+        assert_eq!((p.after(0, &precheck), p.after(0, &foreign)), (Verdict::Next, Verdict::Next), "разные коды одного класса");
+
+        let mut p = QueuePolicy::default();
+        assert_eq!(p.after(0, &precheck), Verdict::Next);
+        assert_eq!(p.after(0, &Finished::Done), Verdict::Next);
+        assert_eq!(p.after(0, &precheck), Verdict::Next, "успех сбрасывает серию");
+
+        let mut p = QueuePolicy::default();
+        assert_eq!(p.after(0, &hlae), Verdict::Next);
+        assert_eq!(p.after(0, &Finished::Cancelled), Verdict::Pause(PauseReason::Cancelled));
+        assert_eq!(p.after(0, &hlae), Verdict::Next, "отмена сбрасывает серию");
+
+        let mut p = QueuePolicy::default();
+        let other = failed(1, FailCode::TakeInvalid, RecordState::Take);
+        assert_eq!(
+            (p.after(0, &precheck), p.after(0, &other), p.after(0, &precheck)),
+            (Verdict::Next, Verdict::Next, Verdict::Next),
+            "сбой «прочее» сбрасывает серию"
+        );
+    }
+
+    #[test]
+    fn spent_launch_failures_pause_the_queue_too() {
+        let mut p = QueuePolicy::default();
+        let console = failed(1, FailCode::ConsoleNotOpen, RecordState::Console);
+        assert_eq!(p.after(0, &console), Verdict::AutoRetry, "первый сбой запуска — авто-повтор, серию не трогает");
+        assert_eq!(p.after(1, &console), Verdict::Next, "авто-повтор не помог — это первый итоговый сбой серии");
+        match p.after(1, &console) {
+            Verdict::Pause(PauseReason::Repeated { class, jobs, .. }) => assert_eq!((class, jobs), (FailClass::Launch, 2)),
+            v => panic!("ждали паузу по повторяющемуся сбою запуска: {v:?}"),
+        }
+    }
+
+    #[test]
+    fn a_long_failure_message_is_cut_in_the_pause_reason() {
+        let mut p = QueuePolicy::default();
+        let long = "строка консоли ".repeat(40);
+        let f = failed_with(FailCode::HlaeError, RecordState::Take, &long, "");
+        p.after(0, &f);
+        let Verdict::Pause(PauseReason::Repeated { message, .. }) = p.after(0, &f) else { panic!("ждали паузу") };
+        assert!(message.chars().count() <= 200 && message.ends_with('…'), "{message}");
+    }
+
+    #[test]
+    fn environment_streak_pauses_the_queue_and_keeps_the_rest_queued() {
+        let store = Store::in_memory().unwrap();
+        let (a, b, c) = (add(&store, "первая"), add(&store, "вторая"), add(&store, "третья"));
+        let precheck = || -> Behavior { Box::new(|| Err(failure(FailCode::PrecheckFailed, RecordState::Precheck, "нет ffmpeg"))) };
+        let (runner, started) = stub(vec![("первая", precheck()), ("вторая", precheck()), ("третья", precheck())]);
+        let q = start(store.clone(), host(), runner, Reporter::detached(), None, cfg());
+
+        wait_for(&store, b, JobStatus::Failed);
+        let begin = Instant::now();
+        while q.view().paused.is_none() && begin.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        match q.view().paused {
+            Some(PauseReason::Repeated { code, class, jobs, .. }) => assert_eq!((code.as_str(), class, jobs), ("PRECHECK_FAILED", FailClass::Environment, 2)),
+            other => panic!("ждали паузу по повторяющемуся сбою: {other:?}"),
+        }
+        stays_queued(&store, c);
+        assert_eq!(*started.lock().unwrap(), ["первая", "вторая"], "третья не стартовала");
+        q.resume();
+        wait_for(&store, c, JobStatus::Failed);
+        assert_eq!(*started.lock().unwrap(), ["первая", "вторая", "третья"]);
+        assert_eq!(store.job(a).unwrap().unwrap().auto_retries, 0, "окружение не повторяется автоматически");
     }
 }

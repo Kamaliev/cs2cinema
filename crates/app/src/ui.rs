@@ -292,3 +292,14 @@ fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
     use std::os::windows::process::CommandExt;
     cmd.creation_flags(0x0800_0000)
 }
+
+/// Число с существительным в нужной форме: 1 ошибка, 2 ошибки, 5 ошибок.
+pub fn plural(n: usize, one: &str, few: &str, many: &str) -> String {
+    let word = match (n % 100, n % 10) {
+        (11..=14, _) => many,
+        (_, 1) => one,
+        (_, 2..=4) => few,
+        _ => many,
+    };
+    format!("{n} {word}")
+}

@@ -9,7 +9,7 @@ use store::{Job, JobKind, JobStatus};
 
 use crate::{
     app::{App, Page, THUMB},
-    queue::PauseReason,
+    queue::{self, PauseReason},
     ui::{self, ACCENT, BAD, MUTED, OK},
 };
 
@@ -322,22 +322,9 @@ pub fn hold_text(until: std::time::Instant, now: std::time::Instant) -> String {
 
 /// Текст баннера паузы очереди: называет причину (D-16).
 pub fn pause_banner(reason: &PauseReason, waiting: usize) -> String {
-    let n = plural(waiting, "задача", "задачи", "задач");
-    match reason {
-        PauseReason::Cancelled => format!("Очередь на паузе после отмены: {n} ждут"),
-        PauseReason::Interrupted => format!("Очередь на паузе: задача прервана закрытием приложения — {n} ждут"),
-    }
-}
-
-/// Число с существительным в нужной форме: 1 ошибка, 2 ошибки, 5 ошибок.
-fn plural(n: usize, one: &str, few: &str, many: &str) -> String {
-    let word = match (n % 100, n % 10) {
-        (11..=14, _) => many,
-        (_, 1) => one,
-        (_, 2..=4) => few,
-        _ => many,
-    };
-    format!("{n} {word}")
+    let n = ui::plural(waiting, "задача", "задачи", "задач");
+    let sep = if matches!(reason, PauseReason::Cancelled) { ":" } else { " —" };
+    format!("{}{sep} {n} ждут", queue::pause_text(reason))
 }
 
 /// Отчёт предпроверки: свёрнутый заголовок с итогом и строки ✔ / ⚠ / ✖ с сообщением; у `warn` и `fail` под строкой подсказка (PRE-01).
@@ -346,9 +333,9 @@ pub fn precheck_view(ui: &mut Ui, salt: impl std::hash::Hash, r: &Report, open: 
     let count = |level: Level| r.items.iter().filter(|i| i.level == level).count();
     let (fails, warns) = (count(Level::Fail), count(Level::Warn));
     let title = if fails > 0 {
-        format!("Предпроверка: {}", plural(fails, "ошибка", "ошибки", "ошибок"))
+        format!("Предпроверка: {}", ui::plural(fails, "ошибка", "ошибки", "ошибок"))
     } else if warns > 0 {
-        format!("Предпроверка: {}", plural(warns, "предупреждение", "предупреждения", "предупреждений"))
+        format!("Предпроверка: {}", ui::plural(warns, "предупреждение", "предупреждения", "предупреждений"))
     } else {
         "Предпроверка: всё в порядке".to_owned()
     };
@@ -494,6 +481,32 @@ fn progress(app: &App, stage: &str) -> (f32, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pause_banner_explains_a_repeated_environment_failure() {
+        let reason = PauseReason::Repeated {
+            code: "PRECHECK_FAILED".into(),
+            class: pipeline::record::failure::FailClass::Environment,
+            jobs: 2,
+            message: "нет ffmpeg".into(),
+            hint: "установите ffmpeg".into(),
+        };
+        assert_eq!(
+            pause_banner(&reason, 1),
+            "Очередь на паузе: 2 задачи подряд упали с кодом PRECHECK_FAILED (окружение). Последняя: нет ffmpeg. установите ffmpeg Исправьте причину и нажмите «Продолжить» — 1 задача ждут"
+        );
+        let no_hint = PauseReason::Repeated {
+            code: "HLAE_ERROR".into(),
+            class: pipeline::record::failure::FailClass::Environment,
+            jobs: 5,
+            message: "сбой.".into(),
+            hint: String::new(),
+        };
+        assert_eq!(
+            pause_banner(&no_hint, 3),
+            "Очередь на паузе: 5 задач подряд упали с кодом HLAE_ERROR (окружение). Последняя: сбой. Исправьте причину и нажмите «Продолжить» — 3 задачи ждут"
+        );
+    }
 
     #[test]
     fn pause_banner_names_the_reason() {

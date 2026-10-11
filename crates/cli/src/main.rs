@@ -2,6 +2,7 @@ use std::{env, error::Error, path::PathBuf, process::ExitCode};
 
 use director::{NoPositions, Order, PositionSource};
 
+mod acceptance;
 mod record;
 
 use record::ConsoleProgress;
@@ -36,6 +37,10 @@ cs2-cli — хайлайт-ролик из матча FACEIT
 
 Запись и повтор задачи:
   cs2-cli record … / cs2-cli retry … (подробно: cs2-cli record --help)
+
+Приёмка (база приложения только на чтение):
+  cs2-cli acceptance check [--db <файл>] [--batch <имя> | --last] [--expect-restart-from <партия A>]
+  — машинная проверка серии из пяти матчей; код выхода 0 только если приёмка пройдена (подробно: cs2-cli acceptance --help)
 
 Ключ FACEIT берётся из переменной FACEIT_API_KEY.";
 
@@ -123,6 +128,7 @@ fn main() -> ExitCode {
         Some("assemble") => return assemble_cmd(),
         Some("record") => return record::record_cmd(),
         Some("retry") => return record::retry_cmd(),
+        Some("acceptance") => return acceptance::acceptance_cmd(),
         _ => {}
     }
     let args = match parse_args() {

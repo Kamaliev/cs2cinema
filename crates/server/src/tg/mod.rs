@@ -5,6 +5,7 @@
 //! Типы обновлений разбираются `serde`: лишние поля игнорируются, необязательные имеют значения по умолчанию.
 
 pub mod fake;
+pub mod http;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

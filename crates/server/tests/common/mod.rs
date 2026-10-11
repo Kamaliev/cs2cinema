@@ -743,3 +743,188 @@ impl BotStand {
             .expect("строка tg_jobs")
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Поддельный Bot API (07-05): настоящий HTTP-сервер на loopback вместо локального telegram-bot-api
+// ---------------------------------------------------------------------------------------------------------
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+
+/// Запрос, дошедший до поддельного Bot API.
+#[derive(Debug, Clone)]
+pub struct BotApiRequest {
+    pub method: String,
+    /// В пути стоял ожидаемый токен.
+    pub token_ok: bool,
+    pub body: serde_json::Value,
+}
+
+#[derive(Default)]
+struct BotApiState {
+    log: Vec<BotApiRequest>,
+    replies: HashMap<String, VecDeque<serde_json::Value>>,
+    silent: HashSet<String>,
+}
+
+pub struct FakeBotApi {
+    addr: std::net::SocketAddr,
+    state: Arc<Mutex<BotApiState>>,
+    stop: Arc<AtomicBool>,
+    main: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FakeBotApi {
+    /// Поднимает сервер на `127.0.0.1:0`. Без сценарных ответов: `getMe` и `setMyCommands` отвечают сами,
+    /// `getUpdates` ждёт `min(timeout, 1 с)` и возвращает пустой список (как длинный опрос настоящего bot-api).
+    pub fn start(token: &str) -> FakeBotApi {
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("поддельный Bot API"));
+        let addr = server
+            .server_addr()
+            .to_ip()
+            .expect("адрес поддельного Bot API");
+        let state = Arc::new(Mutex::new(BotApiState::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let expected = token.to_owned();
+        let main = {
+            let (state, stop) = (state.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let Ok(Some(rq)) = server.recv_timeout(Duration::from_millis(50)) else {
+                        continue;
+                    };
+                    let (state, stop, expected) = (state.clone(), stop.clone(), expected.clone());
+                    // Каждый запрос в своём потоке: долгий опрос не должен задерживать остальные вызовы.
+                    std::thread::spawn(move || bot_api_handle(rq, &state, &stop, &expected));
+                }
+            })
+        };
+        FakeBotApi {
+            addr,
+            state,
+            stop,
+            main: Some(main),
+        }
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    pub fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
+    pub fn requests(&self) -> Vec<BotApiRequest> {
+        self.state.lock().unwrap().log.clone()
+    }
+
+    /// Запросы к одному методу.
+    pub fn requests_to(&self, method: &str) -> Vec<BotApiRequest> {
+        self.requests()
+            .into_iter()
+            .filter(|r| r.method == method)
+            .collect()
+    }
+
+    /// Следующий ответ на метод; если у ответа `ok:false`, HTTP-статус берётся из `error_code`.
+    pub fn reply(&self, method: &str, json: serde_json::Value) {
+        self.state
+            .lock()
+            .unwrap()
+            .replies
+            .entry(method.to_owned())
+            .or_default()
+            .push_back(json);
+    }
+
+    /// Следующий запрос к методу остаётся без ответа до остановки поддельного сервера.
+    pub fn silence(&self, method: &str) {
+        self.state.lock().unwrap().silent.insert(method.to_owned());
+    }
+}
+
+impl Drop for FakeBotApi {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.main.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn bot_api_handle(
+    mut rq: tiny_http::Request,
+    state: &Mutex<BotApiState>,
+    stop: &AtomicBool,
+    expected: &str,
+) {
+    let mut raw = String::new();
+    let _ = rq.as_reader().read_to_string(&mut raw);
+    let body = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    // Путь: /bot<токен>/<метод>
+    let path = rq.url().to_owned();
+    let mut parts = path.trim_start_matches('/').splitn(2, '/');
+    let token = parts
+        .next()
+        .and_then(|s| s.strip_prefix("bot"))
+        .unwrap_or("")
+        .to_owned();
+    let method = parts.next().unwrap_or("").to_owned();
+    let token_ok = token == expected;
+    let (scripted, silent) = {
+        let mut st = state.lock().unwrap();
+        st.log.push(BotApiRequest {
+            method: method.clone(),
+            token_ok,
+            body: body.clone(),
+        });
+        let silent = st.silent.remove(&method);
+        let scripted = st.replies.get_mut(&method).and_then(VecDeque::pop_front);
+        (scripted, silent)
+    };
+    let wait = |d: Duration| {
+        let until = std::time::Instant::now() + d;
+        while std::time::Instant::now() < until && !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    if silent {
+        // Держим запрос без ответа, пока не остановят сервер.
+        while !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        return;
+    }
+    let reply = if !token_ok {
+        serde_json::json!({"ok": false, "error_code": 401, "description": "Unauthorized"})
+    } else if let Some(r) = scripted {
+        r
+    } else {
+        match method.as_str() {
+            "getMe" => {
+                serde_json::json!({"ok": true, "result": {"id": 1, "username": "cs2cinema_test_bot"}})
+            }
+            "setMyCommands" => serde_json::json!({"ok": true, "result": true}),
+            "getUpdates" => {
+                let secs = body["timeout"].as_u64().unwrap_or(0).min(1);
+                wait(Duration::from_secs(secs));
+                serde_json::json!({"ok": true, "result": []})
+            }
+            _ => serde_json::json!({"ok": false, "error_code": 404, "description": "Not Found"}),
+        }
+    };
+    let status = if reply["ok"].as_bool() == Some(true) {
+        200
+    } else {
+        reply["error_code"].as_u64().unwrap_or(500) as u16
+    };
+    let header =
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let _ = rq.respond(
+        tiny_http::Response::from_string(reply.to_string())
+            .with_status_code(status)
+            .with_header(header),
+    );
+}

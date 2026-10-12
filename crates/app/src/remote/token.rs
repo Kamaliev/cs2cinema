@@ -4,11 +4,12 @@
 //! `runner::Token`, у которого `Debug` печатает `Token(***)`. Тексты ошибок строятся без значения токена.
 
 use std::{
-    io,
+    io::{self, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-use pipeline::host::Host;
+use pipeline::host::{CmdSpec, Host};
 use runner::Token;
 
 /// Имя файла токена в рабочей папке раннера.
@@ -56,14 +57,73 @@ pub fn exists(dir: &Path) -> bool {
     std::fs::read_to_string(path(dir)).is_ok_and(|t| !t.trim().is_empty())
 }
 
-/// Записывает токен в файл с суженным доступом (заглушка до реализации).
-pub fn save(_host: &dyn Host, _dir: &Path, _value: &str) -> Result<(), String> {
-    Err("не реализовано".to_owned())
+/// Сколько ждём `icacls`: утилита отрабатывает за доли секунды, дольше — зависла.
+const ACL_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Сохраняет токен в файл рабочей папки так, чтобы значение никогда не лежало в файле с чужим доступом.
+///
+/// Порядок обязателен: пустой файл -> доступ сужается до автора -> только потом пишется значение. Если сузить доступ
+/// не удалось, файл удаляется и токен не сохраняется (D-02). Тексты ошибок значения токена не содержат.
+pub fn save(host: &dyn Host, dir: &Path, value: &str) -> Result<(), String> {
+    let value = validate(value)?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("Не удалось создать папку раннера: {}", e.kind()))?;
+    let file = path(dir);
+    let result = write_private(host, &file, &value);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&file);
+    }
+    result
 }
 
-/// Удаляет файл токена (заглушка до реализации).
-pub fn clear(_dir: &Path) -> Result<(), String> {
-    Err("не реализовано".to_owned())
+fn write_private(host: &dyn Host, file: &Path, value: &str) -> Result<(), String> {
+    // пустой файл: прежнее значение (если было) стёрто, чужого доступа к новому значению ещё нет
+    std::fs::File::create(file).map_err(|e| format!("Не удалось создать файл токена: {}", e.kind()))?;
+    narrow_access(host, file)?;
+    let mut f = std::fs::OpenOptions::new().write(true).truncate(true).open(file).map_err(|e| format!("Не удалось открыть файл токена: {}", e.kind()))?;
+    f.write_all(value.as_bytes()).and_then(|()| f.sync_all()).map_err(|e| format!("Не удалось записать файл токена: {}", e.kind()))
+}
+
+/// Сужает доступ к файлу до автора: на Windows `icacls <файл> /inheritance:r /grant:r <пользователь>:F`, успех — только код 0.
+#[cfg(windows)]
+fn narrow_access(host: &dyn Host, file: &Path) -> Result<(), String> {
+    let user = std::env::var("USERNAME").ok().filter(|u| !u.trim().is_empty()).ok_or("Не удалось узнать имя пользователя Windows — токен не сохранён")?;
+    let spec = CmdSpec {
+        program: PathBuf::from("icacls"),
+        args: vec![file.to_string_lossy().into_owned(), "/inheritance:r".to_owned(), "/grant:r".to_owned(), format!("{user}:F")],
+        cwd: None,
+        deadline: ACL_DEADLINE,
+    };
+    match host.run(&spec, &|| false, &mut |_| {}) {
+        Ok(out) if out.code == Some(0) => Ok(()),
+        Ok(out) => {
+            let code = out.code.map_or("нет кода".to_owned(), |c| c.to_string());
+            Err(format!("Не удалось закрыть доступ к файлу токена для других учётных записей (icacls, код {code}) — токен не сохранён"))
+        }
+        Err(e) => Err(format!("Не удалось закрыть доступ к файлу токена для других учётных записей (icacls: {e}) — токен не сохранён")),
+    }
+}
+
+/// На остальных ОС доступ сужается правами `0600`.
+#[cfg(not(windows))]
+fn narrow_access(_host: &dyn Host, file: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Не удалось закрыть доступ к файлу токена для других учётных записей ({}) — токен не сохранён", e.kind()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
+}
+
+/// Удаляет файл токена; отсутствие файла не ошибка.
+pub fn clear(dir: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path(dir)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Не удалось удалить файл токена: {}", e.kind())),
+    }
 }
 
 #[cfg(test)]

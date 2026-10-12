@@ -209,10 +209,15 @@ impl Bot {
     /// `downloading` → `pending`, `sending` → `uncertain` (без повторной отправки).
     pub fn recover(&self) -> Result<()> {
         let (inbox, sending) = store::recover(self.core.db(), self.now_ms())?;
-        if inbox + sending > 0 {
+        if inbox + sending.len() > 0 {
             self.log.info(&format!(
-                "бот: после перезапуска вернул в очередь приёма {inbox}, неясных отправок {sending}"
+                "бот: после перезапуска вернул в очередь приёма {inbox}, неясных отправок {}",
+                sending.len()
             ));
+        }
+        // Друг должен узнать, что ролик мог не дойти, и про `/resend` (WR-02).
+        for id in sending {
+            deliver::tell_uncertain_after_restart(self, id);
         }
         Ok(())
     }

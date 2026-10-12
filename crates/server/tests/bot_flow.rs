@@ -238,6 +238,16 @@ fn sending_delivery_becomes_uncertain_after_restart_without_a_resend() {
     let tj = st.tg_job(id);
     assert_eq!(tj.delivery, "uncertain");
     assert!(tj.delivery_error.unwrap().contains("перезапустился"));
+    // WR-02: друг узнаёт, что ролик мог не дойти, и про /resend, ровно один раз.
+    let want = format!(
+        "Не уверен, что ролик задачи #{id} дошёл. Если его нет в чате — отправьте /resend {id}"
+    );
+    assert_eq!(
+        st.tg.texts_to(FRIEND).iter().filter(|t| **t == want).count(),
+        1,
+        "{:?}",
+        st.tg.texts_to(FRIEND)
+    );
     bot.step().unwrap();
     bot.step().unwrap();
     assert_eq!(

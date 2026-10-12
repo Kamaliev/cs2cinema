@@ -586,17 +586,23 @@ pub fn requeue_delivery(db: &Db, job_id: i64, now_ms: i64) -> Result<bool> {
 }
 
 /// Восстановление после перезапуска: `downloading` → `pending`, `sending` → `uncertain`.
-/// Возвращает числа переведённых строк входящих и доставок.
-pub fn recover(db: &Db, now_ms: i64) -> Result<(usize, usize)> {
+/// Возвращает число переведённых строк входящих и номера задач, чья отправка стала неясной (им нужно сообщение).
+pub fn recover(db: &Db, now_ms: i64) -> Result<(usize, Vec<i64>)> {
     db.write(|tx| {
+        let sending: Vec<i64> = tx
+            .prepare("SELECT job_id FROM tg_jobs WHERE delivery = 'sending' ORDER BY job_id")
+            .map_err(db_err)?
+            .query_map([], |r| r.get::<_, i64>(0))
+            .map_err(db_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_err)?;
         let inbox = tx
             .execute(
                 "UPDATE tg_inbox SET state = 'pending', updated_at = ?1 WHERE state = 'downloading'",
                 [now_ms],
             )
             .map_err(db_err)?;
-        let sending = tx
-            .execute(
+        tx.execute(
                 "UPDATE tg_jobs SET delivery = 'uncertain', delivery_error = 'сервер перезапустился во время отправки', updated_at = ?1
                  WHERE delivery = 'sending'",
                 [now_ms],

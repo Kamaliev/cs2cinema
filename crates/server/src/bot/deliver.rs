@@ -179,13 +179,7 @@ fn fail_delivery(bot: &Bot, tj: &TgJob, e: &TgError, attempts: i64, now: i64) ->
         bot.log().warn(&format!(
             "бот: отправка ролика задачи #{id} — uncertain: {text}"
         ));
-        tell(
-            bot,
-            tj,
-            &format!(
-                "Не уверен, что ролик задачи #{id} дошёл. Если его нет в чате — отправьте /resend {id}"
-            ),
-        );
+        tell(bot, tj, &uncertain_text(id));
         return Ok(());
     }
     if e.is_forbidden() {
@@ -228,6 +222,23 @@ fn fail_delivery(bot: &Bot, tj: &TgJob, e: &TgError, attempts: i64, now: i64) ->
         }
     }
     Ok(())
+}
+
+/// Сообщение другу про неясную отправку: ролик мог не дойти, решает `/resend`.
+fn uncertain_text(id: i64) -> String {
+    format!("Не уверен, что ролик задачи #{id} дошёл. Если его нет в чате — отправьте /resend {id}")
+}
+
+/// После перезапуска: отправка, прерванная падением процесса, стала `uncertain` без слова другу. Говорим то же,
+/// что и в обычном пути (WR-02). Ошибки только в журнал: запуск бота они не останавливают.
+pub(super) fn tell_uncertain_after_restart(bot: &Bot, job_id: i64) {
+    match store::tg_job(bot.core().db(), job_id) {
+        Ok(Some(tj)) => tell(bot, &tj, &uncertain_text(job_id)),
+        Ok(None) => {}
+        Err(e) => bot.log().warn(&format!(
+            "бот: не прочитал доставку задачи #{job_id} для сообщения после перезапуска: {e}"
+        )),
+    }
 }
 
 /// Подпись под роликом: номер задачи и игрок.

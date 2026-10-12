@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 8
 current_phase_name: Режим раннера в приложении
 status: planning
-stopped_at: Phase 07 complete, ready to plan Phase 8
-last_updated: "2026-10-12T10:30:51.938Z"
+stopped_at: Completed 08-01-PLAN.md
+last_updated: "2026-10-12T12:21:17.181Z"
 last_activity: 2026-10-12
 last_activity_desc: Phase 07 complete, transitioned to Phase 8
-state_head: 878976dae08f9d9cc249bab4db928e3eff415761
+state_head: 7655ebbefd10702154ae9d8da03900ff640797f5
 progress:
   total_phases: 5
   completed_phases: 3
-  total_plans: 27
-  completed_plans: 27
+  total_plans: 33
+  completed_plans: 28
   percent: 60
 ---
 
@@ -120,6 +120,7 @@ Progress: [██████░░░░] 60%
 | Phase 07 P07 | 75min | 3 tasks | 10 files |
 | Phase 07 P08 | 35min | 3 tasks | 5 files |
 | Phase 07 P09 | 40min | 3 tasks | 8 files |
+| Phase 08 P01 | 40min | 2 tasks | 13 files |
 
 ## Accumulated Context
 
@@ -228,6 +229,8 @@ Recent decisions affecting current work:
 - [Phase 07]: 07-08: заглушённый чат (403) глушит все строки tg_jobs чата; первое сообщение статуса после постановки идёт через notify::push_now и считается в частоте правок; /retry только владельцу, несуществующий номер отвечает как чужой
 - [Phase 07]: 07-09: исход доставки и отчёт о сбое делят final_reported_ms; /resend снимает отметку и разглушает чат; повторяется только запрос, который точно не ушёл
 - [Phase 07]: 07-09: /resend чужой или несуществующей задачи отвечает «Это не ваша задача.» — наличие чужих задач не раскрывается; админ чужой ролик не получает
+- [Phase 08]: [08-01] Ветка удалённой карточки - обёртка queue_runner над jobs::runner; queue::start не менялся, хук подключается через start_with_hook
+- [Phase 08]: [08-01] external_ref = srv:{job_id}:{epoch} (D-03), миграция 6 с уникальным частичным индексом; итог раннеру через SettleHook только после QueuePolicy и не при AutoRetry
 
 ### Pending Todos
 
@@ -257,6 +260,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11T21:14:50.970Z
-Stopped at: Phase 07 complete, ready to plan Phase 8
+Last session: 2026-10-12T12:21:16.977Z
+Stopped at: Completed 08-01-PLAN.md
 Resume file: None

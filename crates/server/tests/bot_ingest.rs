@@ -584,3 +584,49 @@ fn ingest_errors_name_no_paths() {
         assert!(!hay.contains(&s), "утечка «{s}» в:\n{hay}");
     }
 }
+
+/// WR-01: чужая задача не загоняет второго друга в тупик. Пока она идёт, ответ без номера и без `/resend`;
+/// когда её ролик готов, второй друг получает свою задачу.
+#[test]
+fn another_friends_duplicate_is_never_a_dead_end() {
+    const OTHER: i64 = 222;
+    let st = BotStand::start();
+    st.add_friend(FRIEND, "вася");
+    let other_uid = st.add_friend(OTHER, "петя");
+    let bytes = demo_bytes();
+    put(&st, "f1", "u1", &bytes);
+    put(&st, "f2", "u2", &bytes);
+    let len = Some(bytes.len() as u64);
+    push(&st, FRIEND, "f1", "u1", "match.dem", len, "s1mple");
+    st.step();
+    let a = jobs(&st)[0].id;
+
+    // Идёт у первого друга: второму отвечают без номера чужой задачи и без /resend.
+    push(&st, OTHER, "f2", "u2", "match.dem", len, "s1mple");
+    st.step();
+    let text = chat_text(&st, OTHER);
+    assert!(text.contains("уже в очереди"), "{text}");
+    assert!(
+        !text.contains(&format!("#{a}")) && !text.contains("/resend"),
+        "чужой номер и /resend не показываем: {text}"
+    );
+    assert!(
+        jobs(&st)
+            .iter()
+            .all(|j| j.user_id != Some(other_uid) || j.state == JobState::Cancelled),
+        "активной задачи у второго друга нет"
+    );
+
+    // Ролик первого друга готов: второй получает свою задачу, а не «/resend чужой».
+    let token = st.runner_token();
+    st.finish_done(a, &token);
+    st.step();
+    push(&st, OTHER, "f2", "u2", "match.dem", len, "s1mple");
+    st.step();
+    let mine: Vec<_> = jobs(&st)
+        .into_iter()
+        .filter(|j| j.user_id == Some(other_uid) && j.state == JobState::Queued)
+        .collect();
+    assert_eq!(mine.len(), 1, "своя задача поставлена: {:?}", jobs(&st));
+    assert!(!chat_text(&st, OTHER).contains("/resend"));
+}

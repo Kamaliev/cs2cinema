@@ -521,6 +521,17 @@ impl Core {
     /// Самая свежая задача с таким ключом среди активных и готовых. Упавшая и отменённая дублем не считаются:
     /// повтор после сбоя разрешён.
     pub fn find_duplicate(&self, key: &DedupKey) -> Result<Option<JobRow>> {
+        self.find_duplicate_impl(key, None)
+    }
+
+    /// Дубль с точки зрения пользователя `user_id` (WR-01): его собственная задача (активная или готовая) либо чужая
+    /// ещё идущая. Чужой готовый ролик дублем не считается: другу он нужен тоже, а `/resend` чужой задачи ему
+    /// запрещён, так что отказ был бы тупиком.
+    pub fn find_duplicate_for(&self, key: &DedupKey, user_id: i64) -> Result<Option<JobRow>> {
+        self.find_duplicate_impl(key, Some(user_id))
+    }
+
+    fn find_duplicate_impl(&self, key: &DedupKey, user: Option<i64>) -> Result<Option<JobRow>> {
         let (rows, wanted): (Vec<JobRow>, &str) = match key {
             DedupKey::File { sha256, player_key } => (
                 self.db.read(|c| {
@@ -554,9 +565,10 @@ impl Core {
                 )
             }
         };
-        Ok(rows
-            .into_iter()
-            .find(|j| player_key(&j.player_name) == wanted))
+        Ok(rows.into_iter().find(|j| {
+            player_key(&j.player_name) == wanted
+                && user.is_none_or(|u| j.user_id == Some(u) || j.state != JobState::Done)
+        }))
     }
 
     /// Сколько задач обгонит эта: для `queued` — задачи в очереди с меньшим id плюс выданные раннеру и ведущиеся;

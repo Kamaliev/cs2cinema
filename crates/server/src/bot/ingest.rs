@@ -108,8 +108,15 @@ fn active_tasks(n: i64) -> String {
 }
 
 /// Ответ про повтор: задача в очереди или готовый ролик.
-fn duplicate_text(job: &JobRow, player: &str) -> String {
+fn duplicate_text(job: &JobRow, player: &str, user_id: i64) -> String {
     let faceit = job.source_kind == "faceit";
+    // Чужую задачу не раскрываем номером и не предлагаем `/resend`: чужой ролик слать нельзя (WR-01).
+    if job.user_id != Some(user_id) {
+        return format!(
+            "{} для игрока {player} уже в очереди — дождитесь результата и пришлите снова.",
+            if faceit { "Этот матч" } else { "Эта демка" }
+        );
+    }
     if job.state == JobState::Done {
         format!(
             "Ролик по {} для игрока {player} уже готов: /resend {}",
@@ -171,8 +178,8 @@ fn precheck_text(bot: &Bot, user: &User, msg: &Message) -> Precheck {
             link: canonical.clone(),
             player_key: player_key(&player),
         };
-        match bot.core().find_duplicate(&key) {
-            Ok(Some(dup)) => return Precheck::Reply(duplicate_text(&dup, &player)),
+        match bot.core().find_duplicate_for(&key, user.id) {
+            Ok(Some(dup)) => return Precheck::Reply(duplicate_text(&dup, &player, user.id)),
             Ok(None) => {}
             Err(_) => bot.log().warn("бот: не удалось проверить повтор ссылки"),
         }
@@ -245,8 +252,8 @@ pub fn precheck(bot: &Bot, user: &User, msg: &Message) -> Precheck {
                 sha256: known.sha256,
                 player_key: player_key(&player),
             };
-            match bot.core().find_duplicate(&key) {
-                Ok(Some(dup)) => return Precheck::Reply(duplicate_text(&dup, &player)),
+            match bot.core().find_duplicate_for(&key, user.id) {
+                Ok(Some(dup)) => return Precheck::Reply(duplicate_text(&dup, &player, user.id)),
                 Ok(None) => {}
                 Err(_) => bot.log().warn("бот: не удалось проверить повтор файла"),
             }
@@ -505,7 +512,7 @@ fn status(bot: &Bot, row: &store::InboxRow, text: &str) {
 fn reject_duplicate(bot: &Bot, row: &store::InboxRow, dup: &JobRow) -> Result<bool> {
     let reason = format!("дубль задачи #{}", dup.id);
     store::reject(bot.core().db(), row.id, &reason, bot.now_ms())?;
-    status(bot, row, &duplicate_text(dup, &row.player));
+    status(bot, row, &duplicate_text(dup, &row.player, row.user_id));
     Ok(true)
 }
 
@@ -640,7 +647,7 @@ fn ingest_faceit(bot: &Bot, row: &store::InboxRow, sub: &Submit) -> Result<bool>
         link: link.clone(),
         player_key: player_key(&row.player),
     };
-    if let Some(dup) = bot.core().find_duplicate(&key)? {
+    if let Some(dup) = bot.core().find_duplicate_for(&key, row.user_id)? {
         return reject_duplicate(bot, row, &dup);
     }
     match bot.core().submit_faceit(&link, sub) {
@@ -660,7 +667,14 @@ fn ingest_faceit(bot: &Bot, row: &store::InboxRow, sub: &Submit) -> Result<bool>
 }
 
 /// Другая задача с тем же хешем демки и игроком (активная или готовая), кроме `exclude` — только что созданной.
-fn other_duplicate(bot: &Bot, sha256: &str, key: &str, exclude: i64) -> Result<Option<JobRow>> {
+/// Задачи других пользователей, уже готовые, дублем не считаются (WR-01): у этого друга своя задача.
+fn other_duplicate(
+    bot: &Bot,
+    sha256: &str,
+    key: &str,
+    exclude: i64,
+    user_id: i64,
+) -> Result<Option<JobRow>> {
     let ids: Vec<i64> = bot.core().db().read(|c| {
         let mut st = c
             .prepare(&format!(
@@ -676,6 +690,7 @@ fn other_duplicate(bot: &Bot, sha256: &str, key: &str, exclude: i64) -> Result<O
     for id in ids {
         if let Some(job) = bot.core().job(id)?
             && player_key(&job.player_name) == key
+            && (job.user_id == Some(user_id) || job.state != JobState::Done)
         {
             return Ok(Some(job));
         }
@@ -727,7 +742,7 @@ pub fn ingest_once(bot: &Bot) -> Result<bool> {
             sha256: known.sha256.clone(),
             player_key: key.clone(),
         };
-        if let Some(dup) = bot.core().find_duplicate(&dup_key)? {
+        if let Some(dup) = bot.core().find_duplicate_for(&dup_key, row.user_id)? {
             return reject_duplicate(bot, &row, &dup);
         }
         match bot.core().submit_from(known.job_id, &sub) {
@@ -781,7 +796,7 @@ pub fn ingest_once(bot: &Bot) -> Result<bool> {
         ));
     }
     // Слой 2: тот же хеш и игрок, но под другим `file_unique_id` — новая копия лишняя.
-    if let Some(dup) = other_duplicate(bot, &ingested.sha256, &key, job_id)? {
+    if let Some(dup) = other_duplicate(bot, &ingested.sha256, &key, job_id, row.user_id)? {
         remember_file(bot, row.file_unique_id.as_deref(), dup.id)?;
         if let Err(e) = bot.core().cancel(job_id, true) {
             bot.log().warn(&format!(

@@ -545,3 +545,149 @@ fn dry_run_reports_what_would_go_and_deletes_nothing() {
     assert!(!demo_path(&srv, id).exists());
     assert!(!orphan.exists());
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Рабочая папка telegram-bot-api и журнал без путей и токена (Task 3)
+// ---------------------------------------------------------------------------------------------------------
+
+/// Файл с содержимым и временем изменения `age` назад от часов стенда; нужные папки создаются.
+fn aged_file(path: &Path, clock: &ManualClock, age: Duration) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, b"bot-api file").unwrap();
+    set_age(path, clock, age);
+}
+
+#[test]
+fn bot_api_files_go_only_inside_documents_and_only_when_old() {
+    let (srv, clock) = manual_server(None);
+    let root = common::TestDir::new("botapi-root");
+    let outside = common::TestDir::new("botapi-outside");
+    let r = &root.path;
+    let bot = r.join("123456789~SECRETpart");
+    let old_doc = bot.join("documents").join("file_1.dem");
+    let fresh_doc = bot.join("documents").join("file_2.dem");
+    let old_video = bot.join("videos").join("file_3.mp4");
+    let binlog = bot.join("td.binlog");
+    let sqlite = bot.join("db.sqlite");
+    let deep = r
+        .join("x")
+        .join("y")
+        .join("z")
+        .join("documents")
+        .join("deep.dem");
+    aged_file(&old_doc, &clock, hours(7));
+    aged_file(&fresh_doc, &clock, hours(1));
+    aged_file(&old_video, &clock, hours(7));
+    aged_file(&binlog, &clock, hours(7));
+    aged_file(&sqlite, &clock, hours(7));
+    aged_file(&deep, &clock, hours(7));
+    // Ссылка внутри documents на файл вне корня: ни ссылка, ни цель не удаляются.
+    #[cfg(unix)]
+    let (link, target) = {
+        let target = outside.path.join("precious.dem");
+        aged_file(&target, &clock, hours(7));
+        let link = bot.join("documents").join("link.dem");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        (link, target)
+    };
+    let _ = &outside;
+
+    let got = srv
+        .running()
+        .core()
+        .clean(&Retention::default(), Some(r), CleanMode::Apply)
+        .unwrap();
+    assert_eq!(got.botapi_files, 2, "{got:?}");
+    assert!(
+        !old_doc.exists() && !old_video.exists(),
+        "старые файлы убраны"
+    );
+    assert!(fresh_doc.exists(), "свежий файл остаётся");
+    assert!(
+        binlog.exists() && sqlite.exists(),
+        "служебные файлы bot-api целы"
+    );
+    assert!(deep.exists(), "глубже трёх уровней не заходим");
+    assert!(
+        bot.join("documents").is_dir() && bot.join("videos").is_dir(),
+        "каталоги остаются"
+    );
+    #[cfg(unix)]
+    {
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "ссылка не удалена"
+        );
+        assert!(target.exists(), "цель ссылки вне корня цела");
+    }
+
+    // DryRun только считает.
+    aged_file(&old_doc, &clock, hours(7));
+    let dry = srv
+        .running()
+        .core()
+        .clean(&Retention::default(), Some(r), CleanMode::DryRun)
+        .unwrap();
+    assert_eq!(dry.botapi_files, 1, "{dry:?}");
+    assert!(old_doc.exists());
+
+    // Корня нет — проход пропускается без ошибки.
+    let got = srv
+        .running()
+        .core()
+        .clean(
+            &Retention::default(),
+            Some(&r.join("нет-такого")),
+            CleanMode::Apply,
+        )
+        .unwrap();
+    assert_eq!((got.botapi_files, got.errors), (0, 0), "{got:?}");
+}
+
+#[test]
+fn cleaner_log_has_counts_but_no_paths_or_token() {
+    use server::tg::fake::FakeTelegram;
+    const TOKEN: &str = "123456789:AAHsentinelSECRETsecretBOTapiToken0001";
+    const SECRET: &str = "AAHsentinelSECRETsecretBOTapiToken0001";
+    let tg_dir = common::TestDir::new("cleanlog-tg");
+    let tg = FakeTelegram::new(tg_dir.path.clone());
+    let clock = ManualClock::new(T0);
+    let srv = TestServer::start_with(TestOptions {
+        tg: Some(tg.clone()),
+        clock: Some(clock.clone()),
+        bot_token: Some(TOKEN.to_owned()),
+        clean_interval_secs: Some(1),
+        ..Default::default()
+    });
+    assert!(srv.running().bot().is_some(), "бот должен быть запущен");
+    // Рабочая папка bot-api названа токеном (вид с «~»): в журнал она попадать не должна.
+    let old = tg
+        .files_dir()
+        .join(format!("123456789~{SECRET}"))
+        .join("documents")
+        .join("old.dem");
+    aged_file(&old, &clock, hours(7));
+
+    assert!(
+        wait_until(10, || !old.exists()),
+        "поток уборки не убрал файл bot-api; журнал: {}",
+        srv.sink_text()
+    );
+    assert!(
+        wait_until(10, || srv.sink_text().contains("файлов bot-api 1")),
+        "в журнале нет итога уборки: {}",
+        srv.sink_text()
+    );
+    let log = srv.sink_text();
+    assert!(log.contains("уборка:"), "{log}");
+    for forbidden in [
+        TOKEN,
+        "123456789~AAH",
+        "123456789:AAH",
+        SECRET,
+        "documents",
+        "old.dem",
+    ] {
+        assert!(!log.contains(forbidden), "{forbidden:?} в журнале: {log}");
+    }
+}

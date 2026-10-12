@@ -15,8 +15,9 @@
 use crate::Result;
 use crate::core::Core;
 use crate::db::db_err;
-use rusqlite::params;
-use std::path::{Component, Path};
+use rusqlite::{OptionalExtension, params};
+use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 const HOUR_MS: i64 = 3_600_000;
 
@@ -116,7 +117,8 @@ struct Expired {
 
 /// Отбор просроченных файлов; общий для пометки (`UPDATE … RETURNING`) и для `DryRun` (`SELECT`).
 /// Параметры: ?2 — граница демки готовой задачи, ?3 — демки упавшей, ?4 — доставленного ролика,
-/// ?5 — ролика без доставки (`now` минус срок).
+/// ?5 — ролика без доставки (`now` минус срок). Ролик отбирается только при `sent` с `result_file_id`,
+/// `sent` без него, `failed` или без строки `tg_jobs`; при `none`, `pending`, `sending`, `uncertain` — никогда.
 const EXPIRED_FILES: &str = "FROM files f \
      JOIN jobs j ON j.id = f.job_id \
      LEFT JOIN tg_jobs t ON t.job_id = j.id \
@@ -124,11 +126,17 @@ const EXPIRED_FILES: &str = "FROM files f \
         (f.kind = 'demo' AND ( \
             (j.state IN ('done','cancelled') AND j.finished_at <= ?2) \
             OR (j.state = 'failed' AND j.finished_at <= ?3))) \
+        OR (f.kind = 'result' AND j.state = 'done' AND ( \
+            (t.job_id IS NULL AND j.finished_at <= ?5) \
+            OR (t.delivery = 'sent' AND t.result_file_id IS NOT NULL AND t.updated_at <= ?4) \
+            OR (t.delivery = 'sent' AND t.result_file_id IS NULL AND j.finished_at <= ?5) \
+            OR (t.delivery = 'failed' AND j.finished_at <= ?5))) \
      )";
 
 impl Core {
     /// Один проход уборки по правилам модуля. `Err` — только ошибка базы (текст без путей); ошибки файлов
-    /// считаются в `Cleaned::errors`.
+    /// считаются в `Cleaned::errors`. Порядок: пометка и удаление просроченных файлов, недозагруженные куски,
+    /// остатки, рабочая папка bot-api.
     pub fn clean(
         &self,
         r: &Retention,
@@ -138,7 +146,6 @@ impl Core {
         let now = self.clock().now_ms();
         let mut out = Cleaned::default();
         let _ = botapi_root;
-        // 1. Пометка просроченных файлов и (после коммита) их удаление.
         for e in self.mark_expired(r, now, mode)? {
             match mode {
                 CleanMode::Apply => self.remove_expired(&e, &mut out),
@@ -149,12 +156,20 @@ impl Core {
                 _ => out.results.push(e.job_id),
             }
         }
+        self.clean_parts(r, now, mode, &mut out)?;
+        self.clean_leftovers(r, now, mode, &mut out)?;
         Ok(out)
     }
 
     /// Шаг 1: в одной транзакции помечает просроченные строки `files`; `DryRun` только читает.
     fn mark_expired(&self, r: &Retention, now: i64, mode: CleanMode) -> Result<Vec<Expired>> {
-        let args = params![now, now - r.demo_ms, now - r.failed_demo_ms];
+        let args = params![
+            now,
+            now - r.demo_ms,
+            now - r.failed_demo_ms,
+            now - r.result_ms,
+            now - r.unsent_result_ms
+        ];
         let from_row = |row: &rusqlite::Row<'_>| {
             Ok(Expired {
                 job_id: row.get(0)?,
@@ -205,9 +220,242 @@ impl Core {
             let _ = std::fs::remove_dir(dir);
         }
     }
+
+    /// Состояние и эпоха задачи; `None` — строки нет.
+    fn job_state(&self, id: i64) -> Result<Option<(String, i64)>> {
+        self.db().read(|c| -> Result<Option<(String, i64)>> {
+            c.query_row("SELECT state, epoch FROM jobs WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()
+            .map_err(db_err)
+        })
+    }
+
+    /// Есть ли у задачи живая (не помеченная) строка `files` этого вида.
+    fn has_live_file(&self, id: i64, kind: &str) -> Result<bool> {
+        self.db().read(|c| -> Result<bool> {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM files WHERE job_id = ?1 AND kind = ?2 AND deleted_at IS NULL)",
+                params![id, kind],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
+        })
+    }
+
+    /// Недозагруженные куски: `results/<id>/<эпоха>.part` и `incoming/<id>/demo.part`. Кусок идущей загрузки
+    /// (занята `Blobs::lock_upload`) и свежий кусок текущей эпохи живой задачи остаются.
+    fn clean_parts(
+        &self,
+        r: &Retention,
+        now: i64,
+        mode: CleanMode,
+        out: &mut Cleaned,
+    ) -> Result<()> {
+        let blobs = self.data_dir().join("blobs");
+        for (id, dir) in numeric_dirs(&blobs.join("results")) {
+            let job = self.job_state(id)?;
+            for (path, epoch) in part_files(&dir) {
+                let Some(meta) = regular_meta(&path) else {
+                    continue;
+                };
+                let stale = is_old(&meta, now, r.part_ms);
+                let remove = match &job {
+                    None => true,
+                    Some((state, _)) if is_terminal(state) => true,
+                    Some((_, current)) => epoch != *current || stale,
+                };
+                if !remove {
+                    continue;
+                }
+                // Идущая загрузка держит охрану: её кусок не трогаем, а охрану держим на время удаления.
+                let Some(_guard) = self.blobs().lock_upload(id, epoch) else {
+                    continue;
+                };
+                match mode {
+                    CleanMode::Apply => match std::fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => {
+                            out.errors += 1;
+                            continue;
+                        }
+                    },
+                    CleanMode::DryRun => {}
+                }
+                out.parts += 1;
+                out.freed_bytes += meta.len();
+            }
+        }
+        for (id, dir) in numeric_dirs(&blobs.join("incoming")) {
+            let path = dir.join("demo.part");
+            let Some(meta) = regular_meta(&path) else {
+                continue;
+            };
+            if !is_old(&meta, now, r.part_ms) {
+                continue;
+            }
+            let receiving = matches!(self.job_state(id)?, Some((state, _)) if state == "receiving");
+            if receiving {
+                continue;
+            }
+            if mode == CleanMode::Apply {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        out.errors += 1;
+                        continue;
+                    }
+                }
+            }
+            out.parts += 1;
+            out.freed_bytes += meta.len();
+        }
+        Ok(())
+    }
+
+    /// Остатки: папки `incoming/<id>` и `results/<id>` без живой строки `files` своего вида, у задач, которых
+    /// нет или которые окончательны, с содержимым старше `part_ms`. Так добираются остатки прерванной уборки.
+    fn clean_leftovers(
+        &self,
+        r: &Retention,
+        now: i64,
+        mode: CleanMode,
+        out: &mut Cleaned,
+    ) -> Result<()> {
+        let blobs = self.data_dir().join("blobs");
+        for (sub, kind) in [("incoming", "demo"), ("results", "result")] {
+            for (id, dir) in numeric_dirs(&blobs.join(sub)) {
+                if let Some((state, _)) = self.job_state(id)? {
+                    if !is_terminal(&state) {
+                        continue;
+                    }
+                }
+                if self.has_live_file(id, kind)? {
+                    continue;
+                }
+                let Some((newest_ms, bytes)) = dir_stats(&dir) else {
+                    out.errors += 1;
+                    continue;
+                };
+                if now - newest_ms < r.part_ms {
+                    continue;
+                }
+                if mode == CleanMode::Apply {
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => {
+                            out.errors += 1;
+                            continue;
+                        }
+                    }
+                }
+                out.leftovers += 1;
+                out.freed_bytes += bytes;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Задача окончательна: дальше её файлы никто не пишет.
+fn is_terminal(state: &str) -> bool {
+    matches!(state, "done" | "failed" | "cancelled")
 }
 
 /// Путь лежит внутри `root` по составным частям и не содержит `..`: строковая проверка до обращения к диску.
 fn is_inside(path: &Path, root: &Path) -> bool {
     path.starts_with(root) && !path.components().any(|c| matches!(c, Component::ParentDir))
+}
+
+/// Подпапки `root` с именем из одних цифр (номер задачи); ссылки и обычные файлы пропускаются.
+fn numeric_dirs(root: &Path) -> Vec<(i64, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        // `DirEntry::file_type` не идёт по ссылкам: ссылка на каталог не каталог.
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(id) = name.parse::<i64>() {
+            out.push((id, entry.path()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Файлы `<эпоха>.part` в папке результата задачи.
+fn part_files(dir: &Path) -> Vec<(PathBuf, i64)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "part") {
+                return None;
+            }
+            let epoch = path.file_stem()?.to_str()?.parse::<i64>().ok()?;
+            Some((path, epoch))
+        })
+        .collect()
+}
+
+/// Метаданные обычного файла (не ссылки); иначе `None`.
+fn regular_meta(path: &Path) -> Option<std::fs::Metadata> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.file_type().is_file())
+}
+
+/// Время изменения в unix-миллисекундах; `None`, если система его не сообщает.
+fn mtime_ms(meta: &std::fs::Metadata) -> Option<i64> {
+    let t = meta.modified().ok()?;
+    let d = t.duration_since(UNIX_EPOCH).ok()?;
+    Some(d.as_millis() as i64)
+}
+
+/// Файл не менялся не меньше `age_ms`; время из будущего или неизвестное — не старое.
+fn is_old(meta: &std::fs::Metadata, now: i64, age_ms: i64) -> bool {
+    mtime_ms(meta).is_some_and(|m| now - m >= age_ms)
+}
+
+/// Самое позднее время изменения и общий размер обычных файлов в папке (рекурсивно, ссылки не разворачиваются).
+/// Пустая папка — её собственное время. `None` — папку прочитать не удалось.
+fn dir_stats(dir: &Path) -> Option<(i64, u64)> {
+    fn walk(dir: &Path, depth: u32, newest: &mut Option<i64>, bytes: &mut u64) -> Option<()> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let meta = std::fs::symlink_metadata(entry.path()).ok()?;
+            if meta.file_type().is_dir() {
+                if depth < 4 {
+                    walk(&entry.path(), depth + 1, newest, bytes)?;
+                }
+                continue;
+            }
+            *bytes += meta.len();
+            if let Some(m) = mtime_ms(&meta) {
+                *newest = Some(newest.map_or(m, |n| n.max(m)));
+            }
+        }
+        Some(())
+    }
+    let (mut newest, mut bytes) = (None, 0);
+    walk(dir, 0, &mut newest, &mut bytes)?;
+    let newest = match newest {
+        Some(n) => n,
+        None => mtime_ms(&std::fs::symlink_metadata(dir).ok()?)?,
+    };
+    Some((newest, bytes))
 }

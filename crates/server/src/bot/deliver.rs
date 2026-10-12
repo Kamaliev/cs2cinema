@@ -381,6 +381,17 @@ pub fn resend(bot: &Bot, user: &User, job_id: i64) -> String {
         }
         Err(e) => return format!("Не удалось получить доставку: {e}"),
     };
+    // Ролик убран уборщиком по сроку хранения, а в Telegram его file_id не сохранён: отправлять нечего.
+    // Другу остаётся прислать демку заново (тупика `/resend` → «не найден» нет).
+    match bot.core().result_file(id) {
+        Ok(None) if tj.result_file_id.is_none() => {
+            return format!(
+                "Ролик задачи #{id} уже удалён с сервера по сроку хранения. Пришлите демку ещё раз — сделаю заново."
+            );
+        }
+        Ok(_) => {}
+        Err(e) => return format!("Не удалось получить задачу: {e}"),
+    }
     let was_sent = match tj.delivery.as_str() {
         "sent" => true,
         "uncertain" | "failed" => false,

@@ -532,6 +532,11 @@ impl Core {
     }
 
     fn find_duplicate_impl(&self, key: &DedupKey, user: Option<i64>) -> Result<Option<JobRow>> {
+        // Готовая задача — дубль, только пока её ролик ещё можно отдать: он лежит на диске или в Telegram
+        // сохранён file_id. Иначе бот ответил бы «уже готов: /resend N», а /resend — «ролика нет» (тупик, 09-02).
+        let alive = "(state != 'done' \
+             OR EXISTS (SELECT 1 FROM files r WHERE r.job_id = jobs.id AND r.kind = 'result' AND r.deleted_at IS NULL) \
+             OR EXISTS (SELECT 1 FROM tg_jobs t WHERE t.job_id = jobs.id AND t.result_file_id IS NOT NULL))";
         let (rows, wanted): (Vec<JobRow>, &str) = match key {
             DedupKey::File { sha256, player_key } => (
                 self.db.read(|c| {
@@ -539,7 +544,7 @@ impl Core {
                         c,
                         &format!(
                             "SELECT {JOB_COLUMNS} FROM jobs WHERE id IN (SELECT job_id FROM files WHERE kind = 'demo' AND sha256 = ?1) \
-                             AND state IN {DEDUP_STATES} ORDER BY id DESC"
+                             AND state IN {DEDUP_STATES} AND {alive} ORDER BY id DESC"
                         ),
                         sha256,
                     )
@@ -556,7 +561,7 @@ impl Core {
                             c,
                             &format!(
                                 "SELECT {JOB_COLUMNS} FROM jobs WHERE source_kind = 'faceit' AND faceit_link = ?1 \
-                                 AND state IN {DEDUP_STATES} ORDER BY id DESC"
+                                 AND state IN {DEDUP_STATES} AND {alive} ORDER BY id DESC"
                             ),
                             &link,
                         )

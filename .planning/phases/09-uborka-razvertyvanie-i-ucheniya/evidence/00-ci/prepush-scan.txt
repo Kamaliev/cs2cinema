@@ -29,3 +29,5 @@
   - файла образцов %LOCALAPPDATA%\cs2cinema\drills\patterns.txt нет, класс exact-values не проверен — решение за автором на точке Task 3.
   - классы faceit-key, telegram-api, runner-token, secret-files: совпадений в origin/main..HEAD нет (контроль выражений 1).
 пометку «НУЖНО ПРОВЕРИТЬ АВТОРУ» снимает только автор.
+
+решение автора на точке Task 3 (2026-10-12): класс exact-values — автор опубликовал без проверки точных значений (файла образцов нет).

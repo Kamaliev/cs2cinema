@@ -190,6 +190,8 @@ pub struct App {
     pub queue: Queue,
     /// Режим раннера: поток, который берёт задачи сервера и отдаёт их очереди (пуст, пока адрес сервера не задан).
     pub remote: RemoteRunner,
+    /// О том, что смена адреса сервера ждёт конца задачи, строка состояния уже сказала.
+    pending_noted: bool,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
     ctx: egui::Context,
@@ -261,6 +263,7 @@ impl App {
             precheck_busy: false,
             queue,
             remote,
+            pending_noted: false,
             rx,
             tx,
             ctx: cc.egui_ctx.clone(),
@@ -806,6 +809,14 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll();
         self.remote.tick();
+        if self.remote.pending() {
+            if !self.pending_noted {
+                self.pending_noted = true;
+                self.status.push("адрес применится, когда закончится задача с сервера");
+            }
+        } else {
+            self.pending_noted = false;
+        }
         if self.jobs.dirty {
             self.refresh_jobs();
         }

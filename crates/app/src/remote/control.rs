@@ -17,7 +17,7 @@ use std::{
 };
 
 use pipeline::{host::Host, inspect::InspectLimits};
-use runner::{Admission, Config, Control, Gate, InspectSettings, Observer, PipelineExecutor, RunnerEvent};
+use runner::{Admission, Config, Control, Gate, InspectSettings, JobState, Observer, PipelineExecutor, RunnerEvent};
 use store::Store;
 
 use super::{RemoteExecutor, RemoteHub, external_ref, hub::ExecFactory, token};
@@ -79,19 +79,60 @@ pub enum StatusLevel {
 }
 
 impl RemoteStatus {
-    /// Полное описание для страницы настроек (заглушка до реализации).
+    /// Полное описание для страницы настроек.
     pub fn text(&self) -> String {
-        String::new()
+        match self {
+            RemoteStatus::Off => "Выключено: адрес сервера не задан".to_owned(),
+            RemoteStatus::NoToken => "Токен раннера не задан — введите его и нажмите «Сохранить токен»".to_owned(),
+            RemoteStatus::BadToken(why) => format!("Файл токена не читается: {why}"),
+            RemoteStatus::NoCli(path) => format!("Не найден cs2-cli.exe рядом с приложением ({}) — задачи с сервера отключены", path.display()),
+            RemoteStatus::LockBusy => "Раннер уже запущен другим процессом в той же папке (cs2-cli runner) — остановите его".to_owned(),
+            RemoteStatus::BadAddress(why) => format!("Адрес не принят: {why}"),
+            RemoteStatus::Starting => "Подключаюсь…".to_owned(),
+            RemoteStatus::Online { server_version } => format!("На связи · сервер {server_version} · жду задачу"),
+            RemoteStatus::Gated { reason, .. } => format!("На связи · задачи не беру: {reason}"),
+            RemoteStatus::Working { job_id } => format!("Выполняю задачу с сервера #{job_id}"),
+            RemoteStatus::NetError { message, retry_secs } => format!("Нет связи: {message}; повтор через {retry_secs} с"),
+            RemoteStatus::Paused { code, message } => format!("Раннер на паузе: {code} — {message}. Исправьте причину и нажмите «Продолжить»"),
+            RemoteStatus::TokenRejected => "Сервер не принял токен — введите новый токен".to_owned(),
+            RemoteStatus::ProtocolMismatch(why) => format!("Версия протокола не совпала с сервером: {why} — обновите приложение или сервер"),
+            RemoteStatus::Stopped => "Раннер остановлен".to_owned(),
+        }
     }
 
-    /// Короткая строка для боковой панели (заглушка до реализации).
+    /// Короткая строка для боковой панели.
     pub fn short(&self) -> String {
-        String::new()
+        match self {
+            RemoteStatus::Off => "Сервер: выключен".to_owned(),
+            RemoteStatus::Starting => "Сервер: подключаюсь".to_owned(),
+            RemoteStatus::Online { .. } => "Сервер: на связи".to_owned(),
+            RemoteStatus::Gated { .. } => "Сервер: занят".to_owned(),
+            RemoteStatus::Working { job_id } => format!("Сервер: задача #{job_id}"),
+            RemoteStatus::NetError { .. } => "Сервер: нет связи".to_owned(),
+            RemoteStatus::Paused { .. } | RemoteStatus::NoToken => "Сервер: пауза".to_owned(),
+            RemoteStatus::Stopped => "Сервер: остановлен".to_owned(),
+            RemoteStatus::BadToken(_)
+            | RemoteStatus::NoCli(_)
+            | RemoteStatus::LockBusy
+            | RemoteStatus::BadAddress(_)
+            | RemoteStatus::TokenRejected
+            | RemoteStatus::ProtocolMismatch(_) => "Сервер: ошибка".to_owned(),
+        }
     }
 
-    /// Уровень состояния (заглушка до реализации).
+    /// Уровень состояния: от него зависит цвет.
     pub fn level(&self) -> StatusLevel {
-        StatusLevel::Off
+        match self {
+            RemoteStatus::Off | RemoteStatus::Stopped => StatusLevel::Off,
+            RemoteStatus::Starting | RemoteStatus::Online { .. } | RemoteStatus::Working { .. } => StatusLevel::Ok,
+            RemoteStatus::NoToken | RemoteStatus::NetError { .. } | RemoteStatus::Paused { .. } | RemoteStatus::Gated { .. } => StatusLevel::Warn,
+            RemoteStatus::BadToken(_)
+            | RemoteStatus::NoCli(_)
+            | RemoteStatus::LockBusy
+            | RemoteStatus::BadAddress(_)
+            | RemoteStatus::TokenRejected
+            | RemoteStatus::ProtocolMismatch(_) => StatusLevel::Bad,
+        }
     }
 }
 
@@ -238,21 +279,36 @@ pub struct RemoteRunner {
     handle: Option<Handle>,
     /// Адрес, с которым раннер сейчас запущен (обрезанный).
     server: String,
+    /// Адрес, который ждёт закрытия карточки сервера: остановка раннера при идущей карточке отменила бы её.
+    pending: Option<String>,
 }
 
 impl RemoteRunner {
     pub fn new(deps: RemoteDeps) -> RemoteRunner {
         let shared = Arc::new(Shared { status: Mutex::new((0, RemoteStatus::Off)), version: Mutex::new(String::new()) });
-        RemoteRunner { deps, shared, handle: None, server: String::new() }
+        RemoteRunner { deps, shared, handle: None, server: String::new(), pending: None }
     }
 
     /// Применить адрес сервера: пусто — раннер выключен, иначе поток раннера (пере)запускается.
+    /// Пока идёт карточка сервера, раннер не трогают: новый адрес применяется в `tick`, когда карточка закрыта.
     pub fn apply(&mut self, server: &str) {
-        self.start(server.trim().to_owned());
+        let server = server.trim().to_owned();
+        if self.is_running() && self.busy() {
+            self.pending = Some(server);
+            return;
+        }
+        self.pending = None;
+        self.start(server);
     }
 
     /// Раз в кадр окна. Сюда же приходит применение отложенного адреса.
     pub fn tick(&mut self) {
+        if let Some(server) = self.pending.clone() {
+            if !self.busy() {
+                self.pending = None;
+                self.start(server);
+            }
+        }
         if self.handle.as_ref().is_some_and(|h| h.finished()) && self.server.is_empty() {
             self.handle = None;
         }
@@ -272,30 +328,45 @@ impl RemoteRunner {
         self.deps.hub.has_slots()
     }
 
-    /// Есть ли отложенная смена адреса или токена (заглушка до реализации).
+    /// Есть ли отложенная смена адреса или токена: она применится, когда закончится карточка сервера.
     pub fn pending(&self) -> bool {
-        false
+        self.pending.is_some()
     }
 
-    /// Снять паузу раннера (заглушка до реализации).
-    pub fn resume_paused(&self) {}
-
-    /// Переподключиться с текущим адресом (заглушка до реализации).
-    pub fn restart(&mut self) {}
-
-    /// Сохранить токен и переподключиться (заглушка до реализации).
-    pub fn save_token(&mut self, _value: &str) -> Result<(), String> {
-        Err("не реализовано".to_owned())
+    /// Снять паузу раннера (кнопка «Продолжить»).
+    pub fn resume_paused(&self) {
+        if let Some(h) = &self.handle {
+            if let Ok(c) = h.control.lock() {
+                if let Some(c) = c.as_ref() {
+                    c.resume();
+                }
+            }
+        }
     }
 
-    /// Удалить токен и переподключиться (заглушка до реализации).
+    /// Переподключиться с текущим адресом (кнопка «Переподключить»); при идущей карточке — после её закрытия.
+    pub fn restart(&mut self) {
+        let server = self.pending.clone().unwrap_or_else(|| self.server.clone());
+        self.apply(&server);
+    }
+
+    /// Сохранить токен в файл с суженным доступом и переподключиться. Значение наружу не возвращается и в ошибках не печатается.
+    pub fn save_token(&mut self, value: &str) -> Result<(), String> {
+        token::save(&*self.deps.host, &self.deps.dir, value)?;
+        self.restart();
+        Ok(())
+    }
+
+    /// Удалить файл токена и переподключиться (состояние станет «нет токена»).
     pub fn clear_token(&mut self) -> Result<(), String> {
-        Err("не реализовано".to_owned())
+        token::clear(&self.deps.dir)?;
+        self.restart();
+        Ok(())
     }
 
-    /// Есть ли файл токена (заглушка до реализации).
+    /// Есть ли файл токена.
     pub fn has_token(&self) -> bool {
-        false
+        token::exists(&self.deps.dir)
     }
 
     pub fn hub(&self) -> &Arc<RemoteHub> {
@@ -316,6 +387,14 @@ impl RemoteRunner {
         }
         if off {
             self.deps.hub.set_held_ref(None);
+            self.handle = previous;
+            (self.deps.repaint)();
+            return;
+        }
+        // отказы, которым не нужен замок: поток не создаётся, состояние называет причину
+        if let Some(refusal) = refusal(&self.deps) {
+            self.deps.hub.set_held_ref(None);
+            self.shared.set(generation, refusal);
             self.handle = previous;
             (self.deps.repaint)();
             return;
@@ -350,6 +429,18 @@ struct ThreadArgs {
     stop: Arc<AtomicBool>,
 }
 
+/// Отказ до запуска раннера, которому не нужен замок: нет `cs2-cli`, нет токена или он не читается.
+fn refusal(deps: &RemoteDeps) -> Option<RemoteStatus> {
+    if let Err(path) = &deps.inspect_exe {
+        return Some(RemoteStatus::NoCli(path.clone()));
+    }
+    match token::load(&deps.dir) {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(RemoteStatus::NoToken),
+        Err(e) => Some(RemoteStatus::BadToken(e)),
+    }
+}
+
 /// Замок рабочей папки; `None` — папку держит другой процесс.
 fn lock_dir(dir: &Path) -> Result<Option<fs::File>, String> {
     fs::create_dir_all(dir).map_err(|e| format!("не удалось создать {}: {e}", dir.display()))?;
@@ -379,7 +470,7 @@ fn gate(deps: &RemoteDeps) -> Gate {
 
 /// Наблюдатель раннера: ведёт состояние, ссылку удерживаемой карточки и перерисовку окна.
 fn observer(deps: &RemoteDeps, shared: Arc<Shared>, generation: u64) -> Observer {
-    let (hub, repaint) = (deps.hub.clone(), deps.repaint.clone());
+    let (hub, repaint, store) = (deps.hub.clone(), deps.repaint.clone(), deps.store.clone());
     Arc::new(move |event, holding| {
         if !shared.is_current(generation) {
             return;
@@ -403,8 +494,31 @@ fn observer(deps: &RemoteDeps, shared: Arc<Shared>, generation: u64) -> Observer
             RunnerEvent::Fatal(e) => RemoteStatus::ProtocolMismatch(e.clone()),
         };
         shared.set(generation, status);
+        journal(&store, event);
         repaint();
     })
+}
+
+/// Итог выдачи одной строкой в журнале карточки: что сервер принял, вернул или снял.
+fn journal(store: &Store, event: &RunnerEvent) {
+    let (job_id, epoch, text) = match event {
+        RunnerEvent::Settled { job_id, epoch, state } => {
+            let text = match state {
+                JobState::Done => "результат принят сервером; локальная копия ролика и дублей удалена из папки раннера",
+                JobState::Cancelled => "итог отправлен на сервер: отменена",
+                _ => "итог отправлен на сервер: сбой",
+            };
+            (*job_id, *epoch, text.to_owned())
+        }
+        RunnerEvent::Released { job_id, epoch } => (*job_id, *epoch, "задача возвращена в очередь сервера (неисправность окружения или запуска)".to_owned()),
+        RunnerEvent::Dropped { job_id, epoch, reason } => (*job_id, *epoch, format!("сервер снял задачу: {reason}")),
+        _ => return,
+    };
+    let Ok(Some(card)) = store.job_by_external_ref(&external_ref(job_id, epoch)) else {
+        return;
+    };
+    let line = format!("{}  {} {text}", chrono::Local::now().format("%H:%M:%S"), store::journal::prefix("Сервер", card.attempt));
+    let _ = store.append_log(card.id, &line);
 }
 
 /// Тело потока раннера: дождаться прежнего потока, занять замок, собрать раннер и крутить его до остановки.
@@ -422,15 +536,14 @@ fn run_thread(a: ThreadArgs) {
     // файл замка живёт до конца потока
     let _lock = match lock_dir(&a.deps.dir) {
         Ok(Some(f)) => f,
-        Ok(None) => return refuse(RemoteStatus::Stopped),
-        Err(_) => return refuse(RemoteStatus::Stopped),
+        Ok(None) => return refuse(RemoteStatus::LockBusy),
+        Err(e) => return refuse(RemoteStatus::BadAddress(e)),
     };
-    if a.deps.inspect_exe.is_err() {
-        return refuse(RemoteStatus::Stopped);
+    if let Some(r) = refusal(&a.deps) {
+        return refuse(r);
     }
-    let token = match token::load(&a.deps.dir) {
-        Ok(Some(t)) => t,
-        _ => return refuse(RemoteStatus::Stopped),
+    let Ok(Some(token)) = token::load(&a.deps.dir) else {
+        return refuse(RemoteStatus::NoToken);
     };
     let mut cfg = Config::new(a.server.clone(), token, a.deps.dir.clone());
     cfg.name = a.deps.name.clone();
@@ -442,7 +555,7 @@ fn run_thread(a: ThreadArgs) {
     cfg.observer = Some(observer(&a.deps, a.shared.clone(), a.generation));
     let mut runner = match runner::Runner::new(cfg, Arc::new(RemoteExecutor::new(a.deps.hub.clone()))) {
         Ok(r) => r,
-        Err(_) => return refuse(RemoteStatus::Stopped),
+        Err(e) => return refuse(RemoteStatus::BadAddress(e)),
     };
     if let Ok(mut c) = a.control.lock() {
         *c = Some(runner.control());

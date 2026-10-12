@@ -472,16 +472,27 @@ fn safe_local_path(
     if !meta.file_type().is_file() {
         return Err("не обычный файл");
     }
-    if meta.len() != expected_size {
-        return Err("размер не совпал");
-    }
     let real = std::fs::canonicalize(&local).map_err(|_| "файл недоступен")?;
     let root =
         std::fs::canonicalize(&settings.files_root_local).map_err(|_| "корень недоступен")?;
     if !real.starts_with(&root) {
         return Err("файл за пределами корня");
     }
+    if meta.len() != expected_size {
+        // Файл точно внутри корня, но не тот, что заявлен: в локальном режиме bot-api сам его не уберёт (WR-06).
+        let _ = std::fs::remove_file(&local);
+        return Err("размер не совпал");
+    }
     Ok(local)
+}
+
+/// Удаляет скачанный bot-api оригинал при выходе из области видимости; отсутствие файла не ошибка.
+struct OriginalGuard(PathBuf);
+
+impl Drop for OriginalGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Класс ошибки постановки в очередь: без путей и подробностей.
@@ -827,14 +838,12 @@ pub fn ingest_once(bot: &Bot) -> Result<bool> {
             return reject_with(bot, &row, PATH_REJECTED, PATH_REJECTED_TEXT);
         }
     };
+    // Оригинал в папке bot-api уходит при любом выходе ниже: отказ, сбой записи, падение между шагами (WR-06).
+    let _original = OriginalGuard(local.clone());
     let (job_id, ingested) = match bot.core().submit(&local, &sub) {
         Ok(v) => v,
         Err(e) => {
             let class = submit_error_class(&e);
-            if e.contains("не похоже на демку") {
-                // Содержимое отвергнуто: оригинал в папке bot-api больше не нужен.
-                let _ = std::fs::remove_file(&local);
-            }
             return reject(bot, &row, class);
         }
     };

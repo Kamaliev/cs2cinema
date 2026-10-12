@@ -485,7 +485,7 @@ fn size_mismatch_is_refused() {
     let st = BotStand::start();
     st.add_friend(FRIEND, "вася");
     let bytes = demo_bytes();
-    put(&st, "f1", "u1", &bytes);
+    let original = put(&st, "f1", "u1", &bytes);
     push(
         &st,
         FRIEND,
@@ -497,6 +497,7 @@ fn size_mismatch_is_refused() {
     );
     st.step();
     assert_refused_without_job(&st);
+    assert!(!original.exists(), "файл с неверным размером убран из папки bot-api (WR-06)");
 }
 
 #[test]

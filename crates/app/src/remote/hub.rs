@@ -13,12 +13,12 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use pipeline::{Artifact, Event, Progress, RunError, Stage, job::Outcome};
 use runner::{Executor, Task};
-use store::{JobKind, JobOutcome, JobSource, NewJob, Store};
+use store::{JobKind, JobOutcome, JobSource, JobStatus, NewJob, Store};
 
 use super::{card_label, external_ref};
 use crate::{
@@ -28,6 +28,9 @@ use crate::{
 
 /// Как часто поток раннера просыпается, пока ждёт итога карточки.
 const WAIT_STEP: Duration = Duration::from_millis(200);
+
+/// Как часто поток раннера смотрит в строку карточки: отмена или удаление ждущей карточки автором должны дойти до сервера.
+const ROW_STEP: Duration = Duration::from_secs(1);
 
 /// Исполнитель карточки создаётся заново на каждый запуск: приложение читает настройки на каждую задачу.
 pub type ExecFactory = Arc<dyn Fn() -> Result<Arc<dyn Executor>, String> + Send + Sync>;
@@ -50,7 +53,9 @@ struct Slot {
     /// Сервер отменил задачу (мягко / жёстко): карточка видит это через `Progress`.
     server_cancel: AtomicBool,
     server_force: AtomicBool,
-    /// Поток очереди взял карточку.
+    /// Карточку исполняет поток очереди: ставится при взятии (под замком хаба) и снимается, когда попытка кончилась сбоем,
+    /// после которого карточка может вернуться в очередь авто-повтором. Пока признак снят, карточка «ждёт», и отмену ждущей
+    /// карточки поток раннера закрывает сам, не запуская её.
     started: AtomicBool,
 }
 
@@ -86,6 +91,15 @@ impl RemoteHub {
 
     fn slot(&self, external_ref: &str) -> Option<Arc<Slot>> {
         self.slots.lock().ok()?.get(external_ref).cloned()
+    }
+
+    /// Карточку берёт поток очереди: запись находится и помечается взятой под одним замком хаба. Проверка `started` в
+    /// `RemoteExecutor` идёт под тем же замком, поэтому «очередь взяла карточку в момент отмены» решается в одну сторону.
+    fn take(&self, external_ref: &str) -> Option<Arc<Slot>> {
+        let slots = self.slots.lock().ok()?;
+        let slot = slots.get(external_ref)?.clone();
+        slot.started.store(true, Ordering::SeqCst);
+        Some(slot)
     }
 
     fn remove(&self, external_ref: &str) {
@@ -162,9 +176,54 @@ impl RemoteExecutor {
     }
 }
 
+impl RemoteExecutor {
+    /// Отмена, пришедшая в поток раннера (сервер отменил задачу, выдача потеряна или раннер останавливается): очередь приложения
+    /// на паузу не встаёт. Ждущая карточка закрывается, не запускаясь (`Some` — итог для раннера); идущая получает отмену через
+    /// `Progress` и показывает «Отменяется…».
+    fn on_server_cancel(&self, reference: &str, slot: &Slot) -> Option<Result<Outcome, RunError>> {
+        slot.server_cancel.store(true, Ordering::SeqCst);
+        let _ = self.hub.store.append_log(slot.card_id, "задача с сервера снята: отмена на сервере, потеря выдачи или остановка раннера");
+        {
+            let mut slots = self.hub.slots.lock().ok()?;
+            if !slot.started.load(Ordering::SeqCst) && self.hub.store.cancel_if_queued(slot.card_id).unwrap_or(false) {
+                slots.remove(reference);
+                return Some(Err(RunError::from(pipeline::CANCELLED)));
+            }
+        }
+        // карточка уже идёт (или очередь как раз её взяла): отмена дойдёт через `CardProgress::cancelled`
+        let _ = self.hub.store.set_cancelling(slot.card_id);
+        None
+    }
+
+    /// Строка карточки: ждущую карточку автор отменил или удалил — запись закрывается без запуска, раннер сообщает серверу отмену.
+    fn on_row_closed(&self, reference: &str, slot: &Slot, p: &dyn Progress) -> Option<Result<Outcome, RunError>> {
+        let closed = match self.hub.store.job(slot.card_id) {
+            Ok(None) => true,
+            Ok(Some(job)) => job.status == JobStatus::Cancelled,
+            Err(_) => false,
+        };
+        if !closed {
+            return None;
+        }
+        let mut slots = self.hub.slots.lock().ok()?;
+        if slot.started.load(Ordering::SeqCst) {
+            return None;
+        }
+        slots.remove(reference);
+        drop(slots);
+        p.log("задача отменена в приложении");
+        Some(Err(RunError::from(pipeline::CANCELLED)))
+    }
+}
+
 impl Executor for RemoteExecutor {
     fn run(&self, task: &Task, p: &dyn Progress) -> Result<Outcome, RunError> {
         let (reference, rx) = self.open(task)?;
+        let Some(slot) = self.hub.slot(&reference) else {
+            return Err(RunError::from("запись карточки пропала из хаба"));
+        };
+        let (mut cancel_seen, mut force_seen) = (false, false);
+        let mut row_checked = Instant::now();
         loop {
             match rx.recv_timeout(WAIT_STEP) {
                 Ok(HubMsg::Stage(s)) => p.stage(s),
@@ -180,6 +239,22 @@ impl Executor for RemoteExecutor {
                 Err(RecvTimeoutError::Disconnected) => {
                     self.hub.remove(&reference);
                     return Err(RunError::from("очередь приложения не вернула итог карточки"));
+                }
+            }
+            if !cancel_seen && p.cancelled() {
+                cancel_seen = true;
+                if let Some(done) = self.on_server_cancel(&reference, &slot) {
+                    return done;
+                }
+            }
+            if !force_seen && p.force_cancelled() {
+                force_seen = true;
+                slot.server_force.store(true, Ordering::SeqCst);
+            }
+            if row_checked.elapsed() >= ROW_STEP {
+                row_checked = Instant::now();
+                if let Some(done) = self.on_row_closed(&reference, &slot, p) {
+                    return done;
                 }
             }
         }
@@ -231,25 +306,29 @@ pub fn queue_runner(local: queue::Runner, hub: Arc<RemoteHub>, factory: ExecFact
         let Some(reference) = job.external_ref.as_deref() else {
             return local(job, rep);
         };
-        let Some(slot) = hub.slot(reference) else {
+        let Some(slot) = hub.take(reference) else {
             if job.resume {
                 rep.log("результат не отправляется: задача на сервере закрыта");
                 return local(job, rep);
             }
             return Err(RunError::from("задача с сервера уже закрыта — начать её заново нельзя; «Повторить» продолжит по record.json"));
         };
-        slot.started.store(true, Ordering::SeqCst);
         if slot.server_cancel.load(Ordering::SeqCst) {
             return Err(RunError::from(pipeline::CANCELLED));
         }
-        let exec = factory().map_err(RunError::from)?;
-        let task = Task {
-            attempt: rep.attempt,
-            resume: slot.task.resume || job.resume,
-            out_dir: job.out_dir.clone().or_else(|| slot.task.out_dir.clone()),
-            ..slot.task.clone()
-        };
-        let progress = CardProgress { rep, slot: &slot };
-        exec.run(&task, &progress).map(job_outcome)
+        let result = factory().map_err(RunError::from).and_then(|exec| {
+            let task = Task {
+                attempt: rep.attempt,
+                resume: slot.task.resume || job.resume,
+                out_dir: job.out_dir.clone().or_else(|| slot.task.out_dir.clone()),
+                ..slot.task.clone()
+            };
+            exec.run(&task, &CardProgress { rep, slot: &slot }).map(job_outcome)
+        });
+        // сбой (не отмена) может кончиться авто-повтором: до него карточка снова ждёт, и отмену автора ловит поток раннера
+        if result.as_ref().is_err_and(|e| e.message != pipeline::CANCELLED) {
+            slot.started.store(false, Ordering::SeqCst);
+        }
+        result
     })
 }

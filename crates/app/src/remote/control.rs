@@ -65,6 +65,36 @@ pub enum RemoteStatus {
     Stopped,
 }
 
+/// Как показывать состояние: цвет значка и текста в окне.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusLevel {
+    /// Режим выключен или раннер остановлен.
+    Off,
+    /// Всё работает.
+    Ok,
+    /// Раннер ждёт: нужно внимание, но не сбой.
+    Warn,
+    /// Раннер не работает по причине, которую исправляет автор.
+    Bad,
+}
+
+impl RemoteStatus {
+    /// Полное описание для страницы настроек (заглушка до реализации).
+    pub fn text(&self) -> String {
+        String::new()
+    }
+
+    /// Короткая строка для боковой панели (заглушка до реализации).
+    pub fn short(&self) -> String {
+        String::new()
+    }
+
+    /// Уровень состояния (заглушка до реализации).
+    pub fn level(&self) -> StatusLevel {
+        StatusLevel::Off
+    }
+}
+
 /// Настройки интервалов: в тестах короткие, у приложения — по умолчанию.
 #[derive(Debug, Clone)]
 pub struct RemoteTuning {
@@ -242,6 +272,32 @@ impl RemoteRunner {
         self.deps.hub.has_slots()
     }
 
+    /// Есть ли отложенная смена адреса или токена (заглушка до реализации).
+    pub fn pending(&self) -> bool {
+        false
+    }
+
+    /// Снять паузу раннера (заглушка до реализации).
+    pub fn resume_paused(&self) {}
+
+    /// Переподключиться с текущим адресом (заглушка до реализации).
+    pub fn restart(&mut self) {}
+
+    /// Сохранить токен и переподключиться (заглушка до реализации).
+    pub fn save_token(&mut self, _value: &str) -> Result<(), String> {
+        Err("не реализовано".to_owned())
+    }
+
+    /// Удалить токен и переподключиться (заглушка до реализации).
+    pub fn clear_token(&mut self) -> Result<(), String> {
+        Err("не реализовано".to_owned())
+    }
+
+    /// Есть ли файл токена (заглушка до реализации).
+    pub fn has_token(&self) -> bool {
+        false
+    }
+
     pub fn hub(&self) -> &Arc<RemoteHub> {
         &self.deps.hub
     }
@@ -408,11 +464,11 @@ fn run_thread(a: ThreadArgs) {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::atomic::{AtomicBool, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         time::{Duration, Instant},
     };
 
-    use pipeline::{Progress, RunError, Stage, host::fake::FakeHost, job::Outcome};
+    use pipeline::{FailCode, Progress, RecordFailure, RecordState, RunError, Stage, host::fake::FakeHost, job::Outcome};
     use store::{JobKind, JobOutcome, JobSource, JobStatus, NewJob};
     use wire::JobState;
 
@@ -645,5 +701,201 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         let done = wait_until(30, || stand.job(id).state == JobState::Done);
         assert!(done, "после локальной задачи задача сервера не дошла до done: {:?}", stand.job(id).state);
+    }
+    #[test]
+    fn refusals_before_start_name_their_reason() {
+        let stand = Stand::start();
+        let id = stand.submit(&fake_demo(MIB), "s1mple");
+        let mut fx = Fixture::new(&stand, false, instant_local(), |_, _, _| Err(RunError::from("карточка в этом тесте не ожидалась")));
+
+        // нет файла токена
+        let mut remote = RemoteRunner::new(fx.deps());
+        remote.apply(&stand.base);
+        assert!(wait_until(5, || !remote.is_running()), "без токена поток раннера не работает");
+        assert_eq!(remote.status(), RemoteStatus::NoToken);
+
+        // содержимое файла токена не годится
+        std::fs::create_dir_all(&fx.dir).unwrap();
+        std::fs::write(fx.dir.join(token::TOKEN_FILE), "ab cd").unwrap();
+        remote.apply(&stand.base);
+        assert!(wait_until(5, || !remote.is_running()));
+        assert!(matches!(remote.status(), RemoteStatus::BadToken(ref why) if !why.contains("ab cd")), "{:?}", remote.status());
+
+        // публичный адрес по http
+        std::fs::write(fx.dir.join(token::TOKEN_FILE), &stand.token).unwrap();
+        remote.apply("http://8.8.8.8:1");
+        assert!(wait_until(5, || !remote.is_running() && matches!(remote.status(), RemoteStatus::BadAddress(_))), "{:?}", remote.status());
+
+        // нет cs2-cli.exe рядом с приложением
+        let missing = PathBuf::from("C:/app/cs2-cli.exe");
+        fx.exe = Err(missing.clone());
+        let mut remote = RemoteRunner::new(fx.deps());
+        remote.apply(&stand.base);
+        assert!(wait_until(5, || !remote.is_running()));
+        assert_eq!(remote.status(), RemoteStatus::NoCli(missing));
+
+        let job = stand.job(id);
+        assert_eq!((job.state, job.grants), (JobState::Queued, 0), "ни одного запроса за задачей к серверу");
+    }
+
+    #[test]
+    fn saving_a_token_restarts_the_runner() {
+        let stand = Stand::start();
+        let fx = Fixture::new(&stand, false, instant_local(), |_, _, _| Err(RunError::from("карточка в этом тесте не ожидалась")));
+        let mut remote = RemoteRunner::new(fx.deps());
+        remote.apply(&stand.base);
+        assert_eq!(remote.status(), RemoteStatus::NoToken);
+        assert!(!remote.has_token());
+
+        remote.save_token(&stand.token).expect("токен должен сохраниться");
+        assert!(remote.has_token());
+        let online = wait_until(10, || matches!(remote.status(), RemoteStatus::Online { .. } | RemoteStatus::Working { .. }));
+        assert!(online, "после сохранения токена раннер должен выйти на связь: {:?}", remote.status());
+
+        remote.clear_token().expect("токен должен удалиться");
+        assert!(!remote.has_token());
+        assert!(wait_until(10, || !remote.is_running()), "без токена поток раннера завершается");
+        assert_eq!(remote.status(), RemoteStatus::NoToken);
+    }
+
+    #[test]
+    fn second_runner_in_the_same_folder_is_refused() {
+        let stand = Stand::start();
+        let id = stand.submit(&fake_demo(MIB), "s1mple");
+        let fx = Fixture::new(&stand, true, instant_local(), |_, _, _| Err(RunError::from("карточка в этом тесте не ожидалась")));
+        // другой процесс (например, `cs2-cli runner`) держит замок папки
+        let other = std::fs::File::create(fx.dir.join(LOCK_FILE)).unwrap();
+        other.try_lock().expect("замок свободен");
+
+        let mut remote = RemoteRunner::new(fx.deps());
+        remote.apply(&stand.base);
+        assert!(wait_until(5, || !remote.is_running()), "при занятом замке поток раннера завершается");
+        assert_eq!(remote.status(), RemoteStatus::LockBusy);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(stand.job(id).state, JobState::Queued, "задача на сервере остаётся в очереди");
+    }
+
+    #[test]
+    fn revoked_token_shows_token_rejected() {
+        let stand = Stand::start();
+        let fx = Fixture::new(&stand, true, instant_local(), |_, _, _| Err(RunError::from("карточка в этом тесте не ожидалась")));
+        let mut remote = RemoteRunner::new(fx.deps());
+        remote.apply(&stand.base);
+        assert!(wait_until(10, || matches!(remote.status(), RemoteStatus::Online { .. })), "{:?}", remote.status());
+
+        let core = stand.core();
+        server::auth::revoke_runner(core.db(), "tester", core.clock().now_ms()).unwrap();
+        assert!(wait_until(15, || remote.status() == RemoteStatus::TokenRejected), "{:?}", remote.status());
+        assert!(wait_until(5, || !remote.is_running()), "при отозванном токене поток раннера завершается");
+    }
+
+    #[test]
+    fn address_change_waits_for_the_server_card() {
+        let stand = Stand::start();
+        let id = stand.submit(&fake_demo(MIB), "s1mple");
+        let release = Arc::new(AtomicBool::new(false));
+        let fx = Fixture::new(&stand, true, instant_local(), waiting_job_fn(stand.runner_dir(), release.clone()));
+        let mut remote = RemoteRunner::new(fx.deps());
+        remote.apply(&stand.base);
+        assert!(wait_until(20, || remote.busy()), "карточка сервера не появилась: {:?}", remote.status());
+
+        remote.apply("http://127.0.0.1:1");
+        assert!(remote.pending(), "смена адреса отложена до закрытия карточки");
+        assert!(remote.is_running(), "раннер не остановлен");
+        remote.tick();
+        assert!(remote.pending(), "пока карточка идёт, адрес не применяется");
+        let card = fx.store.jobs().unwrap().into_iter().find(|j| j.external_ref.is_some()).expect("карточка есть");
+        assert_ne!(card.status, JobStatus::Cancelled, "карточка не отменена");
+        assert_ne!(stand.job(id).state, JobState::Cancelled);
+
+        release.store(true, Ordering::SeqCst);
+        assert!(wait_until(20, || stand.job(id).state == JobState::Done), "задача на сервере не стала done: {:?}", stand.job(id).state);
+        assert!(wait_until(10, || !remote.busy()), "запись карточки закрыта");
+        assert!(
+            wait_until(10, || {
+                remote.tick();
+                !remote.pending()
+            }),
+            "отложенный адрес применяется после закрытия карточки"
+        );
+        assert!(wait_until(10, || matches!(remote.status(), RemoteStatus::Starting | RemoteStatus::NetError { .. })), "{:?}", remote.status());
+        assert!(wait_until(10, || fx.store.job(card.id).unwrap().unwrap().status == JobStatus::Done), "карточка дошла до Done");
+    }
+
+    #[test]
+    fn server_outcome_is_written_into_the_card_journal() {
+        let stand = Stand::start();
+        let id = stand.submit(&fake_demo(MIB), "s1mple");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner_dir = stand.runner_dir();
+        let job_fn = {
+            let calls = calls.clone();
+            let ok = waiting_job_fn(runner_dir, Arc::new(AtomicBool::new(true)));
+            move |host: &dyn Host, spec: &pipeline::job::JobSpec, p: &dyn Progress| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let f = RecordFailure::new(FailCode::PrevGameStuck, RecordState::Precheck, "прежняя игра ещё закрывается".to_owned(), Duration::ZERO);
+                    return Err(RunError { message: f.message.clone(), fail: Some(f) });
+                }
+                ok(host, spec, p)
+            }
+        };
+        let fx = Fixture::new(&stand, true, instant_local(), job_fn);
+        let mut remote = RemoteRunner::new(fx.deps());
+        remote.apply(&stand.base);
+
+        let done = wait_until(30, || stand.job(id).state == JobState::Done);
+        assert!(done, "после возврата задача должна дойти до done: {:?}, вызовов {}", stand.job(id).state, calls.load(Ordering::SeqCst));
+        let logs = |fx: &Fixture| fx.store.jobs().unwrap().into_iter().filter(|j| j.external_ref.is_some()).map(|j| j.log).collect::<Vec<_>>().join("\n---\n");
+        assert!(wait_until(10, || logs(&fx).contains("результат принят сервером")), "{}", logs(&fx));
+        let all = logs(&fx);
+        assert!(all.contains("локальная копия"), "{all}");
+        assert!(all.contains("возвращена в очередь сервера"), "{all}");
+        assert_eq!(fx.queue.view().paused, None, "один сбой окружения очередь на паузу не ставит");
+    }
+
+    #[test]
+    fn status_texts_are_russian_and_short() {
+        use RemoteStatus::*;
+        let all = [
+            Off,
+            NoToken,
+            BadToken("ошибка".into()),
+            NoCli(PathBuf::from("C:/app/cs2-cli.exe")),
+            LockBusy,
+            BadAddress("ошибка".into()),
+            Starting,
+            Online { server_version: "0.1.0".into() },
+            Gated { server_version: "0.1.0".into(), reason: "идёт задача приложения".into() },
+            Working { job_id: 7 },
+            NetError { message: "нет связи".into(), retry_secs: 4 },
+            Paused { code: "CONSOLE_NOT_OPEN".into(), message: "консоль не открылась".into() },
+            TokenRejected,
+            ProtocolMismatch("версия".into()),
+            Stopped,
+        ];
+        for s in &all {
+            let (text, short) = (s.text(), s.short());
+            let first = text.chars().next().expect("текст состояния не пуст");
+            assert!(('А'..='Я').contains(&first) || first == 'Ё', "{s:?}: текст начинается не с заглавной русской буквы: {text}");
+            assert!(short.starts_with("Сервер:") && short.chars().count() <= 32, "{s:?}: короткая строка «{short}»");
+        }
+        let level = |s: RemoteStatus| s.level();
+        for bad in [NoCli(PathBuf::new()), LockBusy, BadAddress(String::new()), BadToken(String::new()), TokenRejected, ProtocolMismatch(String::new())] {
+            assert_eq!(level(bad.clone()), StatusLevel::Bad, "{bad:?}");
+        }
+        for warn in [
+            NoToken,
+            NetError { message: String::new(), retry_secs: 1 },
+            Paused { code: String::new(), message: String::new() },
+            Gated { server_version: String::new(), reason: String::new() },
+        ] {
+            assert_eq!(level(warn.clone()), StatusLevel::Warn, "{warn:?}");
+        }
+        for ok in [Online { server_version: String::new() }, Working { job_id: 1 }, Starting] {
+            assert_eq!(level(ok.clone()), StatusLevel::Ok, "{ok:?}");
+        }
+        assert_eq!((Off.level(), Stopped.level()), (StatusLevel::Off, StatusLevel::Off));
+        assert!(Working { job_id: 7 }.text().contains("#7") && Working { job_id: 7 }.short().contains("#7"));
+        assert!(NoCli(PathBuf::from("C:/app/cs2-cli.exe")).text().contains("cs2-cli.exe"));
     }
 }

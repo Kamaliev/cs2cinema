@@ -72,16 +72,12 @@ pub fn deliver_once(bot: &Bot) -> Result<bool> {
         let caption = caption_for(bot, id, &player);
         match send(bot, tj.chat_id, &InputFile::Id(file_id.clone()), &caption) {
             Ok(s) => {
-                let new_id = s.file_id.as_deref().unwrap_or(&file_id);
-                store::mark_sent(db, id, s.message_id, Some(new_id), bot.now_ms())?;
-                bot.log()
-                    .info(&format!("бот: ролик задачи #{id} отправлен повторно по file_id"));
+                record_sent(bot, &tj, &s, Some(&file_id));
                 return Ok(true);
             }
             Err(TgError::Api { code: 400, .. }) => {}
             Err(e) => {
-                let attempts = tj.delivery_attempts + 1;
-                fail_delivery(bot, &tj, &e, attempts, bot.now_ms())?;
+                record_failure(bot, &tj, &e);
                 return Ok(true);
             }
         }
@@ -148,20 +144,72 @@ pub fn deliver_once(bot: &Bot) -> Result<bool> {
     );
     let video = InputFile::Local(uri);
     let caption = caption_for(bot, id, &player);
-    let sent = send(bot, tj.chat_id, &video, &caption);
-    let done_at = bot.now_ms();
-    match sent {
-        Ok(s) => {
-            store::mark_sent(db, id, s.message_id, s.file_id.as_deref(), done_at)?;
-            bot.log()
-                .info(&format!("бот: ролик задачи #{id} отправлен"));
-        }
-        Err(e) => {
-            let attempts = tj.delivery_attempts + 1;
-            fail_delivery(bot, &tj, &e, attempts, done_at)?;
-        }
+    // Telegram уже вызван: что бы ни случилось с записью итога, `Err` отсюда не уходит (WR-10).
+    match send(bot, tj.chat_id, &video, &caption) {
+        Ok(s) => record_sent(bot, &tj, &s, None),
+        Err(e) => record_failure(bot, &tj, &e),
     }
     Ok(true)
+}
+
+/// Сколько раз пробуем записать итог отправки, прежде чем признать запись потерянной.
+const RECORD_ATTEMPTS: u32 = 3;
+
+/// Повторяет запись в базу несколько раз с короткой паузой: `database is locked` обычно проходит сам.
+fn with_retries<T>(mut op: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut last = op();
+    for _ in 1..RECORD_ATTEMPTS {
+        if last.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        last = op();
+    }
+    last
+}
+
+/// Записывает успешную отправку. `keep_file_id` — прежний `file_id`, если Telegram не вернул новый.
+fn record_sent(bot: &Bot, tj: &TgJob, s: &Sent, keep_file_id: Option<&str>) {
+    let id = tj.job_id;
+    let file_id = s.file_id.as_deref().or(keep_file_id);
+    match with_retries(|| store::mark_sent(bot.core().db(), id, s.message_id, file_id, bot.now_ms())) {
+        Ok(()) => bot.log().info(&format!("бот: ролик задачи #{id} отправлен")),
+        Err(e) => outcome_lost(bot, tj, &e),
+    }
+}
+
+/// Записывает исход неудачной отправки (`fail_delivery`) с повтором записи.
+fn record_failure(bot: &Bot, tj: &TgJob, e: &TgError) {
+    let attempts = tj.delivery_attempts + 1;
+    if let Err(db_err) = with_retries(|| fail_delivery(bot, tj, e, attempts, bot.now_ms())) {
+        outcome_lost(bot, tj, &db_err);
+    }
+}
+
+/// Итог отправки не удалось записать: ролик мог уйти, а строка осталась `sending`, и без этого шага её не тронул бы
+/// ни один тик. Отдельной записью помечаем её `uncertain` и говорим другу про `/resend` (WR-10).
+fn outcome_lost(bot: &Bot, tj: &TgJob, why: &str) {
+    let id = tj.job_id;
+    bot.log().warn(&format!(
+        "бот: итог отправки ролика задачи #{id} не записан: {}",
+        bot.core().redactor().clean(why, 200)
+    ));
+    let marked = with_retries(|| {
+        store::mark_delivery(
+            bot.core().db(),
+            id,
+            "uncertain",
+            "не удалось записать итог отправки",
+            bot.now_ms(),
+        )
+    });
+    if let Err(e) = marked {
+        bot.log().warn(&format!(
+            "бот: задача #{id} осталась в sending, пометить её неясной тоже не удалось: {}",
+            bot.core().redactor().clean(&e, 200)
+        ));
+    }
+    tell(bot, tj, &uncertain_text(id));
 }
 
 /// Разбор неудачной отправки. Повторяется только то, что точно не ушло (T-07-35):

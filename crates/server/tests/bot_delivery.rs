@@ -661,3 +661,35 @@ fn admin_report_is_retried_when_the_send_definitely_failed() {
     st.step();
     assert_eq!(st.tg.texts_to(ADMIN).len(), 1, "и больше не дублируется");
 }
+
+/// WR-10: если итог отправки не записывается, строка не остаётся в `sending`: ролик помечается неясным, друг получает
+/// сообщение про `/resend`, а шаг бота не падает.
+#[test]
+fn lost_outcome_write_turns_into_uncertain_and_a_message() {
+    let st = BotStand::start();
+    st.add_friend(FRIEND, "вася");
+    let id = queue_job(&st, FRIEND, "s1mple");
+    finish_job(&st, id);
+    st.server
+        .running()
+        .core()
+        .db()
+        .write(|tx| {
+            tx.execute_batch(
+                "CREATE TRIGGER no_sent BEFORE UPDATE OF delivery ON tg_jobs WHEN NEW.delivery = 'sent' \
+                 BEGIN SELECT RAISE(ABORT, 'database is locked'); END",
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+    st.step();
+    assert_eq!(videos_to(&st, FRIEND), 1, "ролик ушёл один раз");
+    assert_eq!(st.tg_job(id).delivery, "uncertain");
+    let want = format!(
+        "Не уверен, что ролик задачи #{id} дошёл. Если его нет в чате — отправьте /resend {id}"
+    );
+    assert!(st.tg.texts_to(FRIEND).contains(&want));
+    st.step();
+    assert_eq!(videos_to(&st, FRIEND), 1, "слепого повтора нет");
+}

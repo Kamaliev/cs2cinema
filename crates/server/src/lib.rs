@@ -8,6 +8,7 @@ pub mod api;
 pub mod auth;
 pub mod blobs;
 pub mod bot;
+pub mod clean;
 pub mod cli;
 pub mod clock;
 pub mod config;
@@ -38,6 +39,7 @@ pub struct Running {
     core: core::Core,
     log: log::Log,
     sweeper: Option<std::thread::JoinHandle<()>>,
+    cleaner: Option<std::thread::JoinHandle<()>>,
     bot: Option<bot::BotHandle>,
 }
 
@@ -70,6 +72,9 @@ impl Running {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.core.wake();
         if let Some(h) = self.sweeper.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.cleaner.take() {
             let _ = h.join();
         }
         self.http.stop();
@@ -159,17 +164,28 @@ pub fn serve_with_bot(
         http.addr(),
         cfg.data_dir.display()
     ));
+    // Рабочую папку bot-api чистим, только когда бот запущен: иначе корень в настройках может быть не задан.
+    let botapi_root = bot.as_ref().map(|_| cfg.bot_settings().files_root_local);
     let bot = bot.map(|(bot, me)| {
         let name = me.username.unwrap_or_else(|| "без имени".to_owned());
         log.info(&format!("бот @{name} запущен через локальный Bot API"));
         bot::spawn(bot, shutdown_flag.clone())
     });
-    let sweeper = spawn_sweeper(core.clone(), log.clone(), shutdown_flag);
+    let sweeper = spawn_sweeper(core.clone(), log.clone(), shutdown_flag.clone());
+    let cleaner = spawn_cleaner(
+        core.clone(),
+        log.clone(),
+        shutdown_flag,
+        cfg.retention(),
+        botapi_root,
+        cfg.clean_interval_secs,
+    );
     Ok(Running {
         http,
         core,
         log,
         sweeper: Some(sweeper),
+        cleaner: Some(cleaner),
         bot,
     })
 }
@@ -206,6 +222,35 @@ fn spawn_sweeper(
                     }
                 }
                 Err(e) => log.warn(&format!("sweep: {e}")),
+            }
+        }
+    })
+}
+
+/// Поток уборки: раз в `interval_secs` один проход `Core::clean`; в журнал уходят только числа. Выходит по флагу
+/// остановки, ожидая шагами по 200 мс, как `spawn_sweeper`.
+fn spawn_cleaner(
+    core: core::Core,
+    log: log::Log,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    retention: clean::Retention,
+    botapi_root: Option<std::path::PathBuf>,
+    interval_secs: u64,
+) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    std::thread::spawn(move || {
+        'outer: loop {
+            for _ in 0..interval_secs.saturating_mul(5) {
+                if stop.load(Ordering::SeqCst) {
+                    break 'outer;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            match core.clean(&retention, botapi_root.as_deref(), clean::CleanMode::Apply) {
+                Ok(c) if !c.is_empty() => log.info(&format!("уборка: {}", c.summary())),
+                Ok(_) => {}
+                Err(e) => log.warn(&format!("уборка: {e}")),
             }
         }
     })

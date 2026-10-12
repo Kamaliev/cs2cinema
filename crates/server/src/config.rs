@@ -47,6 +47,20 @@ pub struct Config {
     pub bot_queue_max_active: u32,
     pub bot_status_edit_secs: u64,
     pub bot_transfer_timeout_mins: u64,
+    /// Сколько часов после окончания хранится демка готовой или отменённой задачи.
+    pub retention_demo_hours: u64,
+    /// Сколько часов после сбоя хранится демка упавшей задачи (запас на `/retry`).
+    pub retention_failed_demo_hours: u64,
+    /// Сколько часов после доставки (`sent` с `file_id`) хранится ролик задачи бота.
+    pub retention_result_hours: u64,
+    /// Сколько часов хранится ролик, который не ушёл в Telegram: задача без бота, неудавшаяся доставка.
+    pub retention_unsent_result_hours: u64,
+    /// Через сколько часов удаляются недозагруженные `*.part` и остатки прерванной уборки.
+    pub retention_part_hours: u64,
+    /// Через сколько часов удаляются файлы рабочей папки `telegram-bot-api`.
+    pub retention_botapi_hours: u64,
+    /// Как часто поток уборки проходит по базе и файлам, секунд.
+    pub clean_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -77,6 +91,14 @@ impl Default for Config {
             bot_queue_max_active: 10,
             bot_status_edit_secs: 10,
             bot_transfer_timeout_mins: 60,
+            // Решение 09-02 (RESEARCH A1): сроки хранения; автор меняет их в файле настроек.
+            retention_demo_hours: 24,
+            retention_failed_demo_hours: 72,
+            retention_result_hours: 24,
+            retention_unsent_result_hours: 168,
+            retention_part_hours: 6,
+            retention_botapi_hours: 6,
+            clean_interval_secs: 600,
         }
     }
 }
@@ -120,6 +142,19 @@ impl Config {
             startup_grace_ms: self.startup_grace_secs as i64 * 1000,
             max_demo_bytes: self.max_demo_mib * MIB,
             max_result_bytes: self.max_result_mib * MIB,
+        }
+    }
+
+    /// Сроки хранения для уборщика: часы настроек в миллисекундах.
+    pub fn retention(&self) -> crate::clean::Retention {
+        const HOUR_MS: i64 = 3_600_000;
+        crate::clean::Retention {
+            demo_ms: self.retention_demo_hours as i64 * HOUR_MS,
+            failed_demo_ms: self.retention_failed_demo_hours as i64 * HOUR_MS,
+            result_ms: self.retention_result_hours as i64 * HOUR_MS,
+            unsent_result_ms: self.retention_unsent_result_hours as i64 * HOUR_MS,
+            part_ms: self.retention_part_hours as i64 * HOUR_MS,
+            botapi_ms: self.retention_botapi_hours as i64 * HOUR_MS,
         }
     }
 
@@ -170,6 +205,13 @@ struct FileConfig {
     bot_queue_max_active: Option<u32>,
     bot_status_edit_secs: Option<u64>,
     bot_transfer_timeout_mins: Option<u64>,
+    retention_demo_hours: Option<u64>,
+    retention_failed_demo_hours: Option<u64>,
+    retention_result_hours: Option<u64>,
+    retention_unsent_result_hours: Option<u64>,
+    retention_part_hours: Option<u64>,
+    retention_botapi_hours: Option<u64>,
+    clean_interval_secs: Option<u64>,
 }
 
 fn parse_send_as(v: &str) -> Result<SendAs> {
@@ -304,6 +346,27 @@ pub fn load(flags: &Flags, env: &dyn Fn(&str) -> Option<String>) -> Result<Loade
         if let Some(v) = f.bot_transfer_timeout_mins {
             c.bot_transfer_timeout_mins = v;
         }
+        if let Some(v) = f.retention_demo_hours {
+            c.retention_demo_hours = v;
+        }
+        if let Some(v) = f.retention_failed_demo_hours {
+            c.retention_failed_demo_hours = v;
+        }
+        if let Some(v) = f.retention_result_hours {
+            c.retention_result_hours = v;
+        }
+        if let Some(v) = f.retention_unsent_result_hours {
+            c.retention_unsent_result_hours = v;
+        }
+        if let Some(v) = f.retention_part_hours {
+            c.retention_part_hours = v;
+        }
+        if let Some(v) = f.retention_botapi_hours {
+            c.retention_botapi_hours = v;
+        }
+        if let Some(v) = f.clean_interval_secs {
+            c.clean_interval_secs = v;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -380,6 +443,27 @@ pub fn load(flags: &Flags, env: &dyn Fn(&str) -> Option<String>) -> Result<Loade
     }
     if let Some(v) = env_num(env, "CS2_SERVER_BOT_TRANSFER_TIMEOUT_MINS")? {
         c.bot_transfer_timeout_mins = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_RETENTION_DEMO_HOURS")? {
+        c.retention_demo_hours = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_RETENTION_FAILED_DEMO_HOURS")? {
+        c.retention_failed_demo_hours = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_RETENTION_RESULT_HOURS")? {
+        c.retention_result_hours = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_RETENTION_UNSENT_RESULT_HOURS")? {
+        c.retention_unsent_result_hours = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_RETENTION_PART_HOURS")? {
+        c.retention_part_hours = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_RETENTION_BOTAPI_HOURS")? {
+        c.retention_botapi_hours = v;
+    }
+    if let Some(v) = env_num(env, "CS2_SERVER_CLEAN_INTERVAL_SECS")? {
+        c.clean_interval_secs = v;
     }
     let env_token = env("CS2_SERVER_TELEGRAM_BOT_TOKEN")
         .filter(|v| !v.is_empty())
@@ -486,6 +570,31 @@ pub fn validate(c: &Config) -> Result<()> {
     }
     if !(1..=240).contains(&c.bot_transfer_timeout_mins) {
         return Err("bot_transfer_timeout_mins: нужно число от 1 до 240".to_owned());
+    }
+    for (name, v) in [
+        ("retention_demo_hours", c.retention_demo_hours),
+        ("retention_failed_demo_hours", c.retention_failed_demo_hours),
+        ("retention_result_hours", c.retention_result_hours),
+        (
+            "retention_unsent_result_hours",
+            c.retention_unsent_result_hours,
+        ),
+        ("retention_part_hours", c.retention_part_hours),
+        ("retention_botapi_hours", c.retention_botapi_hours),
+    ] {
+        if !(1..=8760).contains(&v) {
+            return Err(format!("{name}: нужно число от 1 до 8760"));
+        }
+    }
+    if !(1..=86400).contains(&c.clean_interval_secs) {
+        return Err("clean_interval_secs: нужно число от 1 до 86400".to_owned());
+    }
+    // Приём большой демки идёт до bot_transfer_timeout_mins: файл bot-api не должен исчезнуть раньше.
+    if c.retention_botapi_hours * 60 < 2 * c.bot_transfer_timeout_mins {
+        return Err(
+            "retention_botapi_hours: нужно не меньше удвоенного bot_transfer_timeout_mins (в часах)"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -879,6 +988,87 @@ mod tests {
                 .unwrap_or_else(|| panic!("{key} должен быть отвергнут"));
             assert!(e.contains(name), "{e}");
         }
+    }
+
+    #[test]
+    fn retention_keys_have_defaults_and_are_checked() {
+        let c = load(&Flags::default(), &env_of(&[])).unwrap().config;
+        assert_eq!(
+            (
+                c.retention_demo_hours,
+                c.retention_failed_demo_hours,
+                c.retention_result_hours,
+                c.retention_unsent_result_hours,
+                c.retention_part_hours,
+                c.retention_botapi_hours,
+                c.clean_interval_secs,
+            ),
+            (24, 72, 24, 168, 6, 6, 600)
+        );
+        let r = c.retention();
+        assert_eq!(r.demo_ms, 24 * 3_600_000);
+        assert_eq!(r.unsent_result_ms, 168 * 3_600_000);
+        assert_eq!(r, crate::clean::Retention::default());
+
+        let e = load_with(
+            Some(r#"{"retention_demo_hours": 0}"#),
+            "ret-zero",
+            &[],
+            Flags::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            e.contains("retention_demo_hours: нужно число от 1 до 8760"),
+            "{e}"
+        );
+        let e = load_with(
+            Some(r#"{"clean_interval_secs": 0}"#),
+            "ret-interval",
+            &[],
+            Flags::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains("clean_interval_secs"), "{e}");
+        let e = load_with(
+            Some(r#"{"retention_botapi_hours": 1, "bot_transfer_timeout_mins": 60}"#),
+            "ret-botapi",
+            &[],
+            Flags::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            e.contains(
+                "retention_botapi_hours: нужно не меньше удвоенного bot_transfer_timeout_mins"
+            ),
+            "{e}"
+        );
+
+        // Окружение сильнее файла.
+        let got = load_with(
+            Some(r#"{"retention_demo_hours": 12}"#),
+            "ret-env",
+            &[
+                ("CS2_SERVER_RETENTION_DEMO_HOURS", "48"),
+                ("CS2_SERVER_CLEAN_INTERVAL_SECS", "30"),
+            ],
+            Flags::default(),
+        )
+        .unwrap();
+        assert_eq!(got.config.retention_demo_hours, 48);
+        assert_eq!(got.config.clean_interval_secs, 30);
+        let e = load(
+            &Flags::default(),
+            &env_of(&[("CS2_SERVER_RETENTION_PART_HOURS", "abc")]),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            e,
+            "переменная CS2_SERVER_RETENTION_PART_HOURS: нужно целое число"
+        );
     }
 
     #[test]

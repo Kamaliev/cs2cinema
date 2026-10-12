@@ -49,6 +49,8 @@ pub struct TestOptions {
     pub bot_api_url: Option<String>,
     /// Корень файлов bot-api для `bot_api_url` (по умолчанию — папка внутри стенда).
     pub bot_api_files_root: Option<PathBuf>,
+    /// Период потока уборки, секунд; `None` — умолчание `Config` (600 с: в обычных тестах уборка не срабатывает).
+    pub clean_interval_secs: Option<u64>,
 }
 
 impl Default for TestOptions {
@@ -61,6 +63,7 @@ impl Default for TestOptions {
             tg: None,
             bot_api_url: None,
             bot_api_files_root: None,
+            clean_interval_secs: None,
         }
     }
 }
@@ -129,6 +132,9 @@ impl TestServer {
             bot_api_files_root: opts.bot_api_files_root,
             ..Default::default()
         };
+        if let Some(v) = opts.clean_interval_secs {
+            cfg.clean_interval_secs = v;
+        }
         if let Some(tg) = &opts.tg {
             cfg.bot_api_files_root = Some(tg.files_dir());
         } else if cfg.bot_api_url.is_some() && cfg.bot_api_files_root.is_none() {

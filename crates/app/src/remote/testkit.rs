@@ -165,9 +165,9 @@ fn exit0() -> Result<CmdOutput, pipeline::host::HostError> {
     Ok(CmdOutput { code: Some(0), stderr_tail: Vec::new(), elapsed: Duration::ZERO })
 }
 
-/// Хост, в котором дочерняя предпроверка отвечает «демка годна», а ffprobe — «ролик годен».
+/// Хост, в котором дочерняя предпроверка отвечает «демка годна», ffprobe — «ролик годен», а `icacls` (сужение доступа к токену) — успехом.
 pub fn probing_host() -> FakeHost {
-    FakeHost::new(Scenario::happy(1).program("cs2-cli", &[OK_REPLY], exit0()).program("ffprobe", &[GOOD_PROBE], exit0()))
+    FakeHost::new(Scenario::happy(1).program("cs2-cli", &[OK_REPLY], exit0()).program("ffprobe", &[GOOD_PROBE], exit0()).program("icacls", &[], exit0()))
 }
 
 /// Сколько раз хост запускал дочернюю предпроверку `cs2-cli inspect`.
@@ -316,6 +316,24 @@ pub struct RigOpts {
     pub local: Option<queue::Runner>,
 }
 
+/// База, хаб и настоящий поток очереди без потока раннера: раннер приложения (`RemoteRunner`) строит свой сам.
+pub(crate) fn start_queue(factory: ExecFactory, opts: RigOpts) -> (Store, Arc<RemoteHub>, Queue) {
+    let local: queue::Runner = opts.local.unwrap_or_else(|| Arc::new(|_, _| Err(RunError::from("локальная задача в этом тесте не ожидалась"))));
+    let store = opts.store.unwrap_or_else(|| Store::in_memory().unwrap());
+    let hub = RemoteHub::new(store.clone());
+    let host: Arc<dyn Host> = Arc::new(FakeHost::new(Scenario::happy(1)));
+    let queue = queue::start_with_hook(
+        store.clone(),
+        host,
+        queue_runner(local, hub.clone(), factory),
+        Reporter::detached(),
+        opts.paused,
+        queue_cfg(),
+        Some(hub.clone()),
+    );
+    (store, hub, queue)
+}
+
 /// База, хаб, настоящий поток очереди и поток раннера на одном стенде.
 pub(crate) struct Rig {
     pub store: Store,
@@ -333,19 +351,7 @@ impl Rig {
 
     /// То же с необязательными частями: без `local` локальная задача считается ошибкой теста.
     pub fn start_with(stand: &Stand, factory: ExecFactory, opts: RigOpts) -> Rig {
-        let local: queue::Runner = opts.local.unwrap_or_else(|| Arc::new(|_, _| Err(RunError::from("локальная задача в этом тесте не ожидалась"))));
-        let store = opts.store.unwrap_or_else(|| Store::in_memory().unwrap());
-        let hub = RemoteHub::new(store.clone());
-        let host: Arc<dyn Host> = Arc::new(FakeHost::new(Scenario::happy(1)));
-        let queue = queue::start_with_hook(
-            store.clone(),
-            host,
-            queue_runner(local, hub.clone(), factory),
-            Reporter::detached(),
-            opts.paused,
-            queue_cfg(),
-            Some(hub.clone()),
-        );
+        let (store, hub, queue) = start_queue(factory, opts);
 
         let mut cfg = Config::new(stand.base.clone(), Token::new(stand.token.clone()), stand.runner_dir());
         cfg.name = "tester".to_owned();

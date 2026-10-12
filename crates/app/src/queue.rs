@@ -313,6 +313,7 @@ impl Worker {
 
 /// Запустить поток очереди. `paused` — пауза с самого начала (после падения приложения: задача «прервана»).
 /// `host` нужен для уведомлений в трее.
+#[allow(dead_code)] // приложение зовёт `start_with_hook`; `start` остаётся для тестов очереди без режима раннера
 pub fn start(store: Store, host: Arc<dyn Host>, runner: Runner, ui: Reporter, paused: Option<PauseReason>, cfg: QueueConfig) -> Queue {
     start_with_hook(store, host, runner, ui, paused, cfg, None)
 }

@@ -6,8 +6,12 @@
 //! ни в настройки, ни в журналы.
 #![allow(dead_code)] // хаб подключается к окну и настройкам следующими планами фазы 8
 
+pub mod control;
 pub mod hub;
+pub mod token;
 
+#[allow(unused_imports)]
+pub use control::{RemoteRunner, RemoteStatus};
 #[allow(unused_imports)]
 pub use hub::{ExecFactory, RemoteExecutor, RemoteHub, queue_runner};
 

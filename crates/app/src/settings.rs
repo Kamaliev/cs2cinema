@@ -30,6 +30,8 @@ pub struct Settings {
     pub detailed: bool,
     /// Подстроки строк AFXERROR, которые не останавливают запись (D-09). Правится руками в settings.json, экрана нет; по умолчанию пусто.
     pub afxerror_ignore: Vec<String>,
+    /// Адрес cs2-server для режима раннера; пусто — режим выключен.
+    pub runner_server: String,
 }
 
 impl Settings {
@@ -128,6 +130,7 @@ impl Default for Settings {
             gpu_encode: true,
             detailed: false,
             afxerror_ignore: Vec::new(),
+            runner_server: String::new(),
         }
     }
 }
@@ -179,5 +182,14 @@ mod tests {
         assert!(old.afxerror_ignore.is_empty(), "старый файл без поля — пустой список");
         let new: Settings = serde_json::from_str(r#"{"afxerror_ignore":["shader cache","audio"]}"#).unwrap();
         assert_eq!(new.afxerror_ignore, vec!["shader cache".to_owned(), "audio".to_owned()]);
+    }
+
+    #[test]
+    fn settings_without_runner_server_still_load() {
+        let old: Settings = serde_json::from_str(r#"{"hlae_dir":"C:/hlae","fps":90}"#).unwrap();
+        assert!(old.runner_server.is_empty(), "старый файл без поля — режим раннера выключен");
+        assert!(Settings::default().runner_server.is_empty(), "по умолчанию адрес сервера не задан");
+        let new: Settings = serde_json::from_str(r#"{"runner_server":"http://192.168.1.5:8080"}"#).unwrap();
+        assert_eq!(new.runner_server, "http://192.168.1.5:8080");
     }
 }

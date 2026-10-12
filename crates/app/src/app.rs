@@ -20,6 +20,10 @@ use store::{Job, JobKind, JobSource, JobStatus, NewJob, Store};
 use crate::{
     jobs,
     queue::{self, PauseReason, Queue, QueueConfig},
+    remote::{
+        self, RemoteHub, RemoteRunner,
+        control::{RemoteDeps, RemoteTuning},
+    },
     settings::{self, Settings},
     status::Status,
     ui, update,
@@ -184,6 +188,8 @@ pub struct App {
     pub precheck_busy: bool,
     /// Очередь задач в своём потоке: окно читает её вид и шлёт команды (RET-05).
     pub queue: Queue,
+    /// Режим раннера: поток, который берёт задачи сервера и отдаёт их очереди (пуст, пока адрес сервера не задан).
+    pub remote: RemoteRunner,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
     ctx: egui::Context,
@@ -207,15 +213,39 @@ impl App {
         // файлы задачи и помечаем оборванные дубли (D-08, D-15), и только потом задача становится «прервана» (`reset_running`)
         let host: Arc<dyn Host> = Arc::from(pipeline::host::default_host());
         let reset = crate::jobs::recover_after_crash(&store, &*host, &s.cs2_dir).unwrap_or_default();
-        // очередь стартует после уборки; прерванная задача ставит её на паузу до «Продолжить» (D-16)
-        let queue = queue::start(
+        // очередь стартует после уборки; прерванная задача ставит её на паузу до «Продолжить» (D-16). Хаб удалённых карточек
+        // подключён всегда: без адреса сервера он ничего не делает, а локальные строки идут в прежний исполнитель
+        let hub = RemoteHub::new(store.clone());
+        let runner_dir = remote::control::runner_dir();
+        let inspect_exe = remote::control::inspect_exe();
+        let settings_fn: Arc<dyn Fn() -> Settings + Send + Sync> = Arc::new(Settings::load);
+        let queue = queue::start_with_hook(
             store.clone(),
             host.clone(),
-            jobs::runner(Arc::new(Settings::load), host),
+            remote::queue_runner(
+                jobs::runner(settings_fn.clone(), host.clone()),
+                hub.clone(),
+                remote::control::app_factory(settings_fn.clone(), host.clone(), runner_dir.clone(), inspect_exe.clone()),
+            ),
             Reporter { tx: tx.clone(), ctx: cc.egui_ctx.clone() },
             (reset.interrupted > 0).then_some(PauseReason::Interrupted),
             QueueConfig::default(),
+            Some(hub.clone()),
         );
+        let repaint_ctx = cc.egui_ctx.clone();
+        let mut remote = RemoteRunner::new(RemoteDeps {
+            store: store.clone(),
+            host,
+            queue: queue.clone(),
+            hub,
+            dir: runner_dir,
+            inspect_exe,
+            name: std::env::var("COMPUTERNAME").ok().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "cs2cinema".to_owned()),
+            settings: settings_fn,
+            repaint: Arc::new(move || repaint_ctx.request_repaint()),
+            tuning: RemoteTuning::default(),
+        });
+        remote.apply(&s.runner_server);
         let mut app = Self {
             draft: s.clone(),
             matches: MatchesState { nickname: s.nickname.clone(), ..Default::default() },
@@ -230,6 +260,7 @@ impl App {
             precheck: None,
             precheck_busy: false,
             queue,
+            remote,
             rx,
             tx,
             ctx: cc.egui_ctx.clone(),
@@ -253,6 +284,10 @@ impl App {
         if reset.interrupted > 0 {
             // прерванная задача останавливает очередь до «Продолжить» (D-16); без неё оставшиеся задачи продолжаются
             app.status.push(&format!("задач прервано при прошлом запуске: {} — очередь на паузе, нажмите «Продолжить»", reset.interrupted));
+        }
+        if reset.interrupted_remote > 0 {
+            // карточка сервера, прерванная закрытием приложения, паузу не ставит: раннер держит выдачу и продолжит её сам
+            app.status.push("задача с сервера прервана закрытием приложения — продолжится сама после подключения к серверу");
         }
         app.refresh_jobs();
         // `cs2cinema.exe demo.dem` — открыть демку сразу (и для «Открыть с помощью»)
@@ -770,6 +805,7 @@ fn thumbnail(path: &Path) -> Option<Vec<u8>> {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll();
+        self.remote.tick();
         if self.jobs.dirty {
             self.refresh_jobs();
         }

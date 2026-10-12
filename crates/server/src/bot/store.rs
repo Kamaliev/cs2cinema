@@ -181,9 +181,11 @@ pub fn claim_pending(db: &Db, now_ms: i64) -> Result<Option<InboxRow>> {
 /// Сколько раз приём этой строки уже откладывался (WR-05, WR-07).
 pub fn inbox_attempts(db: &Db, row_id: i64) -> Result<i64> {
     db.read(|c| {
-        c.query_row("SELECT attempts FROM tg_inbox WHERE id = ?1", [row_id], |r| {
-            r.get(0)
-        })
+        c.query_row(
+            "SELECT attempts FROM tg_inbox WHERE id = ?1",
+            [row_id],
+            |r| r.get(0),
+        )
         .map_err(db_err)
     })
 }

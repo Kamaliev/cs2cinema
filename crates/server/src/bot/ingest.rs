@@ -127,19 +127,31 @@ pub(super) fn duplicate_text(job: &JobRow, player: &str, user_id: i64) -> String
     if job.user_id != Some(user_id) {
         return format!(
             "{} для игрока {player} уже в очереди — дождитесь результата и пришлите снова.",
-            if faceit { "Этот матч" } else { "Эта демка" }
+            if faceit {
+                "Этот матч"
+            } else {
+                "Эта демка"
+            }
         );
     }
     if job.state == JobState::Done {
         format!(
             "Ролик по {} для игрока {player} уже готов: /resend {}",
-            if faceit { "этому матчу" } else { "этой демке" },
+            if faceit {
+                "этому матчу"
+            } else {
+                "этой демке"
+            },
             job.id
         )
     } else {
         format!(
             "{} для игрока {player} уже в очереди: задача #{}",
-            if faceit { "Этот матч" } else { "Эта демка" },
+            if faceit {
+                "Этот матч"
+            } else {
+                "Эта демка"
+            },
             job.id
         )
     }
@@ -555,7 +567,12 @@ fn defer_or_reject(bot: &Bot, row: &store::InboxRow, e: &TgError) -> Result<bool
     let attempts = store::inbox_attempts(db, row.id)?;
     if is_transient(e) && attempts + 1 < MAX_INGEST_ATTEMPTS {
         let now = bot.now_ms();
-        store::defer_inbox(db, row.id, now + backoff_ms(attempts, retry_after_of(e)), now)?;
+        store::defer_inbox(
+            db,
+            row.id,
+            now + backoff_ms(attempts, retry_after_of(e)),
+            now,
+        )?;
         bot.log().warn(&format!(
             "бот: getFile не удался ({}), приём строки #{} отложен, попытка {}",
             bot.core().redactor().clean(&e.to_string(), 200),

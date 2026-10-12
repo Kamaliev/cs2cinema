@@ -594,7 +594,11 @@ fn resend_of_a_sent_video_is_left_to_the_delivery_thread() {
     say(&st, FRIEND, &format!("/resend {id}"));
     st.bot.poll_once(0).unwrap();
     assert_eq!(st.tg_job(id).delivery, "pending");
-    assert_eq!(send_video_calls(&st), 1, "из потока опроса ничего не уходит");
+    assert_eq!(
+        send_video_calls(&st),
+        1,
+        "из потока опроса ничего не уходит"
+    );
 
     // Telegram не принял file_id: запрос точно не сработал, ролик идёт с файла.
     st.tg.fail_next(

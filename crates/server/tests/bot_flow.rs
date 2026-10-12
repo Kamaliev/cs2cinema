@@ -243,7 +243,11 @@ fn sending_delivery_becomes_uncertain_after_restart_without_a_resend() {
         "Не уверен, что ролик задачи #{id} дошёл. Если его нет в чате — отправьте /resend {id}"
     );
     assert_eq!(
-        st.tg.texts_to(FRIEND).iter().filter(|t| **t == want).count(),
+        st.tg
+            .texts_to(FRIEND)
+            .iter()
+            .filter(|t| **t == want)
+            .count(),
         1,
         "{:?}",
         st.tg.texts_to(FRIEND)

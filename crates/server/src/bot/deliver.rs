@@ -172,8 +172,12 @@ fn with_retries<T>(mut op: impl FnMut() -> Result<T>) -> Result<T> {
 fn record_sent(bot: &Bot, tj: &TgJob, s: &Sent, keep_file_id: Option<&str>) {
     let id = tj.job_id;
     let file_id = s.file_id.as_deref().or(keep_file_id);
-    match with_retries(|| store::mark_sent(bot.core().db(), id, s.message_id, file_id, bot.now_ms())) {
-        Ok(()) => bot.log().info(&format!("бот: ролик задачи #{id} отправлен")),
+    match with_retries(|| {
+        store::mark_sent(bot.core().db(), id, s.message_id, file_id, bot.now_ms())
+    }) {
+        Ok(()) => bot
+            .log()
+            .info(&format!("бот: ролик задачи #{id} отправлен")),
         Err(e) => outcome_lost(bot, tj, &e),
     }
 }

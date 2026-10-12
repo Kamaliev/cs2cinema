@@ -497,7 +497,10 @@ fn size_mismatch_is_refused() {
     );
     st.step();
     assert_refused_without_job(&st);
-    assert!(!original.exists(), "файл с неверным размером убран из папки bot-api (WR-06)");
+    assert!(
+        !original.exists(),
+        "файл с неверным размером убран из папки bot-api (WR-06)"
+    );
 }
 
 #[test]
@@ -649,7 +652,15 @@ fn bad_caption_nick_is_refused_with_a_reason_not_truncated() {
         "{}",
         chat_text(&st, FRIEND)
     );
-    push(&st, FRIEND, "f1", "u1", "match.dem", len, "вот моя игра\nник s1mple");
+    push(
+        &st,
+        FRIEND,
+        "f1",
+        "u1",
+        "match.dem",
+        len,
+        "вот моя игра\nник s1mple",
+    );
     st.step();
     let link = "https://www.faceit.com/en/cs2/room/1-0f9a1b2c-3d4e-5f60-7182-93a4b5c6d7e8";
     st.tg.push_update(
@@ -659,7 +670,11 @@ fn bad_caption_nick_is_refused_with_a_reason_not_truncated() {
     st.step();
 
     let text = chat_text(&st, FRIEND);
-    assert_eq!(text.matches("Не принял ник из подписи").count(), 3, "{text}");
+    assert_eq!(
+        text.matches("Не принял ник из подписи").count(),
+        3,
+        "{text}"
+    );
     assert!(jobs(&st).is_empty(), "задач нет: {:?}", jobs(&st));
     assert!(inbox(&st).is_empty(), "во входящие ничего не попало");
     assert_eq!(st.tg.get_file_calls(), 0);
@@ -685,7 +700,11 @@ fn transient_get_file_errors_are_retried_later_permanent_ones_are_not() {
     );
     push(&st, FRIEND, "f1", "u1", "match.dem", len, "s1mple");
     st.step();
-    assert_eq!(inbox(&st)[0].state, "pending", "строка ждёт, а не отвергнута");
+    assert_eq!(
+        inbox(&st)[0].state,
+        "pending",
+        "строка ждёт, а не отвергнута"
+    );
     assert!(jobs(&st).is_empty());
     assert!(!chat_text(&st, FRIEND).contains("Не получилось принять"));
 

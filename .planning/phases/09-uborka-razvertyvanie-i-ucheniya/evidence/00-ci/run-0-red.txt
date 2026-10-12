@@ -1,0 +1,21 @@
+прогон CI № 0 (первая попытка) на main — КРАСНЫЙ; после исправления см. run-1.txt
+
+workflow: CI (.github/workflows/ci.yml)
+run id: 38289485363
+url: https://github.com/Kamaliev/cs2cinema/actions/runs/38289485363
+head_sha: b14970ace1f170c9c4763fa2b45b0bda2fced720
+создан: 2026-10-12T18:13:43Z
+conclusion: failure
+
+задачи:
+  test (ubuntu-latest)  — conclusion: failure  (18:13:47Z — 18:17:57Z); упал шаг «Tests», аннотация: «Process completed with exit code 101»
+  test (windows-latest) — conclusion: failure  (18:13:47Z — 18:20:00Z); упал шаг «Tests», аннотация: «Process completed with exit code 1»
+  шаг «Dependency guard» на обоих — success; шаги сборки и выгрузки артефактов пропущены
+
+артефакты: 0 (cs2-server-linux-x64 не создан — шаг выгрузки не дошёл)
+
+что известно:
+  - логи шагов без токена недоступны (HTTP 403), доступны только аннотации;
+  - сбой не сводится к известному флейку win_session: упала и ubuntu-latest;
+  - локальное воспроизведение `cargo test --release --workspace --no-fail-fast` на чистом чекауте b14970a (Windows, ffmpeg установлен, переменных CS2_*/FACEIT_* нет): 956 passed, 0 failed, 1 ignored, код 0 — то есть локально не воспроизводится;
+  - нужен хвост лога шага «Tests» от автора, чтобы найти упавший тест.

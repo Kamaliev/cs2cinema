@@ -1,21 +1,23 @@
-прогон CI № 1 на main — КРАСНЫЙ (план не закрывается)
+прогон CI № 1 (зелёный, по плану — главная улика) на main — ЗЕЛЁНЫЙ
 
 workflow: CI (.github/workflows/ci.yml)
-run id: 38289485363
-url: https://github.com/Kamaliev/cs2cinema/actions/runs/38289485363
-head_sha: b14970ace1f170c9c4763fa2b45b0bda2fced720
-создан: 2026-10-12T18:13:43Z
-conclusion: failure
+run id: 38291001638
+url: https://github.com/Kamaliev/cs2cinema/actions/runs/38291001638
+head_sha: a8420b5d2be1cbbc2bbf539f1f2cf4350dcc8c71
+создан: 2026-10-12T18:27:13Z
+завершён: 2026-10-12T18:35:47Z
+conclusion: success
 
 задачи:
-  test (ubuntu-latest)  — conclusion: failure  (18:13:47Z — 18:17:57Z); упал шаг «Tests», аннотация: «Process completed with exit code 101»
-  test (windows-latest) — conclusion: failure  (18:13:47Z — 18:20:00Z); упал шаг «Tests», аннотация: «Process completed with exit code 1»
-  шаг «Dependency guard» на обоих — success; шаги сборки и выгрузки артефактов пропущены
+  test (ubuntu-latest) conclusion: success (18:27:16Z — 18:32:31Z)
+  test (windows-latest) conclusion: success (18:27:16Z — 18:35:46Z)
+  шаги «Dependency guard», «Tests», «Build cs2-cli», «Build cs2-server» на обоих — success;
+  «Upload Linux server build» пропущен на Windows, «Upload Windows build» пропущен на Linux — так и задумано (if runner.os).
 
-артефакты: 0 (cs2-server-linux-x64 не создан — шаг выгрузки не дошёл)
+артефакты (2):
+  cs2-server-linux-x64    3148136 байт  2026-10-12T18:32:18Z
+  cs2-cli-windows-x64     3640871 байт  2026-10-12T18:35:08Z
 
-что известно:
-  - логи шагов без токена недоступны (HTTP 403), доступны только аннотации;
-  - сбой не сводится к известному флейку win_session: упала и ubuntu-latest;
-  - локальное воспроизведение `cargo test --release --workspace --no-fail-fast` на чистом чекауте b14970a (Windows, ffmpeg установлен, переменных CS2_*/FACEIT_* нет): 956 passed, 0 failed, 1 ignored, код 0 — то есть локально не воспроизводится;
-  - нужен хвост лога шага «Tests» от автора, чтобы найти упавший тест.
+что изменилось с первой попытки (run-0-red.txt, прогон 38289485363, красный):
+  - a8420b5: тестовый файл настроек сервера создаётся с правами 0600 — это причина падения ubuntu-latest (config::tests::bot_url_must_be_local_http);
+  - падение windows-latest в первой попытке (код 1, лог не получен) без изменений кода, затрагивающих Windows, в этом прогоне не повторилось; причина не установлена.

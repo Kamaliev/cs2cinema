@@ -56,6 +56,36 @@ pub fn deliver_once(bot: &Bot) -> Result<bool> {
         return Ok(false);
     };
     let id = tj.job_id;
+    let player = bot
+        .core()
+        .job(id)?
+        .map(|j| j.player_name)
+        .unwrap_or_default();
+    // Повторная отправка (`/resend` доставленного) идёт по сохранённому `file_id` без загрузки файла. Если Telegram
+    // его не принял (`400`), запрос точно не сработал, и ниже ролик уходит с файла (WR-08).
+    let mut began = false;
+    if let Some(file_id) = tj.result_file_id.clone() {
+        if !store::begin_sending(db, id, now)? {
+            return Ok(true);
+        }
+        began = true;
+        let caption = caption_for(bot, id, &player);
+        match send(bot, tj.chat_id, &InputFile::Id(file_id.clone()), &caption) {
+            Ok(s) => {
+                let new_id = s.file_id.as_deref().unwrap_or(&file_id);
+                store::mark_sent(db, id, s.message_id, Some(new_id), bot.now_ms())?;
+                bot.log()
+                    .info(&format!("бот: ролик задачи #{id} отправлен повторно по file_id"));
+                return Ok(true);
+            }
+            Err(TgError::Api { code: 400, .. }) => {}
+            Err(e) => {
+                let attempts = tj.delivery_attempts + 1;
+                fail_delivery(bot, &tj, &e, attempts, bot.now_ms())?;
+                return Ok(true);
+            }
+        }
+    }
     let on_disk = bot
         .core()
         .data_dir()
@@ -106,12 +136,7 @@ pub fn deliver_once(bot: &Bot) -> Result<bool> {
         );
         return Ok(true);
     }
-    let player = bot
-        .core()
-        .job(id)?
-        .map(|j| j.player_name)
-        .unwrap_or_default();
-    if !store::begin_sending(db, id, now)? {
+    if !began && !store::begin_sending(db, id, now)? {
         return Ok(true);
     }
     // Путь строится только из числового id и префикса оператора.
@@ -260,13 +285,13 @@ fn tell(bot: &Bot, tj: &TgJob, text: &str) {
     }
 }
 
-/// `/resend N`: отправляет ролик своей готовой задачи ещё раз и возвращает ответ для чата (пустой — отвечать
-/// нечего, сам ролик и есть ответ).
+/// `/resend N`: отправляет ролик своей готовой задачи ещё раз и возвращает ответ для чата.
 ///
-/// - доставленный (`sent`) уходит сразу по `file_id` Telegram, без повторной загрузки файла (вызов быстрый, поэтому
-///   его можно сделать в потоке опроса);
-/// - неясный или не ушедший (`uncertain`, `failed`) возвращается в `pending` с нуля, и отправку с файла делает
-///   `deliver_once` вне потока опроса; дубль возможен, о чём сказано заранее;
+/// Сама отправка всегда идёт в `deliver_once` в потоке доставки, а не в потоке опроса: передача может занять до часа
+/// (WR-08). Здесь доставка только возвращается в `pending`:
+/// - доставленный (`sent`) уходит по сохранённому `file_id` Telegram без повторной загрузки файла (`deliver_once`
+///   сам берёт `result_file_id` и при отказе Telegram шлёт с файла);
+/// - неясный или не ушедший (`uncertain`, `failed`) возвращается с нуля; дубль возможен, о чём сказано заранее;
 /// - ещё отправляемый ролик не трогаем.
 pub fn resend(bot: &Bot, user: &User, job_id: i64) -> String {
     let job = match bot.core().job(job_id) {
@@ -293,78 +318,18 @@ pub fn resend(bot: &Bot, user: &User, job_id: i64) -> String {
         }
         Err(e) => return format!("Не удалось получить доставку: {e}"),
     };
-    match tj.delivery.as_str() {
-        "sent" => {
-            if let Some(file_id) = tj.result_file_id.clone() {
-                match resend_by_id(bot, &tj, &job.player_name, &file_id) {
-                    ByIdOutcome::Reply(text) => return text,
-                    // Telegram не принял `file_id`: отправляем с файла.
-                    ByIdOutcome::FromFile => {}
-                }
-            }
-        }
-        "uncertain" | "failed" => {}
+    let was_sent = match tj.delivery.as_str() {
+        "sent" => true,
+        "uncertain" | "failed" => false,
         _ => return format!("Ролик задачи #{id} уже отправляется."),
-    }
+    };
     match store::requeue_delivery(bot.core().db(), id, bot.now_ms()) {
+        Ok(true) if was_sent => format!("Отправляю ролик задачи #{id} ещё раз."),
         Ok(true) => {
             format!("Отправляю ещё раз; если ролик уже пришёл, дубль — нормально. Задача #{id}.")
         }
         Ok(false) => format!("Ролик задачи #{id} уже отправляется."),
         Err(e) => format!("Не удалось поставить отправку заново: {e}"),
-    }
-}
-
-enum ByIdOutcome {
-    Reply(String),
-    FromFile,
-}
-
-/// Повторная отправка по `file_id`: новое сообщение, `result_message_id` обновляется.
-fn resend_by_id(bot: &Bot, tj: &TgJob, player: &str, file_id: &str) -> ByIdOutcome {
-    let id = tj.job_id;
-    let caption = caption_for(bot, id, player);
-    match send(
-        bot,
-        tj.chat_id,
-        &InputFile::Id(file_id.to_owned()),
-        &caption,
-    ) {
-        Ok(s) => {
-            let new_id = s.file_id.as_deref().unwrap_or(file_id);
-            if let Err(e) = store::mark_sent(
-                bot.core().db(),
-                id,
-                s.message_id,
-                Some(new_id),
-                bot.now_ms(),
-            ) {
-                bot.log().warn(&format!(
-                    "бот: повторная отправка задачи #{id} не записана: {e}"
-                ));
-            }
-            bot.log().info(&format!(
-                "бот: ролик задачи #{id} отправлен повторно по file_id"
-            ));
-            ByIdOutcome::Reply(String::new())
-        }
-        Err(TgError::Api { code: 400, .. }) => ByIdOutcome::FromFile,
-        Err(e) if e.maybe_delivered() => ByIdOutcome::Reply(format!(
-            "Не уверен, что ролик задачи #{id} дошёл ещё раз. Если его нет в чате — отправьте /resend {id} снова."
-        )),
-        Err(e) => {
-            if e.is_forbidden() {
-                let _ = store::mute_chat(bot.core().db(), tj.chat_id, bot.now_ms());
-            }
-            bot.log().warn(&format!(
-                "бот: повторная отправка задачи #{id} не удалась: {}",
-                bot.core().redactor().clean(&e.to_string(), 200)
-            ));
-            ByIdOutcome::Reply(format!(
-                "Не получилось отправить ролик задачи #{id} ещё раз ({}). Попробуйте позже: /resend {id}",
-                bot.core().redactor().clean(&e.to_string(), 200)
-            ))
-        }
     }
 }
 

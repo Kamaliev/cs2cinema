@@ -578,3 +578,43 @@ fn admin_owner_gets_both_messages_and_a_muted_friend_only_the_admin_report() {
     );
     assert!(st.tg_job(friends).admin_reported_ms.is_some());
 }
+
+/// WR-08: `/resend` доставленного ролика не отправляет его из потока опроса. Команда только возвращает доставку в
+/// `pending`; отправку по `file_id` делает поток доставки, а если Telegram `file_id` не принял, ролик уходит с файла.
+#[test]
+fn resend_of_a_sent_video_is_left_to_the_delivery_thread() {
+    let st = BotStand::start();
+    st.add_friend(FRIEND, "вася");
+    let id = done_job(&st, FRIEND, "s1mple");
+    st.step();
+    let file_id = st.tg_job(id).result_file_id.clone().expect("file_id");
+    assert_eq!(send_video_calls(&st), 1);
+
+    // Опрос обработал команду, доставки ещё не было.
+    say(&st, FRIEND, &format!("/resend {id}"));
+    st.bot.poll_once(0).unwrap();
+    assert_eq!(st.tg_job(id).delivery, "pending");
+    assert_eq!(send_video_calls(&st), 1, "из потока опроса ничего не уходит");
+
+    // Telegram не принял file_id: запрос точно не сработал, ролик идёт с файла.
+    st.tg.fail_next(
+        "send_video",
+        TgError::Api {
+            code: 400,
+            description: "Bad Request: wrong file identifier".to_owned(),
+            retry_after: None,
+        },
+    );
+    st.step();
+    let calls: Vec<_> = st
+        .tg
+        .calls()
+        .into_iter()
+        .filter(|c| c.method == "send_video")
+        .collect();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert_eq!(calls[1].detail, format!("id:{file_id}"));
+    assert!(calls[2].detail.starts_with("file:"), "{:?}", calls[2]);
+    assert_eq!(st.tg_job(id).delivery, "sent");
+    assert_eq!(videos_to(&st, FRIEND), 2);
+}

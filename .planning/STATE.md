@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v1.1
 milestone_name: Сервер и Telegram-бот
-current_phase: 9
+current_phase: 09
 current_phase_name: Уборка, развёртывание и учения
 status: executing
-stopped_at: Phase 08 complete, ready to plan Phase 9
-last_updated: "2026-10-12T17:36:10.369Z"
+stopped_at: Completed 09-03-PLAN.md
+last_updated: "2026-10-12T17:57:22.977Z"
 last_activity: 2026-10-12
-last_activity_desc: Phase 08 complete, transitioned to Phase 9
-state_head: a7d7ee91c7d2eaa9264cdbb85b5c97f6ba3d91bc
+last_activity_desc: Phase 09 execution started
+state_head: 0200547d2cfe3122b7821d06f27d999ad2af9459
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 43
-  completed_plans: 33
-  percent: 77
+  completed_plans: 34
+  percent: 79
 ---
 
 # Project State
@@ -25,16 +25,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-12)
 
 **Core value:** Задача на монтаж доходит до готового `highlights.mp4` без ручного вмешательства, а если это невозможно — останавливается быстро и объясняет, что именно пошло не так. Для v1.1 то же верно от демки, отправленной боту, до ролика в чате.
-**Current focus:** Phase 9 — Уборка, развёртывание и учения
+**Current focus:** Phase 09 — Уборка, развёртывание и учения
 
 ## Current Position
 
-Phase: 9 (Уборка, развёртывание и учения) — READY TO EXECUTE
-Plan: Not started
+Phase: 09 (Уборка, развёртывание и учения) — EXECUTING
+Plan: 2 of 10
 Status: Ready to execute
-Last activity: 2026-10-12 — Phase 08 complete, transitioned to Phase 9
+Last activity: 2026-10-12 — Phase 09 execution started
 
-Progress: [████████░░] 77%
+Progress: [████████░░] 79%
 
 ## Performance Metrics
 
@@ -127,6 +127,7 @@ Progress: [████████░░] 77%
 | Phase 08 P04 | 12 min | 3 tasks | 7 files |
 | Phase 08 P05 | 25 min | 2 tasks | 7 files |
 | Phase 08 P06 | 13 min | 3 tasks | 3 files |
+| Phase 09 P03 | 20 min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -251,6 +252,8 @@ Recent decisions affecting current work:
 - [Phase 08]: 08-05: заголовок «Задача с сервера #N» строится из числа в external_ref, текст от друга в него не попадает
 - [Phase 08]: 08-05: у удержанной раннером карточки нет «Повторить», «Заново», «Открыть папку», «Удалить»; «Отменить» остаётся (отмена идёт на сервер)
 - [Phase 08]: 08-06: без папки задачи (убит до того, как пайплайн её назвал) раннер начинает запись заново с предпроверкой демки ровно один раз; тест фиксирует это поведение
+- [Phase 09]: 09-03: подтверждённый результат отличается от неподтверждённого меткой out/srv{N}.accepted, а не возрастом; повтор finish один раз перед drop_job — метка переживает обрыв и порчу runner_state.json, сервер остаётся единственным судьёй приёма
+- [Phase 09]: 09-03: сроки уборки раннера — константы runner::sweep (72 ч папки дублей без подтверждения, 24 ч демки), не поля Config — литералы Config в cs2-cli и тестах не меняются
 
 ### Pending Todos
 
@@ -281,6 +284,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-12T15:12:00Z
-Stopped at: Phase 08 complete, ready to plan Phase 9
+Last session: 2026-10-12T17:57:22.711Z
+Stopped at: Completed 09-03-PLAN.md
 Resume file: None

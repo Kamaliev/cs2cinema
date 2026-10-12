@@ -14,6 +14,7 @@ director = { path = "../director" }
 cs2 = { path = "../cs2" }
 highlights = { path = "../highlights" }
 store = { path = "../store" }
+runner = { path = "../runner" }
 eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 rfd = "0.15"
 faceit = { path = "../faceit" }
@@ -26,3 +27,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.19", default-features = false }
+
+[dev-dependencies]
+server = { path = "../server" }
+wire = { path = "../wire" }

@@ -76,6 +76,26 @@ pub struct Config {
     pub max_demo_bytes: u64,
 }
 
+impl Config {
+    /// Настройки по умолчанию для приложения и его тестов: имя `runner`, интервалы опроса и пульса — от сервера,
+    /// остальные пороги стандартные. Поля меняются присваиванием, поэтому новые поля `Config` приложение не ломают.
+    pub fn new(server: impl Into<String>, token: Token, dir: PathBuf) -> Config {
+        Config {
+            server: server.into(),
+            token,
+            dir,
+            name: "runner".to_owned(),
+            poll_secs: None,
+            upload_chunk_limit: None,
+            heartbeat: None,
+            debounce: Duration::from_secs(2),
+            force_after: FORCE_AFTER,
+            release_cooldown: RELEASE_COOLDOWN,
+            max_demo_bytes: MAX_DEMO_BYTES,
+        }
+    }
+}
+
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
@@ -181,6 +201,7 @@ fn needs_download(held: &HeldJob) -> bool {
 fn task_of(held: &HeldJob, attempt: u32, resumed_dir: Option<PathBuf>) -> Task {
     Task {
         job_id: held.server_job_id,
+        epoch: held.epoch,
         attempt,
         demo: held.demo_path.clone(),
         faceit: held.faceit.clone(),

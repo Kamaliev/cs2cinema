@@ -105,12 +105,15 @@ dependencies = [
  "pipeline",
  "renderer",
  "rfd",
+ "runner",
  "serde",
  "serde_json",
+ "server",
  "sha2",
  "store",
  "tray-icon",
  "ureq",
+ "wire",
  "zip",
 ]
 

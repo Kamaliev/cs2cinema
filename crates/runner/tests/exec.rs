@@ -68,6 +68,7 @@ fn executor(host: &FakeHost, dir: &TestDir) -> PipelineExecutor {
 fn task(demo: &str) -> Task {
     Task {
         job_id: 7,
+        epoch: 1,
         attempt: 1,
         demo: PathBuf::from(demo),
         faceit: None,

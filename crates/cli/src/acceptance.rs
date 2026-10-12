@@ -1114,6 +1114,7 @@ mod tests {
             resume: false,
             auto_retries: 0,
             batch: Some("acc-1700000000-100".into()),
+            external_ref: None,
         }
     }
 

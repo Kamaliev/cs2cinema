@@ -246,10 +246,24 @@ impl QueuePolicy {
     }
 }
 
+/// Совет хука очереди: что поменять в решении политики для этой задачи.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Advice {
+    /// Не ставить очередь на паузу после отмены: отменил сервер, а не автор.
+    pub suppress_pause: bool,
+}
+
+/// Слушатель итогов задач очереди. Нужен режиму раннера: итог удалённой карточки уходит раннеру ровно один раз.
+pub trait SettleHook: Send + Sync {
+    /// Вызывается один раз после решения политики, если оно не авто-повтор: промежуточный сбой запуска серверу не нужен.
+    fn on_settled(&self, job: &Job, finished: &Finished, result: &Result<JobOutcome, RunError>) -> Advice;
+}
+
 /// Исполнитель одной задачи: настоящий — `jobs::runner`, в тестах — заглушка.
 pub type Runner = Arc<dyn Fn(&Job, &JobReporter) -> Result<JobOutcome, RunError> + Send + Sync>;
 
-/// Ручка очереди для окна.
+/// Ручка очереди для окна. Копии делят один поток очереди и один вид.
+#[derive(Clone)]
 pub struct Queue {
     tx: Sender<Cmd>,
     view: Arc<Mutex<QueueView>>,
@@ -286,6 +300,7 @@ struct Worker {
     shared: Arc<Mutex<QueueView>>,
     policy: QueuePolicy,
     totals: Summary,
+    hook: Option<Arc<dyn SettleHook>>,
 }
 
 impl Worker {
@@ -299,9 +314,23 @@ impl Worker {
 /// Запустить поток очереди. `paused` — пауза с самого начала (после падения приложения: задача «прервана»).
 /// `host` нужен для уведомлений в трее.
 pub fn start(store: Store, host: Arc<dyn Host>, runner: Runner, ui: Reporter, paused: Option<PauseReason>, cfg: QueueConfig) -> Queue {
+    start_with_hook(store, host, runner, ui, paused, cfg, None)
+}
+
+/// То же, что `start`, с хуком итогов (режим раннера): хук слышит окончательное решение по задаче и может снять паузу отмены.
+pub fn start_with_hook(
+    store: Store,
+    host: Arc<dyn Host>,
+    runner: Runner,
+    ui: Reporter,
+    paused: Option<PauseReason>,
+    cfg: QueueConfig,
+    hook: Option<Arc<dyn SettleHook>>,
+) -> Queue {
     let (tx, rx) = channel();
     let view = Arc::new(Mutex::new(QueueView { running: None, paused, hold: None }));
-    let mut worker = Worker { store, host, runner, ui: ui.clone(), cfg, shared: view.clone(), policy: QueuePolicy::default(), totals: Summary::default() };
+    let mut worker =
+        Worker { store, host, runner, ui: ui.clone(), cfg, shared: view.clone(), policy: QueuePolicy::default(), totals: Summary::default(), hook };
     let spawned = std::thread::Builder::new().name("cs2cinema-queue".into()).spawn(move || {
         let mut last_error = String::new();
         loop {
@@ -392,7 +421,7 @@ impl Worker {
         rep.close_stage();
         let _ = jobs::finish(&self.store, job.id, &result);
         // готовый ролик открываем в плеере здесь, а не в `run_job`: тесты `pipeline` плеер не запускают
-        if self.cfg.open_results {
+        if opens_result(self.cfg.open_results, &job) {
             if let Ok(o) = &result {
                 if o.result.extension().is_some_and(|e| e == "mp4") {
                     ui::open_path(&o.result);
@@ -401,7 +430,17 @@ impl Worker {
         }
         // итог берётся до любых `requeue_*`: они стирают `fail_*` в базе
         let finished = Finished::of(job.id, &result);
-        let verdict = self.policy.after(job.auto_retries, &finished);
+        let mut verdict = self.policy.after(job.auto_retries, &finished);
+        // хук слышит только окончательное решение: промежуточный сбой запуска раннеру не отдаётся (T-08-05)
+        if verdict != Verdict::AutoRetry {
+            if let Some(hook) = &self.hook {
+                let advice = hook.on_settled(&job, &finished, &result);
+                // совет снимает только паузу отмены; остальные паузы остаются
+                if advice.suppress_pause && verdict == Verdict::Pause(PauseReason::Cancelled) {
+                    verdict = Verdict::Next;
+                }
+            }
+        }
         if verdict != Verdict::AutoRetry {
             self.totals.add(&finished);
         }
@@ -459,6 +498,12 @@ impl Worker {
             Err(e) => self.ui.send(Msg::Log(format!("авто-повтор не поставлен: {e}"))),
         }
     }
+}
+
+/// Открывать ли готовый ролик в плеере: только если так настроено и задача своя. Ролик чужой задачи сервера на экране
+/// автора не открывается.
+fn opens_result(open_results: bool, job: &Job) -> bool {
+    open_results && job.external_ref.is_none()
 }
 
 /// Текст паники из полезной нагрузки: `&str` или `String`.

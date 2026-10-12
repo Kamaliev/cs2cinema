@@ -8,6 +8,7 @@ mod match_page;
 mod mock;
 mod player;
 mod queue;
+mod remote;
 mod settings;
 mod settings_page;
 mod status;

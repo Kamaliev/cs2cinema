@@ -159,6 +159,8 @@ pub struct Job {
     pub auto_retries: u32,
     /// Партия приёмочного прогона (ACC-01); пусто — задача поставлена не приёмкой.
     pub batch: Option<String>,
+    /// Ссылка на выдачу задачи сервера (`srv:{id задачи}:{эпоха}`, фаза 8); пусто — задача локальная.
+    pub external_ref: Option<String>,
 }
 
 /// Сборка CS2 и версия HLAE последней удачной записи (D-04, DIF-01): с ней предпроверка сравнивает текущую сборку CS2.
@@ -261,7 +263,8 @@ CREATE TABLE IF NOT EXISTS demos (
 // 2 — прошедшее время сбоя и состояние записи для карточки (D-06);
 // 3 — отчёт предпроверки (`jobs.precheck`, JSON) и пара «сборка CS2 / версия HLAE» последней удачной записи (`last_good`, D-04);
 // 4 — номер попытки (`attempt`, D-10) и флаг «повтор с записи» (`resume`, RET-02);
-// 5 — счётчик авто-повторов (`auto_retries`, DIF-04) и партия приёмки (`batch`, ACC-01).
+// 5 — счётчик авто-повторов (`auto_retries`, DIF-04) и партия приёмки (`batch`, ACC-01);
+// 6 — ссылка на выдачу задачи сервера (`external_ref`, фаза 8).
 // Новая версия — только новым шагом в конце списка и только добавлением колонок или таблиц.
 // Элемент k поднимает схему до версии k+1; шаг идёт в одной транзакции со своим `user_version`.
 const MIGRATIONS: &[&str] = &[
@@ -282,6 +285,8 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE jobs ADD COLUMN resume INTEGER NOT NULL DEFAULT 0;",
     "ALTER TABLE jobs ADD COLUMN auto_retries INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE jobs ADD COLUMN batch TEXT;",
+    "ALTER TABLE jobs ADD COLUMN external_ref TEXT;
+     CREATE UNIQUE INDEX IF NOT EXISTS jobs_external_ref ON jobs(external_ref) WHERE external_ref IS NOT NULL;",
 ];
 
 /// Версия схемы, которую создаёт и ожидает эта сборка (число шагов `MIGRATIONS`).
@@ -387,6 +392,7 @@ impl Store {
             resume: r.get::<_, i64>("resume")? != 0,
             auto_retries: r.get::<_, i64>("auto_retries")?.max(0) as u32,
             batch: r.get("batch")?,
+            external_ref: r.get("external_ref")?,
         })
     }
 
@@ -562,6 +568,44 @@ impl Store {
                 params![id, now(), resume as i64],
             )?;
             Ok(())
+        })
+    }
+
+    /// Задача по ссылке на выдачу сервера (`external_ref`): совпадение точное, `srv:5:1` не находит `srv:5:12`.
+    pub fn job_by_external_ref(&self, r: &str) -> Result<Option<Job>> {
+        self.with(|c| c.query_row("SELECT * FROM jobs WHERE external_ref = ?1", [r], Self::row).optional())
+    }
+
+    /// Карточка задачи сервера (фаза 8): одна на пару «задача, выдача». Есть строка с этим `external_ref` — она в любом
+    /// статусе возвращается в очередь (сбрасываются этап, ошибка, сбой, предпроверка; `resume` как передан; прежняя папка
+    /// сохраняется, иначе берётся переданная); счётчик `auto_retries` не меняется — усыновление не ручной запуск. Строки нет —
+    /// создаётся новая в очереди. Всё в одной транзакции; возвращает id строки.
+    pub fn adopt_remote(&self, j: &NewJob, external_ref: &str, resume: bool, out_dir: Option<&Path>) -> Result<i64> {
+        let (sk, sv) = j.source.parts();
+        let t = now();
+        let dir = out_dir.map(|d| d.to_string_lossy().into_owned());
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            let found: Option<i64> = tx.query_row("SELECT id FROM jobs WHERE external_ref = ?1", [external_ref], |r| r.get(0)).optional()?;
+            let id = match found {
+                Some(id) => {
+                    tx.execute(
+                        "UPDATE jobs SET status = 'queued', stage = '', error = NULL, fail_code = NULL, fail_state = NULL, fail_hint = NULL, fail_tail = NULL, fail_elapsed_ms = NULL, phase = '', precheck = NULL, resume = ?2, out_dir = COALESCE(out_dir, ?3), updated_at = ?4 WHERE id = ?1",
+                        params![id, resume as i64, dir, t],
+                    )?;
+                    id
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO jobs (created_at, updated_at, kind, source_kind, source, label, hero_name, hero_steam, map, status, external_ref, resume, out_dir)
+                         VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, ?10, ?11)",
+                        params![t, j.kind.as_str(), sk, sv, j.label, j.hero_name, j.hero_steam as i64, j.map, external_ref, resume as i64, dir],
+                    )?;
+                    tx.last_insert_rowid()
+                }
+            };
+            tx.commit()?;
+            Ok(id)
         })
     }
 
@@ -933,13 +977,13 @@ mod tests {
             insert_old_job(&c);
         }
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 5);
+        assert_eq!(user_version(&s), schema_version() as i64);
         let j = s.jobs().unwrap().pop().unwrap();
         assert_eq!(j.error.as_deref(), Some("старая ошибка"));
         assert_eq!((j.auto_retries, j.batch), (0, None));
         drop(s);
         let s = Store::open(&db.0).unwrap();
-        assert_eq!(user_version(&s), 5, "повторное открытие ничего не меняет");
+        assert_eq!(user_version(&s), schema_version() as i64, "повторное открытие ничего не меняет");
         assert_eq!(s.jobs().unwrap().len(), 1);
     }
 
@@ -1177,5 +1221,110 @@ mod tests {
         let j = s.job(a).unwrap().unwrap();
         assert_eq!((j.status, j.error, j.fail_code, j.fail_state, j.fail_hint, j.fail_tail), (JobStatus::Running, None, None, None, None, None));
         assert_eq!((j.fail_elapsed_ms, j.phase.as_str()), (None, ""));
+    }
+
+    #[test]
+    fn version_five_database_gains_external_ref() {
+        let db = TempDb::new("v5");
+        {
+            let c = Connection::open(&db.0).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            for sql in &MIGRATIONS[..5] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.execute_batch("PRAGMA user_version = 5").unwrap();
+            insert_old_job(&c);
+        }
+        let s = Store::open(&db.0).unwrap();
+        assert_eq!(user_version(&s), schema_version() as i64);
+        assert_eq!(schema_version(), 6);
+        let j = s.jobs().unwrap().pop().unwrap();
+        assert_eq!(j.error.as_deref(), Some("старая ошибка"));
+        assert_eq!(j.external_ref, None, "старые строки — локальные задачи");
+        drop(s);
+        let s = Store::open(&db.0).unwrap();
+        assert_eq!(user_version(&s), schema_version() as i64, "повторное открытие ничего не меняет");
+        assert_eq!(s.jobs().unwrap().len(), 1);
+    }
+
+    fn remote_job() -> NewJob {
+        NewJob {
+            kind: JobKind::Record,
+            source: JobSource::File("remote/srv5.dem".into()),
+            label: "Задача с сервера #5".into(),
+            hero_name: "s1mple".into(),
+            hero_steam: 0,
+            map: String::new(),
+        }
+    }
+
+    #[test]
+    fn adopt_remote_creates_one_card_per_grant_and_requeues_it_in_any_status() {
+        let s = Store::in_memory().unwrap();
+        let first = s.adopt_remote(&remote_job(), "srv:5:1", false, None).unwrap();
+        let j = s.job(first).unwrap().unwrap();
+        assert_eq!((j.status, j.external_ref.as_deref(), j.resume), (JobStatus::Queued, Some("srv:5:1"), false));
+        assert_eq!((j.label.as_str(), j.hero_name.as_str(), j.source.clone()), ("Задача с сервера #5", "s1mple", JobSource::File("remote/srv5.dem".into())));
+
+        let again = s.adopt_remote(&remote_job(), "srv:5:1", false, None).unwrap();
+        assert_eq!(again, first, "та же выдача — та же карточка");
+        assert_eq!(s.jobs().unwrap().len(), 1, "новой строки не создаётся");
+        let other = s.adopt_remote(&remote_job(), "srv:5:2", false, None).unwrap();
+        assert_ne!(other, first, "новая эпоха — новая карточка");
+
+        // из «прервана» (после падения приложения)
+        s.start_job(first).unwrap();
+        s.set_phase(first, "take").unwrap();
+        s.set_out_dir(first, Path::new("out/srv5")).unwrap();
+        s.reset_running().unwrap();
+        let j = s.job(first).unwrap().unwrap();
+        assert_eq!((j.status, j.fail_code.as_deref()), (JobStatus::Interrupted, Some("INTERRUPTED")));
+        s.requeue_auto(first).unwrap();
+        s.start_job(first).unwrap();
+        s.finish_job(first, Err("упала")).unwrap();
+        s.requeue_auto(first).unwrap();
+        let retries = s.job(first).unwrap().unwrap().auto_retries;
+        assert_eq!(retries, 2);
+        s.start_job(first).unwrap();
+        s.reset_running().unwrap();
+        s.adopt_remote(&remote_job(), "srv:5:1", true, Some(Path::new("out/other"))).unwrap();
+        let j = s.job(first).unwrap().unwrap();
+        assert_eq!((j.status, j.error, j.fail_code, j.fail_state, j.fail_hint), (JobStatus::Queued, None, None, None, None));
+        assert_eq!((j.resume, j.auto_retries), (true, retries), "флаг как передан, счётчик авто-повторов прежний");
+        assert_eq!(j.out_dir, Some(PathBuf::from("out/srv5")), "прежняя папка сохраняется");
+
+        // из «ошибка»
+        s.start_job(first).unwrap();
+        s.finish_job(first, Err("упала")).unwrap();
+        s.adopt_remote(&remote_job(), "srv:5:1", false, None).unwrap();
+        let j = s.job(first).unwrap().unwrap();
+        assert_eq!((j.status, j.error, j.resume), (JobStatus::Queued, None, false));
+
+        // из «готово»
+        s.start_job(first).unwrap();
+        s.finish_job(first, Ok(&JobOutcome { out_dir: "out/srv5".into(), result: "out/srv5/highlights.mp4".into(), shots: 1, secs: 5.0 })).unwrap();
+        assert_eq!(s.job(first).unwrap().unwrap().status, JobStatus::Done);
+        s.adopt_remote(&remote_job(), "srv:5:1", true, None).unwrap();
+        let j = s.job(first).unwrap().unwrap();
+        assert_eq!((j.status, j.resume), (JobStatus::Queued, true));
+
+        // папки не было — берётся переданная
+        let fresh = s.adopt_remote(&remote_job(), "srv:6:1", true, Some(Path::new("out/srv6"))).unwrap();
+        assert_eq!(s.job(fresh).unwrap().unwrap().out_dir, Some(PathBuf::from("out/srv6")));
+        s.adopt_remote(&remote_job(), "srv:6:1", true, Some(Path::new("out/new"))).unwrap();
+        assert_eq!(s.job(fresh).unwrap().unwrap().out_dir, Some(PathBuf::from("out/srv6")), "прежняя папка важнее");
+    }
+
+    #[test]
+    fn job_by_external_ref_matches_the_whole_reference() {
+        let s = Store::in_memory().unwrap();
+        let short = s.adopt_remote(&remote_job(), "srv:5:1", false, None).unwrap();
+        let long = s.adopt_remote(&remote_job(), "srv:5:12", false, None).unwrap();
+        assert_eq!(s.job_by_external_ref("srv:5:1").unwrap().unwrap().id, short);
+        assert_eq!(s.job_by_external_ref("srv:5:12").unwrap().unwrap().id, long);
+        assert!(s.job_by_external_ref("srv:5").unwrap().is_none());
+        assert!(s.job_by_external_ref("srv:5:123").unwrap().is_none());
+        let local = s.add_job(&new_job(JobKind::Record)).unwrap();
+        assert_eq!(s.job(local).unwrap().unwrap().external_ref, None, "локальные задачи пишут NULL");
     }
 }

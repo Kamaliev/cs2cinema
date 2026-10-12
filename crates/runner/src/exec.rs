@@ -26,6 +26,8 @@ const VERIFY_DEADLINE: Duration = Duration::from_secs(60);
 pub struct Task {
     /// Номер задачи на сервере: уникален в папке раннера и служит `JobSpec.job_id`.
     pub job_id: i64,
+    /// Эпоха выдачи: вместе с `job_id` называет одну выдачу задачи.
+    pub epoch: i64,
     /// Номер попытки с единицы.
     pub attempt: u32,
     /// Скачанная и проверенная демка: `remote/srv{job_id}.dem`.

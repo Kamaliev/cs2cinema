@@ -435,3 +435,39 @@ fn held_reference_marks_the_card() {
     release.store(true, Ordering::SeqCst);
     assert!(!rig.hub.is_held(&card), "после закрытия записи карточка не удержана");
 }
+
+#[test]
+fn card_learns_map_and_player_from_the_preflight() {
+    let stand = Stand::start();
+    let id = stand.submit(&fake_demo(MIB), "s1mple");
+    let tools = TestDir::new("tools");
+    // дочерняя предпроверка отвечает картой: подпись карточки берётся из неё
+    let reply = super::testkit::OK_REPLY.replace("\"moments\"", "\"map\":\"de_mirage\",\"moments\"");
+    let host = pipeline::host::fake::FakeHost::new(
+        pipeline::host::fake::Scenario::happy(1)
+            .program("cs2-cli", &[reply.as_str()], Ok(pipeline::host::CmdOutput { code: Some(0), stderr_tail: Vec::new(), elapsed: Duration::ZERO }))
+            .program(
+                "ffprobe",
+                &[super::testkit::GOOD_PROBE],
+                Ok(pipeline::host::CmdOutput { code: Some(0), stderr_tail: Vec::new(), elapsed: Duration::ZERO }),
+            ),
+    );
+    let runner_dir = stand.runner_dir();
+    let factory = pipeline_factory(&host, &tools, runner_dir.clone(), move |_, spec, p| {
+        p.stage(Stage::Record);
+        let out_dir = runner_dir.join("out").join(format!("srv{}", spec.job_id));
+        p.artifact(&Artifact::OutDir(out_dir.clone()));
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let result = out_dir.join("highlights.mp4");
+        std::fs::write(&result, faststart_mp4()).unwrap();
+        Ok(Outcome { out_dir, result, shots: 1, secs: 5.0 })
+    });
+    let local = jobs::runner(Arc::new(Settings::default), Arc::new(host.clone()));
+    let mut rig = Rig::start(&stand, factory, local);
+
+    let done = wait_until(20, || stand.job(id).state == JobState::Done);
+    let card = rig.card_for(id).expect("карточка выдачи");
+    assert!(done, "за 20 с задача сервера не стала done: {:?}\n{}", stand.job(id).state, card.log);
+    assert_eq!((card.map.as_str(), card.hero_name.as_str()), ("de_mirage", "s1mple"), "{}", card.log);
+    assert!(rig.stop());
+}

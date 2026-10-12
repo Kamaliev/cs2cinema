@@ -480,6 +480,11 @@ impl Store {
         })
     }
 
+    /// Карта и игрок карточки по ответу предпроверки; пустое значение прежнее не затирает.
+    pub fn set_card_info(&self, _id: i64, _map: &str, _hero_name: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Папка известна до записи — чтобы у упавшей задачи карточка могла назвать record.log.
     pub fn set_out_dir(&self, id: i64, dir: &Path) -> Result<()> {
         self.with(|c| {
@@ -1393,5 +1398,24 @@ mod tests {
         assert!(s.job_by_external_ref("srv:5:123").unwrap().is_none());
         let local = s.add_job(&new_job(JobKind::Record)).unwrap();
         assert_eq!(s.job(local).unwrap().unwrap().external_ref, None, "локальные задачи пишут NULL");
+    }
+
+    #[test]
+    fn set_card_info_keeps_known_values_when_new_ones_are_empty() {
+        let s = Store::in_memory().unwrap();
+        let mut n = new_job(JobKind::Record);
+        n.map = String::new();
+        n.hero_name = String::new();
+        let id = s.add_job(&n).unwrap();
+        s.set_card_info(id, "de_mirage", "s1mple").unwrap();
+        let j = s.job(id).unwrap().unwrap();
+        assert_eq!((j.map.as_str(), j.hero_name.as_str()), ("de_mirage", "s1mple"));
+        s.set_card_info(id, "", "").unwrap();
+        let j = s.job(id).unwrap().unwrap();
+        assert_eq!((j.map.as_str(), j.hero_name.as_str()), ("de_mirage", "s1mple"), "пустые значения прежние не затирают");
+        s.set_card_info(id, "de_nuke", "").unwrap();
+        let j = s.job(id).unwrap().unwrap();
+        assert_eq!((j.map.as_str(), j.hero_name.as_str()), ("de_nuke", "s1mple"), "непустая карта заменяет, пустой игрок остаётся");
+        assert!(s.set_card_info(9999, "x", "y").is_ok(), "несуществующая строка — не ошибка");
     }
 }

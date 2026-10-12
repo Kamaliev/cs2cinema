@@ -9,7 +9,7 @@ use store::{Job, JobKind, JobStatus};
 
 use crate::{
     app::{App, Page, THUMB},
-    queue::{self, PauseReason},
+    queue::{self, PauseReason, QueueView},
     ui::{self, ACCENT, BAD, MUTED, OK},
 };
 
@@ -147,6 +147,30 @@ pub fn card_buttons(status: JobStatus, resumable: bool, has_dir: bool, busy: boo
         JobStatus::Done => CardButtons { retry: None, redo: false, open_dir: has_dir },
         JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling => CardButtons { retry: None, redo: false, open_dir: false },
     }
+}
+
+/// Кнопки карточки задачи сервера (D-01): у удержанной раннером нет никаких, «Заново» нет никогда.
+pub fn remote_card_buttons(status: JobStatus, resumable: bool, has_dir: bool, busy: bool, held: bool) -> CardButtons {
+    let _ = (status, resumable, has_dir, busy, held);
+    CardButtons { retry: None, redo: true, open_dir: true }
+}
+
+/// Заголовок карточки сервера, если карта и игрок неизвестны: её подпись «Задача с сервера #N».
+pub fn server_heading(j: &Job) -> Option<String> {
+    let _ = j;
+    Some(String::new())
+}
+
+/// Чего ждёт карточка в очереди приложения.
+pub fn waiting_reason(view: &QueueView, card: i64) -> String {
+    let _ = (view, card);
+    String::new()
+}
+
+/// Пояснение под подписью карточки сервера.
+pub fn server_note(j: &Job, held: bool, waiting: Option<&str>, result_exists: bool) -> Option<String> {
+    let _ = (j, held, waiting, result_exists);
+    Some(String::new())
 }
 
 fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
@@ -508,6 +532,7 @@ fn progress(app: &App, stage: &str) -> (f32, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use store::{JobSource, NewJob, Store};
 
     #[test]
     fn pause_banner_explains_a_repeated_environment_failure() {
@@ -585,5 +610,79 @@ mod tests {
         assert_eq!(stage_summary_text(&log).as_deref(), Some("по этапам: Скачивание 12 с · Разбор 4 с · Запись 4 мин 12 с"));
         assert_eq!(stage_summary_text("просто строка\nдругая"), None);
         assert_eq!(stage_summary_text(""), None);
+    }
+
+    /// Карточка в базе: локальная или с выдачей сервера.
+    fn card(server: bool, map: &str, hero: &str) -> Job {
+        let s = Store::in_memory().unwrap();
+        let new = NewJob {
+            kind: JobKind::Record,
+            source: JobSource::File("d.dem".into()),
+            label: "Задача с сервера #7".into(),
+            hero_name: hero.into(),
+            hero_steam: 0,
+            map: map.into(),
+        };
+        let id = if server { s.adopt_remote(&new, "srv:7:1", false, None).unwrap() } else { s.add_job(&new).unwrap() };
+        s.job(id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn remote_card_offers_retry_without_redo_and_nothing_while_held() {
+        use JobStatus::*;
+        for status in [Failed, Cancelled, Interrupted] {
+            assert_eq!(remote_card_buttons(status, true, true, false, false), CardButtons { retry: Some(true), redo: false, open_dir: true }, "{status:?}");
+            assert_eq!(remote_card_buttons(status, false, true, false, false).retry, Some(false), "без record.json «Повторить» неактивна: {status:?}");
+            assert_eq!(remote_card_buttons(status, true, true, true, false).retry, Some(false), "окно занято: {status:?}");
+            assert_eq!(
+                remote_card_buttons(status, true, true, false, true),
+                CardButtons { retry: None, redo: false, open_dir: false },
+                "удержанная карточка без кнопок: {status:?}"
+            );
+        }
+        assert_eq!(remote_card_buttons(Done, true, true, false, false), card_buttons(Done, true, true, false));
+        for status in [Running, Cancelling, Queued] {
+            assert_eq!(remote_card_buttons(status, true, true, false, false), CardButtons { retry: None, redo: false, open_dir: false }, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn server_card_without_map_and_player_is_titled_by_its_number() {
+        assert_eq!(server_heading(&card(true, "", "")).as_deref(), Some("Задача с сервера #7"));
+        assert_eq!(server_heading(&card(true, "", "s1mple")), None, "игрок известен — заголовок из карты и игрока");
+        assert_eq!(server_heading(&card(true, "de_mirage", "")), None);
+        assert_eq!(server_heading(&card(false, "", "")), None, "локальная карточка заголовок не меняет");
+    }
+
+    #[test]
+    fn server_note_explains_waiting_and_the_deleted_copy() {
+        let paused = QueueView { running: None, paused: Some(PauseReason::Cancelled), hold: None };
+        let other = QueueView { running: Some((3, crate::jobs::CancelToken::default())), paused: None, hold: None };
+        let hold = QueueView { running: None, paused: None, hold: Some((5, std::time::Instant::now())) };
+        let free = QueueView { running: None, paused: None, hold: None };
+        let reasons = [waiting_reason(&paused, 5), waiting_reason(&other, 5), waiting_reason(&hold, 5), waiting_reason(&free, 5)];
+        for (i, a) in reasons.iter().enumerate() {
+            assert!(!a.is_empty());
+            for b in &reasons[i + 1..] {
+                assert_ne!(a, b, "четыре разных причины ожидания");
+            }
+        }
+        assert!(reasons[0].contains("Продолжить"), "{}", reasons[0]);
+        assert!(reasons[1].contains("#3"), "{}", reasons[1]);
+        assert_eq!(waiting_reason(&hold, 6), waiting_reason(&free, 6), "авто-повтор чужой задачи ничего не объясняет");
+
+        let mut j = card(true, "", "");
+        j.status = JobStatus::Queued;
+        assert_eq!(server_note(&j, true, Some("идёт задача #3"), false).as_deref(), Some("ждёт очереди приложения: идёт задача #3"));
+        j.status = JobStatus::Interrupted;
+        let note = server_note(&j, true, None, false).unwrap();
+        assert!(note.starts_with("продолжится сама"), "{note}");
+        assert_eq!(server_note(&j, false, None, false), None, "не удержана — раннер её не продолжит");
+        j.status = JobStatus::Done;
+        assert_eq!(server_note(&j, false, None, false).as_deref(), Some("ролик отправлен на сервер, локальная копия удалена"));
+        assert_eq!(server_note(&j, false, None, true), None, "файл на месте — объяснять нечего");
+        let mut local = card(false, "", "");
+        local.status = JobStatus::Done;
+        assert_eq!(server_note(&local, false, None, false), None, "локальная карточка без пояснений");
     }
 }

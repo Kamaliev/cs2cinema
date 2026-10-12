@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 08
 current_phase_name: Режим раннера в приложении
 status: executing
-stopped_at: Completed 08-03-PLAN.md
-last_updated: "2026-10-12T13:09:51.693Z"
+stopped_at: Completed 08-04-PLAN.md
+last_updated: "2026-10-12T13:30:16.842Z"
 last_activity: 2026-10-12
 last_activity_desc: Phase 08 execution started
-state_head: eb383531d4c214a3353f1ab4cee6c6357737c4fd
+state_head: 96c85fe16f5a60b1acea543f3dc14046ff091a6d
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 33
-  completed_plans: 30
+  completed_plans: 31
   percent: 60
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 08 (Режим раннера в приложении) — EXECUTING
-Plan: 2 of 6
+Plan: 3 of 6
 Status: Ready to execute
 Last activity: 2026-10-12 — Phase 08 execution started
 
@@ -123,6 +123,7 @@ Progress: [██████░░░░] 60%
 | Phase 08 P01 | 40min | 2 tasks | 13 files |
 | Phase 08 P02 | 35min | 3 tasks | 10 files |
 | Phase 08 P03 | 45min | 3 tasks | 4 files |
+| Phase 08 P04 | 12 min | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -237,6 +238,8 @@ Recent decisions affecting current work:
 - [Phase 08]: 08-02: наблюдатель — Config.observer, Working один раз на удержание, Fatal один раз в конце run(); токен вычёркивается во всех строках события
 - [Phase 08]: 08-03: reset_running переводит удалённые queued и running в interrupted с текстом «продолжится сама» (Reset.interrupted_remote), пауза Interrupted только за локальные задачи
 - [Phase 08]: 08-03: любое p.cancelled() в потоке раннера (отмена сервера, потеря выдачи, остановка) — отмена не автором, пауза очереди не ставится; started в записи хаба снимается после сбоя без отмены
+- [Phase 08]: 08-04: смена адреса или токена при открытой карточке сервера откладывается (pending) и применяется в tick после закрытия карточки; хаб и queue_runner подключены к очереди всегда
+- [Phase 08]: 08-04: токен только в файле token каталога раннера: пустой файл, icacls /inheritance:r /grant:r (на не-Windows 0600), потом значение; при отказе токена нет (D-02)
 
 ### Pending Todos
 
@@ -266,6 +269,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-12T13:09:51.536Z
-Stopped at: Completed 08-03-PLAN.md
+Last session: 2026-10-12T13:30:16.692Z
+Stopped at: Completed 08-04-PLAN.md
 Resume file: None

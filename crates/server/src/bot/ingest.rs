@@ -76,17 +76,27 @@ const PATH_REJECTED_TEXT: &str =
     "Не удалось принять файл: он лежит не там, где ожидалось. Попробуйте прислать его ещё раз.";
 
 /// Игрок задачи (D-02): непустая подпись переопределяет сохранённого игрока.
-fn choose_player(bot: &Bot, user: &User, caption: Option<&str>) -> Option<String> {
-    let from_caption = caption
-        .map(|c| bot.core().redactor().clean(c.trim(), 64))
-        .map(|c| c.trim().to_owned())
-        .filter(|c| !c.is_empty());
-    from_caption.or_else(|| {
-        user.player_steam
-            .clone()
-            .or_else(|| user.player_name.clone())
-            .filter(|p| !p.trim().is_empty())
-    })
+/// Ник из подписи или остатка после ссылки проходит ту же проверку, что `/player` (WR-04): длинный или с
+/// управляющими символами не обрезается молча, а отклоняется с причиной. `Err` — готовый ответ другу.
+fn choose_player(
+    bot: &Bot,
+    user: &User,
+    caption: Option<&str>,
+) -> std::result::Result<String, String> {
+    let from_caption = caption.map(str::trim).filter(|c| !c.is_empty());
+    if let Some(raw) = from_caption {
+        return match super::commands::valid_player(raw) {
+            Ok(p) => Ok(bot.core().redactor().clean(&p, 64)),
+            Err(why) => Err(format!(
+                "Не принял ник из подписи: {why}. Напишите только ник игрока или SteamID64 (17 цифр)."
+            )),
+        };
+    }
+    user.player_steam
+        .clone()
+        .or_else(|| user.player_name.clone())
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| NO_PLAYER.to_owned())
 }
 
 /// Имя похоже на демку: `.dem` или `.dem.zst` без учёта регистра. Только дешёвый фильтр до скачивания:
@@ -170,8 +180,9 @@ fn precheck_text(bot: &Bot, user: &User, msg: &Message) -> Precheck {
     };
     let canonical = wire::faceit::canonical_url(&match_id);
     let caption = (!rest.is_empty()).then_some(rest);
-    let Some(player) = choose_player(bot, user, caption) else {
-        return Precheck::Reply(NO_PLAYER.to_owned());
+    let player = match choose_player(bot, user, caption) {
+        Ok(p) => p,
+        Err(text) => return Precheck::Reply(text),
     };
     if !is_replay(bot, msg) {
         let key = DedupKey::Faceit {
@@ -221,8 +232,9 @@ pub fn precheck(bot: &Bot, user: &User, msg: &Message) -> Precheck {
     let Some(doc) = &msg.document else {
         return precheck_text(bot, user, msg);
     };
-    let Some(player) = choose_player(bot, user, msg.caption.as_deref()) else {
-        return Precheck::Reply(NO_PLAYER.to_owned());
+    let player = match choose_player(bot, user, msg.caption.as_deref()) {
+        Ok(p) => p,
+        Err(text) => return Precheck::Reply(text),
     };
     // Размер и имя — до любых обращений к Telegram за файлом (BOT-04, BOT-11).
     let Some(size) = doc.file_size else {

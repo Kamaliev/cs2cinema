@@ -630,3 +630,36 @@ fn another_friends_duplicate_is_never_a_dead_end() {
     assert_eq!(mine.len(), 1, "своя задача поставлена: {:?}", jobs(&st));
     assert!(!chat_text(&st, OTHER).contains("/resend"));
 }
+
+/// WR-04: ник из подписи проходит ту же проверку, что `/player`: длинный и с переводом строки отклоняются
+/// ответом с причиной, молча не обрезаются и до `getFile` не доходят.
+#[test]
+fn bad_caption_nick_is_refused_with_a_reason_not_truncated() {
+    let st = BotStand::start();
+    st.add_friend(FRIEND, "вася");
+    let bytes = demo_bytes();
+    put(&st, "f1", "u1", &bytes);
+    let len = Some(bytes.len() as u64);
+
+    push(&st, FRIEND, "f1", "u1", "match.dem", len, &"я".repeat(70));
+    st.step();
+    assert!(
+        chat_text(&st, FRIEND).contains("Не принял ник из подписи"),
+        "{}",
+        chat_text(&st, FRIEND)
+    );
+    push(&st, FRIEND, "f1", "u1", "match.dem", len, "вот моя игра\nник s1mple");
+    st.step();
+    let link = "https://www.faceit.com/en/cs2/room/1-0f9a1b2c-3d4e-5f60-7182-93a4b5c6d7e8";
+    st.tg.push_update(
+        st.tg
+            .text_update(FRIEND, FRIEND, &format!("{link} a\u{202E}b")),
+    );
+    st.step();
+
+    let text = chat_text(&st, FRIEND);
+    assert_eq!(text.matches("Не принял ник из подписи").count(), 3, "{text}");
+    assert!(jobs(&st).is_empty(), "задач нет: {:?}", jobs(&st));
+    assert!(inbox(&st).is_empty(), "во входящие ничего не попало");
+    assert_eq!(st.tg.get_file_calls(), 0);
+}

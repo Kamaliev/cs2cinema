@@ -712,3 +712,67 @@ fn transient_get_file_errors_are_retried_later_permanent_ones_are_not() {
     assert_eq!(inbox(&st)[1].state, "rejected");
     assert!(chat_text(&st, FRIEND).contains("Не получилось принять файл"));
 }
+
+fn sql_ok(st: &BotStand, q: &str) {
+    sql(st, q);
+}
+
+/// WR-07: сбой необязательного кэша файла после постановки не оставляет задачу без `tg_jobs`.
+#[test]
+fn file_cache_failure_does_not_leave_the_job_without_notifications() {
+    let st = BotStand::start();
+    st.add_friend(FRIEND, "вася");
+    let bytes = demo_bytes();
+    put(&st, "f1", "u1", &bytes);
+    let len = Some(bytes.len() as u64);
+    sql_ok(
+        &st,
+        "CREATE TRIGGER no_cache BEFORE INSERT ON tg_files BEGIN SELECT RAISE(ABORT, 'database is locked'); END",
+    );
+    push(&st, FRIEND, "f1", "u1", "match.dem", len, "s1mple");
+    st.step();
+    let all = jobs(&st);
+    assert_eq!(all.len(), 1);
+    assert_eq!(inbox(&st)[0].state, "queued");
+    assert!(
+        store::tg_job(st.server.running().core().db(), all[0].id)
+            .unwrap()
+            .is_some(),
+        "строка tg_jobs создана"
+    );
+}
+
+/// WR-07: сбой посреди приёма не оставляет строку в `downloading` (лимиты не залипают до перезапуска), а следующая
+/// попытка привязывается к уже созданной задаче, не ставя вторую.
+#[test]
+fn error_inside_ingest_returns_the_row_to_pending_and_relinks_the_job() {
+    let st = BotStand::start();
+    st.add_friend(FRIEND, "вася");
+    let bytes = demo_bytes();
+    put(&st, "f1", "u1", &bytes);
+    let len = Some(bytes.len() as u64);
+    sql_ok(
+        &st,
+        "CREATE TRIGGER no_queue BEFORE UPDATE OF state ON tg_inbox WHEN NEW.state = 'queued' \
+         BEGIN SELECT RAISE(ABORT, 'database is locked'); END",
+    );
+    push(&st, FRIEND, "f1", "u1", "match.dem", len, "s1mple");
+    assert!(st.bot.step().is_err(), "ошибка приёма видна наружу");
+    assert_eq!(
+        inbox(&st)[0].state,
+        "pending",
+        "строка не залипла в downloading"
+    );
+    assert_eq!(jobs(&st).len(), 1, "задача уже создана");
+
+    sql_ok(&st, "DROP TRIGGER no_queue");
+    st.clock().advance(std::time::Duration::from_secs(60));
+    st.step();
+    assert_eq!(inbox(&st)[0].state, "queued");
+    assert_eq!(jobs(&st).len(), 1, "вторая задача не поставлена");
+    assert!(
+        store::tg_job(st.server.running().core().db(), jobs(&st)[0].id)
+            .unwrap()
+            .is_some()
+    );
+}

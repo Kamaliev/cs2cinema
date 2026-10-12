@@ -193,7 +193,7 @@ pub fn defer_inbox(db: &Db, row_id: i64, next_try_ms: i64, now_ms: i64) -> Resul
     db.write(|tx| {
         tx.execute(
             "UPDATE tg_inbox SET state = 'pending', attempts = attempts + 1, next_try_ms = ?2, updated_at = ?3
-             WHERE id = ?1",
+             WHERE id = ?1 AND state = 'downloading'",
             params![row_id, next_try_ms, now_ms],
         )
         .map(|_| ())

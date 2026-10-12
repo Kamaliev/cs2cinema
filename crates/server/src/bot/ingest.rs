@@ -533,11 +533,19 @@ fn is_transient(e: &TgError) -> bool {
 }
 
 /// Через сколько повторять: `retry_after` от Telegram, иначе 30 с, 2 мин, 8 мин (но не дольше 10 мин).
-fn backoff_ms(attempts: i64, e: &TgError) -> i64 {
-    if let TgError::Api { retry_after: Some(s), .. } = e {
-        return (*s as i64).clamp(1, 600) * 1000;
+fn backoff_ms(attempts: i64, retry_after: Option<u64>) -> i64 {
+    if let Some(s) = retry_after {
+        return (s as i64).clamp(1, 600) * 1000;
     }
     (30_000_i64 << (2 * attempts.clamp(0, 3))).min(600_000)
+}
+
+/// Срок повтора из ответа `429`, если Telegram его назвал.
+fn retry_after_of(e: &TgError) -> Option<u64> {
+    match e {
+        TgError::Api { retry_after, .. } => *retry_after,
+        _ => None,
+    }
 }
 
 /// Ошибка `getFile`: временную откладывает (строка снова `pending` с отсрочкой), пока попытки не кончились; остальное и
@@ -547,7 +555,7 @@ fn defer_or_reject(bot: &Bot, row: &store::InboxRow, e: &TgError) -> Result<bool
     let attempts = store::inbox_attempts(db, row.id)?;
     if is_transient(e) && attempts + 1 < MAX_INGEST_ATTEMPTS {
         let now = bot.now_ms();
-        store::defer_inbox(db, row.id, now + backoff_ms(attempts, e), now)?;
+        store::defer_inbox(db, row.id, now + backoff_ms(attempts, retry_after_of(e)), now)?;
         bot.log().warn(&format!(
             "бот: getFile не удался ({}), приём строки #{} отложен, попытка {}",
             bot.core().redactor().clean(&e.to_string(), 200),
@@ -598,8 +606,14 @@ fn remember_file(bot: &Bot, unique: Option<&str>, job_id: i64) -> Result<()> {
 
 /// Задача создана: привязать к строке, запомнить файл и поправить подтверждение на «Задача #N в очереди».
 fn queue_row(bot: &Bot, row: &store::InboxRow, job_id: i64) -> Result<bool> {
-    remember_file(bot, row.file_unique_id.as_deref(), job_id)?;
+    // Сначала привязка и `tg_jobs`: без них задача остаётся без уведомлений и доставки. Кэш файла необязателен (WR-07).
     store::mark_queued(bot.core().db(), row, job_id, bot.now_ms())?;
+    if let Err(e) = remember_file(bot, row.file_unique_id.as_deref(), job_id) {
+        bot.log().warn(&format!(
+            "бот: не удалось запомнить файл задачи #{job_id}: {}",
+            bot.core().redactor().clean(&e, 200)
+        ));
+    }
     let what = if row.kind == "faceit" {
         "ссылка FACEIT"
     } else {
@@ -761,10 +775,53 @@ fn other_duplicate(
 
 /// Берёт самую старую строку `pending`, скачивает файл (`getFile`) и ставит задачу через `Core::submit`.
 pub fn ingest_once(bot: &Bot) -> Result<bool> {
-    let db = bot.core().db();
-    let Some(mut row) = store::claim_pending(db, bot.now_ms())? else {
+    let Some(row) = store::claim_pending(bot.core().db(), bot.now_ms())? else {
         return Ok(false);
     };
+    match ingest_row(bot, row.clone()) {
+        Ok(done) => Ok(done),
+        Err(e) => {
+            // Любой сбой внутри (в том числе `database is locked`) не оставляет строку в `downloading`: иначе она
+            // до перезапуска сервера считалась бы в лимитах `admit` (WR-07).
+            release_after_error(bot, &row);
+            Err(e)
+        }
+    }
+}
+
+/// Возвращает строку, оставшуюся в `downloading` после ошибки, в `pending` с отсрочкой, а когда попытки кончились,
+/// отвергает с общим текстом. Свой сбой только пишет в журнал: наружу идёт исходная ошибка.
+fn release_after_error(bot: &Bot, row: &store::InboxRow) {
+    let db = bot.core().db();
+    let still_downloading =
+        matches!(store::inbox_row(db, row.id), Ok(Some(r)) if r.state == "downloading");
+    if !still_downloading {
+        return;
+    }
+    let attempts = store::inbox_attempts(db, row.id).unwrap_or(MAX_INGEST_ATTEMPTS);
+    let now = bot.now_ms();
+    let moved = if attempts + 1 < MAX_INGEST_ATTEMPTS {
+        store::defer_inbox(db, row.id, now + backoff_ms(attempts, None), now)
+    } else {
+        store::reject(db, row.id, "сбой записи на сервере", now).inspect(|_| {
+            bot.say(
+                row.chat_id,
+                "Не получилось принять файл: сервер не смог его записать. Пришлите его ещё раз.",
+            );
+        })
+    };
+    if let Err(e) = moved {
+        bot.log().warn(&format!(
+            "бот: строка приёма #{} застряла после сбоя: {}",
+            row.id,
+            bot.core().redactor().clean(&e, 200)
+        ));
+    }
+}
+
+/// Один захваченный ряд: `getFile`, постановка в очередь, привязка к `tg_jobs`.
+fn ingest_row(bot: &Bot, mut row: store::InboxRow) -> Result<bool> {
+    let db = bot.core().db();
     // Подтверждение могло не уйти (падение между записью и ответом): отправляем его до `getFile`.
     if row.status_message_id.is_none() {
         let text = ack_text(bot, row.id);
@@ -856,7 +913,8 @@ pub fn ingest_once(bot: &Bot) -> Result<bool> {
     }
     // Слой 2: тот же хеш и игрок, но под другим `file_unique_id` — новая копия лишняя.
     if let Some(dup) = other_duplicate(bot, &ingested.sha256, &key, job_id, row.user_id)? {
-        remember_file(bot, row.file_unique_id.as_deref(), dup.id)?;
+        // Кэш файла необязателен: его сбой не должен оставлять лишнюю копию в очереди.
+        let _ = remember_file(bot, row.file_unique_id.as_deref(), dup.id);
         if let Err(e) = bot.core().cancel(job_id, true) {
             bot.log().warn(&format!(
                 "бот: не удалось отменить лишнюю копию задачи #{job_id}: {e}"

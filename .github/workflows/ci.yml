@@ -50,3 +50,17 @@ jobs:
           name: cs2-cli-windows-x64
           path: target/release/cs2-cli.exe
           if-no-files-found: error
+
+  # сквозная цепочка: фейковый Telegram -> бот -> сервер -> раннер на FakeHost -> ролик в чате (OPS-03)
+  chain:
+    name: chain (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Dependency guard
+        run: cargo test --release -p server --test deps
+      - name: Chain test
+        run: cargo test --release -p runner --test chain -- --nocapture

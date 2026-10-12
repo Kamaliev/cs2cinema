@@ -210,6 +210,23 @@ impl Db {
         f(&conn)
     }
 
+    /// Консистентная копия живой базы в новый файл (`VACUUM INTO`): безопасно, пока сервер работает
+    /// (режим WAL). Команда идёт вне транзакции под мьютексом соединения. Существующий файл — ошибка:
+    /// копию нельзя перезаписать, SQLite отказал бы сам, но понятное сообщение лучше.
+    pub fn vacuum_into(&self, dest: &Path) -> Result<()> {
+        if dest.exists() {
+            let name = dest
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Err(format!("копия уже существует: {name}"));
+        }
+        let conn = self.lock();
+        conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Запись: транзакция `BEGIN IMMEDIATE`, коммит при `Ok`, откат при `Err`.
     pub fn write<T, E: From<String>>(
         &self,

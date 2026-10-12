@@ -30,6 +30,13 @@ const ENV_KEYS: &[&str] = &[
     "CS2_SERVER_BOT_QUEUE_MAX_ACTIVE",
     "CS2_SERVER_BOT_STATUS_EDIT_SECS",
     "CS2_SERVER_BOT_TRANSFER_TIMEOUT_MINS",
+    "CS2_SERVER_RETENTION_DEMO_HOURS",
+    "CS2_SERVER_RETENTION_FAILED_DEMO_HOURS",
+    "CS2_SERVER_RETENTION_RESULT_HOURS",
+    "CS2_SERVER_RETENTION_UNSENT_RESULT_HOURS",
+    "CS2_SERVER_RETENTION_PART_HOURS",
+    "CS2_SERVER_RETENTION_BOTAPI_HOURS",
+    "CS2_SERVER_CLEAN_INTERVAL_SECS",
     "CS2_SERVER_TELEGRAM_BOT_TOKEN",
     "TELEGRAM_BOT_TOKEN",
     "STATE_DIRECTORY",
@@ -713,5 +720,191 @@ fn job_show_prints_the_telegram_delivery_state() {
     let (code, out, err) = run(&["job", "show", "2", "--data-dir", &data]);
     assert_eq!(code, 0, "{err}");
     assert!(!out.contains("доставка в Telegram"), "{out}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Файлы копий в папке, по имени.
+fn backups_in(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            let n = p.file_name().unwrap().to_string_lossy().into_owned();
+            n.starts_with("server-") && n.ends_with(".db")
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Копия открывается как обычная база, проходит `integrity_check` и содержит `jobs` задач.
+fn assert_backup_is_whole(path: &Path, jobs: i64) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let check: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, jobs);
+}
+
+#[test]
+fn backup_makes_a_consistent_copy_and_keeps_only_the_newest() {
+    let d = test_dir("backup");
+    let data = data_arg(&d);
+    let demo = d.join("match.dem");
+    fake_demo(&demo, 256 * 1024);
+    let (code, _, err) = run(&[
+        "submit",
+        demo.to_str().unwrap(),
+        "--player",
+        "s1mple",
+        "--data-dir",
+        &data,
+    ]);
+    assert_eq!(code, 0, "{err}");
+
+    let target = d.join("backups");
+    for _ in 0..3 {
+        let (code, out, err) = run(&[
+            "backup",
+            target.to_str().unwrap(),
+            "--keep",
+            "2",
+            "--data-dir",
+            &data,
+        ]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("резервная копия:"), "{out}");
+    }
+    let copies = backups_in(&target);
+    assert_eq!(copies.len(), 2, "остаются две последние копии: {copies:?}");
+    assert_backup_is_whole(copies.last().unwrap(), 1);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&target), 0o700, "папка копий закрыта от чужих");
+        assert_eq!(
+            mode(copies.last().unwrap()),
+            0o600,
+            "копия закрыта от чужих"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn backup_leaves_foreign_files_alone() {
+    let d = test_dir("backup-foreign");
+    let data = data_arg(&d);
+    let target = d.join("backups");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("notes.txt"), b"mine").unwrap();
+    std::fs::write(target.join("server-old.db"), b"not ours").unwrap();
+    let (code, _, err) = run(&[
+        "backup",
+        target.to_str().unwrap(),
+        "--keep",
+        "1",
+        "--data-dir",
+        &data,
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(target.join("notes.txt").exists() && target.join("server-old.db").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn backup_while_the_server_runs_is_consistent() {
+    let srv = common::TestServer::start();
+    for _ in 0..3 {
+        srv.submit(&common::fake_demo(64 * 1024), "s1mple");
+    }
+    let d = test_dir("backup-live");
+    let target = d.join("backups");
+    let data = srv.dir.path.join("data");
+    let (code, out, err) = run(&[
+        "--data-dir",
+        data.to_str().unwrap(),
+        "backup",
+        target.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("резервная копия:"), "{out}");
+    let copies = backups_in(&target);
+    assert_eq!(copies.len(), 1);
+    assert_backup_is_whole(&copies[0], 3);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn backup_refuses_a_bad_keep() {
+    let d = test_dir("backup-keep");
+    let data = data_arg(&d);
+    let target = d.join("backups");
+    for bad in ["0", "1001", "abc"] {
+        let (code, _, err) = run(&[
+            "backup",
+            target.to_str().unwrap(),
+            "--keep",
+            bad,
+            "--data-dir",
+            &data,
+        ]);
+        assert_eq!(code, 2, "--keep {bad}: {err}");
+        assert!(err.contains("--keep: нужно число от 1 до 1000"), "{err}");
+    }
+    assert!(!target.exists(), "при ошибке разбора папка не создаётся");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn clean_dry_run_prints_counts_and_deletes_nothing() {
+    let d = test_dir("clean-dry");
+    let data = data_arg(&d);
+    let demo = d.join("match.dem");
+    fake_demo(&demo, 64 * 1024);
+    let (code, _, err) = run(&[
+        "submit",
+        demo.to_str().unwrap(),
+        "--player",
+        "s1mple",
+        "--data-dir",
+        &data,
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let (code, out, err) = run(&["clean", "--dry-run", "--data-dir", &data]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("уборка (проверка):"), "{out}");
+    assert!(out.contains("демок 0"), "{out}");
+    assert!(d.join("data/blobs/incoming/1/demo").exists());
+    // Настоящий проход тоже не трогает демку задачи в очереди.
+    let (code, out, err) = run(&["clean", "--data-dir", &data]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("уборка:") && out.contains("демок 0"), "{out}");
+    assert!(d.join("data/blobs/incoming/1/demo").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn config_show_prints_retention_keys() {
+    let d = test_dir("show-retention");
+    let (code, out, err) = run(&["config", "show", "--data-dir", &data_arg(&d)]);
+    assert_eq!(code, 0, "{err}");
+    for line in [
+        "retention_demo_hours = 24",
+        "retention_failed_demo_hours = 72",
+        "retention_result_hours = 24",
+        "retention_unsent_result_hours = 168",
+        "retention_part_hours = 6",
+        "retention_botapi_hours = 6",
+        "clean_interval_secs = 600",
+    ] {
+        assert!(out.contains(line), "нет строки «{line}»: {out}");
+    }
     let _ = std::fs::remove_dir_all(&d);
 }

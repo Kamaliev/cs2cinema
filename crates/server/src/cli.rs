@@ -6,6 +6,7 @@
 use crate::Result;
 use crate::auth;
 use crate::bot::store::TgJob;
+use crate::clean::CleanMode;
 use crate::clock::SystemClock;
 use crate::config::{self, Flags};
 use crate::core::{Core, CoreOptions, FileRow, JobRow, Submit};
@@ -15,7 +16,7 @@ use crate::tg::Tg;
 use crate::tg::http::HttpTg;
 use crate::users;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,7 +36,9 @@ cs2-server — сервер очереди монтажа
   runner revoke {имя}                                    отозвать токен раннера
   user add {имя} [--tg {id}] [--admin]                   добавить пользователя
   user list                                              список пользователей
-  config show                                            итоговые настройки (токен бота скрыт)
+  backup {папка} [--keep N]                              резервная копия базы (VACUUM INTO), хранит N последних, по умолчанию 14
+  clean [--dry-run]                                      один проход уборки по срокам; с --dry-run только показать
+  config show                                           итоговые настройки (токен бота скрыт)
   bot check                                              проверить связь с локальным telegram-bot-api (getMe)
 
 Общие флаги:
@@ -43,6 +46,8 @@ cs2-server — сервер очереди монтажа
   --data-dir {папка}   папка данных (база server.db и blobs/)
   --bind {адрес}       адрес HTTP (по умолчанию 127.0.0.1:8080)
   --threads {n}        число обработчиков HTTP (по умолчанию 16)
+  --keep {N}           сколько последних копий хранить (backup; от 1 до 1000, по умолчанию 14)
+  --dry-run            ничего не удалять, только показать (clean)
   -h, --help           эта справка
 
 Порядок настроек: умолчания < файл < переменные окружения < флаги.
@@ -56,6 +61,11 @@ cs2-server — сервер очереди монтажа
   CS2_SERVER_BOT_API_RESULTS_PREFIX, CS2_SERVER_BOT_SEND_AS (video | document),
   CS2_SERVER_BOT_USER_MAX_ACTIVE, CS2_SERVER_BOT_ADMIN_MAX_ACTIVE, CS2_SERVER_BOT_QUEUE_MAX_ACTIVE,
   CS2_SERVER_BOT_STATUS_EDIT_SECS, CS2_SERVER_BOT_TRANSFER_TIMEOUT_MINS.
+Сроки хранения и уборка (часы; в файле настроек — ключи того же имени строчными):
+  CS2_SERVER_RETENTION_DEMO_HOURS, CS2_SERVER_RETENTION_FAILED_DEMO_HOURS,
+  CS2_SERVER_RETENTION_RESULT_HOURS, CS2_SERVER_RETENTION_UNSENT_RESULT_HOURS,
+  CS2_SERVER_RETENTION_PART_HOURS, CS2_SERVER_RETENTION_BOTAPI_HOURS,
+  CS2_SERVER_CLEAN_INTERVAL_SECS (период потока уборки, секунд).
 ";
 
 #[derive(Default)]
@@ -70,7 +80,14 @@ struct Args {
     force: bool,
     bind: Option<String>,
     threads: Option<usize>,
+    keep: Option<usize>,
+    dry_run: bool,
 }
+
+const KEEP_HINT: &str = "--keep: нужно число от 1 до 1000";
+
+/// Сколько копий хранить, если `--keep` не задан.
+const DEFAULT_KEEP: usize = 14;
 
 enum CliError {
     /// Ошибка разбора: печатается справка.
@@ -116,6 +133,16 @@ fn parse_args(args: Vec<String>) -> std::result::Result<Args, CliError> {
                         .map_err(|_| CliError::Usage("--threads: нужно целое число".to_owned()))?,
                 )
             }
+            "--keep" => {
+                let n: usize = value("--keep")?
+                    .parse()
+                    .map_err(|_| CliError::Usage(KEEP_HINT.to_owned()))?;
+                if !(1..=1000).contains(&n) {
+                    return Err(CliError::Usage(KEEP_HINT.to_owned()));
+                }
+                out.keep = Some(n);
+            }
+            "--dry-run" => out.dry_run = true,
             s if s.starts_with("--") => {
                 return Err(CliError::Usage(format!("неизвестный флаг {s}")));
             }
@@ -225,6 +252,102 @@ fn show_config(loaded: &config::Loaded) {
         "bot_transfer_timeout_mins = {}",
         c.bot_transfer_timeout_mins
     );
+    println!("retention_demo_hours = {}", c.retention_demo_hours);
+    println!(
+        "retention_failed_demo_hours = {}",
+        c.retention_failed_demo_hours
+    );
+    println!("retention_result_hours = {}", c.retention_result_hours);
+    println!(
+        "retention_unsent_result_hours = {}",
+        c.retention_unsent_result_hours
+    );
+    println!("retention_part_hours = {}", c.retention_part_hours);
+    println!("retention_botapi_hours = {}", c.retention_botapi_hours);
+    println!("clean_interval_secs = {}", c.clean_interval_secs);
+}
+
+/// Имя копии: `server-ГГГГММДД-ЧЧММСС-мс.db` по UTC. Миллисекунды нужны, чтобы две копии в одну секунду
+/// не столкнулись, а сортировка по имени совпадала с порядком создания.
+fn backup_name(now: chrono::DateTime<chrono::Utc>) -> String {
+    format!("server-{}.db", now.format("%Y%m%d-%H%M%S-%3f"))
+}
+
+/// Имя файла — наша копия: строго `server-` + 8 цифр + `-` + 6 цифр + `-` + 3 цифры + `.db`.
+fn is_backup_name(name: &str) -> bool {
+    let Some(mid) = name
+        .strip_prefix("server-")
+        .and_then(|n| n.strip_suffix(".db"))
+    else {
+        return false;
+    };
+    let parts: Vec<&str> = mid.split('-').collect();
+    parts.len() == 3
+        && [8, 6, 3]
+            .iter()
+            .zip(&parts)
+            .all(|(len, p)| p.len() == *len && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Создаёт папку копий; на Linux новая папка получает права 0700 (в копиях хеши токенов и Telegram-ID).
+fn create_backup_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("папка копий {}: {e}", dir.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir).map_err(|e| format!("папка копий {}: {e}", dir.display()))
+    }
+}
+
+/// Оставляет в папке `keep` последних копий; чужие файлы не трогает. Возвращает число удалённых.
+fn prune_backups(dir: &Path, keep: usize) -> Result<usize> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| format!("папка копий {}: {e}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| is_backup_name(n))
+        .collect();
+    names.sort();
+    let excess = names.len().saturating_sub(keep);
+    let mut removed = 0;
+    for name in names.into_iter().take(excess) {
+        std::fs::remove_file(dir.join(&name)).map_err(|e| format!("удаление копии {name}: {e}"))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// `backup`: копия живой базы, затем ротация. Возвращает строку для печати.
+fn make_backup(core: &Core, dir: &Path, keep: usize) -> Result<String> {
+    create_backup_dir(dir)?;
+    let path = dir.join(backup_name(chrono::Utc::now()));
+    core.db().vacuum_into(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("права копии {}: {e}", path.display()))?;
+    }
+    let size = std::fs::metadata(&path)
+        .map_err(|e| format!("копия {}: {e}", path.display()))?
+        .len();
+    let removed = prune_backups(dir, keep)?;
+    Ok(format!(
+        "резервная копия: {} ({:.1} МиБ); удалено старых: {removed}",
+        path.display(),
+        size as f64 / (1024.0 * 1024.0)
+    ))
 }
 
 fn execute(
@@ -420,6 +543,51 @@ fn execute(
             );
             Ok(())
         }
+        ["backup", dir] => {
+            let core = open_core(&a, env, redactor)?;
+            let keep = a.keep.unwrap_or(DEFAULT_KEEP);
+            println!("{}", make_backup(&core, Path::new(dir), keep)?);
+            Ok(())
+        }
+        ["clean"] => {
+            let loaded = load_config(&a, env, redactor)?;
+            let c = &loaded.config;
+            let core = Core::open(CoreOptions {
+                data_dir: c.data_dir.clone(),
+                limits: c.limits(),
+                clock: Arc::new(SystemClock),
+                redactor: redactor.clone(),
+            })?;
+            // Рабочую папку bot-api чистим, только когда бот включён настройками (задан адрес bot-api).
+            let root = c
+                .bot_api_url
+                .as_ref()
+                .map(|_| c.bot_settings().files_root_local);
+            let mode = if a.dry_run {
+                CleanMode::DryRun
+            } else {
+                CleanMode::Apply
+            };
+            let done = core.clean(&c.retention(), root.as_deref(), mode)?;
+            if a.dry_run {
+                println!("уборка (проверка): {}", done.summary());
+                let ids = |v: &[i64]| {
+                    v.iter()
+                        .map(|id| format!("#{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                if !done.demos.is_empty() {
+                    println!("задачи, чьи демки убрали бы: {}", ids(&done.demos));
+                }
+                if !done.results.is_empty() {
+                    println!("задачи, чьи ролики убрали бы: {}", ids(&done.results));
+                }
+            } else {
+                println!("уборка: {}", done.summary());
+            }
+            Ok(())
+        }
         ["config", "show"] => {
             let loaded = load_config(&a, env, redactor)?;
             show_config(&loaded);
@@ -524,6 +692,18 @@ fn utc(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_our_backup_names_are_pruned() {
+        assert!(is_backup_name("server-20261012-153045-007.db"));
+        assert!(!is_backup_name("server-20261012-153045.db"));
+        assert!(!is_backup_name("server-20261012-153045-007.db-wal"));
+        assert!(!is_backup_name("server-2026101a-153045-007.db"));
+        assert!(!is_backup_name("notes.txt"));
+        let t = chrono::DateTime::from_timestamp_millis(1_700_000_000_007).unwrap();
+        assert_eq!(backup_name(t), "server-20231114-221320-007.db");
+        assert!(is_backup_name(&backup_name(t)));
+    }
 
     #[test]
     fn utc_formats_known_instants() {

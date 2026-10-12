@@ -1,6 +1,6 @@
 ---
 phase: 07-telegram-bot-i-dostavka
-verified: 2026-10-12T00:00:00Z
+verified: 2026-10-12T12:00:00Z
 status: human_needed
 score: 4/5 must-haves verified
 covered_files:
@@ -72,9 +72,15 @@ covered_files:
   - crates/server/tests/tg_http.rs
   - crates/wire/src/faceit.rs
   - crates/wire/src/lib.rs
-covered_digest: "v3:sha256:acfa5c21b114660a353843d2b7c814eb6b7037e9a6d84f06a7bfc27cc5619436"
+covered_digest: "v3:sha256:483ecb909030a88e15c0ec4527875af53b571463c521020edfd9680743247631"
 behavior_unverified: 0
 overrides_applied: 0
+re_verification:
+  previous_status: human_needed
+  previous_score: 4/5
+  gaps_closed: []
+  gaps_remaining: []
+  regressions: []
 human_verification:
   - test: "Живая цепочка: демка друга через бота на локальном `telegram-bot-api --local` → `cs2-server serve` → `cs2-cli runner` с настоящими CS2 и HLAE → ролик в чате друга"
     expected: "Подтверждение с местом в очереди сразу; правки статуса не чаще раза в 10 с с этапом и «дубль k из n»; ролик приходит новым сообщением, воспроизводится на телефоне и в Telegram Desktop; `job show` показывает «доставка в Telegram: sent»"
@@ -96,13 +102,13 @@ human_verification:
 # Фаза 7: Telegram-бот и доставка — отчёт о проверке
 
 **Цель фазы:** Автор и друзья из белого списка отправляют боту демку файлом (до 2 ГБ через локальный `telegram-bot-api`) или ссылку FACEIT, видят место в очереди и ход записи и получают готовый ролик новым сообщением или понятную причину сбоя, а незнакомцы не могут занять ни диск, ни очередь.
-**Проверено:** 2026-10-12
+**Проверено:** 2026-10-12 (повторно, после исправлений код-ревью)
 **Статус:** human_needed
-**Повторная проверка:** нет, первичная
+**Повторная проверка:** да — после исправлений код-ревью (`07-REVIEW-FIX.md`, 12 из 12: CR-01, CR-02, WR-01…WR-10; коммиты c1910fc…e08b5af); прежних gaps не было, регрессий нет
 
 ## Итог
 
-Всё, что можно доказать кодом и тестами на фейках, подтверждено: `cargo test --workspace --release` выполнен в этой проверке заново, код выхода 0, 68 строк `test result: ok`, 864 пройдено, 0 упало, 1 игнорируемый (`host`, окно на рабочем столе, ручной запуск). `crates/cli/tests/pipeline.rs` зелёный. Бот-тесты: `bot_access` 12, `bot_ingest` 16, `bot_status` 8, `bot_delivery` 11, `bot_faceit` 7, `bot_flow` 11, `bot_e2e` 5, `core_bot` 9, `tg_http` 7, `secrets` 7, плюс `runner/tests/faceit_flow.rs`. Критерий 5 (живой стенд) и живые части критериев 2–4 не доказаны: план 07-11 пропущен по решению автора (07-11-SUMMARY.md: `status: skipped-by-author`; `07-SPIKE.md`, `07-LIVE-STAND.md`, `evidence/` не созданы). Они не засчитаны как пройденные и вынесены в `human_verification`. Невыполненных по коду пунктов (gaps) нет. Долг оформлен так же, как 06-11 в фазе 6.
+Всё, что можно доказать кодом и тестами на фейках, подтверждено: `cargo test --workspace --release` выполнен в этой проверке заново на коде после исправлений ревью, код выхода 0, 68 строк `test result: ok`, 876 пройдено (было 864: +12 регрессионных тестов исправлений), 0 упало, 1 игнорируемый (`host`, окно на рабочем столе, ручной запуск). `crates/cli/tests/pipeline.rs` зелёный. Бот-тесты: `bot_access` 12, `bot_ingest` 21, `bot_status` 10, `bot_delivery` 14, `bot_faceit` 7, `bot_flow` 11, `bot_e2e` 5, `core_bot` 9, `tg_http` 7, `secrets` 7, плюс `runner/tests/faceit_flow.rs`. Критерий 5 (живой стенд) и живые части критериев 2–4 не доказаны: план 07-11 пропущен по решению автора (07-11-SUMMARY.md: `status: skipped-by-author`; `07-SPIKE.md`, `07-LIVE-STAND.md`, `evidence/` не созданы). Они не засчитаны как пройденные и вынесены в `human_verification`. Невыполненных по коду пунктов (gaps) нет. Исправления код-ревью (миграция схемы базы сервера до версии 3 — колонки `tg_inbox.attempts` и `tg_inbox.next_try_ms`, новый порядок `/retry`, доставка по `file_id`, повтор отчёта админам, запись итога доставки) прочитаны в коде и проверены запуском тестов; отдельный раздел ниже. Долг оформлен так же, как 06-11 в фазе 6.
 
 ## Достижение цели
 
@@ -117,6 +123,27 @@ human_verification:
 | 5 | Демка друга проходит всю цепочку на реальном стенде; токен бота не в журналах и сообщениях | ? UNCERTAIN (human_needed) | Не выполнялось (07-11 пропущен автором). Заменители на фейках: `running_server_with_the_bot_turns_a_friend_demo_into_a_delivered_video` и `serve_starts_the_bot_against_a_local_bot_api_and_stops_quickly` (настоящий `serve`, `HttpTg` против поддельного Bot API на loopback, быстрая остановка), `bot_failing_getme_stops_serve_with_a_clear_error`, `non_loopback_or_cloud_url_is_refused`, `closed_port_error_has_no_token_in_any_form`, `bot_token_never_leaves_config_errors_or_config_show`, `bot_token_in_tilde_form_is_masked_everywhere`. |
 
 **Счёт:** 4/5 истин подтверждены; истина 5 (живой стенд) — человеку. У истины 4 есть живая часть в `human_verification`.
+
+### Исправления код-ревью (повторная проверка)
+
+Сверено с кодом на HEAD, а не с `07-REVIEW-FIX.md`; поведенческие пункты подтверждены зелёными регрессионными тестами в запуске выше.
+
+| Находка | Что в коде | Тест | Статус |
+|---------|-----------|------|--------|
+| CR-01 путь `getFile` вида `/var/lib/…` на Windows | `ingest::safe_local_path` зовёт `config::is_abs` (`pub(crate)`, `is_absolute() || has_root()`) | `unix_style_path_from_foreign_bot_api_is_accepted_on_windows`, `relative_path_and_parent_components_are_rejected` | ✓ VERIFIED |
+| CR-02 `/retry`: `tg_jobs` раньше вызова Telegram | `commands::retry_cmd`: `insert_tg_job` (`status_message_id: None`) до `bot.say`; при сбое вставки задача снимается `cancel(.., true)`; номер сообщения дописывается `set_status_message` | `retry_records_the_delivery_row_even_when_the_confirmation_is_lost` (порядок проверен чтением кода, тест — по итоговому состоянию) | ✓ VERIFIED |
+| WR-01 дубли по всем пользователям | `Core::find_duplicate_for`: своя задача или чужая не `Done` | тесты `bot_ingest`/`bot_status` | ✓ VERIFIED |
+| WR-02 тишина после перезапуска | `store::recover` возвращает номера, `Bot::recover` → `deliver::tell_uncertain_after_restart` | `sending_delivery_becomes_uncertain_after_restart_without_a_resend` | ✓ VERIFIED |
+| WR-03 `/retry` и дубли | `DedupKey` по хешу или ссылке + `find_duplicate_for` до `resubmit` | `second_retry_of_the_same_job_does_not_queue_a_copy` | ✓ VERIFIED |
+| WR-04 ник из подписи | `choose_player` → `Result`, `valid_player` | `bad_caption_nick_is_refused_with_a_reason_not_truncated` | ✓ VERIFIED |
+| WR-05 временный сбой `getFile` | миграция 3, `claim_pending` по `next_try_ms`, `defer_or_reject`/`backoff_ms`, предел попыток | `transient_get_file_errors_are_retried_later_permanent_ones_are_not` | ✓ VERIFIED |
+| WR-06 файл остаётся в bot-api | `OriginalGuard` (удаление в `Drop`), удаление при несовпадении размера внутри корня | `size_mismatch_is_refused` | ✓ VERIFIED |
+| WR-07 строка застревает в `downloading` | `ingest_once` → `release_after_error`; `queue_row`: `mark_queued` раньше `remember_file` | тесты с триггерами в `bot_ingest` | ✓ VERIFIED |
+| WR-08 `/resend` блокирует опрос | `deliver_once` шлёт по `result_file_id` в потоке доставки, `400` → отправка с файла | `resend_of_a_sent_video_is_left_to_the_delivery_thread` | ✓ VERIFIED |
+| WR-09 отчёт админам теряется | `store::unclaim_admin_report` при ошибке или если ничего точно не ушло | `admin_report_is_retried_when_the_send_definitely_failed` | ✓ VERIFIED |
+| WR-10 потеря записи итога | `with_retries` (3 попытки), `outcome_lost` → `uncertain` + сообщение другу | `lost_outcome_write_turns_into_uncertain_and_a_message` | ✓ VERIFIED |
+
+Миграция схемы 3 добавляет только колонки с `DEFAULT`, существующие базы поднимаются сами (шаг в `MIGRATIONS` в `db.rs`, тесты базы зелёные). Info-находки IN-01…IN-06 по заданию не трогались и на цель фазы не влияют.
 
 ### Отложенные пункты (Step 9b)
 
@@ -165,16 +192,16 @@ human_verification:
 
 ### Предупреждения и остаточные риски
 
-- Код-ревью фазы 7 (07-REVIEW.md) не проводилось; рекомендуется `/gsd-code-review 7` до закрытия фазы.
+- Код-ревью фазы 7 проведено (`07-REVIEW.md`: 2 критических, 10 предупреждений, 6 info), все 12 находок в области исправлены (`07-REVIEW-FIX.md`). Повторное ревью после исправлений не запускалось; Info-находки открыты. Тесты проверяют сценарии исправлений на `FakeTelegram` и настоящем сервере с базой, но не все сочетания состояний (например, порядок CR-02 «вставка раньше вызова Telegram» тест видит только по итоговому состоянию).
 - WR-03 фазы 5 (таймауты медленных клиентов) остаётся для фазы 9: порт `cs2-server` слушает только loopback или Tailscale.
 - Умолчание `bot_send_as = video` без метаданных видео (A3) не проверено на настоящем Telegram; при провале спайка — смена умолчания или расширение протокола (`/gsd-plan-phase 07 --gaps`).
 - Допущение: «число попыток» в отчёте админа — число выдач раннеру (`grants`).
 
 ### Резюме
 
-Нереализованных по коду требований нет: BOT-01…BOT-11 имеют реализацию, проводку и тесты на фейках и настоящем `server::serve`. Статус `human_needed` отражает только то, что спайк и живой стенд (07-11, критерий 5) автор пропустил осознанно; эти пункты остаются долгом ручной проверки и не считаются выполненными.
+Нереализованных по коду требований нет (в том числе после исправлений ревью): BOT-01…BOT-11 имеют реализацию, проводку и тесты на фейках и настоящем `server::serve`. Статус `human_needed` отражает только то, что спайк и живой стенд (07-11, критерий 5) автор пропустил осознанно; эти пункты остаются долгом ручной проверки и не считаются выполненными.
 
 ---
 
-_Verified: 2026-10-12_
+_Verified: 2026-10-12 (повторно)_
 _Verifier: Claude (gsd-verifier)_

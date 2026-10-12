@@ -1,0 +1,31 @@
+коммитов в origin/main..HEAD: 380
+класс bot-token: контроль 1; коммитов 8; файлов 10
+  .planning/phases/05-yadro-servera-i-protokol/05-01-PLAN.md — НУЖНО ПРОВЕРИТЬ АВТОРУ (строк 1, из них с подставным маркером 1)
+  .planning/phases/05-yadro-servera-i-protokol/05-04-PLAN.md — НУЖНО ПРОВЕРИТЬ АВТОРУ (строк 1, из них с подставным маркером 1)
+  .planning/phases/05-yadro-servera-i-protokol/05-RESEARCH.md — НУЖНО ПРОВЕРИТЬ АВТОРУ (строк 1, из них с подставным маркером 1)
+  .planning/phases/07-telegram-bot-i-dostavka/07-05-PLAN.md — НУЖНО ПРОВЕРИТЬ АВТОРУ (строк 1, из них с подставным маркером 1)
+  crates/server/src/config.rs — тестовый подставной (строк 1, из них с подставным маркером 1)
+  crates/server/src/secret.rs — тестовый подставной (строк 1, из них с подставным маркером 1)
+  crates/server/tests/bot_e2e.rs — тестовый подставной (строк 2, из них с подставным маркером 2)
+  crates/server/tests/operator.rs — тестовый подставной (строк 2, из них с подставным маркером 1)
+  crates/server/tests/secrets.rs — тестовый подставной (строк 1, из них с подставным маркером 1)
+  crates/server/tests/tg_http.rs — тестовый подставной (строк 1, из них с подставным маркером 1)
+класс faceit-key: контроль 1; коммитов 0; файлов 0
+класс telegram-api: контроль 1; коммитов 0; файлов 0
+класс runner-token: контроль 1; коммитов 0; файлов 0
+класс server-config: контроль 1; коммитов 6; файлов 6
+  .planning/phases/05-yadro-servera-i-protokol/05-01-PLAN.md — НУЖНО ПРОВЕРИТЬ АВТОРУ (строк 3, из них с подставным маркером 1)
+  .planning/phases/05-yadro-servera-i-protokol/05-RESEARCH.md — НУЖНО ПРОВЕРИТЬ АВТОРУ (строк 1, из них с подставным маркером 1)
+  crates/server/cs2-server.example.json — НУЖНО ПРОВЕРИТЬ АВТОРУ (строк 3, из них с подставным маркером 0)
+  crates/server/src/config.rs — НУЖНО ПРОВЕРИТЬ АВТОРУ (строк 4, из них с подставным маркером 0)
+  crates/server/tests/bot_e2e.rs — тестовый подставной (строк 1, из них с подставным маркером 0)
+  crates/server/tests/common/mod.rs — тестовый подставной (строк 1, из них с подставным маркером 0)
+класс secret-files: файлов 0
+класс exact-values: не проверено — нет файла образцов, решение за автором (Task 3)
+
+примечание исполнителя (значения не выводились; просмотр с маскированием совпадений):
+  - в файлах плана и исследования фазы 5 и 7 (.planning/…) совпадения — подставные значения из описаний тестов (123456789:…, SENTINEL), класс bot-token, server-config;
+  - cs2-server.example.json и crates/server/src/config.rs: у ключа telegram_bot_token значение null или имя поля/типа, настоящего значения нет;
+  - файла образцов %LOCALAPPDATA%\cs2cinema\drills\patterns.txt нет, класс exact-values не проверен — решение за автором на точке Task 3.
+  - классы faceit-key, telegram-api, runner-token, secret-files: совпадений в origin/main..HEAD нет (контроль выражений 1).
+пометку «НУЖНО ПРОВЕРИТЬ АВТОРУ» снимает только автор.

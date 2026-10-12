@@ -9,10 +9,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# новый push в ту же ветку отменяет прежний незаконченный прогон
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -22,6 +28,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Dependency guard
+        run: cargo test --release -p server --test deps
       - name: Tests
         run: cargo test --release --workspace
       - name: Build cs2-cli

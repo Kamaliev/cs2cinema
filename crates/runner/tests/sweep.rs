@@ -6,10 +6,17 @@ mod common;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use common::{Scenario, ScriptedExecutor, Stand, TestDir};
-use runner::{Runner, Tick, sweep};
+use common::{Scenario, ScriptedExecutor, Stand, TestDir, result_bytes, sha256_hex};
+use pipeline::job::Outcome as Produced;
+use pipeline::{Progress, RunError};
+use runner::{
+    Executor, HeldJob, Link, ResultFile, Runner, RunnerState, Stage, Task, Tick, Token, sweep,
+};
+use wire::{Assignment, FinishRequest, JobState, Outcome};
 
 const HOUR: u64 = 3600;
 const DAY: u64 = 24 * HOUR;
@@ -247,5 +254,397 @@ fn sweep_runs_at_most_once_per_interval() {
     assert!(
         dir.join("out/srv21").exists(),
         "уборка прошла раньше, чем через SWEEP_EVERY"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Подтверждённые задачи: метка принятия, повтор `finish`, инвариант «Finished на диске до загрузки».
+// ---------------------------------------------------------------------------------------------------------
+
+const MIB: usize = 1024 * 1024;
+
+/// Берёт задачу у сервера «руками», как это сделал бы умерший раннер.
+fn claim_by_hand(stand: &Stand) -> Assignment {
+    link(stand)
+        .claim(0)
+        .unwrap()
+        .expect("задача должна быть выдана")
+}
+
+fn link(stand: &Stand) -> Link {
+    Link::new(&stand.base, Token::new(stand.token.clone())).unwrap()
+}
+
+/// Состояние «исполнитель отдал результат, загрузки ещё не было»; папка названа так, как её называет `run_job`.
+fn finished_state(stand: &Stand, a: &Assignment, bytes: &[u8]) -> HeldJob {
+    let dir = stand.runner_dir();
+    let out_dir = dir.join("out").join(format!("srv{}_s1mple", a.job_id));
+    fs::create_dir_all(&out_dir).unwrap();
+    fs::create_dir_all(dir.join("remote")).unwrap();
+    let path = out_dir.join("highlights.mp4");
+    fs::write(&path, bytes).unwrap();
+    fs::write(out_dir.join("take1.mp4"), b"raw take").unwrap();
+    let mut held = HeldJob::claimed(a, dir.join("remote").join(format!("srv{}.dem", a.job_id)));
+    held.stage = Stage::Finished;
+    held.attempt = 1;
+    held.out_dir = Some(out_dir);
+    held.result = Some(ResultFile {
+        path,
+        size: bytes.len() as u64,
+        sha256: sha256_hex(bytes),
+    });
+    held
+}
+
+fn write_state(stand: &Stand, job: Option<HeldJob>) {
+    fs::create_dir_all(stand.runner_dir()).unwrap();
+    RunnerState {
+        job,
+        ..Default::default()
+    }
+    .save(&stand.runner_dir())
+    .unwrap();
+}
+
+fn state_of(stand: &Stand) -> RunnerState {
+    let (state, warning) = RunnerState::load(&stand.runner_dir());
+    assert!(warning.is_none(), "{warning:?}");
+    state
+}
+
+/// Закрывает задачу на сервере итогом `Done` с размером и SHA-256 всего файла.
+fn finish_done(link: &Link, id: i64, epoch: i64, bytes: &[u8]) {
+    let reply = link
+        .finish(
+            id,
+            &FinishRequest {
+                epoch,
+                outcome: Outcome::Done {
+                    size: bytes.len() as u64,
+                    sha256: sha256_hex(bytes),
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(reply.state, JobState::Done);
+}
+
+/// Результат загружен и принят «руками»: куски не больше `CHUNK_SIZE`, затем `finish`.
+fn accept_by_hand(stand: &Stand, id: i64, epoch: i64, bytes: &[u8]) {
+    let link = link(stand);
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let end = (offset + wire::CHUNK_SIZE as usize).min(bytes.len());
+        offset = link
+            .result_put(id, epoch, offset as u64, &bytes[offset..end])
+            .unwrap() as usize;
+    }
+    finish_done(&link, id, epoch, bytes);
+    assert_eq!(stand.job(id).state, JobState::Done);
+}
+
+#[test]
+fn confirmed_takes_are_swept_at_once_even_when_fresh() {
+    let stand = Stand::start();
+    let dir = stand.runner_dir();
+    put(&dir.join("out/srv31_s1mple/take1.mp4"), Duration::ZERO);
+    put(&dir.join("remote/srv31.dem"), Duration::ZERO);
+    put(&dir.join("out/srv31.accepted"), Duration::ZERO);
+    put(&dir.join("out/srv32_s1mple/take1.mp4"), Duration::ZERO);
+
+    let exec = ScriptedExecutor::new(dir.clone(), vec![Scenario::Result(1)]);
+    let mut runner = Runner::new(stand.runner_config(), exec).unwrap();
+    assert_eq!(runner.tick().unwrap(), Tick::Idle);
+
+    assert!(
+        !dir.join("out/srv31_s1mple").exists(),
+        "подтверждённые дубли остались"
+    );
+    assert!(
+        !dir.join("remote/srv31.dem").exists(),
+        "демка подтверждённой задачи осталась"
+    );
+    assert!(!dir.join("out/srv31.accepted").exists(), "метка осталась");
+    assert!(
+        dir.join("out/srv32_s1mple/take1.mp4").exists(),
+        "свежая неподтверждённая папка удалена"
+    );
+    let log = runner_log(&stand);
+    assert!(
+        log.lines()
+            .any(|l| l.contains("уборка:") && l.contains("#31")),
+        "в журнале нет итога уборки:\n{log}"
+    );
+}
+
+#[test]
+fn restart_after_the_server_accepted_the_result_removes_the_takes() {
+    let stand = Stand::start();
+    let id = stand.submit(&common::fake_demo(MIB), "s1mple");
+    let a = claim_by_hand(&stand);
+    assert_eq!(a.job_id, id);
+    // Сервер принял результат, раннер упал, не получив ответа.
+    let bytes = result_bytes(MIB);
+    accept_by_hand(&stand, id, a.epoch, &bytes);
+    write_state(&stand, Some(finished_state(&stand, &a, &bytes)));
+
+    let exec = ScriptedExecutor::new(stand.runner_dir(), vec![Scenario::Result(MIB)]);
+    let mut runner = Runner::new(stand.runner_config(), exec.clone()).unwrap();
+    runner.tick().unwrap();
+
+    let dir = stand.runner_dir();
+    assert!(
+        state_of(&stand).job.is_none(),
+        "задача осталась в состоянии"
+    );
+    assert!(
+        !dir.join(format!("out/srv{id}_s1mple")).exists(),
+        "дубли подтверждённой задачи остались"
+    );
+    assert!(
+        !dir.join(format!("out/srv{id}.accepted")).exists(),
+        "метка осталась"
+    );
+    let log = runner_log(&stand);
+    assert!(
+        log.lines()
+            .any(|l| l.contains("сервер уже принял результат") && l.contains(&format!("#{id}"))),
+        "в журнале нет подтверждения:\n{log}"
+    );
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 0, "исполнитель вызван");
+    assert_eq!(stand.job(id).state, JobState::Done);
+}
+
+/// Исполнитель-заглушка: пишет результат, ломает запись `runner_state.json` и отдаёт результат.
+struct BreakStateWrites {
+    dir: PathBuf,
+    calls: AtomicUsize,
+}
+
+impl Executor for BreakStateWrites {
+    fn run(&self, task: &Task, _p: &dyn Progress) -> Result<Produced, RunError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let out_dir = self
+            .dir
+            .join("out")
+            .join(format!("srv{}_s1mple", task.job_id));
+        fs::create_dir_all(&out_dir).unwrap();
+        let result = out_dir.join("highlights.mp4");
+        fs::write(&result, result_bytes(MIB)).unwrap();
+        // Каталог с именем временного файла состояния: `RunnerState::save` не сможет его создать.
+        fs::create_dir_all(self.dir.join("runner_state.json.tmp")).unwrap();
+        Ok(Produced {
+            out_dir,
+            result,
+            shots: 1,
+            secs: 1.0,
+        })
+    }
+}
+
+#[test]
+fn upload_never_starts_before_the_finished_state_is_on_disk() {
+    let stand = Stand::start();
+    let id = stand.submit(&common::fake_demo(MIB), "s1mple");
+    let exec = Arc::new(BreakStateWrites {
+        dir: stand.runner_dir(),
+        calls: AtomicUsize::new(0),
+    });
+    let mut runner = Runner::new(stand.runner_config(), exec.clone()).unwrap();
+
+    let err = runner
+        .tick()
+        .expect_err("запись состояния сломана, тик обязан вернуть ошибку");
+    assert!(err.contains("runner_state.json"), "{err}");
+
+    let epoch = stand.job(id).epoch;
+    assert_eq!(
+        link(&stand).result_head(id, epoch).unwrap(),
+        0,
+        "сервер получил байты до записи Finished"
+    );
+    let state = stand.job(id).state;
+    assert!(
+        state != JobState::Uploading && state != JobState::Done,
+        "загрузка началась: {state:?}"
+    );
+    let result = stand
+        .runner_dir()
+        .join(format!("out/srv{id}_s1mple/highlights.mp4"));
+    assert!(result.exists(), "файл результата удалён");
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn runner_stopped_mid_upload_restarts_from_finished_and_settles_the_accepted_result() {
+    let stand = Stand::start();
+    let id = stand.submit(&common::fake_demo(MIB), "s1mple");
+    let exec = ScriptedExecutor::new(stand.runner_dir(), vec![Scenario::Result(20 * MIB)]);
+
+    let mut cfg = stand.runner_config();
+    cfg.upload_chunk_limit = Some(1);
+    let mut first = Runner::new(cfg, exec.clone()).unwrap();
+    assert_eq!(first.tick().unwrap(), Tick::Stopped);
+    drop(first);
+
+    // Состояние написал сам раннер: этап `Finished` и запись о результате.
+    let bytes = result_bytes(20 * MIB);
+    let job = state_of(&stand)
+        .job
+        .expect("задача должна остаться в состоянии");
+    assert_eq!(job.server_job_id, id);
+    assert_eq!(job.stage, Stage::Finished);
+    let result = job.result.clone().expect("записи о результате нет");
+    assert_eq!(result.size, (20 * MIB) as u64);
+    assert_eq!(result.sha256, sha256_hex(&bytes));
+    let link = link(&stand);
+    assert_eq!(link.result_head(id, job.epoch).unwrap(), (8 * MIB) as u64);
+    assert_eq!(stand.job(id).state, JobState::Uploading);
+
+    // Остаток загружен и задача закрыта «руками»: сервер принял результат, раннер ответа не получил.
+    for from in [8 * MIB, 16 * MIB] {
+        let to = (from + 8 * MIB).min(bytes.len());
+        link.result_put(id, job.epoch, from as u64, &bytes[from..to])
+            .unwrap();
+    }
+    finish_done(&link, id, job.epoch, &bytes);
+    assert_eq!(stand.job(id).state, JobState::Done);
+
+    let mut second = Runner::new(stand.runner_config(), exec.clone()).unwrap();
+    second.tick().unwrap();
+
+    let dir = stand.runner_dir();
+    assert!(
+        state_of(&stand).job.is_none(),
+        "задача осталась в состоянии"
+    );
+    assert!(!dir.join(format!("out/srv{id}")).exists(), "дубли остались");
+    assert!(
+        !dir.join(format!("remote/srv{id}.dem")).exists(),
+        "демка осталась"
+    );
+    assert!(
+        !dir.join(format!("out/srv{id}.accepted")).exists(),
+        "метка осталась"
+    );
+    let log = runner_log(&stand);
+    assert!(
+        log.lines()
+            .any(|l| l.contains("сервер уже принял результат") && l.contains(&format!("#{id}"))),
+        "в журнале нет подтверждения:\n{log}"
+    );
+    assert_eq!(
+        exec.calls.load(Ordering::SeqCst),
+        1,
+        "исполнитель вызван заново"
+    );
+    assert_eq!(stand.job(id).state, JobState::Done);
+}
+
+/// Исполнитель-заглушка: сам загружает и закрывает результат на сервере, а раннеру отдаёт его как обычный.
+struct AcceptBehindBack {
+    dir: PathBuf,
+    base: String,
+    token: String,
+}
+
+impl Executor for AcceptBehindBack {
+    fn run(&self, task: &Task, _p: &dyn Progress) -> Result<Produced, RunError> {
+        let out_dir = self
+            .dir
+            .join("out")
+            .join(format!("srv{}_s1mple", task.job_id));
+        fs::create_dir_all(&out_dir).unwrap();
+        let result = out_dir.join("highlights.mp4");
+        let bytes = result_bytes(MIB);
+        fs::write(&result, &bytes).unwrap();
+        fs::write(out_dir.join("take1.mp4"), b"raw take").unwrap();
+        let link = Link::new(&self.base, Token::new(self.token.clone())).unwrap();
+        link.result_put(task.job_id, task.epoch, 0, &bytes).unwrap();
+        finish_done(&link, task.job_id, task.epoch, &bytes);
+        Ok(Produced {
+            out_dir,
+            result,
+            shots: 1,
+            secs: 1.0,
+        })
+    }
+}
+
+#[test]
+fn result_accepted_behind_the_runners_back_is_settled_not_dropped() {
+    let stand = Stand::start();
+    let id = stand.submit(&common::fake_demo(MIB), "s1mple");
+    let exec = Arc::new(AcceptBehindBack {
+        dir: stand.runner_dir(),
+        base: stand.base.clone(),
+        token: stand.token.clone(),
+    });
+    let mut cfg = stand.runner_config();
+    // Пульсы отключены: о закрытии раннер узнаёт только из отказа `HEAD`.
+    cfg.heartbeat = Some(Duration::from_secs(3600));
+    cfg.debounce = Duration::from_secs(3600);
+    let mut runner = Runner::new(cfg, exec).unwrap();
+
+    assert_eq!(
+        runner.tick().unwrap(),
+        Tick::Settled {
+            job_id: id,
+            state: JobState::Done
+        }
+    );
+
+    let dir = stand.runner_dir();
+    assert!(
+        !dir.join(format!("out/srv{id}_s1mple")).exists(),
+        "дубли остались"
+    );
+    assert!(
+        !dir.join(format!("out/srv{id}.accepted")).exists(),
+        "метка осталась"
+    );
+    assert!(state_of(&stand).job.is_none());
+    let log = runner_log(&stand);
+    assert!(log.contains("сервер уже принял результат"), "{log}");
+}
+
+#[test]
+fn unconfirmed_dropped_job_keeps_its_takes_until_the_age_limit() {
+    let stand = Stand::start();
+    let dir = stand.runner_dir();
+    // Задачу сервер не знает: на `hello` он отвечает `abandon`, повтор `finish` получает 404.
+    let a = Assignment {
+        job_id: 4242,
+        epoch: 1,
+        lease_until_ms: 0,
+        demo: wire::DemoInfo::default(),
+        faceit_link: None,
+        player: wire::Player {
+            steam64: None,
+            name: "s1mple".to_owned(),
+        },
+        requested_by: String::new(),
+        options: Default::default(),
+    };
+    write_state(&stand, Some(finished_state(&stand, &a, &result_bytes(MIB))));
+
+    let exec = ScriptedExecutor::new(dir.clone(), vec![Scenario::Result(MIB)]);
+    let mut runner = Runner::new(stand.runner_config(), exec).unwrap();
+    runner.tick().unwrap();
+
+    assert!(state_of(&stand).job.is_none());
+    let log = runner_log(&stand);
+    assert!(
+        log.lines()
+            .any(|l| l.contains("задача #4242: сервер велел бросить задачу")),
+        "в журнале нет причины:\n{log}"
+    );
+    assert!(
+        dir.join("out/srv4242_s1mple/take1.mp4").exists(),
+        "неподтверждённые дубли удалены"
+    );
+    assert!(
+        !dir.join("out/srv4242.accepted").exists(),
+        "метка появилась без подтверждения сервера"
     );
 }

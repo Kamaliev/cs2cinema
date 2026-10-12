@@ -59,7 +59,7 @@ coverage:
     description: "Строка состояния раннера в боковой панели при заданном адресе; «Продолжить» в очереди снимает и паузу очереди, и паузу раннера"
     requirement: "APP-01"
     verification:
-      - kind: command
+      - kind: other
         ref: "cargo build --release -p app (grep: resume_paused() в App::resume_queue)"
         status: pass
     human_judgment: true

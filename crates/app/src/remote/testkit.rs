@@ -29,13 +29,16 @@ use server::{
     core::{Core, JobRow, Submit},
     log::MemorySink,
 };
-use store::{Job, JobKind, JobSource, NewJob, Store};
+use store::{Job, JobKind, JobOutcome, JobSource, NewJob, Store};
 
+use super::control::{RemoteDeps, RemoteRunner, RemoteTuning};
 use super::hub::{ExecFactory, RemoteExecutor, RemoteHub, queue_runner};
 use super::{card_label, external_ref};
 use crate::{
     app::Reporter,
+    jobs,
     queue::{self, Queue, QueueConfig},
+    settings::Settings,
 };
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -386,5 +389,269 @@ impl Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+// Сквозные проверки фазы 8 (`remote/e2e.rs`): сборка, повторяющая запуск приложения, и «записи», которые считаются.
+
+/// Токен раннера в файле рабочей папки: так его кладёт `RemoteRunner::save_token`, минуя сужение доступа.
+pub(crate) fn put_token(runner_dir: &Path, token: &str) {
+    std::fs::create_dir_all(runner_dir).unwrap();
+    std::fs::write(runner_dir.join(super::token::TOKEN_FILE), token).unwrap();
+}
+
+/// Папка результата, которую исполнитель-заглушка выбирает сам: известная (продолжение) или `out/srv{id}` рабочей папки.
+fn job_out_dir(spec: &JobSpec) -> PathBuf {
+    spec.out_dir.clone().unwrap_or_else(|| spec.cfg.out_root.join(format!("srv{}", spec.job_id)))
+}
+
+/// Счётчик записей: сколько их идёт сейчас, сколько было одновременно не больше и в каком порядке они начинались.
+/// Общий для локальной заглушки очереди и `job_fn` удалённой карточки.
+#[derive(Default)]
+pub(crate) struct Recordings {
+    current: AtomicUsize,
+    max_concurrent: AtomicUsize,
+    starts: Mutex<Vec<String>>,
+}
+
+impl Recordings {
+    pub fn new() -> Arc<Recordings> {
+        Arc::new(Recordings::default())
+    }
+
+    /// Запись `name` началась.
+    pub fn enter(&self, name: &str) {
+        let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_concurrent.fetch_max(now, Ordering::SeqCst);
+        if let Ok(mut s) = self.starts.lock() {
+            s.push(name.to_owned());
+        }
+    }
+
+    /// Запись закончилась (удачно, сбоем или отменой).
+    pub fn leave(&self) {
+        self.current.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Сколько записей идёт сейчас.
+    pub fn current(&self) -> usize {
+        self.current.load(Ordering::SeqCst)
+    }
+
+    /// Наибольшее число записей, шедших одновременно.
+    pub fn max_concurrent(&self) -> usize {
+        self.max_concurrent.load(Ordering::SeqCst)
+    }
+
+    /// Имена записей в порядке начала.
+    pub fn starts(&self) -> Vec<String> {
+        self.starts.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// «Запись» `name`: считается, пока `release` не поднят, отмена не пришла или не прошло 30 с. `true` — отменена.
+    fn hold(&self, name: &str, release: &AtomicBool, cancelled: &dyn Fn() -> bool) -> bool {
+        self.enter(name);
+        let until = Instant::now() + Duration::from_secs(30);
+        let mut cancel = false;
+        while !release.load(Ordering::SeqCst) && Instant::now() < until {
+            if cancelled() {
+                cancel = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.leave();
+        cancel
+    }
+}
+
+/// Локальный исполнитель очереди: «записывает» задачу (имя записи — её подпись), пока тест не отпустит `release`;
+/// отмена автора её прерывает.
+pub(crate) fn gated_local(rec: Arc<Recordings>, release: Arc<AtomicBool>) -> queue::Runner {
+    Arc::new(move |job, rep| {
+        if rec.hold(&job.label, &release, &|| rep.cancelled()) {
+            return Err(RunError::from(pipeline::CANCELLED));
+        }
+        Ok(JobOutcome { out_dir: "out/local".into(), result: format!("out/local/{}.mp4", job.id).into(), shots: 1, secs: 1.0 })
+    })
+}
+
+/// `job_fn` удалённой карточки: запись «карточка», пока тест не отпустит `release` (отмена её прерывает), затем годный ролик.
+pub(crate) fn gated_job_fn(
+    rec: Arc<Recordings>,
+    release: Arc<AtomicBool>,
+) -> impl Fn(&dyn Host, &JobSpec, &dyn Progress) -> Result<Outcome, RunError> + Send + Sync + 'static {
+    move |_, spec, p| {
+        p.stage(pipeline::Stage::Record);
+        let out_dir = job_out_dir(spec);
+        std::fs::create_dir_all(&out_dir).unwrap();
+        p.artifact(&pipeline::Artifact::OutDir(out_dir.clone()));
+        if rec.hold("карточка", &release, &|| p.cancelled()) {
+            return Err(RunError::from(pipeline::CANCELLED));
+        }
+        let result = out_dir.join("highlights.mp4");
+        std::fs::write(&result, faststart_mp4()).unwrap();
+        Ok(Outcome { out_dir, result, shots: 1, secs: 5.0 })
+    }
+}
+
+/// Состояние «приложение убито, пока результат грузился»: задача выдана, ролик записан и внесён в `runner_state.json`
+/// (этап «исполнитель отдал результат», путь, размер и SHA-256), а карточка в базе уже `Done`.
+pub(crate) fn after_upload_cut(stand: &Stand, runner_dir: &Path, db: &Path) -> AfterKill {
+    let demo = fake_demo(1024 * 1024);
+    let job_id = stand.submit(&demo, "s1mple");
+    let link = Link::new(&stand.base, Token::new(stand.token.clone())).unwrap();
+    let assignment = link.claim(0).unwrap().expect("задача должна быть выдана");
+    assert_eq!(assignment.job_id, job_id);
+
+    let demo_path = runner_dir.join("remote").join(format!("srv{job_id}.dem"));
+    std::fs::create_dir_all(demo_path.parent().unwrap()).unwrap();
+    std::fs::write(&demo_path, &demo).unwrap();
+    let out_dir = runner_dir.join("out").join(format!("srv{job_id}"));
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let result = out_dir.join("highlights.mp4");
+    std::fs::write(&result, faststart_mp4()).unwrap();
+    let (size, sha256) = runner::sha256_file(&result).unwrap();
+    let mut held = HeldJob::claimed(&assignment, demo_path.clone());
+    held.stage = HeldStage::Finished;
+    held.out_dir = Some(out_dir.clone());
+    held.attempt = 1;
+    held.result = Some(runner::ResultFile { path: result.clone(), size, sha256 });
+    RunnerState { version: state::VERSION, job: Some(held), last_seq: 0 }.save(runner_dir).unwrap();
+
+    let store = Store::open(db).unwrap();
+    let new_job = NewJob {
+        kind: JobKind::Record,
+        source: JobSource::File(demo_path),
+        label: card_label(job_id),
+        hero_name: "s1mple".to_owned(),
+        hero_steam: 0,
+        map: String::new(),
+    };
+    let card = store.adopt_remote(&new_job, &external_ref(job_id, assignment.epoch), false, Some(&out_dir)).unwrap();
+    store.start_job(card).unwrap();
+    store.set_out_dir(card, &out_dir).unwrap();
+    store.finish_job(card, Ok(&JobOutcome { out_dir: out_dir.clone(), result, shots: 1, secs: 5.0 })).unwrap();
+    AfterKill { job_id, epoch: assignment.epoch, card, out_dir }
+}
+
+/// Состояние «приложение убито, пока карточка ждала локальную задачу»: выдача у раннера на этапе «исполнитель работает», но
+/// пайплайн папку ещё не назвал; карточка `queued`, рядом локальная строка `running`. `AfterKill::out_dir` — папка, которую
+/// исполнитель выбрал бы сам (на диске её нет). Второе значение — номер локальной строки.
+pub(crate) fn after_kill_without_dir(stand: &Stand, runner_dir: &Path, db: &Path) -> (AfterKill, i64) {
+    let demo = fake_demo(1024 * 1024);
+    let job_id = stand.submit(&demo, "s1mple");
+    let link = Link::new(&stand.base, Token::new(stand.token.clone())).unwrap();
+    let assignment = link.claim(0).unwrap().expect("задача должна быть выдана");
+    assert_eq!(assignment.job_id, job_id);
+
+    let demo_path = runner_dir.join("remote").join(format!("srv{job_id}.dem"));
+    std::fs::create_dir_all(demo_path.parent().unwrap()).unwrap();
+    std::fs::write(&demo_path, &demo).unwrap();
+    let mut held = HeldJob::claimed(&assignment, demo_path.clone());
+    held.stage = HeldStage::Executing;
+    held.attempt = 1;
+    RunnerState { version: state::VERSION, job: Some(held), last_seq: 0 }.save(runner_dir).unwrap();
+
+    let store = Store::open(db).unwrap();
+    let local = NewJob { kind: JobKind::Record, source: JobSource::File("local.dem".into()), label: "своя".into(), hero_name: String::new(), hero_steam: 0, map: String::new() };
+    let local = store.add_job(&local).unwrap();
+    store.start_job(local).unwrap();
+    let new_job = NewJob {
+        kind: JobKind::Record,
+        source: JobSource::File(demo_path),
+        label: card_label(job_id),
+        hero_name: "s1mple".to_owned(),
+        hero_steam: 0,
+        map: String::new(),
+    };
+    let card = store.adopt_remote(&new_job, &external_ref(job_id, assignment.epoch), false, None).unwrap();
+    let out_dir = runner_dir.join("out").join(format!("srv{job_id}"));
+    (AfterKill { job_id, epoch: assignment.epoch, card, out_dir }, local)
+}
+
+/// Что нужно, чтобы поднять приложение так, как его поднимает `App::new`.
+pub(crate) struct BootOpts {
+    /// Файловая база приложения (переживает «перезапуск»).
+    pub db: PathBuf,
+    /// Рабочая папка раннера: токен, замок, состояние, демки и результаты.
+    pub runner_dir: PathBuf,
+    pub host: FakeHost,
+    /// Исполнитель удалённых карточек.
+    pub factory: ExecFactory,
+    /// Исполнитель локальных задач очереди.
+    pub local: queue::Runner,
+    /// Адрес сервера из настроек; пусто — режим раннера выключен.
+    pub address: String,
+}
+
+/// Приложение целиком, кроме окна: база, уборка после падения, хаб, поток очереди и раннер приложения.
+pub(crate) struct AppStand {
+    pub store: Store,
+    pub hub: Arc<RemoteHub>,
+    pub queue: Queue,
+    pub remote: RemoteRunner,
+    /// Итог уборки при запуске: сколько задач прервано.
+    pub reset: store::Reset,
+}
+
+impl AppStand {
+    /// Запуск в порядке `App::new` (crates/app/src/app.rs): база → `recover_after_crash` (внутри него `reset_running`) →
+    /// хаб → очередь `start_with_hook` (пауза `Interrupted`, если прервана локальная задача) → `RemoteRunner::apply(адрес)`.
+    /// Окна и трея нет, интервалы короткие, папки HLAE и CS2 в настройках не пусты.
+    pub fn boot(opts: BootOpts) -> AppStand {
+        let BootOpts { db, runner_dir, host, factory, local, address } = opts;
+        let store = Store::open(&db).expect("файловая база приложения");
+        let host: Arc<dyn Host> = Arc::new(host);
+        let reset = jobs::recover_after_crash(&store, &*host, "").unwrap_or_default();
+        let hub = RemoteHub::new(store.clone());
+        let queue = queue::start_with_hook(
+            store.clone(),
+            host.clone(),
+            queue_runner(local, hub.clone(), factory),
+            Reporter::detached(),
+            (reset.interrupted > 0).then_some(queue::PauseReason::Interrupted),
+            queue_cfg(),
+            Some(hub.clone()),
+        );
+        let settings = Settings { hlae_dir: "C:/hlae".to_owned(), cs2_dir: "C:/cs2".to_owned(), ..Settings::default() };
+        let mut remote = RemoteRunner::new(RemoteDeps {
+            store: store.clone(),
+            host,
+            queue: queue.clone(),
+            hub: hub.clone(),
+            dir: runner_dir,
+            inspect_exe: Ok(PathBuf::from("cs2-cli")),
+            name: "tester".to_owned(),
+            settings: Arc::new(move || settings.clone()),
+            repaint: Arc::new(|| {}),
+            tuning: RemoteTuning {
+                poll_secs: Some(0),
+                heartbeat: Some(Duration::from_millis(200)),
+                debounce: Duration::from_millis(50),
+                release_cooldown: Duration::ZERO,
+            },
+        });
+        remote.apply(&address);
+        AppStand { store, hub, queue, remote, reset }
+    }
+
+    /// Закрытие приложения: адрес сбрасывается, поток раннера ждётся (не дольше 10 с).
+    pub fn shutdown(mut self) {
+        self.stop_runner();
+    }
+
+    fn stop_runner(&mut self) {
+        self.remote.apply("");
+        wait_until(10, || {
+            self.remote.tick();
+            !self.remote.is_running()
+        });
+    }
+}
+
+impl Drop for AppStand {
+    fn drop(&mut self) {
+        self.stop_runner();
     }
 }

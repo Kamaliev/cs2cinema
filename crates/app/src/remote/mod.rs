@@ -18,6 +18,8 @@ pub use hub::{ExecFactory, RemoteExecutor, RemoteHub, queue_runner};
 #[cfg(test)]
 pub(crate) mod testkit;
 #[cfg(test)]
+mod e2e;
+#[cfg(test)]
 mod tests;
 
 /// Ссылка карточки на выдачу задачи сервера: пара «номер задачи, эпоха» даёт ровно одну карточку.

@@ -196,6 +196,7 @@ pub enum Tick {
 /// Журнал `runner.log`: строки `{время} {текст}`, значение токена заменено на `***`.
 struct Log {
     file: Mutex<File>,
+    path: PathBuf,
     secret: String,
 }
 
@@ -208,8 +209,22 @@ impl Log {
             .map_err(|e| format!("не удалось открыть {}: {e}", path.display()))?;
         Ok(Log {
             file: Mutex::new(file),
+            path: path.to_path_buf(),
             secret: secret.to_owned(),
         })
+    }
+
+    /// Журнал больше `max_bytes` уходит в `runner.log.1`, новые строки идут в новый `runner.log`.
+    fn rotate(&self, max_bytes: u64) {
+        let Ok(mut file) = self.file.lock() else {
+            return;
+        };
+        if !matches!(sweep::rotate_log(&self.path, max_bytes), Ok(true)) {
+            return;
+        }
+        if let Ok(fresh) = OpenOptions::new().create(true).append(true).open(&self.path) {
+            *file = fresh;
+        }
     }
 
     fn line(&self, text: &str) {
@@ -347,6 +362,7 @@ impl Runner {
             fs::create_dir_all(&dir)
                 .map_err(|e| format!("не удалось создать {}: {e}", dir.display()))?;
         }
+        let _ = sweep::rotate_log(&cfg.dir.join("runner.log"), sweep::LOG_MAX_BYTES);
         let log = Arc::new(Log::open(&cfg.dir.join("runner.log"), cfg.token.secret())?);
         let link = Link::new(&cfg.server, cfg.token.clone())?;
         let (state, warning) = RunnerState::load(&cfg.dir);
@@ -453,6 +469,7 @@ impl Runner {
         if !swept.is_empty() {
             self.log.line(&swept.line());
         }
+        self.log.rotate(sweep::LOG_MAX_BYTES);
     }
 
     /// Строка для наблюдателя: значение токена заменено на `***`, переводы строк убраны.

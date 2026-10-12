@@ -156,6 +156,7 @@ fn real_dir(dir: &Path, sub: &str) -> Option<std::path::PathBuf> {
 pub fn sweep(dir: &Path, held: Option<i64>, now: SystemTime) -> Swept {
     let mut swept = Swept::default();
     sweep_out(dir, held, now, &mut swept);
+    sweep_remote(dir, held, now, &mut swept);
     swept
 }
 
@@ -195,7 +196,147 @@ fn sweep_out(dir: &Path, held: Option<i64>, now: SystemTime, swept: &mut Swept) 
     }
 }
 
-/// Заглушка до реализации ротации журнала.
-pub fn rotate_log(_path: &Path, _max_bytes: u64) -> std::io::Result<bool> {
-    Ok(false)
+/// Что лежит в `remote/` под именем задачи.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Remote {
+    /// `srv{N}.dem` и `srv{N}.dem.part`: обычный файл.
+    File,
+    /// `srv{N}.faceit`: временная папка скачивания FACEIT.
+    Dir,
+}
+
+/// Номер задачи и вид следа из имени в `remote/`; всё остальное — чужое.
+fn remote_item(name: &str) -> Option<(i64, Remote)> {
+    let (n, tail) = job_number(name)?;
+    match tail {
+        ".dem" | ".dem.part" => Some((n, Remote::File)),
+        ".faceit" => Some((n, Remote::Dir)),
+        _ => None,
+    }
+}
+
+/// Скачанные демки, их части и папки FACEIT старше `ORPHAN_REMOTE_AGE`.
+fn sweep_remote(dir: &Path, held: Option<i64>, now: SystemTime, swept: &mut Swept) {
+    let Some(remote) = real_dir(dir, "remote") else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&remote) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            continue;
+        }
+        let Some((number, what)) = entry.file_name().to_str().and_then(remote_item) else {
+            continue;
+        };
+        if Some(number) == held || !path.starts_with(dir) || path == dir {
+            continue;
+        }
+        let (age, bytes) = match what {
+            Remote::File if kind.is_file() => {
+                let age = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| now.duration_since(t).ok())
+                    .unwrap_or(Duration::ZERO);
+                (age, meta.len())
+            }
+            Remote::Dir if kind.is_dir() => tree_age(&path, meta.modified().ok(), now),
+            _ => continue,
+        };
+        if age < ORPHAN_REMOTE_AGE {
+            continue;
+        }
+        let removed = match what {
+            Remote::File => fs::remove_file(&path),
+            Remote::Dir => fs::remove_dir_all(&path),
+        };
+        match removed {
+            Ok(()) => {
+                swept.remote_items += 1;
+                swept.freed_bytes += bytes;
+            }
+            Err(_) => swept.errors += 1,
+        }
+    }
+}
+
+/// Переименовывает `path` в `{имя}.1`, если файл больше `max_bytes`; прежний `.1` заменяется. `true` — файл
+/// переименован (вызывающий открывает новый). Нет файла — `Ok(false)`.
+pub fn rotate_log(path: &Path, max_bytes: u64) -> std::io::Result<bool> {
+    let size = match fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if size <= max_bytes {
+        return Ok(false);
+    }
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("у журнала нет имени файла"))?
+        .to_os_string();
+    name.push(".1");
+    fs::rename(path, path.with_file_name(name))?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cs2sweep-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn rotate_log_leaves_small_files_and_replaces_the_previous_rotation() {
+        let dir = temp("rotate");
+        let log = dir.join("runner.log");
+        assert!(
+            !rotate_log(&log, 10).unwrap(),
+            "нет файла — нечего ротировать"
+        );
+
+        fs::write(&log, b"0123456789").unwrap();
+        assert!(
+            !rotate_log(&log, 10).unwrap(),
+            "ровно порог — не больше порога"
+        );
+        assert!(log.exists() && !dir.join("runner.log.1").exists());
+
+        fs::write(&log, b"0123456789a").unwrap();
+        fs::write(dir.join("runner.log.1"), b"prev").unwrap();
+        assert!(rotate_log(&log, 10).unwrap());
+        assert!(!log.exists());
+        assert_eq!(fs::read(dir.join("runner.log.1")).unwrap(), b"0123456789a");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_are_parsed_strictly() {
+        assert_eq!(out_dir_number("srv7"), Some(7));
+        assert_eq!(out_dir_number("srv7_s1mple"), Some(7));
+        assert_eq!(out_dir_number("srv7_"), Some(7));
+        for bad in [
+            "srv", "srv_7", "srvX", "srv7abc", "srv07", "srv7.dem", "xsrv7", "srv-7",
+        ] {
+            assert_eq!(out_dir_number(bad), None, "{bad}");
+        }
+        assert!(remote_item("srv9.dem") == Some((9, Remote::File)));
+        assert!(remote_item("srv9.dem.part") == Some((9, Remote::File)));
+        assert!(remote_item("srv9.faceit") == Some((9, Remote::Dir)));
+        for bad in ["srv9", "srv9.mp4", "srv9.dem.bak", "srv.dem", "srv9_x.dem"] {
+            assert!(remote_item(bad).is_none(), "{bad}");
+        }
+    }
 }

@@ -770,7 +770,7 @@ impl Runner {
                     Some(DirectiveAction::Abandon) => "сервер велел бросить задачу",
                     _ => "сервер не знает этой задачи",
                 };
-                self.drop_job(why)?;
+                self.settle_or_drop(why)?;
             }
         }
         Ok(())
@@ -793,6 +793,68 @@ impl Runner {
             reason: reason.to_owned(),
         });
         Ok(())
+    }
+
+    /// Сервер принял результат удерживаемой задачи: метка подтверждения пишется до удаления, чтобы обрыв посреди
+    /// уборки оставил следы, по которым ближайший проход доделает работу сразу, а не через 72 часа. Затем
+    /// удаляются демка, ролик и дубли, метка снимается, и только после этого очищается состояние.
+    fn settle_accepted(&mut self, job: HeldJob, state: JobState) -> Result<Tick, String> {
+        let id = job.server_job_id;
+        if let Err(e) = sweep::mark_accepted(&self.cfg.dir, id) {
+            self.log.line(&format!(
+                "задача #{id}: метку подтверждения записать не удалось ({e}); дубли уйдут по сроку"
+            ));
+        }
+        self.remove_finished(&job);
+        sweep::remove_confirmed(&self.cfg.dir, id);
+        self.state.job = None;
+        self.persist()?;
+        self.emit(RunnerEvent::Settled {
+            job_id: id,
+            epoch: job.epoch,
+            state,
+        });
+        Ok(Tick::Settled { job_id: id, state })
+    }
+
+    /// Спрашивает сервер, принят ли результат задачи: повтор `finish` с тем же размером и SHA-256. Сервер отвечает
+    /// на повтор той же эпохи без записи, поэтому вопрос безопасен. Спрашивается только для этапа `Finished` с
+    /// проверенным результатом; любая ошибка, в том числе сеть, значит «не подтверждено» (один раз, без повторов).
+    fn server_accepted(&self, job: &HeldJob) -> bool {
+        if job.stage != Stage::Finished {
+            return false;
+        }
+        let Some(result) = &job.result else {
+            return false;
+        };
+        let req = FinishRequest {
+            epoch: job.epoch,
+            outcome: Outcome::Done {
+                size: result.size,
+                sha256: result.sha256.clone(),
+            },
+        };
+        matches!(
+            self.link.finish(job.server_job_id, &req),
+            Ok(reply) if reply.state == JobState::Done
+        )
+    }
+
+    /// Сервер велел бросить задачу или потерял её. Если результат на самом деле принят (ответ `Done` до раннера не
+    /// дошёл), задача закрывается как принятая, иначе — прежний `drop_job`: дубли остаются до срока уборки.
+    fn settle_or_drop(&mut self, why: &str) -> Result<Tick, String> {
+        let Some(job) = self.state.job.clone() else {
+            return Ok(Tick::Idle);
+        };
+        let id = job.server_job_id;
+        if self.server_accepted(&job) {
+            self.log.line(&format!(
+                "задача #{id}: сервер уже принял результат (ответ до раннера не дошёл); папка дублей и демка удалены"
+            ));
+            return self.settle_accepted(job, JobState::Done);
+        }
+        self.drop_job(why)?;
+        Ok(Tick::Dropped { job_id: id })
     }
 
     /// Удаляет скачанную демку (и недокачанную) внутри рабочей папки раннера: сервер хранит её сам.
@@ -852,6 +914,8 @@ impl Runner {
             .line(&format!("задача #{id} выдана (эпоха {})", a.epoch));
         // Имя файла строится только из номера задачи: `orig_name` от пользователя в путях не участвует.
         let demo = self.cfg.dir.join("remote").join(format!("srv{id}.dem"));
+        // Метка относится только к прошлой задаче с этим номером (сервер мог начать нумерацию заново).
+        let _ = fs::remove_file(sweep::marker_path(&self.cfg.dir, id));
         self.state.job = Some(HeldJob::claimed(&a, demo));
         self.persist()?;
         self.drive()
@@ -972,8 +1036,7 @@ impl Runner {
             return Ok(Tick::Stopped);
         }
         let reason = self.shared.lost_reason();
-        self.drop_job(&format!("задача потеряна — {reason}"))?;
-        Ok(Tick::Dropped { job_id: id })
+        self.settle_or_drop(&format!("задача потеряна — {reason}"))
     }
 
     /// Отмена сервера: итог `Cancelled` сохраняется и уходит как обычный `finish`, файлы убираются после ответа.
@@ -1287,14 +1350,7 @@ impl Runner {
         match end {
             TransferEnd::Done(state) => {
                 self.log.line(&format!("задача #{id}: {}", state.as_str()));
-                self.remove_finished(&held);
-                self.persist()?;
-                self.emit(RunnerEvent::Settled {
-                    job_id: id,
-                    epoch: held.epoch,
-                    state,
-                });
-                Ok(Some(Tick::Settled { job_id: id, state }))
+                self.settle_accepted(held, state).map(Some)
             }
             TransferEnd::Stopped => {
                 self.state.job = Some(held);
@@ -1315,8 +1371,8 @@ impl Runner {
             }
             TransferEnd::Dropped(reason) => {
                 self.state.job = Some(held);
-                self.drop_job(&format!("сервер не принял результат — {reason}"))?;
-                Ok(Some(Tick::Dropped { job_id: id }))
+                self.settle_or_drop(&format!("сервер не принял результат — {reason}"))
+                    .map(Some)
             }
         }
     }

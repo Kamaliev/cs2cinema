@@ -5,12 +5,17 @@
 //! броске задачи, поэтому без уборки автономный раннер за дни заполнил бы диск. Решает возраст, а не догадка:
 //! свежее не трогается никогда, а старое уходит по сроку своего вида.
 //!
+//! Задачи, чей результат сервер подтвердил, убираются не по возрасту, а по состоянию: раннер пишет метку
+//! `out/srv{N}.accepted` до удаления дублей и снимает её, когда ничего от задачи не осталось. Метка переживает
+//! обрыв (падение раннера, неудачное удаление), и ближайший проход доделывает уборку сразу, не ожидая срока.
+//!
 //! Никогда не убирается: удерживаемая задача, имена не вида `srv{число}`, ссылки, всё вне `out/` и `remote/`
 //! рабочей папки и сама рабочая папка. Возраст папки — самое позднее изменение обычных файлов внутри: время
 //! изменения каталога на Windows меняется непредсказуемо.
 
-use std::fs;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// Папка дублей без подтверждения сервера старше этого срока удаляется. Срок совпадает со сроком упавшей демки на
@@ -32,6 +37,8 @@ const MAX_DEPTH: u32 = 6;
 pub struct Swept {
     /// Номера задач удалённых папок дублей (по записи на папку).
     pub out_dirs: Vec<i64>,
+    /// Номера задач, чьё подтверждение сервера отработано (метка `out/srv{N}.accepted` найдена).
+    pub confirmed: Vec<i64>,
     /// Сколько скачанных демок, их частей и папок FACEIT удалено.
     pub remote_items: usize,
     /// Сколько байт файлов освобождено.
@@ -44,6 +51,7 @@ impl Swept {
     /// Ничего не удалено и ничего не сломалось: в журнал писать нечего.
     pub fn is_empty(&self) -> bool {
         self.out_dirs.is_empty()
+            && self.confirmed.is_empty()
             && self.remote_items == 0
             && self.freed_bytes == 0
             && self.errors == 0
@@ -57,6 +65,13 @@ impl Swept {
                 "удалено папок дублей {} (задачи {})",
                 self.out_dirs.len(),
                 ids(&self.out_dirs)
+            ));
+        }
+        if !self.confirmed.is_empty() {
+            parts.push(format!(
+                "подтверждённых задач {} ({})",
+                self.confirmed.len(),
+                ids(&self.confirmed)
             ));
         }
         if self.remote_items > 0 {
@@ -146,7 +161,7 @@ fn tree_age(path: &Path, own: Option<SystemTime>, now: SystemTime) -> (Duration,
 }
 
 /// Настоящий каталог рабочей папки (`out`, `remote`): не ссылка и не файл.
-fn real_dir(dir: &Path, sub: &str) -> Option<std::path::PathBuf> {
+fn real_dir(dir: &Path, sub: &str) -> Option<PathBuf> {
     let path = dir.join(sub);
     let meta = fs::symlink_metadata(&path).ok()?;
     (meta.file_type().is_dir() && !meta.file_type().is_symlink()).then_some(path)
@@ -155,13 +170,145 @@ fn real_dir(dir: &Path, sub: &str) -> Option<std::path::PathBuf> {
 /// Один проход уборки по рабочей папке `dir`. `held` — номер удерживаемой задачи: её следы не трогаются.
 pub fn sweep(dir: &Path, held: Option<i64>, now: SystemTime) -> Swept {
     let mut swept = Swept::default();
-    sweep_out(dir, held, now, &mut swept);
-    sweep_remote(dir, held, now, &mut swept);
+    // Сначала подтверждённые: их судьбу решило состояние, возраст не спрашивается.
+    let marked = sweep_confirmed(dir, held, &mut swept);
+    sweep_out(dir, held, &marked, now, &mut swept);
+    sweep_remote(dir, held, &marked, now, &mut swept);
     swept
 }
 
+/// Путь метки подтверждения: `out/srv{id}.accepted`. Метка лежит рядом с папкой дублей, а не в ней: частичное
+/// удаление папки не уносит метку раньше самих дублей.
+pub fn marker_path(dir: &Path, job_id: i64) -> PathBuf {
+    dir.join("out").join(format!("srv{job_id}.accepted"))
+}
+
+/// Пишет метку «результат задачи принят сервером»: до удаления дублей, чтобы обрыв не оставил подтверждённую
+/// задачу без отметки. В файле нет путей и токена.
+pub fn mark_accepted(dir: &Path, job_id: i64) -> std::io::Result<()> {
+    fs::create_dir_all(dir.join("out"))?;
+    let mut file = File::create(marker_path(dir, job_id))?;
+    writeln!(file, "результат задачи #{job_id} принят сервером")?;
+    file.sync_all()
+}
+
+/// Номер задачи из имени метки `srv{N}.accepted`.
+fn marker_number(name: &str) -> Option<i64> {
+    let (n, tail) = job_number(name)?;
+    (tail == ".accepted").then_some(n)
+}
+
+fn merge(into: &mut Swept, from: Swept) {
+    into.out_dirs.extend(from.out_dirs);
+    into.confirmed.extend(from.confirmed);
+    into.remote_items += from.remote_items;
+    into.freed_bytes += from.freed_bytes;
+    into.errors += from.errors;
+}
+
+/// Убирает без проверки возраста всё, что осталось от задачи `job_id`, чей результат сервер подтвердил: папки
+/// `out/srv{id}` и `out/srv{id}_…`, демку, её часть и папку FACEIT в `remote/`. Метку снимает последней и только
+/// когда удаление прошло без ошибок: иначе следующий проход повторит.
+pub fn remove_confirmed(dir: &Path, job_id: i64) -> Swept {
+    let mut swept = Swept::default();
+    let marker = marker_path(dir, job_id);
+    let had_marker = fs::symlink_metadata(&marker).is_ok_and(|m| m.file_type().is_file());
+    if let Some(out) = real_dir(dir, "out")
+        && let Ok(entries) = fs::read_dir(&out)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let named = entry.file_name().to_str().and_then(out_dir_number) == Some(job_id);
+            if !named || !meta.file_type().is_dir() || !path.starts_with(dir) || path == dir {
+                continue;
+            }
+            let (_, bytes) = tree_age(&path, None, SystemTime::now());
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    swept.out_dirs.push(job_id);
+                    swept.freed_bytes += bytes;
+                }
+                Err(_) => swept.errors += 1,
+            }
+        }
+    }
+    if let Some(remote) = real_dir(dir, "remote")
+        && let Ok(entries) = fs::read_dir(&remote)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let kind = meta.file_type();
+            let Some((number, what)) = entry.file_name().to_str().and_then(remote_item) else {
+                continue;
+            };
+            if number != job_id || kind.is_symlink() || !path.starts_with(dir) || path == dir {
+                continue;
+            }
+            let (removed, bytes) = match what {
+                Remote::File if kind.is_file() => (fs::remove_file(&path), meta.len()),
+                Remote::Dir if kind.is_dir() => {
+                    let (_, bytes) = tree_age(&path, None, SystemTime::now());
+                    (fs::remove_dir_all(&path), bytes)
+                }
+                _ => continue,
+            };
+            match removed {
+                Ok(()) => {
+                    swept.remote_items += 1;
+                    swept.freed_bytes += bytes;
+                }
+                Err(_) => swept.errors += 1,
+            }
+        }
+    }
+    if had_marker {
+        swept.confirmed.push(job_id);
+        if swept.errors == 0 && fs::remove_file(&marker).is_err() {
+            swept.errors += 1;
+        }
+    }
+    swept
+}
+
+/// Проход по меткам подтверждения: для каждой `remove_confirmed`. Возвращает номера, чья метка осталась (удаление
+/// не удалось): проходы по возрасту их пропускают, их судьбу решило подтверждение.
+fn sweep_confirmed(dir: &Path, held: Option<i64>, swept: &mut Swept) -> Vec<i64> {
+    let mut numbers = Vec::new();
+    if let Some(out) = real_dir(dir, "out")
+        && let Ok(entries) = fs::read_dir(&out)
+    {
+        for entry in entries.flatten() {
+            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if !meta.file_type().is_file() {
+                continue;
+            }
+            if let Some(n) = entry.file_name().to_str().and_then(marker_number)
+                && Some(n) != held
+            {
+                numbers.push(n);
+            }
+        }
+    }
+    let mut marked = Vec::new();
+    for n in numbers {
+        merge(swept, remove_confirmed(dir, n));
+        if fs::symlink_metadata(marker_path(dir, n)).is_ok() {
+            marked.push(n);
+        }
+    }
+    marked
+}
+
 /// Папки дублей `out/srv{N}` и `out/srv{N}_…` старше `ORPHAN_OUT_AGE`.
-fn sweep_out(dir: &Path, held: Option<i64>, now: SystemTime, swept: &mut Swept) {
+fn sweep_out(dir: &Path, held: Option<i64>, marked: &[i64], now: SystemTime, swept: &mut Swept) {
     let Some(out) = real_dir(dir, "out") else {
         return;
     };
@@ -179,7 +326,8 @@ fn sweep_out(dir: &Path, held: Option<i64>, now: SystemTime, swept: &mut Swept) 
         let Some(number) = entry.file_name().to_str().and_then(out_dir_number) else {
             continue;
         };
-        if Some(number) == held || !path.starts_with(dir) || path == dir {
+        if Some(number) == held || marked.contains(&number) || !path.starts_with(dir) || path == dir
+        {
             continue;
         }
         let (age, bytes) = tree_age(&path, meta.modified().ok(), now);
@@ -216,7 +364,7 @@ fn remote_item(name: &str) -> Option<(i64, Remote)> {
 }
 
 /// Скачанные демки, их части и папки FACEIT старше `ORPHAN_REMOTE_AGE`.
-fn sweep_remote(dir: &Path, held: Option<i64>, now: SystemTime, swept: &mut Swept) {
+fn sweep_remote(dir: &Path, held: Option<i64>, marked: &[i64], now: SystemTime, swept: &mut Swept) {
     let Some(remote) = real_dir(dir, "remote") else {
         return;
     };
@@ -235,7 +383,8 @@ fn sweep_remote(dir: &Path, held: Option<i64>, now: SystemTime, swept: &mut Swep
         let Some((number, what)) = entry.file_name().to_str().and_then(remote_item) else {
             continue;
         };
-        if Some(number) == held || !path.starts_with(dir) || path == dir {
+        if Some(number) == held || marked.contains(&number) || !path.starts_with(dir) || path == dir
+        {
             continue;
         }
         let (age, bytes) = match what {

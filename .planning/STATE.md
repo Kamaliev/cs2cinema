@@ -2,44 +2,44 @@
 gsd_state_version: "1.0"
 milestone: v1.1
 milestone_name: Сервер и Telegram-бот
-current_phase: 08
-current_phase_name: Режим раннера в приложении
-status: executing
-stopped_at: Completed 08-06-PLAN.md
-last_updated: "2026-10-12T13:55:25.053Z"
+current_phase: 9
+current_phase_name: Уборка, развёртывание и учения
+status: planning
+stopped_at: Phase 08 complete, ready to plan Phase 9
+last_updated: "2026-10-12T14:34:37.156Z"
 last_activity: 2026-10-12
-last_activity_desc: Phase 08 execution started
-state_head: 9500cd53abac5f3b95c29adebb6f02de2d244b7b
+last_activity_desc: Phase 08 complete, transitioned to Phase 9
+state_head: 73f9d58d9699bcc7659823214de1cc74273f713a
 progress:
   total_phases: 5
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 33
   completed_plans: 33
-  percent: 60
+  percent: 80
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-10-11)
+See: .planning/PROJECT.md (updated 2026-10-12)
 
 **Core value:** Задача на монтаж доходит до готового `highlights.mp4` без ручного вмешательства, а если это невозможно — останавливается быстро и объясняет, что именно пошло не так. Для v1.1 то же верно от демки, отправленной боту, до ролика в чате.
-**Current focus:** Phase 08 — Режим раннера в приложении
+**Current focus:** Phase 9 — Уборка, развёртывание и учения
 
 ## Current Position
 
-Phase: 08 (Режим раннера в приложении) — EXECUTING
-Plan: 6 of 6 (все планы фазы выполнены, ждёт проверки фазы)
-Status: Ready to execute
-Last activity: 2026-10-12 — Phase 08 execution started
+Phase: 9 — Уборка, развёртывание и учения
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-10-12 — Phase 08 complete, transitioned to Phase 9
 
-Progress: [██████░░░░] 60%
+Progress: [████████░░] 80%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 43
+- Total plans completed: 49
 - Average duration: -
 - Total execution time: 0 hours
 
@@ -52,6 +52,7 @@ Progress: [██████░░░░] 60%
 | 06 | 11 | - | - |
 | 05 | 5 | - | - |
 | 07 | 11 | - | - |
+| 08 | 6 | - | - |
 
 **Recent Trend:**
 - Last 5 plans: -
@@ -187,6 +188,11 @@ Recent decisions affecting current work:
 - [Phase 04]: 04-10: ручные действия приёмки выводятся только из журнала (First/Auto) и attempt == 1 + auto_retries; серия B доказывается другим PID в имени партии и постановкой после конца серии A
 - [Phase 04]: 04-10: acceptance check/state/job читают базу только Store::open_read_only; ничего не удаляют и не завершают
 - [Phase 04]: 04-11: учения D1-D6 не проводились, приняты по указанию автора без улик; ACC-03 остаётся Pending, A1/A3/кириллица в трее не проверены
+- [Phase 08]: удалённая задача — строка `jobs` с `external_ref = srv:{id}:{epoch}` (миграция 6, уникальный частичный индекс); очередь подключается через `start_with_hook`, `queue::start` остался обёрткой; запись только в потоке очереди
+- [Phase 08]: токен раннера только в `runner/token` с суженным ACL (D-02), в `Settings` его нет, окно видит только `has_token`; `cs2-cli runner` и приложение делят `runner.lock`
+- [Phase 08]: после падения удалённые `running`/`queued` → «прервана, продолжится сама» без паузы очереди (`Reset.interrupted_remote`); в очередь возвращает только `adopt_remote` под замком хаба; «Повторить» закрытой выдачи локально без загрузки, «Заново» у карточки сервера нет (D-01)
+- [Phase 08]: ворота допуска закрыты при идущей, ждущей, стоящей на паузе очереди, открытой карточке сервера и пустых путях HLAE/CS2; ожидание без потолка (D-04); `hello` «занят» каждые 30 с; `release(counts: false)` после закрытия ворот
+- [Phase 08]: живой стенд (бот → сервер → приложение с CS2/HLAE, перезапуск посреди записи) пройден автором в UAT фазы 8 (тест 5); учения фазы 9 остаются
 - [Phase 05]: Настройки сервера — JSON-файл без крейта toml; время в базе — unix-мс по часам сервера; пути хранилища только из целых id
 - [Phase 05]: tiny_http 0.12 подтверждён как HTTP-стек (D-01): тесты протокола проходят, axum не нужен
 - [Phase 05]: http::start_with_flag: общий флаг остановки у Ctx и HttpServer; Core::claim без фильтра max_grants (потолок — в плане аренд)
@@ -252,9 +258,10 @@ None yet.
 
 ### Blockers/Concerns
 
-- Phase 5: модель доступа к БД сервера (поток-актор или `Arc<Mutex<Connection>>`) и поведение `tiny_http` под `PUT` по 8 МиБ, `Expect: 100-continue` и обрывы нужно решить коротким спайком в начале фазы
-- Phase 6: изоляция разбора демки в дочернем процессе с лимитом памяти (Job Object) не опробована; значения дедлайнов записи из v1.0 (консоль ~90 с, простой дубля ~60 с) и допуск `ffprobe` не подстроены на живом прогоне
-- Phase 7: поведение локального `telegram-bot-api` (общий том и права, `getFile` с абсолютным путём, `sendVideo` по `file://` на ~1 ГБ) требует спайка; приём ссылок FACEIT подтвердить с автором (риск SSRF)
+- Phase 9 (из фазы 5, вариант B): до входа закрыть CR-01, WR-01, WR-02 фазы 5 и прогнать CI на ubuntu-latest (05-UAT отложен)
+- Phase 9 (из фазы 6): дедлайны записи (консоль ~90 с, простой дубля ~60 с) и допуск `ffprobe` не подстроены на живом прогоне
+- Phase 9 (из фазы 7): спайки `telegram-bot-api` (общий том и права, `getFile` с абсолютным путём, `sendVideo` по `file://` на ~1 ГБ) отложены в 07-UAT (5 пунктов)
+- Phase 9 (из фазы 8, 08-REVIEW): две гонки — WR-01 (`adopt_remote` возвращает в `queued` карточку, которую очередь уже выполняет локально при выключенном раннере) и WR-02 (`start_job` перезаписывает `cancelled` между `next_queued` и `start_job`); WR-03 — синхронный `icacls` в потоке окна; все `open` в 08-REVIEW-DISPOSITION.md
 - Не выбраны ОС сервера (исследование рекомендует Linux + Tailscale Serve) и способ доступа к API раннера (Tailscale или Caddy); влияет на документацию фазы 9, не на код
 - В REQUIREMENTS.md число требований v1.1 было записано как 41, фактически их 37; счётчик исправлен при создании roadmap
 
@@ -275,5 +282,5 @@ Items acknowledged and deferred at milestone close, most recent first:
 ## Session Continuity
 
 Last session: 2026-10-12T13:55:12.926Z
-Stopped at: Completed 08-06-PLAN.md
+Stopped at: Phase 08 complete, ready to plan Phase 9
 Resume file: None

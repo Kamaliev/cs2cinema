@@ -194,3 +194,8 @@ fn sweep_out(dir: &Path, held: Option<i64>, now: SystemTime, swept: &mut Swept) 
         }
     }
 }
+
+/// Заглушка до реализации ротации журнала.
+pub fn rotate_log(_path: &Path, _max_bytes: u64) -> std::io::Result<bool> {
+    Ok(false)
+}

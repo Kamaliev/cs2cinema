@@ -193,13 +193,13 @@ Plans:
 Plans:
 **Wave 1**
 - [ ] 09-01-PLAN.md — вход: WR-02 с окном возврата и регрессионными тестами, `ci.yml` (`concurrency`, `timeout-minutes`), проверка истории на секреты, первый push автора и зелёный CI на ubuntu-latest (волна 1)
-- [ ] 09-03-PLAN.md — уборщик раннера: сироты `out/srv*`, `remote/srv*` по возрасту на простое, ротация `runner.log` (волна 1)
+- [ ] 09-03-PLAN.md — уборщик раннера: дубли задач с подтверждённым результатом — сразу по метке `out/srv{N}.accepted` и повтору `finish` (переживает обрыв), неподтверждённые сироты `out/srv*`, `remote/srv*` — по возрасту на простое, ротация `runner.log` (волна 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 - [ ] 09-02-PLAN.md — уборщик сервера: ключи `retention_*`, `Core::clean` с двухшаговым удалением, поток `spawn_cleaner`, `.part`, остатки, папка bot-api, понятные `/retry` и `/resend` после уборки (волна 2)
-- [ ] 09-04-PLAN.md — сквозной тест `runner/tests/chain.rs` (ролик в чате и понятный сбой), job `chain (ubuntu)` в CI, push автора (волна 2)
 
 **Wave 3** *(blocked on Wave 2 completion)*
+- [ ] 09-04-PLAN.md — сквозной тест `runner/tests/chain.rs` (ролик в чате и понятный сбой), job `chain (ubuntu)` в CI, push автора (волна 3, после 09-02)
 - [ ] 09-05-PLAN.md — развёртывание: `cs2-server backup`/`clean`, `docs/deploy/` (compose, systemd, таймер копий, Tailscale Serve/Caddy, проверка хоста), охранный тест `deploy_docs` (волна 3)
 
 **Wave 4** *(blocked on Wave 3 completion)*

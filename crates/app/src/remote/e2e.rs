@@ -10,12 +10,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use pipeline::{RunError, host::fake::FakeHost};
+use runner::RunnerState;
 use store::{JobKind, JobSource, JobStatus, NewJob, Store};
 use wire::JobState;
 
 use super::control::RemoteStatus;
+use super::hub::ExecFactory;
 use super::testkit::{
-    AppStand, BootOpts, Recordings, Stand, TestDir, fake_demo, gated_job_fn, gated_local, pipeline_factory, probing_host, put_token, wait_until,
+    AppStand, BootOpts, JobFnCalls, Recordings, Stand, TestDir, after_kill, after_kill_without_dir, after_upload_cut, fake_demo, faststart_mp4, gated_job_fn,
+    gated_local, inspect_runs, pipeline_factory, probing_host, put_token, wait_until,
 };
 use crate::queue::PauseReason;
 
@@ -140,6 +144,173 @@ fn paused_queue_keeps_server_jobs_out() {
     app.queue.resume();
     assert!(wait_until(30, || stand.job(id).state == JobState::Done), "после «Продолжить» задача сервера не дошла до done: {:?}", stand.job(id).state);
     assert_eq!(rec.starts(), vec!["A", "карточка"]);
+    assert_eq!(rec.max_concurrent(), 1);
+    app.shutdown();
+}
+
+/// Рабочая папка раннера, токен и файловая база приложения для сценариев «убитое приложение».
+struct Disk {
+    stand: Stand,
+    tools: TestDir,
+    db_dir: TestDir,
+}
+
+impl Disk {
+    fn new() -> Disk {
+        let stand = Stand::start();
+        put_token(&stand.runner_dir(), &stand.token);
+        Disk { stand, tools: TestDir::new("tools"), db_dir: TestDir::new("db") }
+    }
+
+    fn db(&self) -> std::path::PathBuf {
+        self.db_dir.path.join("cs2cinema.db")
+    }
+
+    /// Запуск приложения на этих папках и этом сервере.
+    fn boot(&self, host: &FakeHost, factory: ExecFactory, local: crate::queue::Runner) -> AppStand {
+        AppStand::boot(BootOpts { db: self.db(), runner_dir: self.stand.runner_dir(), host: host.clone(), factory, local, address: self.stand.base.clone() })
+    }
+}
+
+fn card_log(app: &AppStand, card: i64) -> String {
+    app.store.job(card).unwrap().map(|j| j.log).unwrap_or_default()
+}
+
+#[test]
+fn killed_during_recording_the_app_finishes_the_server_job_by_itself() {
+    let disk = Disk::new();
+    let runner_dir = disk.stand.runner_dir();
+    let dead = after_kill(&disk.stand, &runner_dir, &disk.db());
+    assert_eq!(disk.stand.job(dead.job_id).state, JobState::Assigned, "сервер считает задачу выданной раннеру");
+
+    let (rec, release, calls) = (Recordings::new(), flag(false), JobFnCalls::default());
+    let host = probing_host();
+    let gated = gated_job_fn(rec.clone(), release.clone());
+    let factory = {
+        let calls = calls.clone();
+        pipeline_factory(&host, &disk.tools, runner_dir.clone(), move |h, spec, p| {
+            calls.record(spec);
+            gated(h, spec, p)
+        })
+    };
+    let local = Recordings::new();
+    let app = disk.boot(&host, factory, gated_local(local.clone(), flag(true)));
+    assert_eq!((app.reset.interrupted, app.reset.interrupted_remote), (0, 1), "карточка сервера считается отдельно: {:?}", app.reset);
+    assert_eq!(app.queue.view().paused, None, "прерванная карточка сервера очередь на паузу не ставит");
+
+    // запись продолжается сама; пока сервер не решил, карточка удержана раннером
+    assert!(wait_until(20, || rec.current() == 1), "карточка не продолжила запись: {}", card_log(&app, dead.card));
+    let card = app.store.job(dead.card).unwrap().unwrap();
+    assert!(app.hub.is_held(&card), "карточка должна быть отмечена удержанной");
+    assert_eq!(app.queue.view().paused, None);
+    release.store(true, Ordering::SeqCst);
+
+    assert!(
+        wait_until(20, || disk.stand.job(dead.job_id).state == JobState::Done),
+        "задача не стала done: {:?}\n{}",
+        disk.stand.job(dead.job_id).state,
+        card_log(&app, dead.card)
+    );
+    assert!(wait_until(10, || status_of(&app.store, dead.card) == Some(JobStatus::Done)), "карточка не стала Done:\n{}", card_log(&app, dead.card));
+    assert!(wait_until(10, || card_log(&app, dead.card).contains("результат принят сервером")), "{}", card_log(&app, dead.card));
+    let log = card_log(&app, dead.card);
+    assert!(log.contains("продолжение после перезапуска"), "{log}");
+
+    assert_eq!(calls.count(), 1, "запись продолжена один раз");
+    assert_eq!(calls.resumes(), vec![true], "по record.json, а не заново");
+    assert_eq!(calls.out_dirs(), vec![Some(dead.out_dir.clone())], "в папке, которую раннер сохранил");
+    assert_eq!(inspect_runs(&host), 0, "повторной предпроверки демки нет");
+    assert_eq!(local.starts(), Vec::<String>::new(), "локальный исполнитель не звался");
+    let uploaded = std::fs::read(disk.stand.results_dir(dead.job_id).join("highlights.mp4")).expect("ролик принят сервером");
+    assert_eq!(uploaded, faststart_mp4());
+    assert_eq!(app.store.jobs().unwrap().iter().filter(|j| j.external_ref.is_some()).count(), 1, "карточка усыновлена, а не создана заново");
+    assert_eq!(app.queue.view().paused, None);
+    app.shutdown();
+}
+
+#[test]
+fn killed_during_upload_the_app_uploads_without_recording_again() {
+    let disk = Disk::new();
+    let runner_dir = disk.stand.runner_dir();
+    let dead = after_upload_cut(&disk.stand, &runner_dir, &disk.db());
+    assert_eq!(disk.stand.job(dead.job_id).state, JobState::Assigned, "сервер ещё не видел результата");
+
+    let calls = JobFnCalls::default();
+    let host = probing_host();
+    let factory = {
+        let calls = calls.clone();
+        pipeline_factory(&host, &disk.tools, runner_dir.clone(), move |_, spec, _| {
+            calls.record(spec);
+            Err(RunError::from("ролик уже готов: запись повторяться не должна"))
+        })
+    };
+    let local = Recordings::new();
+    let app = disk.boot(&host, factory, gated_local(local.clone(), flag(true)));
+    assert_eq!((app.reset.interrupted, app.reset.interrupted_remote), (0, 0), "готовая карточка не прерывается: {:?}", app.reset);
+
+    assert!(wait_until(20, || disk.stand.job(dead.job_id).state == JobState::Done), "результат не дошёл до сервера: {:?}", disk.stand.job(dead.job_id).state);
+    let uploaded = std::fs::read(disk.stand.results_dir(dead.job_id).join("highlights.mp4")).expect("ролик принят сервером");
+    assert_eq!(uploaded, faststart_mp4(), "результат на сервере равен файлу раннера");
+    assert!(wait_until(10, || card_log(&app, dead.card).contains("результат принят сервером")), "{}", card_log(&app, dead.card));
+    assert_eq!(status_of(&app.store, dead.card), Some(JobStatus::Done), "карточка остаётся Done");
+
+    assert_eq!(calls.count(), 0, "запись не повторялась");
+    assert_eq!(inspect_runs(&host), 0, "предпроверка не звалась");
+    assert_eq!(host.launches(), 0, "игра не запускалась");
+    assert_eq!(local.starts(), Vec::<String>::new());
+    assert_eq!(app.queue.view().paused, None);
+    assert!(wait_until(10, || RunnerState::load(&runner_dir).0.job.is_none()), "выдача снята с раннера");
+    assert_eq!(app.store.jobs().unwrap().len(), 1, "новых карточек нет");
+    app.shutdown();
+}
+
+#[test]
+fn closed_app_with_a_waiting_server_card_resumes_it() {
+    let disk = Disk::new();
+    let runner_dir = disk.stand.runner_dir();
+    let (dead, local_id) = after_kill_without_dir(&disk.stand, &runner_dir, &disk.db());
+
+    let (rec, calls) = (Recordings::new(), JobFnCalls::default());
+    let host = probing_host();
+    let gated = gated_job_fn(rec.clone(), flag(true));
+    let factory = {
+        let calls = calls.clone();
+        pipeline_factory(&host, &disk.tools, runner_dir.clone(), move |h, spec, p| {
+            calls.record(spec);
+            gated(h, spec, p)
+        })
+    };
+    let local = Recordings::new();
+    let app = disk.boot(&host, factory, gated_local(local.clone(), flag(true)));
+    assert_eq!((app.reset.interrupted, app.reset.interrupted_remote), (1, 1), "{:?}", app.reset);
+    assert_eq!(status_of(&app.store, local_id), Some(JobStatus::Interrupted), "своя задача прервана, как в v1.0");
+    assert_eq!(app.queue.view().paused, Some(PauseReason::Interrupted), "очередь на паузе, как в v1.0");
+
+    // карточка сервера вернулась в очередь по выдаче и ждёт, пока пауза не снята
+    assert!(wait_until(20, || status_of(&app.store, dead.card) == Some(JobStatus::Queued)), "карточка не вернулась в очередь: {}", card_log(&app, dead.card));
+    let card = app.store.job(dead.card).unwrap().unwrap();
+    assert!(app.hub.is_held(&card), "карточка удержана раннером");
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until {
+        assert_eq!(status_of(&app.store, dead.card), Some(JobStatus::Queued), "пока очередь на паузе, карточка ждёт");
+        assert_eq!(calls.count(), 0);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    app.queue.resume();
+    assert!(
+        wait_until(30, || disk.stand.job(dead.job_id).state == JobState::Done),
+        "задача не стала done: {:?}\n{}",
+        disk.stand.job(dead.job_id).state,
+        card_log(&app, dead.card)
+    );
+    assert!(wait_until(10, || status_of(&app.store, dead.card) == Some(JobStatus::Done)), "карточка не стала Done:\n{}", card_log(&app, dead.card));
+    // папку пайплайн назвать не успел, продолжать нечем: раннер начинает запись заново, с предпроверкой демки, но ровно один раз
+    assert_eq!(calls.resumes(), vec![false], "без папки задачи запись начинается заново");
+    assert_eq!(calls.count(), 1, "запись шла один раз");
+    assert_eq!(inspect_runs(&host), 1, "демка друга проверена перед записью");
+    assert_eq!(status_of(&app.store, local_id), Some(JobStatus::Interrupted), "своя задача сама не запустилась: её ждёт «Повторить»");
+    assert_eq!(local.starts(), Vec::<String>::new(), "локальный исполнитель не звался");
     assert_eq!(rec.max_concurrent(), 1);
     app.shutdown();
 }

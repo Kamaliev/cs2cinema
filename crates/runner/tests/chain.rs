@@ -29,6 +29,7 @@ use server::tg::fake::FakeTelegram;
 use wire::JobState;
 
 const OK_REPLY: &str = r#"{"ok":true,"player_name":"s1mple","player_steam":76561198034202275,"moments":3,"utility":1,"peak_mem_bytes":1048576}"#;
+const BAD_DEMO_REPLY: &str = r#"{"ok":false,"code":"BAD_DEMO","message":"мусор"}"#;
 const GOOD_PROBE: &str = r#"{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","width":1280,"height":720},{"codec_type":"audio","codec_name":"aac"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"5.000000"}}"#;
 
 const ADMIN: i64 = 100;
@@ -224,6 +225,74 @@ fn demo_from_a_friend_goes_through_the_server_and_the_runner_and_comes_back_as_a
 
     // Другу не показывают служебного, а токен раннера не попадает ни в журнал бота, ни в чат.
     assert_friend_texts_clean(&stand, &tg);
+    assert!(
+        sink.lines().iter().all(|l| !l.contains(&stand.token)),
+        "токен раннера в журнале бота"
+    );
+}
+
+#[test]
+fn broken_demo_ends_with_a_clear_message_to_the_friend_and_a_report_to_the_admin() {
+    let stand = Stand::start();
+    add_people(&stand);
+    let tg_dir = TestDir::new("chain-bad-tg");
+    let tg = FakeTelegram::new(tg_dir.path.clone());
+    let (bot, sink) = chain_bot(&stand, &tg);
+    let id = friend_sends_demo(&stand, &tg, &bot);
+
+    // Предпроверка раннера отвергает демку: ни CS2, ни ffprobe не понадобятся.
+    let dir = TestDir::new("chain-bad-runner");
+    let host = FakeHost::new(Scenario::happy(1).program("cs2-cli", &[BAD_DEMO_REPLY], exit0()));
+    let exec = PipelineExecutor::new(
+        Arc::new(host.clone()),
+        job_config(&dir),
+        InspectSettings {
+            exe: "cs2-cli".into(),
+            limits: InspectLimits::default(),
+        },
+    );
+    let mut runner = Runner::new(stand.runner_config(), Arc::new(exec)).unwrap();
+    assert_eq!(
+        runner.tick().unwrap(),
+        Tick::Settled {
+            job_id: id,
+            state: JobState::Failed
+        }
+    );
+    let job = stand.job(id);
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.fail_code.as_deref(), Some("BAD_DEMO"));
+    assert_eq!(host.launches(), 0, "CS2 не должен был запускаться");
+
+    for _ in 0..5 {
+        bot.step().expect("шаг бота");
+    }
+    let friend = tg.texts_to(FRIEND);
+    assert!(
+        friend
+            .iter()
+            .any(|t| t.contains("демка повреждена или это не демка CS2")),
+        "друг не получил понятной фразы: {friend:?}"
+    );
+    for t in &friend {
+        assert!(!t.contains("BAD_DEMO"), "код сбоя дошёл до друга: {t}");
+    }
+    assert_friend_texts_clean(&stand, &tg);
+    let admin = tg.texts_to(ADMIN);
+    assert_eq!(admin.len(), 1, "администратору нужен ровно один отчёт: {admin:?}");
+    assert!(admin[0].contains("BAD_DEMO"), "в отчёте нет кода: {}", admin[0]);
+    assert!(
+        admin[0].contains(&format!("#{id}")),
+        "в отчёте нет номера: {}",
+        admin[0]
+    );
+    assert!(tg.videos().is_empty(), "ролика быть не должно: {:?}", tg.videos());
+
+    // Повторные шаги бота сообщений не плодят.
+    bot.step().expect("шаг бота");
+    bot.step().expect("шаг бота");
+    assert_eq!(tg.texts_to(FRIEND), friend, "друг получил лишнее");
+    assert_eq!(tg.texts_to(ADMIN), admin, "администратор получил лишнее");
     assert!(
         sink.lines().iter().all(|l| !l.contains(&stand.token)),
         "токен раннера в журнале бота"

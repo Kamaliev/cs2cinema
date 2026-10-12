@@ -658,3 +658,29 @@ fn retry_records_the_delivery_row_even_when_the_confirmation_is_lost() {
         "тик сам присылает сообщение статуса"
     );
 }
+
+/// WR-03: второй `/retry` той же упавшей задачи не ставит вторую копию, а показывает уже идущий повтор.
+#[test]
+fn second_retry_of_the_same_job_does_not_queue_a_copy() {
+    let st = BotStand::start();
+    st.add_friend(A, "вася");
+    st.send_demo(A, "s1mple");
+    st.step();
+    let token = st.runner_token();
+    st.finish_failed(1, &token, "RECORD_TIMEOUT");
+    st.step();
+
+    let reply = ask(&st, A, "/retry");
+    assert!(reply.contains("повтор задачи #1"), "{reply}");
+    assert_eq!(st.server.running().core().jobs().unwrap().len(), 2);
+
+    let reply = ask(&st, A, "/retry 1");
+    assert!(reply.contains("уже в очереди: задача #2"), "{reply}");
+    let reply = ask(&st, A, "/retry");
+    assert!(reply.contains("уже в очереди: задача #2"), "{reply}");
+    assert_eq!(
+        st.server.running().core().jobs().unwrap().len(),
+        2,
+        "новых задач нет"
+    );
+}

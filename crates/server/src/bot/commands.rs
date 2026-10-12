@@ -7,7 +7,7 @@
 use super::ingest::{self, ACTIVE_STATES, ahead_phrase};
 use super::store::{self, NewTgJob};
 use super::{Bot, deliver, notify};
-use crate::core::is_steam64;
+use crate::core::{DedupKey, is_steam64, player_key};
 use crate::users::{self, User};
 use wire::{CancelMode, JobState};
 
@@ -353,6 +353,28 @@ fn retry_cmd(bot: &Bot, user: &User, chat_id: i64, args: &str) -> String {
             return format!("Задача #{id} уже готова. Прислать ролик ещё раз: /resend {id}");
         }
         _ => return format!("Задача #{id} ещё идёт — повторять нечего."),
+    }
+    // Повтор не ставится второй раз: тот же матч или демка и тот же игрок уже в очереди или готовы (WR-03).
+    let key = if job.source_kind == "faceit" {
+        job.faceit_link.clone().map(|link| DedupKey::Faceit {
+            link,
+            player_key: player_key(&job.player_name),
+        })
+    } else {
+        match bot.core().demo_file(id) {
+            Ok(file) => file.map(|f| DedupKey::File {
+                sha256: f.sha256,
+                player_key: player_key(&job.player_name),
+            }),
+            Err(_) => None,
+        }
+    };
+    if let Some(key) = key {
+        match bot.core().find_duplicate_for(&key, user.id) {
+            Ok(Some(dup)) => return ingest::duplicate_text(&dup, &job.player_name, user.id),
+            Ok(None) => {}
+            Err(e) => return format!("Не удалось проверить повтор задачи #{id}: {e}"),
+        }
     }
     // Лимиты D-03 проверяются до постановки (T-07-34).
     match bot

@@ -108,7 +108,7 @@ fn active_tasks(n: i64) -> String {
 }
 
 /// Ответ про повтор: задача в очереди или готовый ролик.
-fn duplicate_text(job: &JobRow, player: &str, user_id: i64) -> String {
+pub(super) fn duplicate_text(job: &JobRow, player: &str, user_id: i64) -> String {
     let faceit = job.source_kind == "faceit";
     // Чужую задачу не раскрываем номером и не предлагаем `/resend`: чужой ролик слать нельзя (WR-01).
     if job.user_id != Some(user_id) {

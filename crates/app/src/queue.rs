@@ -1135,4 +1135,126 @@ mod tests {
         assert_eq!(fake.notifications(), shown);
         assert_eq!(shown, vec![("CS2 Cinema".to_owned(), format!("0 готово / 2 упало · первая причина: #{a} PRECHECK_FAILED — нет ffmpeg"))]);
     }
+
+    /// Хук-счётчик: слышит каждый итог и отдаёт один и тот же совет.
+    struct CountingHook {
+        calls: std::sync::atomic::AtomicUsize,
+        heard: Mutex<Vec<Finished>>,
+        advice: Advice,
+    }
+
+    impl CountingHook {
+        fn new(advice: Advice) -> Arc<CountingHook> {
+            Arc::new(CountingHook { calls: std::sync::atomic::AtomicUsize::new(0), heard: Mutex::new(Vec::new()), advice })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SettleHook for CountingHook {
+        fn on_settled(&self, _job: &Job, finished: &Finished, _result: &Result<JobOutcome, RunError>) -> Advice {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.heard.lock().unwrap().push(finished.clone());
+            self.advice
+        }
+    }
+
+    /// Ждёт, пока хук услышит хотя бы `n` итогов (хук зовётся уже после смены статуса задачи в базе).
+    fn wait_hook(hook: &CountingHook, n: usize) {
+        let begin = Instant::now();
+        while hook.calls() < n && begin.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn hook_hears_the_final_verdict_once_after_an_auto_retry() {
+        let store = Store::in_memory().unwrap();
+        let a = add(&store, "первая");
+        let calls = Arc::new(Mutex::new(0u32));
+        let c = calls.clone();
+        let runner: Runner = Arc::new(move |_job, _rep| {
+            let n = {
+                let mut n = c.lock().unwrap();
+                *n += 1;
+                *n
+            };
+            if n == 1 {
+                Err(failure(FailCode::ConsoleNotOpen, RecordState::Console, "консольный порт не открылся"))
+            } else {
+                Ok(JobOutcome { out_dir: "out".into(), result: "out/highlights.mp4".into(), shots: 1, secs: 1.0 })
+            }
+        });
+        let hook = CountingHook::new(Advice::default());
+        let _q = start_with_hook(store.clone(), host(), runner, Reporter::detached(), None, cfg(), Some(hook.clone()));
+
+        wait_for(&store, a, JobStatus::Done);
+        wait_hook(&hook, 1);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(*calls.lock().unwrap(), 2, "исполнитель вызван дважды: сбой запуска и авто-повтор");
+        assert_eq!(hook.calls(), 1, "промежуточный сбой запуска хуку не отдаётся");
+        assert_eq!(*hook.heard.lock().unwrap(), vec![Finished::Done]);
+    }
+
+    #[test]
+    fn hook_lifts_only_the_cancel_pause() {
+        let store = Store::in_memory().unwrap();
+        let (a, b, c, d) = (add(&store, "первая"), add(&store, "вторая"), add(&store, "третья"), add(&store, "четвёртая"));
+        let cancelled: Behavior = Box::new(|| Err(RunError::from(pipeline::CANCELLED)));
+        let precheck = || -> Behavior { Box::new(|| Err(failure(FailCode::PrecheckFailed, RecordState::Precheck, "нет ffmpeg"))) };
+        let (runner, started) = stub(vec![("первая", cancelled), ("вторая", precheck()), ("третья", precheck()), ("четвёртая", ok())]);
+        let hook = CountingHook::new(Advice { suppress_pause: true });
+        let q = start_with_hook(store.clone(), host(), runner, Reporter::detached(), None, cfg(), Some(hook.clone()));
+
+        wait_for(&store, a, JobStatus::Cancelled);
+        wait_for(&store, c, JobStatus::Failed);
+        let begin = Instant::now();
+        while q.view().paused.is_none() && begin.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // отмена с советом не остановила очередь: вторая и третья пошли сами
+        assert_eq!(store.job(b).unwrap().unwrap().status, JobStatus::Failed);
+        // а две одинаковые неисправности окружения подряд всё равно ставят паузу
+        match q.view().paused {
+            Some(PauseReason::Repeated { code, jobs, .. }) => assert_eq!((code.as_str(), jobs), ("PRECHECK_FAILED", 2)),
+            other => panic!("ждали паузу Repeated: {other:?}"),
+        }
+        stays_queued(&store, d);
+        assert_eq!(*started.lock().unwrap(), ["первая", "вторая", "третья"]);
+        assert_eq!(hook.calls(), 3, "хук слышит каждый итог без авто-повтора");
+    }
+
+    #[test]
+    fn queue_without_hook_keeps_the_cancel_pause() {
+        let store = Store::in_memory().unwrap();
+        let (a, b) = (add(&store, "первая"), add(&store, "вторая"));
+        let cancelled: Behavior = Box::new(|| Err(RunError::from(pipeline::CANCELLED)));
+        let (runner, _) = stub(vec![("первая", cancelled), ("вторая", ok())]);
+        let q = start(store.clone(), host(), runner, Reporter::detached(), None, cfg());
+
+        wait_for(&store, a, JobStatus::Cancelled);
+        stays_queued(&store, b);
+        assert_eq!(q.view().paused, Some(PauseReason::Cancelled), "без хука отмена ставит паузу, как в v1.0");
+    }
+
+    #[test]
+    fn server_cards_are_not_opened_in_the_player() {
+        let store = Store::in_memory().unwrap();
+        let local = store.job(add(&store, "своя")).unwrap().unwrap();
+        let new_job = store::NewJob {
+            kind: JobKind::Record,
+            source: JobSource::File("remote/srv5.dem".into()),
+            label: "Задача с сервера #5".into(),
+            hero_name: "s1mple".into(),
+            hero_steam: 0,
+            map: String::new(),
+        };
+        let remote = store.job(store.adopt_remote(&new_job, "srv:5:1", false, None).unwrap()).unwrap().unwrap();
+
+        assert!(opens_result(true, &local), "свой ролик открывается");
+        assert!(!opens_result(true, &remote), "ролик задачи сервера на экране автора не открывается");
+        assert!(!opens_result(false, &local), "настройка «не открывать» главнее");
+    }
 }

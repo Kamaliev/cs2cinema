@@ -57,3 +57,9 @@ fn server_job_becomes_a_card_and_its_video_reaches_the_server() {
 
     assert!(rig.stop(), "поток раннера завершился без паники");
 }
+
+#[test]
+fn card_reference_and_label_are_built_from_numbers_only() {
+    assert_eq!(external_ref(7, 3), "srv:7:3");
+    assert_eq!(card_label(7), "Задача с сервера #7");
+}

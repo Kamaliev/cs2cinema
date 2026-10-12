@@ -207,7 +207,12 @@ pub struct Reset {
     pub interrupted: usize,
     /// Было «отменяется» — стало «отменена».
     pub cancelled: usize,
+    /// Было «выполняется» или «в очереди» у карточки сервера (`external_ref`) — стало «прервана»; очередь из-за них
+    /// не встаёт на паузу: раннер сам усыновит карточку и продолжит.
+    pub interrupted_remote: usize,
 }
+
+const INTERRUPTED_REMOTE_NOTE: &str = "приложение закрылось во время задачи с сервера — она продолжится сама, когда раннер снова подключится";
 
 const INTERRUPTED_HINT: &str = "Нажмите «Повторить», чтобы продолжить с записи без скачивания и плана, или «Заново», чтобы начать сначала.";
 
@@ -639,17 +644,35 @@ impl Store {
     }
 
     /// После падения приложения: «выполняется» — в «прервана» (этап остаётся, достигнутое состояние записи уходит в `fail_state`, D-14),
-    /// «отменяется» — в «отменена» (TMO-06). Возвращает оба счётчика.
+    /// «отменяется» — в «отменена» (TMO-06). Карточки сервера (`external_ref IS NOT NULL`) считаются отдельно: и «выполняется», и
+    /// «в очереди» у них становится «прервана» с обещанием «продолжится сама» и без подсказки «Повторить» — иначе поток очереди,
+    /// стартующий раньше раннера, взял бы карточку без записи в хабе; обратно в очередь её вернёт только усыновление.
+    /// Возвращает все три счётчика.
     pub fn reset_running(&self) -> Result<Reset> {
         self.with(|c| {
             let tx = c.unchecked_transaction()?;
             let interrupted = tx.execute(
-                "UPDATE jobs SET status = 'interrupted', fail_code = 'INTERRUPTED', fail_state = NULLIF(phase, ''), error = 'приложение закрылось во время выполнения', fail_hint = ?2, phase = '', updated_at = ?1 WHERE status = 'running'",
+                "UPDATE jobs SET status = 'interrupted', fail_code = 'INTERRUPTED', fail_state = NULLIF(phase, ''), error = 'приложение закрылось во время выполнения', fail_hint = ?2, phase = '', updated_at = ?1 WHERE status = 'running' AND external_ref IS NULL",
                 params![now(), INTERRUPTED_HINT],
+            )?;
+            let interrupted_remote = tx.execute(
+                "UPDATE jobs SET status = 'interrupted', fail_code = 'INTERRUPTED', fail_state = NULLIF(phase, ''), error = ?2, fail_hint = '', phase = '', updated_at = ?1 WHERE status IN ('running', 'queued') AND external_ref IS NOT NULL",
+                params![now(), INTERRUPTED_REMOTE_NOTE],
             )?;
             let cancelled = tx.execute("UPDATE jobs SET status = 'cancelled', stage = '', phase = '', updated_at = ?1 WHERE status = 'cancelling'", [now()])?;
             tx.commit()?;
-            Ok(Reset { interrupted, cancelled })
+            Ok(Reset { interrupted, cancelled, interrupted_remote })
+        })
+    }
+
+    /// Отмена ждущей карточки: `cancelled` только из `queued` (идущая и завершённая не трогаются); `true` — статус сменился.
+    /// Атомарно относительно `start_job`: карточку, которую очередь уже взяла, отменить этим вызовом нельзя.
+    pub fn cancel_if_queued(&self, id: i64) -> Result<bool> {
+        self.with(|c| {
+            Ok(c.execute(
+                "UPDATE jobs SET status = 'cancelled', stage = '', phase = '', updated_at = ?2 WHERE id = ?1 AND status = 'queued'",
+                params![id, now()],
+            )? > 0)
         })
     }
 
@@ -729,7 +752,7 @@ mod tests {
         let s = Store::in_memory().unwrap();
         let a = s.add_job(&new_job(JobKind::Plan)).unwrap();
         s.start_job(a).unwrap();
-        assert_eq!(s.reset_running().unwrap(), Reset { interrupted: 1, cancelled: 0 });
+        assert_eq!(s.reset_running().unwrap(), Reset { interrupted: 1, cancelled: 0, interrupted_remote: 0 });
         assert_eq!(s.job(a).unwrap().unwrap().status, JobStatus::Interrupted);
 
         assert!(s.cache_get("stats:1").unwrap().is_none());
@@ -792,7 +815,7 @@ mod tests {
             vec![(a, JobStatus::Running, Some(PathBuf::from("C:/out/a"))), (b, JobStatus::Cancelling, Some(PathBuf::from("C:/out/b")))],
             "прерванные задачи находятся вместе с папками; задача в очереди — нет"
         );
-        assert_eq!(s.reset_running().unwrap(), Reset { interrupted: 1, cancelled: 1 });
+        assert_eq!(s.reset_running().unwrap(), Reset { interrupted: 1, cancelled: 1, interrupted_remote: 0 });
         let ja = s.job(a).unwrap().unwrap();
         assert_eq!(ja.status, JobStatus::Interrupted);
         assert_eq!(ja.error.as_deref(), Some("приложение закрылось во время выполнения"));
@@ -813,7 +836,7 @@ mod tests {
         let s = Store::in_memory().unwrap();
         let a = s.add_job(&new_job(JobKind::Record)).unwrap();
         s.start_job(a).unwrap();
-        assert_eq!(s.reset_running().unwrap(), Reset { interrupted: 1, cancelled: 0 });
+        assert_eq!(s.reset_running().unwrap(), Reset { interrupted: 1, cancelled: 0, interrupted_remote: 0 });
         let j = s.job(a).unwrap().unwrap();
         assert_eq!((j.status, j.fail_state, j.fail_code.as_deref()), (JobStatus::Interrupted, None, Some("INTERRUPTED")));
         assert!(j.fail_hint.is_some());
@@ -1313,6 +1336,50 @@ mod tests {
         assert_eq!(s.job(fresh).unwrap().unwrap().out_dir, Some(PathBuf::from("out/srv6")));
         s.adopt_remote(&remote_job(), "srv:6:1", true, Some(Path::new("out/new"))).unwrap();
         assert_eq!(s.job(fresh).unwrap().unwrap().out_dir, Some(PathBuf::from("out/srv6")), "прежняя папка важнее");
+    }
+
+    #[test]
+    fn remote_cards_are_reset_apart_and_promise_to_continue() {
+        let s = Store::in_memory().unwrap();
+        let local = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.start_job(local).unwrap();
+        let running = s.adopt_remote(&remote_job(), "srv:5:1", false, None).unwrap();
+        s.start_job(running).unwrap();
+        s.set_phase(running, "take").unwrap();
+        let waiting = s.adopt_remote(&remote_job(), "srv:6:1", false, None).unwrap();
+        let cancelling = s.adopt_remote(&remote_job(), "srv:7:1", false, None).unwrap();
+        s.start_job(cancelling).unwrap();
+        assert!(s.set_cancelling(cancelling).unwrap());
+
+        assert_eq!(s.reset_running().unwrap(), Reset { interrupted: 1, cancelled: 1, interrupted_remote: 2 });
+
+        let l = s.job(local).unwrap().unwrap();
+        assert_eq!((l.status, l.error.as_deref()), (JobStatus::Interrupted, Some("приложение закрылось во время выполнения")));
+        assert!(l.fail_hint.as_deref().is_some_and(|h| h.contains("Повторить")), "у локальной задачи прежняя подсказка");
+
+        for id in [running, waiting] {
+            let j = s.job(id).unwrap().unwrap();
+            assert_eq!((j.status, j.fail_code.as_deref()), (JobStatus::Interrupted, Some("INTERRUPTED")), "карточка {id}");
+            assert!(j.error.as_deref().is_some_and(|e| e.contains("продолжится сама")), "{:?}", j.error);
+            assert_eq!(j.fail_hint.as_deref(), Some(""), "подсказки «Повторить» у карточки сервера нет");
+        }
+        assert_eq!(s.job(running).unwrap().unwrap().fail_state.as_deref(), Some("take"), "достигнутое состояние записи сохраняется");
+        assert_eq!(s.job(cancelling).unwrap().unwrap().status, JobStatus::Cancelled, "«отменяется» у любой карточки становится «отменена»");
+    }
+
+    #[test]
+    fn cancel_if_queued_touches_only_waiting_cards() {
+        let s = Store::in_memory().unwrap();
+        let waiting = s.add_job(&new_job(JobKind::Record)).unwrap();
+        assert!(s.cancel_if_queued(waiting).unwrap());
+        assert_eq!(s.job(waiting).unwrap().unwrap().status, JobStatus::Cancelled);
+        assert!(!s.cancel_if_queued(waiting).unwrap(), "повторно ничего не меняется");
+
+        let running = s.add_job(&new_job(JobKind::Record)).unwrap();
+        s.start_job(running).unwrap();
+        assert!(!s.cancel_if_queued(running).unwrap(), "идущую карточку этим вызовом не отменить");
+        assert_eq!(s.job(running).unwrap().unwrap().status, JobStatus::Running);
+        assert!(!s.cancel_if_queued(9999).unwrap(), "несуществующей карточки нет");
     }
 
     #[test]

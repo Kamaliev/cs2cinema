@@ -3,10 +3,10 @@
 //! (общий крейт не выделяется).
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -21,7 +21,7 @@ use pipeline::{
     inspect::InspectLimits,
     job::{JobConfig, JobSpec, Outcome},
 };
-use runner::{Config, Control, InspectSettings, PipelineExecutor, Token};
+use runner::{Config, Control, HeldJob, InspectSettings, Link, PipelineExecutor, RunnerState, Stage as HeldStage, Token, state};
 use server::{
     Running, auth,
     clock::SystemClock,
@@ -29,9 +29,10 @@ use server::{
     core::{Core, JobRow, Submit},
     log::MemorySink,
 };
-use store::{Job, Store};
+use store::{Job, JobKind, JobSource, NewJob, Store};
 
 use super::hub::{ExecFactory, RemoteExecutor, RemoteHub, queue_runner};
+use super::{card_label, external_ref};
 use crate::{
     app::Reporter,
     queue::{self, Queue, QueueConfig},
@@ -219,6 +220,102 @@ pub fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
     cond()
 }
 
+/// Вызовы подменённого `run_job`: сколько раз он вызван, с `resume` ли и с какой папкой.
+#[derive(Clone, Default)]
+pub struct JobFnCalls(Arc<Mutex<Vec<(bool, Option<PathBuf>)>>>);
+
+impl JobFnCalls {
+    /// Записывает очередной вызов: зовётся из `job_fn` первой строкой.
+    pub fn record(&self, spec: &JobSpec) {
+        if let Ok(mut v) = self.0.lock() {
+            v.push((spec.resume, spec.out_dir.clone()));
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.0.lock().map_or(0, |v| v.len())
+    }
+
+    /// Флаг `resume` каждого вызова по порядку.
+    pub fn resumes(&self) -> Vec<bool> {
+        self.0.lock().map(|v| v.iter().map(|c| c.0).collect()).unwrap_or_default()
+    }
+
+    /// Папка задачи каждого вызова по порядку.
+    pub fn out_dirs(&self) -> Vec<Option<PathBuf>> {
+        self.0.lock().map(|v| v.iter().map(|c| c.1.clone()).collect()).unwrap_or_default()
+    }
+}
+
+/// `job_fn`, который держит карточку занятой, пока её не отменят (не дольше 15 с): ставит `started` и ждёт `p.cancelled()`.
+pub fn blocking_job_fn(started: Arc<AtomicBool>) -> impl Fn(&dyn Host, &JobSpec, &dyn Progress) -> Result<Outcome, RunError> + Send + Sync + 'static {
+    move |_, _, p| {
+        started.store(true, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < until {
+            if p.cancelled() {
+                return Err(RunError::from(pipeline::CANCELLED));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(RunError::from("отмены за 15 с не дождались"))
+    }
+}
+
+/// Состояние «приложение убито посреди записи»: задача сервера выдана раннеру, в `runner_state.json` она на этапе
+/// «исполнитель работает», а карточка в базе приложения усыновлена и запущена.
+pub struct AfterKill {
+    pub job_id: i64,
+    pub epoch: i64,
+    /// Номер карточки в файловой базе.
+    pub card: i64,
+    /// Папка задачи, которую раннер сохранил для продолжения.
+    pub out_dir: PathBuf,
+}
+
+/// Готовит «убитое приложение»: задача ставится на `stand`, выдаётся вручную (как это сделал бы раннер, который потом умер),
+/// `runner_state.json` кладётся в `runner_dir`, а карточка с запуском — в файловую базу `db`. Соединение с базой закрывается.
+pub fn after_kill(stand: &Stand, runner_dir: &Path, db: &Path) -> AfterKill {
+    let demo = fake_demo(1024 * 1024);
+    let job_id = stand.submit(&demo, "s1mple");
+    let link = Link::new(&stand.base, Token::new(stand.token.clone())).unwrap();
+    let assignment = link.claim(0).unwrap().expect("задача должна быть выдана");
+    assert_eq!(assignment.job_id, job_id);
+
+    let demo_path = runner_dir.join("remote").join(format!("srv{job_id}.dem"));
+    std::fs::create_dir_all(demo_path.parent().unwrap()).unwrap();
+    std::fs::write(&demo_path, &demo).unwrap();
+    let out_dir = runner_dir.join("out").join(format!("srv{job_id}"));
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut held = HeldJob::claimed(&assignment, demo_path.clone());
+    held.stage = HeldStage::Executing;
+    held.out_dir = Some(out_dir.clone());
+    held.attempt = 1;
+    RunnerState { version: state::VERSION, job: Some(held), last_seq: 0 }.save(runner_dir).unwrap();
+
+    let store = Store::open(db).unwrap();
+    let new_job = NewJob {
+        kind: JobKind::Record,
+        source: JobSource::File(demo_path),
+        label: card_label(job_id),
+        hero_name: "s1mple".to_owned(),
+        hero_steam: 0,
+        map: String::new(),
+    };
+    let card = store.adopt_remote(&new_job, &external_ref(job_id, assignment.epoch), false, Some(&out_dir)).unwrap();
+    store.start_job(card).unwrap();
+    store.set_out_dir(card, &out_dir).unwrap();
+    AfterKill { job_id, epoch: assignment.epoch, card, out_dir }
+}
+
+/// Необязательные части стенда: своя база (в том числе файловая), пауза с самого начала, исполнитель локальных задач.
+#[derive(Default)]
+pub struct RigOpts {
+    pub store: Option<Store>,
+    pub paused: Option<queue::PauseReason>,
+    pub local: Option<queue::Runner>,
+}
+
 /// База, хаб, настоящий поток очереди и поток раннера на одном стенде.
 pub(crate) struct Rig {
     pub store: Store,
@@ -231,11 +328,24 @@ pub(crate) struct Rig {
 impl Rig {
     /// `local` — исполнитель локальных задач очереди (и закрытых карточек), `factory` — исполнитель удалённых.
     pub fn start(stand: &Stand, factory: ExecFactory, local: queue::Runner) -> Rig {
-        let store = Store::in_memory().unwrap();
+        Rig::start_with(stand, factory, RigOpts { local: Some(local), ..RigOpts::default() })
+    }
+
+    /// То же с необязательными частями: без `local` локальная задача считается ошибкой теста.
+    pub fn start_with(stand: &Stand, factory: ExecFactory, opts: RigOpts) -> Rig {
+        let local: queue::Runner = opts.local.unwrap_or_else(|| Arc::new(|_, _| Err(RunError::from("локальная задача в этом тесте не ожидалась"))));
+        let store = opts.store.unwrap_or_else(|| Store::in_memory().unwrap());
         let hub = RemoteHub::new(store.clone());
         let host: Arc<dyn Host> = Arc::new(FakeHost::new(Scenario::happy(1)));
-        let queue =
-            queue::start_with_hook(store.clone(), host, queue_runner(local, hub.clone(), factory), Reporter::detached(), None, queue_cfg(), Some(hub.clone()));
+        let queue = queue::start_with_hook(
+            store.clone(),
+            host,
+            queue_runner(local, hub.clone(), factory),
+            Reporter::detached(),
+            opts.paused,
+            queue_cfg(),
+            Some(hub.clone()),
+        );
 
         let mut cfg = Config::new(stand.base.clone(), Token::new(stand.token.clone()), stand.runner_dir());
         cfg.name = "tester".to_owned();

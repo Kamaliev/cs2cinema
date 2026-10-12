@@ -1,0 +1,53 @@
+# Службы для cs2-server на Linux-хосте: локальный telegram-bot-api и контейнер-уборщик его рабочей папки.
+# Кладётся в /opt/cs2-bot-api/docker-compose.yml; рядом лежит .env (права 0600) со строками
+# TELEGRAM_API_ID=... и TELEGRAM_API_HASH=... (README, раздел 4). Токен бота сюда не пишется:
+# он живёт только в /etc/cs2-server/env у сервера.
+services:
+  telegram-bot-api:
+    # После первого успешного запуска закрепить дайджестом (README, раздел 4):
+    # так обновление образа не прилетает незаметно.
+    image: aiogram/telegram-bot-api:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TELEGRAM_LOCAL: "1"
+      # Уровень 1: при более подробном журнале в нём появляются адреса запросов с токеном бота.
+      TELEGRAM_VERBOSITY: "1"
+    ports:
+      # Docker обходит ufw: публиковать только на loopback, иначе bot-api окажется в интернете.
+      - "127.0.0.1:8081:8081"
+    volumes:
+      # Рабочая папка bot-api; путь одинаков на хосте и в контейнере, поэтому bot_api_files_root_local не нужен.
+      - /var/lib/telegram-bot-api:/var/lib/telegram-bot-api
+      # Ролики для sendVideo по file://; только чтение.
+      - /var/lib/cs2-server/blobs/results:/var/lib/cs2-server/blobs/results:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Уборщик рабочей папки bot-api под тем же uid, что и сам bot-api (101): права на создаваемые им файлы
+  # у пользователя cs2-server могут не позволять удаление. Раз в 10 минут стирает обычные файлы старше
+  # 6 часов (срок retention_botapi_hours по умолчанию) только в documents/ и videos/ на глубине
+  # <папка-токена>/documents|videos/<файл>. Сети у контейнера нет.
+  botapi-janitor:
+    image: alpine:3.20
+    restart: unless-stopped
+    user: "101:101"
+    network_mode: none
+    volumes:
+      - /var/lib/telegram-bot-api:/var/lib/telegram-bot-api
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          find /var/lib/telegram-bot-api -mindepth 3 -maxdepth 3 -type f \( -path '*/documents/*' -o -path '*/videos/*' \) -mmin +360 -delete
+          sleep 600
+        done
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

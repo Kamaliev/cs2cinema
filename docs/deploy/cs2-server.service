@@ -1,0 +1,35 @@
+# Служба cs2-server (очередь монтажа и Telegram-бот). Кладётся в /etc/systemd/system/cs2-server.service.
+#
+# Пользователь обычный системный, а не динамический: каталог данных должен быть читаем контейнером
+# bot-api (uid 101) для отправки роликов, а динамический пользователь меняет uid между запусками.
+#
+# Токен бота и адрес bot-api (TELEGRAM_BOT_TOKEN, CS2_SERVER_BOT_API_URL) живут только в
+# /etc/cs2-server/env с правами 0600 root:root; файл настроек секретов не содержит.
+# Если после перезагрузки сервер стартует раньше контейнера bot-api, он завершается с ошибкой, и systemd
+# запускает его снова: попытки не ограничены (StartLimitIntervalSec=0).
+[Unit]
+Description=cs2-server (очередь монтажа и Telegram-бот)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+StartLimitIntervalSec=0
+
+[Service]
+User=cs2-server
+Group=cs2-server
+StateDirectory=cs2-server
+StateDirectoryMode=0755
+UMask=0022
+EnvironmentFile=/etc/cs2-server/env
+ExecStart=/usr/local/bin/cs2-server serve --config /etc/cs2-server/cs2-server.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Запись только в каталог состояния (StateDirectory) и в рабочую папку bot-api (уборка её файлов).
+ReadWritePaths=/var/lib/telegram-bot-api
+
+[Install]
+WantedBy=multi-user.target

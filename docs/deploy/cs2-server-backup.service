@@ -1,0 +1,17 @@
+# Разовая резервная копия базы cs2-server; запускается таймером cs2-server-backup.timer.
+# Кладётся в /etc/systemd/system/cs2-server-backup.service.
+#
+# Копия снимается подкомандой backup (VACUUM INTO): она безопасна, пока cs2-server работает.
+# Секретов этой службе не нужно: токен бота и адрес bot-api остаются только у основной службы.
+[Unit]
+Description=Резервная копия базы cs2-server
+
+[Service]
+Type=oneshot
+User=cs2-server
+Group=cs2-server
+ExecStart=/usr/local/bin/cs2-server --config /etc/cs2-server/cs2-server.json backup /var/backups/cs2-server --keep 14
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/cs2-server /var/backups/cs2-server

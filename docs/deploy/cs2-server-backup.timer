@@ -1,0 +1,12 @@
+# Ежесуточный запуск резервной копии базы. Кладётся в /etc/systemd/system/cs2-server-backup.timer.
+# Persistent: если хост был выключен в назначенное время, копия снимется сразу после включения.
+[Unit]
+Description=Ежесуточная резервная копия базы cs2-server
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

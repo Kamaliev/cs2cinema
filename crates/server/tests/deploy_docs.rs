@@ -6,6 +6,10 @@ use std::path::Path;
 
 const SERVICE: &str = include_str!("../../../docs/deploy/cs2-server.service");
 const COMPOSE: &str = include_str!("../../../docs/deploy/docker-compose.yml");
+const BACKUP_SERVICE: &str = include_str!("../../../docs/deploy/cs2-server-backup.service");
+const BACKUP_TIMER: &str = include_str!("../../../docs/deploy/cs2-server-backup.timer");
+const README: &str = include_str!("../../../docs/deploy/README.md");
+const CHECK_HOST: &str = include_str!("../../../docs/deploy/check-host.sh");
 
 /// Подставной токен: только форма настоящего, к Telegram он отношения не имеет.
 const FAKE_TOKEN: &str = "123456789:AAEdeploydocsDEPLOYDOCSdeploydocsDEPLOY01";
@@ -79,5 +83,80 @@ fn compose_publishes_bot_api_only_on_loopback() {
         ":ro",
     ] {
         assert!(COMPOSE.contains(needle), "в compose нет «{needle}»");
+    }
+}
+
+#[test]
+fn backup_timer_runs_the_backup_subcommand_daily() {
+    assert!(BACKUP_SERVICE.contains("backup /var/backups/cs2-server --keep 14"));
+    assert!(BACKUP_SERVICE.contains("User=cs2-server"));
+    for needle in [
+        "OnCalendar=daily",
+        "Persistent=true",
+        "WantedBy=timers.target",
+    ] {
+        assert!(BACKUP_TIMER.contains(needle), "в таймере нет «{needle}»");
+    }
+}
+
+#[test]
+fn readme_never_exposes_the_server_port() {
+    for needle in [
+        "tailscale serve --bg --https=443 http://127.0.0.1:8080",
+        "reverse_proxy 127.0.0.1:8080",
+        "nmap",
+        "systemctl reboot",
+        "check-host.sh",
+        "/etc/cs2-server/env",
+        "cs2-server-backup.timer",
+    ] {
+        assert!(README.contains(needle), "в документе нет «{needle}»");
+    }
+    for forbidden in [
+        "0.0.0.0:8080",
+        "ufw allow 8080",
+        "ufw allow 8081",
+        "http://100.",
+    ] {
+        assert!(
+            !README.contains(forbidden),
+            "документ советует опасное: «{forbidden}»"
+        );
+    }
+    // Шестнадцать нумерованных разделов на месте, в заданном порядке.
+    let mut from = 0;
+    for n in 1..=16 {
+        let head = format!("\n## {n}. ");
+        let at = README[from..]
+            .find(&head)
+            .unwrap_or_else(|| panic!("нет раздела {n} после позиции {from}"));
+        from += at + head.len();
+    }
+}
+
+#[test]
+fn check_host_script_covers_services_ports_and_backups() {
+    assert!(CHECK_HOST.starts_with("#!/usr/bin/env bash"));
+    for needle in [
+        "set -u",
+        "ss -tlnp",
+        "systemctl is-active cs2-server",
+        "/v1/runner/hello",
+        "/var/backups/cs2-server",
+        "stat -c %a",
+    ] {
+        assert!(CHECK_HOST.contains(needle), "в скрипте нет «{needle}»");
+    }
+}
+
+#[test]
+fn deploy_files_have_unix_line_endings() {
+    for (name, text) in [
+        ("check-host.sh", CHECK_HOST),
+        ("cs2-server.service", SERVICE),
+        ("cs2-server-backup.service", BACKUP_SERVICE),
+        ("docker-compose.yml", COMPOSE),
+    ] {
+        assert!(!text.contains('\r'), "{name}: CRLF сломает файл на Linux");
     }
 }

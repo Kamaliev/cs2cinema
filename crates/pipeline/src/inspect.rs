@@ -207,6 +207,8 @@ pub fn inspect_demo(a: &InspectArgs, p: &dyn Progress) -> InspectReport {
 pub struct Preflight {
     pub player_name: String,
     pub player_steam: u64,
+    /// Карта демки из ответа ребёнка, очищенная от управляющих символов; пуста, если ребёнок её не назвал.
+    pub map: String,
     pub moments: usize,
     pub utility: usize,
     /// Пик памяти ребёнка, байт; 0 — неизвестно.
@@ -333,7 +335,8 @@ pub fn preflight(host: &dyn Host, exe: &Path, args: &InspectArgs, cancel: &dyn F
     if player_name.is_empty() {
         return Err(bad_demo(failure::msg_bad_demo("разбор не назвал игрока"), elapsed));
     }
-    Ok(Preflight { player_name, player_steam: rep.player_steam, moments: rep.moments, utility: rep.utility, peak_mem_bytes: rep.peak_mem_bytes })
+    let map = cs2::text::clean_text(&rep.map, cs2::text::NAME_MAX);
+    Ok(Preflight { player_name, player_steam: rep.player_steam, map, moments: rep.moments, utility: rep.utility, peak_mem_bytes: rep.peak_mem_bytes })
 }
 
 #[cfg(test)]
@@ -390,11 +393,25 @@ mod tests {
         let r = run(&host, &args("s1mple")).expect("игрок найден");
         assert_eq!(
             r,
-            Preflight { player_name: "s1mple".into(), player_steam: 76561198034202275, moments: 3, utility: 1, peak_mem_bytes: 1234 }
+            Preflight { player_name: "s1mple".into(), player_steam: 76561198034202275, map: String::new(), moments: 3, utility: 1, peak_mem_bytes: 1234 }
         );
         let runs = host.runs();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].2[0], "inspect");
+    }
+
+    #[test]
+    fn preflight_reports_the_map() {
+        let json = r#"{"ok":true,"player_name":"s1mple","player_steam":76561198034202275,"map":"de_mirage","moments":3,"utility":1,"peak_mem_bytes":1234}"#;
+        let host = host_with(&[json], Ok(exit(Some(0), &[])));
+        assert_eq!(run(&host, &args("s1mple")).expect("игрок найден").map, "de_mirage");
+
+        // карта из враждебного ответа очищается от управляющих символов
+        let json = r#"{"ok":true,"player_name":"s1mple","player_steam":1,"map":"de_\u001b[31mnuke\nquit","moments":1}"#;
+        let host = host_with(&[json], Ok(exit(Some(0), &[])));
+        let map = run(&host, &args("s1mple")).expect("игрок найден").map;
+        assert!(!map.chars().any(char::is_control), "{map:?}");
+        assert!(map.starts_with("de_"), "{map:?}");
     }
 
     #[test]

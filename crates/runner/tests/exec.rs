@@ -281,6 +281,7 @@ fn missing_key_is_faceit_fetch_failed() {
     let e = exec.run(&t, &Quiet).expect_err("без ключа не скачать");
     assert_eq!(fail_code(&e), FailCode::FaceitFetchFailed);
     assert!(e.message.contains("FACEIT_API_KEY"), "{}", e.message);
+    assert!(e.message.contains("настройках"), "{}", e.message);
     assert!(calls.lock().unwrap().is_empty());
     assert_eq!(inspect_runs(&host), 0);
 }
@@ -639,4 +640,85 @@ fn run_returns_an_error_when_the_server_rejects_the_token() {
         .run()
         .expect_err("раннер с чужим токеном должен остановиться");
     assert!(e.contains("токен"), "{e}");
+}
+
+const MIRAGE_REPLY: &str = r#"{"ok":true,"player_name":"s1mple","player_steam":76561198034202275,"map":"de_mirage","moments":3,"utility":1,"peak_mem_bytes":1048576}"#;
+
+/// `Progress`, который складывает по порядку артефакты `Match` и строки журнала.
+struct Recorder(Mutex<Vec<String>>);
+
+impl Progress for Recorder {
+    fn stage(&self, _: pipeline::Stage) {}
+    fn log(&self, msg: &str) {
+        self.0.lock().unwrap().push(format!("лог: {msg}"));
+    }
+    fn artifact(&self, a: &pipeline::Artifact) {
+        if let pipeline::Artifact::Match { map, player } = a {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("карта {map}, игрок {player}"));
+        }
+    }
+}
+
+#[test]
+fn inspected_demo_reports_its_map_and_player() {
+    let dir = TestDir::new("exec-map");
+    let host = FakeHost::new(
+        Scenario::happy(1)
+            .program("cs2-cli", &[MIRAGE_REPLY], exit0())
+            .program("ffprobe", &[GOOD_PROBE], exit0()),
+    );
+    let exec = executor(&host, &dir).with_job_fn({
+        let out = dir.path.join("out").join("srv7");
+        move |_, _, p| {
+            p.log("job_fn");
+            std::fs::create_dir_all(&out).unwrap();
+            let result = out.join("highlights.mp4");
+            std::fs::write(&result, mp4(&[b"ftyp", b"moov", b"mdat"])).unwrap();
+            Ok(Outcome {
+                out_dir: out.clone(),
+                result,
+                shots: 1,
+                secs: 5.0,
+            })
+        }
+    });
+    let rec = Recorder(Mutex::default());
+
+    exec.run(&task("match.dem"), &rec).expect("ролик записан");
+
+    let seen = rec.0.lock().unwrap().clone();
+    let match_at = seen
+        .iter()
+        .position(|l| l == "карта de_mirage, игрок s1mple")
+        .unwrap_or_else(|| panic!("нет Artifact::Match: {seen:?}"));
+    let job_at = seen
+        .iter()
+        .position(|l| l == "лог: job_fn")
+        .expect("job_fn вызван");
+    assert!(match_at < job_at, "карта сообщается до записи: {seen:?}");
+    assert!(
+        seen.iter()
+            .any(|l| l.starts_with("лог: демка проверена: карта de_mirage, игрок s1mple")),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn resumed_task_has_no_preflight_and_reports_no_map() {
+    let dir = TestDir::new("exec-map-resume");
+    let host = FakeHost::new(Scenario::happy(1).program("cs2-cli", &[MIRAGE_REPLY], exit0()));
+    let exec = executor(&host, &dir).with_job_fn(|_, _, _| Err(RunError::from("стоп")));
+    let rec = Recorder(Mutex::default());
+    let mut t = task("match.dem");
+    t.resume = true;
+    t.out_dir = Some(dir.path.join("old"));
+
+    let _ = exec.run(&t, &rec);
+
+    assert_eq!(inspect_runs(&host), 0, "при продолжении предпроверки нет");
+    let seen = rec.0.lock().unwrap().clone();
+    assert!(!seen.iter().any(|l| l.starts_with("карта ")), "{seen:?}");
 }

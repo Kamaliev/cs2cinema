@@ -101,6 +101,8 @@ pub enum Artifact {
     Precheck { json: String, passed: bool },
     /// Пара «сборка CS2 / версия HLAE» удачной записи.
     LastGood { cs2_build: String, hlae_version: String },
+    /// Карта и игрок задачи по ответу дочерней предпроверки; локальные задачи знают их при постановке.
+    Match { map: String, player: String },
 }
 
 /// Сообщение об отмене — по нему окно отличает отмену от ошибки.

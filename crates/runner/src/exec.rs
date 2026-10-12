@@ -15,7 +15,9 @@ use pipeline::inspect::{InspectArgs, InspectLimits, preflight};
 use pipeline::job::{DemoSource, JobConfig, JobSpec, Outcome, run_job};
 use pipeline::record::failure::{msg_faceit_fetch_failed, msg_result_invalid, msg_unsupported_source};
 use pipeline::record::log::one_line;
-use pipeline::{CANCELLED, FailCode, Progress, RecordFailure, RecordState, RunError, Stage};
+use pipeline::{
+    Artifact, CANCELLED, FailCode, Progress, RecordFailure, RecordState, RunError, Stage,
+};
 
 /// Сколько ждать ffprobe при проверке готового ролика.
 const VERIFY_DEADLINE: Duration = Duration::from_secs(60);
@@ -137,7 +139,8 @@ impl PipelineExecutor {
         let key = self.cfg.faceit_key.trim();
         if key.is_empty() {
             return Err(fetch_failed(
-                "у раннера не задан ключ FACEIT (переменная FACEIT_API_KEY)",
+                "не задан ключ FACEIT: у cs2-cli runner — переменная FACEIT_API_KEY, \
+                 в приложении — «Ключ Data API» в настройках",
             ));
         }
         p.log("качаю демку FACEIT…");
@@ -174,8 +177,18 @@ impl PipelineExecutor {
             limits: self.inspect.limits,
         };
         let ok = preflight(&*self.host, &self.inspect.exe, &args, &|| p.cancelled())?;
+        // Карта и игрок нужны вызывающему для подписи карточки (D-05): имена уже очищены в `preflight`.
+        p.artifact(&Artifact::Match {
+            map: ok.map.clone(),
+            player: ok.player_name.clone(),
+        });
+        let map = if ok.map.is_empty() {
+            String::new()
+        } else {
+            format!("карта {}, ", ok.map)
+        };
         p.log(&format!(
-            "демка проверена: игрок {}, моментов {}, пик памяти разбора {} МиБ",
+            "демка проверена: {map}игрок {}, моментов {}, пик памяти разбора {} МиБ",
             ok.player_name,
             ok.moments,
             ok.peak_mem_bytes >> 20

@@ -143,6 +143,9 @@ impl Progress for JobReporter {
             Artifact::LastGood { cs2_build, hlae_version } => {
                 let _ = self.store.set_last_good(cs2_build, hlae_version);
             }
+            // Карта и игрок локальной задачи записаны при постановке; удалённой карточке их пишет
+            // `remote::hub::CardProgress` (план 08-05).
+            Artifact::Match { .. } => {}
         }
     }
 }

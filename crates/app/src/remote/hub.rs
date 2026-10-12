@@ -70,11 +70,31 @@ impl Slot {
 pub struct RemoteHub {
     store: Store,
     slots: Mutex<HashMap<String, Arc<Slot>>>,
+    /// Ссылка выдачи, которую раннер держит в `runner_state.json` (ставит наблюдатель раннера).
+    held: Mutex<Option<String>>,
 }
 
 impl RemoteHub {
     pub fn new(store: Store) -> Arc<RemoteHub> {
-        Arc::new(RemoteHub { store, slots: Mutex::new(HashMap::new()) })
+        Arc::new(RemoteHub { store, slots: Mutex::new(HashMap::new()), held: Mutex::new(None) })
+    }
+
+    /// Запоминает ссылку выдачи (`srv:{задача}:{эпоха}`), которую раннер сейчас держит; `None` — раннер ничего не держит.
+    /// Карточка с такой ссылкой считается удержанной даже тогда, когда записи в хабе у неё ещё (или уже) нет: окно показывает
+    /// её как задачу сервера, которая продолжится сама.
+    pub fn set_held_ref(&self, r: Option<String>) {
+        if let Ok(mut held) = self.held.lock() {
+            *held = r;
+        }
+    }
+
+    /// Удержана ли карточка раннером: у неё есть запись в хабе или её `external_ref` равен удерживаемой ссылке.
+    /// Локальная карточка (без `external_ref`) не удержана никогда.
+    pub fn is_held(&self, job: &store::Job) -> bool {
+        let Some(reference) = job.external_ref.as_deref() else {
+            return false;
+        };
+        self.slot(reference).is_some() || self.held.lock().is_ok_and(|held| held.as_deref() == Some(reference))
     }
 
     /// Есть ли открытая запись карточки.

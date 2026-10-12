@@ -3,7 +3,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -15,7 +15,7 @@ use wire::JobState;
 use super::testkit::{
     JobFnCalls, Rig, RigOpts, Stand, TestDir, after_kill, blocking_job_fn, fake_demo, faststart_mp4, inspect_runs, pipeline_factory, probing_host, wait_until,
 };
-use super::{card_label, external_ref};
+use super::{RemoteHub, card_label, external_ref};
 use crate::{jobs, queue::PauseReason, settings::Settings};
 
 const MIB: usize = 1024 * 1024;
@@ -328,4 +328,110 @@ fn launch_failure_is_retried_inside_the_same_grant() {
     assert_eq!(calls.count(), 2);
     assert_eq!(calls.resumes(), vec![false, true], "повтор идёт с продолжением");
     assert_eq!(rig.store.jobs().unwrap().iter().filter(|j| j.external_ref.is_some()).count(), 1, "одна выдача - одна карточка");
+}
+
+/// Задача сервера, закрытая с итогом «ошибка»: возвращает стенд, стенд раннера, номер задачи, карточку и счётчик вызовов
+/// локального исполнителя. Записи в хабе у карточки уже нет.
+fn closed_failed_card() -> (Stand, Rig, i64, i64, Arc<AtomicUsize>, JobFnCalls) {
+    let stand = Stand::start();
+    let id = stand.submit(&fake_demo(MIB), "s1mple");
+    let tools = TestDir::new("tools");
+    let host = probing_host();
+    let calls = JobFnCalls::default();
+    let factory = {
+        let calls = calls.clone();
+        pipeline_factory(&host, &tools, stand.runner_dir(), move |_, spec, _| {
+            calls.record(spec);
+            let f = RecordFailure::new(FailCode::TakeInvalid, RecordState::Take, "дубль записан неверно".to_owned(), Duration::ZERO);
+            Err(RunError { message: f.message.clone(), fail: Some(f) })
+        })
+    };
+    let local_calls = Arc::new(AtomicUsize::new(0));
+    let local: crate::queue::Runner = {
+        let local_calls = local_calls.clone();
+        Arc::new(move |job, _| {
+            local_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(JobOutcome { out_dir: "out/local".into(), result: format!("out/local/{}.mp4", job.id).into(), shots: 1, secs: 1.0 })
+        })
+    };
+    let rig = Rig::start_with(&stand, factory, RigOpts { local: Some(local), ..RigOpts::default() });
+    assert!(wait_until(20, || stand.job(id).state == JobState::Failed), "задача сервера не стала failed: {:?}", stand.job(id).state);
+    let card = wait_card(&rig, id).id;
+    assert!(wait_until(10, || status_of(&rig, card) == Some(JobStatus::Failed)), "карточка не стала «ошибка»");
+    assert!(wait_until(10, || !rig.hub.has_slots()), "запись карточки в хабе не закрылась");
+    (stand, rig, id, card, local_calls, calls)
+}
+
+#[test]
+fn retry_of_a_closed_server_card_runs_locally_and_uploads_nothing() {
+    let (stand, rig, id, card, local_calls, calls) = closed_failed_card();
+    assert_eq!(local_calls.load(Ordering::SeqCst), 0, "до «Повторить» локальный исполнитель не звался");
+    assert_eq!(calls.count(), 1);
+
+    rig.store.requeue_resume(card).unwrap();
+    rig.queue.resume();
+    assert!(wait_until(15, || status_of(&rig, card) == Some(JobStatus::Done)), "«Повторить» не довёл карточку до Done: {:?}", status_of(&rig, card));
+
+    assert_eq!(local_calls.load(Ordering::SeqCst), 1, "продолжил локальный исполнитель, а не фабрика раннера");
+    assert_eq!(calls.count(), 1, "фабрика раннера второй раз не вызывалась");
+    let log = rig.store.job(card).unwrap().unwrap().log;
+    assert!(log.contains("результат не отправляется: задача на сервере закрыта"), "{log}");
+    assert_eq!(stand.job(id).state, JobState::Failed, "итог задачи на сервере не менялся");
+    let sent = std::fs::read_dir(stand.results_dir(id)).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(sent, 0, "на сервер ничего не загружено");
+}
+
+#[test]
+fn closed_server_card_cannot_start_over() {
+    let (_stand, rig, _id, card, local_calls, _calls) = closed_failed_card();
+
+    rig.store.requeue(card).unwrap();
+    rig.queue.resume();
+    assert!(wait_until(15, || rig.store.job(card).unwrap().unwrap().attempt >= 2), "карточка не была взята очередью");
+    assert!(wait_until(15, || status_of(&rig, card) == Some(JobStatus::Failed) && rig.queue.view().running.is_none()), "карточка не закончила попытку");
+
+    let job = rig.store.job(card).unwrap().unwrap();
+    assert!(job.error.as_deref().is_some_and(|e| e.contains("начать её заново нельзя")), "{:?}", job.error);
+    assert_eq!(rig.queue.view().paused, None, "очередь не на паузе");
+    assert_eq!(local_calls.load(Ordering::SeqCst), 0, "локальный исполнитель не вызывался");
+}
+
+#[test]
+fn held_reference_marks_the_card() {
+    // записи в хабе нет: решает только удерживаемая раннером ссылка
+    let store = Store::in_memory().unwrap();
+    let hub = RemoteHub::new(store.clone());
+    let remote = |reference: &str| {
+        let job = NewJob { label: card_label(5), source: JobSource::File("remote/srv5.dem".into()), ..local_job() };
+        store.job(store.adopt_remote(&job, reference, false, None).unwrap()).unwrap().unwrap()
+    };
+    let (held, other_epoch) = (remote(&external_ref(5, 2)), remote(&external_ref(5, 3)));
+    let local = store.job(store.add_job(&local_job()).unwrap()).unwrap().unwrap();
+    assert!(!hub.is_held(&held), "пока раннер ничего не держит, карточка не удержана");
+
+    hub.set_held_ref(Some(external_ref(5, 2)));
+    assert!(hub.is_held(&held));
+    assert!(!hub.is_held(&other_epoch), "другая эпоха той же задачи не удержана");
+    assert!(!hub.is_held(&local), "локальная карточка не удержана никогда");
+
+    hub.set_held_ref(None);
+    assert!(!hub.is_held(&held), "после снятия отметки карточка не удержана");
+
+    // запись в хабе: карточка, которую раннер ведёт сейчас, удержана и без отметки
+    let stand = Stand::start();
+    let tools = TestDir::new("tools");
+    let host = probing_host();
+    let (entered, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let factory = pipeline_factory(&host, &tools, stand.runner_dir(), |_, _, _| Err(RunError::from("карточка не должна была запускаться")));
+    let rig = Rig::start_with(&stand, factory, RigOpts { local: Some(gated_local(entered.clone(), release.clone())), ..RigOpts::default() });
+    rig.store.add_job(&local_job()).unwrap();
+    assert!(wait_until(10, || entered.load(Ordering::SeqCst)), "локальная задача не заняла очередь");
+    let id = stand.submit(&fake_demo(MIB), "s1mple");
+    let card = wait_card(&rig, id);
+    assert!(rig.hub.is_held(&card), "карточка с записью в хабе удержана");
+    stand.cancel(id, false);
+    assert!(wait_until(15, || stand.job(id).state == JobState::Cancelled), "сервер не получил cancelled");
+    assert!(wait_until(10, || !rig.hub.has_slots()), "запись не закрылась");
+    release.store(true, Ordering::SeqCst);
+    assert!(!rig.hub.is_held(&card), "после закрытия записи карточка не удержана");
 }

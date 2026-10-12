@@ -69,6 +69,11 @@ impl JobReporter {
         JobReporter { store, id, ui, cancel, attempt, cur: Mutex::new(None) }
     }
 
+    /// Номер карточки, которую ведёт отчёт.
+    pub(crate) fn id(&self) -> i64 {
+        self.id
+    }
+
     /// Строка в журнал задачи в базе: время, метка `[этап #попытка]` и текст.
     fn write(&self, label: &str, text: &str) {
         let line = format!("{}  {} {text}", chrono::Local::now().format("%H:%M:%S"), journal::prefix(label, self.attempt));

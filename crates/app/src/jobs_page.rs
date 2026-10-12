@@ -149,34 +149,59 @@ pub fn card_buttons(status: JobStatus, resumable: bool, has_dir: bool, busy: boo
     }
 }
 
-/// Кнопки карточки задачи сервера (D-01): у удержанной раннером нет никаких, «Заново» нет никогда.
+/// Кнопки карточки задачи сервера (D-01, T-08-21): пока карточку держит раннер (запись в хабе или выдача в его состоянии),
+/// кнопок нет — задачу друга нельзя ни потерять, ни записать дважды. «Заново» у карточки сервера нет никогда:
+/// «Повторить» закрытой выдачи продолжает её локально по `record.json` без загрузки.
 pub fn remote_card_buttons(status: JobStatus, resumable: bool, has_dir: bool, busy: bool, held: bool) -> CardButtons {
-    let _ = (status, resumable, has_dir, busy, held);
-    CardButtons { retry: None, redo: true, open_dir: true }
+    if held {
+        return CardButtons { retry: None, redo: false, open_dir: false };
+    }
+    CardButtons { redo: false, ..card_buttons(status, resumable, has_dir, busy) }
 }
 
-/// Заголовок карточки сервера, если карта и игрок неизвестны: её подпись «Задача с сервера #N».
+/// Заголовок карточки сервера, пока карта и игрок неизвестны: подпись «Задача с сервера #N», построенная из номера
+/// в `external_ref` (текст от друга в неё не попадает). У карточки с картой или игроком и у локальной — `None`.
 pub fn server_heading(j: &Job) -> Option<String> {
-    let _ = j;
-    Some(String::new())
+    let id = j.external_ref.as_deref()?.strip_prefix("srv:")?.split(':').next()?.parse::<i64>().ok()?;
+    (j.map.is_empty() && j.hero_name.is_empty()).then(|| crate::remote::card_label(id))
 }
 
-/// Чего ждёт карточка в очереди приложения.
+/// Чего ждёт карточка в очереди приложения (D-04): потолка ожидания нет, но причина видна.
 pub fn waiting_reason(view: &QueueView, card: i64) -> String {
-    let _ = (view, card);
-    String::new()
+    if view.paused.is_some() {
+        "очередь приложения на паузе — нажмите «Продолжить»".to_owned()
+    } else if let Some((id, _)) = view.running {
+        format!("идёт задача #{id}")
+    } else if let Some((id, _)) = view.hold {
+        if id == card {
+            "ждёт авто-повтора".to_owned()
+        } else {
+            "очередь ждёт авто-повтора другой задачи".to_owned()
+        }
+    } else {
+        "начнётся на следующем такте очереди".to_owned()
+    }
 }
 
-/// Пояснение под подписью карточки сервера.
+/// Пояснение под подписью карточки сервера: чего она ждёт, что продолжится сама и что стало с роликом (D-04, Pitfall 5).
+/// `waiting` — причина из `waiting_reason`, `held` — карточку держит раннер, `result_exists` — файл ролика ещё на диске.
 pub fn server_note(j: &Job, held: bool, waiting: Option<&str>, result_exists: bool) -> Option<String> {
-    let _ = (j, held, waiting, result_exists);
-    Some(String::new())
+    j.external_ref.as_ref()?;
+    match j.status {
+        JobStatus::Queued => Some(format!("ждёт очереди приложения: {}", waiting.unwrap_or("начнётся на следующем такте очереди"))),
+        JobStatus::Interrupted if held => Some("продолжится сама, когда раннер подключится к серверу".to_owned()),
+        JobStatus::Done if !result_exists => Some("ролик отправлен на сервер, локальная копия удалена".to_owned()),
+        _ => None,
+    }
 }
 
 fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
     let view = app.queue.view();
-    let running = view.running.is_some_and(|(id, _)| id == j.id);
+    let running = view.running.as_ref().is_some_and(|(id, _)| *id == j.id);
     let hold = view.hold.filter(|(id, _)| *id == j.id).map(|(_, until)| until);
+    let server = j.external_ref.is_some();
+    let held = server && app.remote.hub().is_held(j);
+    let result_exists = j.result.as_ref().is_some_and(|p| p.is_file());
     ui::card(ui, |ui| {
         ui.horizontal_top(|ui| {
             thumb(app, ui, j);
@@ -185,16 +210,37 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                 ui.set_width(ui.available_width());
                 // заголовок: карта · игрок · вид · когда
                 ui.horizontal(|ui| {
-                    ui.label(ui::b(&j.map).size(16.0));
-                    ui.label(ui::b(&j.hero_name).size(16.0).color(ui::ACCENT));
+                    if let Some(title) = server_heading(j) {
+                        ui.label(ui::b(title).size(16.0));
+                    } else if server {
+                        // у карточки сервера пустые части не выводятся
+                        if !j.map.is_empty() {
+                            ui.label(ui::b(&j.map).size(16.0));
+                        }
+                        if !j.hero_name.is_empty() {
+                            ui.label(ui::b(&j.hero_name).size(16.0).color(ui::ACCENT));
+                        }
+                    } else {
+                        ui.label(ui::b(&j.map).size(16.0));
+                        ui.label(ui::b(&j.hero_name).size(16.0).color(ui::ACCENT));
+                    }
                     let (kind, color) = match j.kind {
                         JobKind::Plan => ("план", MUTED),
                         JobKind::Record => ("ролик", ACCENT),
                     };
                     ui::pill(ui, kind, color);
+                    if server {
+                        ui::pill(ui, "с сервера", ACCENT);
+                    }
                     ui.label(RichText::new(format!("#{} · {}", j.id, ui::date(j.created_at))).color(MUTED).size(12.5));
                 });
                 ui.add(egui::Label::new(RichText::new(&j.label).color(MUTED).size(12.5)).truncate());
+                if server {
+                    let waiting = (j.status == JobStatus::Queued).then(|| waiting_reason(&view, j.id));
+                    if let Some(note) = server_note(j, held, waiting.as_deref(), result_exists) {
+                        ui.add(egui::Label::new(RichText::new(note).color(MUTED).size(12.5)).wrap());
+                    }
+                }
                 ui.add_space(2.0);
                 // статус и прогресс
                 ui.horizontal(|ui| match j.status {
@@ -288,7 +334,12 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
             });
         });
         ui.add_space(4.0);
-        let buttons = card_buttons(j.status, app.jobs.resumable.contains(&j.id), j.out_dir.is_some(), app.status.busy);
+        let (resumable, has_dir) = (app.jobs.resumable.contains(&j.id), j.out_dir.is_some());
+        let buttons = if server {
+            remote_card_buttons(j.status, resumable, has_dir, app.status.busy, held)
+        } else {
+            card_buttons(j.status, resumable, has_dir, app.status.busy)
+        };
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 match j.status {
@@ -306,7 +357,8 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                         }
                     }
                     JobStatus::Done => {
-                        if let Some(p) = &j.result {
+                        // ролик карточки сервера после подтверждения сервером удаляется: открывать нечего
+                        if let Some(p) = j.result.as_ref().filter(|_| !server || result_exists) {
                             if ui::primary(ui, true, "Открыть") {
                                 ui::open_path(p);
                             }
@@ -343,7 +395,7 @@ fn job_card(app: &App, ui: &mut Ui, j: &Job, act: &mut Option<Act>) {
                         }
                     }
                 }
-                if !matches!(j.status, JobStatus::Running | JobStatus::Cancelling) && ui.small_button("Удалить").clicked() {
+                if !matches!(j.status, JobStatus::Running | JobStatus::Cancelling) && !held && ui.small_button("Удалить").clicked() {
                     *act = Some(Act::Delete(j.id));
                 }
                 let open = app.jobs.open_log == Some(j.id);
@@ -669,7 +721,7 @@ mod tests {
         }
         assert!(reasons[0].contains("Продолжить"), "{}", reasons[0]);
         assert!(reasons[1].contains("#3"), "{}", reasons[1]);
-        assert_eq!(waiting_reason(&hold, 6), waiting_reason(&free, 6), "авто-повтор чужой задачи ничего не объясняет");
+        assert!(waiting_reason(&hold, 6).contains("другой задачи"), "{}", waiting_reason(&hold, 6));
 
         let mut j = card(true, "", "");
         j.status = JobStatus::Queued;

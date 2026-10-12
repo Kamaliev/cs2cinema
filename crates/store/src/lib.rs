@@ -481,8 +481,14 @@ impl Store {
     }
 
     /// Карта и игрок карточки по ответу предпроверки; пустое значение прежнее не затирает.
-    pub fn set_card_info(&self, _id: i64, _map: &str, _hero_name: &str) -> Result<()> {
-        Ok(())
+    pub fn set_card_info(&self, id: i64, map: &str, hero_name: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE jobs SET map = CASE WHEN ?2 <> '' THEN ?2 ELSE map END, hero_name = CASE WHEN ?3 <> '' THEN ?3 ELSE hero_name END, updated_at = ?4 WHERE id = ?1",
+                params![id, map, hero_name, now()],
+            )?;
+            Ok(())
+        })
     }
 
     /// Папка известна до записи — чтобы у упавшей задачи карточка могла назвать record.log.

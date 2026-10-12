@@ -309,6 +309,11 @@ impl Progress for CardProgress<'_> {
     }
     fn artifact(&self, a: &Artifact) {
         self.rep.artifact(a);
+        // карта и игрок из дочерней предпроверки подписывают карточку (D-05); имена приходят от чужой демки, поэтому очищаются
+        if let Artifact::Match { map, player } = a {
+            let (map, player) = (cs2::text::clean_text(map, cs2::text::NAME_MAX), cs2::text::clean_text(player, cs2::text::NAME_MAX));
+            let _ = self.rep.store.set_card_info(self.rep.id(), &map, &player);
+        }
         self.slot.send(HubMsg::Artifact(a.clone()));
     }
 }

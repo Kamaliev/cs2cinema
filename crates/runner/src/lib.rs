@@ -11,6 +11,7 @@ pub mod exec;
 pub mod link;
 pub mod policy;
 pub mod state;
+pub mod sweep;
 pub mod tee;
 pub mod transfer;
 
@@ -19,7 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use pipeline::record::failure;
 use pipeline::record::log::one_line;
@@ -335,6 +336,8 @@ pub struct Runner {
     announced: Option<Holding>,
     /// Раньше этого момента новый `claim` не делается (пауза после `release`).
     cooldown_until: Option<Instant>,
+    /// Когда раннер последний раз проходил уборку рабочей папки (на простое, не чаще `SWEEP_EVERY`).
+    last_sweep: Option<Instant>,
 }
 
 impl Runner {
@@ -368,6 +371,7 @@ impl Runner {
             gate_hello: None,
             announced: None,
             cooldown_until: None,
+            last_sweep: None,
             fatal: None,
         })
     }
@@ -395,6 +399,13 @@ impl Runner {
         if self.resume.swap(false, Ordering::SeqCst) && self.paused.take().is_some() {
             self.pause_hello = None;
             self.log.line("пауза снята: раннер снова берёт задачи");
+        }
+        if self.state.job.is_none()
+            && self
+                .last_sweep
+                .is_none_or(|t| t.elapsed() >= sweep::SWEEP_EVERY)
+        {
+            self.sweep_now();
         }
         let tick = if self.state.job.is_some() {
             self.drive()?
@@ -431,6 +442,17 @@ impl Runner {
             job_id: j.server_job_id,
             epoch: j.epoch,
         })
+    }
+
+    /// Проход уборки рабочей папки; зовётся только без удерживаемой задачи. Итог — одна строка в `runner.log`
+    /// (числа и номера задач, без путей).
+    fn sweep_now(&mut self) {
+        let held = self.holding().map(|h| h.job_id);
+        let swept = sweep::sweep(&self.cfg.dir, held, SystemTime::now());
+        self.last_sweep = Some(Instant::now());
+        if !swept.is_empty() {
+            self.log.line(&swept.line());
+        }
     }
 
     /// Строка для наблюдателя: значение токена заменено на `***`, переводы строк убраны.

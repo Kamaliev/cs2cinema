@@ -165,6 +165,7 @@ impl Stand {
             force_after: runner::FORCE_AFTER,
             release_cooldown: Duration::ZERO,
             max_demo_bytes: runner::MAX_DEMO_BYTES,
+            admission: None,
         }
     }
 }

@@ -45,8 +45,20 @@ pub const RELEASE_COOLDOWN: Duration = Duration::from_secs(15);
 pub const MAX_DEMO_BYTES: u64 = 2000 << 20;
 /// Начало ошибки `hello` при несовпадении версии протокола: по нему `run` понимает, что повторы не помогут.
 pub const PROTOCOL_MISMATCH: &str = "версия протокола сервера не совпадает с раннером";
-/// Как часто раннер на паузе напоминает серверу о себе.
+/// Как часто раннер на паузе или за закрытыми воротами напоминает серверу о себе.
 const PAUSE_HELLO_EVERY: Duration = Duration::from_secs(30);
+
+/// Решение ворот допуска: можно ли брать новую задачу сервера.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// Новую задачу взять можно.
+    Open,
+    /// Новых задач не брать; причина по-русски, без точки в конце.
+    Closed(String),
+}
+
+/// Ворота допуска: раннер спрашивает их перед каждым `claim` и ещё раз сразу после выдачи.
+pub type Gate = Arc<dyn Fn() -> Admission + Send + Sync>;
 
 /// Настройки раннера.
 #[derive(Clone)]
@@ -74,6 +86,8 @@ pub struct Config {
     pub release_cooldown: Duration,
     /// Демка больше этого размера (по выдаче) не скачивается: задача закрывается `DEMO_TOO_LARGE`.
     pub max_demo_bytes: u64,
+    /// Ворота допуска: `Closed(причина)` — новых задач не брать; `None` — брать всегда, как `cs2-cli runner`.
+    pub admission: Option<Gate>,
 }
 
 impl Config {
@@ -92,6 +106,7 @@ impl Config {
             force_after: FORCE_AFTER,
             release_cooldown: RELEASE_COOLDOWN,
             max_demo_bytes: MAX_DEMO_BYTES,
+            admission: None,
         }
     }
 }
@@ -110,6 +125,7 @@ impl std::fmt::Debug for Config {
             .field("force_after", &self.force_after)
             .field("release_cooldown", &self.release_cooldown)
             .field("max_demo_bytes", &self.max_demo_bytes)
+            .field("admission", &self.admission.is_some())
             .finish()
     }
 }
@@ -129,6 +145,9 @@ pub enum Tick {
     Released { job_id: i64 },
     /// Раннер на паузе и задач не берёт, пока его не продолжат (`Control::resume`).
     Paused(PauseReason),
+    /// Ворота допуска закрыты (причина по-русски): задача не запрошена, а если она была выдана в момент
+    /// закрытия, то возвращена серверу без засчёта выдачи.
+    Gated(String),
 }
 
 /// Журнал `runner.log`: строки `{время} {текст}`, значение токена заменено на `***`.
@@ -268,6 +287,8 @@ pub struct Runner {
     fatal: Option<String>,
     /// Когда раннер последний раз сообщил серверу о паузе.
     pause_hello: Option<Instant>,
+    /// Когда раннер последний раз сообщил серверу, что ворота закрыты; сбрасывается, когда они открылись.
+    gate_hello: Option<Instant>,
     /// Раньше этого момента новый `claim` не делается (пауза после `release`).
     cooldown_until: Option<Instant>,
 }
@@ -300,6 +321,7 @@ impl Runner {
             paused: None,
             resume: Arc::new(AtomicBool::new(false)),
             pause_hello: None,
+            gate_hello: None,
             cooldown_until: None,
             fatal: None,
         })
@@ -334,12 +356,21 @@ impl Runner {
         } else if let Some(reason) = self.paused.clone() {
             self.pause_ping(&reason)?;
             return Ok(Tick::Paused(reason));
+        } else if let Admission::Closed(why) = self.admission() {
+            self.gate_ping(&why)?;
+            return Ok(Tick::Gated(why));
         } else {
+            self.gate_hello = None;
             self.wait_cooldown();
             let poll = self.cfg.poll_secs.or(self.poll_secs).unwrap_or(0);
             match self.link.claim(poll).map_err(link_error)? {
                 None => Tick::Idle,
-                Some(a) => self.accept(a)?,
+                Some(a) => match self.admission() {
+                    Admission::Open => self.accept(a)?,
+                    // Ворота закрылись между решением и выдачей (автор поставил свою задачу): задача
+                    // возвращается серверу, не успев стать нашей.
+                    Admission::Closed(why) => return self.hand_back(a, why),
+                },
             }
         };
         // Вторая неисправность подряд: задача уже возвращена, раннер встаёт на паузу.
@@ -347,6 +378,62 @@ impl Runner {
             (Tick::Released { .. }, Some(reason)) => Tick::Paused(reason.clone()),
             (tick, _) => tick,
         })
+    }
+
+    /// Решение ворот; без ворот — всегда открыто.
+    fn admission(&self) -> Admission {
+        self.cfg
+            .admission
+            .as_ref()
+            .map_or(Admission::Open, |gate| gate())
+    }
+
+    /// Раннер за закрытыми воротами: `hello` «занят: причина» сразу и затем не реже раза в 30 с, чтобы сервер
+    /// считал его «на связи» (любой запрос с токеном обновляет `last_seen_at`).
+    fn gate_ping(&mut self, why: &str) -> Result<(), String> {
+        if self
+            .gate_hello
+            .is_some_and(|t| t.elapsed() < PAUSE_HELLO_EVERY)
+        {
+            return Ok(());
+        }
+        let req = HelloRequest {
+            protocol: wire::PROTOCOL_VERSION,
+            name: self.cfg.name.clone(),
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            status: format!("занят: {why}"),
+            holding: Vec::new(),
+        };
+        self.link.hello(&req).map_err(link_error)?;
+        self.gate_hello = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Ворота закрылись после `claim`: задача возвращается серверу без засчёта выдачи, в `runner_state.json` она
+    /// не попадает и пауза `release_cooldown` не ставится. Если `release` не прошёл, задача принимается как
+    /// обычно и ждёт в очереди приложения: одну запись всё равно обеспечивает единственный поток очереди.
+    fn hand_back(&mut self, a: Assignment, why: String) -> Result<Tick, String> {
+        let id = a.job_id;
+        let req = ReleaseRequest {
+            epoch: a.epoch,
+            reason: format!("раннер занят: {why}"),
+            counts: false,
+        };
+        match self.link.release(id, &req) {
+            Ok(()) => {
+                self.log.line(&format!(
+                    "задача #{id}: раннер занят ({why}) — возвращена серверу, выдача не засчитана"
+                ));
+                Ok(Tick::Gated(why))
+            }
+            Err(e) => {
+                self.log.line(&format!(
+                    "задача #{id}: раннер занят ({why}), но вернуть её серверу не удалось: {} — беру как обычную",
+                    link_error(e)
+                ));
+                self.accept(a)
+            }
+        }
     }
 
     /// Ждёт `release_cooldown` после `release`, проверяя флаг остановки.
@@ -397,7 +484,7 @@ impl Runner {
                 Ok(Tick::Settled { .. } | Tick::Dropped { .. } | Tick::Released { .. }) => {
                     pause = 0
                 }
-                Ok(Tick::Paused(_)) => {
+                Ok(Tick::Paused(_) | Tick::Gated(_)) => {
                     pause = 0;
                     self.sleep(1);
                 }
@@ -550,7 +637,10 @@ impl Runner {
 
     /// Удаляет скачанную демку (и недокачанную) внутри рабочей папки раннера: сервер хранит её сам.
     fn remove_demo(&self, job: &HeldJob) {
-        for p in [job.demo_path.clone(), job.demo_path.with_extension("dem.part")] {
+        for p in [
+            job.demo_path.clone(),
+            job.demo_path.with_extension("dem.part"),
+        ] {
             if p.starts_with(&self.cfg.dir) {
                 let _ = fs::remove_file(&p);
             }

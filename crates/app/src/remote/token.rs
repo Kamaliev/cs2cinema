@@ -8,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use pipeline::host::Host;
 use runner::Token;
 
 /// Имя файла токена в рабочей папке раннера.
@@ -55,6 +56,16 @@ pub fn exists(dir: &Path) -> bool {
     std::fs::read_to_string(path(dir)).is_ok_and(|t| !t.trim().is_empty())
 }
 
+/// Записывает токен в файл с суженным доступом (заглушка до реализации).
+pub fn save(_host: &dyn Host, _dir: &Path, _value: &str) -> Result<(), String> {
+    Err("не реализовано".to_owned())
+}
+
+/// Удаляет файл токена (заглушка до реализации).
+pub fn clear(_dir: &Path) -> Result<(), String> {
+    Err("не реализовано".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +94,84 @@ mod tests {
         assert!(!err.contains("ab cd"), "значение не попадает в ошибку: {err}");
         std::fs::write(dir.path.join(TOKEN_FILE), "\n").unwrap();
         assert!(load(&dir.path).unwrap().is_none(), "пустой файл — токена нет");
+    }
+    use pipeline::host::{
+        CmdOutput,
+        fake::{FakeHost, Scenario},
+    };
+    use std::time::Duration;
+
+    fn icacls_host(code: i32) -> FakeHost {
+        let out = Ok(CmdOutput { code: Some(code), stderr_tail: Vec::new(), elapsed: Duration::ZERO });
+        FakeHost::new(Scenario::happy(1).program("icacls", &[], out))
+    }
+
+    fn icacls_runs(host: &FakeHost) -> Vec<Vec<String>> {
+        host.runs().into_iter().filter(|(_, program, _)| program.contains("icacls")).map(|(_, _, args)| args).collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saved_token_loads_back_and_the_acl_is_narrowed_first() {
+        let dir = TestDir::new("token-save");
+        let host = icacls_host(0);
+        save(
+            &host,
+            &dir.path,
+            "  tok-123 
+",
+        )
+        .expect("токен должен сохраниться");
+        let token = load(&dir.path).unwrap().expect("токен читается обратно");
+        assert_eq!(token.bearer(), "Bearer tok-123");
+        let runs = icacls_runs(&host);
+        assert_eq!(runs.len(), 1, "ровно один запуск icacls: {runs:?}");
+        let user = std::env::var("USERNAME").expect("в Windows есть USERNAME");
+        let file = dir.path.join(TOKEN_FILE).to_string_lossy().into_owned();
+        assert_eq!(runs[0], vec![file, "/inheritance:r".to_owned(), "/grant:r".to_owned(), format!("{user}:F")]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_acl_leaves_no_token_file() {
+        let dir = TestDir::new("token-acl");
+        let err = save(&icacls_host(5), &dir.path, "secret-value-1").expect_err("без суженного доступа токен не сохраняется");
+        assert!(err.contains("доступ"), "{err}");
+        assert!(!err.contains("secret-value-1"), "значение токена не попадает в ошибку: {err}");
+        assert!(!dir.path.join(TOKEN_FILE).exists(), "файла токена быть не должно");
+        assert!(!exists(&dir.path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_token_is_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new("token-unix");
+        let host = icacls_host(0);
+        save(&host, &dir.path, "tok-123").unwrap();
+        let mode = std::fs::metadata(dir.path.join(TOKEN_FILE)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "права файла токена");
+        assert!(icacls_runs(&host).is_empty(), "icacls на этой ОС не запускается");
+    }
+
+    #[test]
+    fn invalid_token_is_not_written() {
+        let dir = TestDir::new("token-bad");
+        let host = icacls_host(0);
+        let err = save(&host, &dir.path, "ab cd").expect_err("пробел внутри токена");
+        assert!(!err.contains("ab cd"), "значение не попадает в ошибку: {err}");
+        assert!(!dir.path.join(TOKEN_FILE).exists(), "файла токена быть не должно");
+        assert!(host.runs().is_empty(), "утилита не запускалась: {:?}", host.runs());
+    }
+
+    #[test]
+    fn clear_removes_the_token() {
+        let dir = TestDir::new("token-clear");
+        clear(&dir.path).expect("без файла очистка не ошибка");
+        std::fs::write(dir.path.join(TOKEN_FILE), "tok-123").unwrap();
+        assert!(exists(&dir.path));
+        clear(&dir.path).unwrap();
+        assert!(!exists(&dir.path), "после очистки токена нет");
+        assert!(!dir.path.join(TOKEN_FILE).exists());
     }
 }

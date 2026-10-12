@@ -6,8 +6,23 @@ use eframe::egui::{self, RichText, Ui};
 
 use crate::{
     app::App,
-    ui::{self, BAD, MUTED, OK},
+    remote::control::{RemoteStatus, StatusLevel},
+    ui::{self, ACCENT, BAD, MUTED, OK},
 };
+
+/// Какие кнопки показывать в разделе «Задачи с сервера».
+#[derive(Debug, PartialEq)]
+pub struct RemoteButtons {
+    /// `None` — кнопки нет (адрес не задан); `Some(активна)` — «Переподключить», неактивна, пока идёт задача сервера.
+    pub reconnect: Option<bool>,
+    /// Показывать «Продолжить»: раннер на паузе после повторяющихся неисправностей.
+    pub resume: bool,
+}
+
+/// Кнопки раздела по состоянию раннера: чистая функция, чтобы правила проверялись без окна.
+pub fn remote_buttons(status: &RemoteStatus, busy: bool, has_server: bool) -> RemoteButtons {
+    RemoteButtons { reconnect: has_server.then_some(!busy), resume: matches!(status, RemoteStatus::Paused { .. }) }
+}
 
 pub fn ui(app: &mut App, ui: &mut Ui) {
     ui.horizontal(|ui| {
@@ -15,8 +30,12 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let changed = app.draft != app.s;
             if ui::primary(ui, changed, "Сохранить") {
+                let server_changed = app.s.runner_server != app.draft.runner_server;
                 app.s = app.draft.clone();
                 app.s.save();
+                if server_changed {
+                    app.remote.apply(&app.s.runner_server);
+                }
                 app.matches.nickname = app.s.nickname.clone();
                 app.status.push("настройки сохранены");
             }
@@ -106,6 +125,8 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
             ui.checkbox(&mut d.gpu_encode, "Кодировать на видеокарте NVIDIA (NVENC) — запись и склейка в разы быстрее");
         });
 
+        remote_section(app, ui);
+
         // действие откладывается флагом: `d` занимает `app.draft`, а запуск проверки берёт `&mut app`
         let mut run_precheck = false;
         let (busy, job_running) = (app.precheck_busy, app.queue.view().running.is_some());
@@ -166,6 +187,85 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
     });
 }
 
+/// Раздел «Задачи с сервера»: адрес, токен (скрытый ввод), состояние подключения и кнопки раннера.
+/// Введённый токен уходит в файл с суженным доступом и стирается из окна при любом исходе; из файла в окно он не читается.
+fn remote_section(app: &mut App, ui: &mut Ui) {
+    let has_server = !app.s.runner_server.trim().is_empty();
+    let status = app.remote.status();
+    let (busy, pending, has_token) = (app.remote.busy(), app.remote.pending(), app.remote.has_token());
+    let buttons = remote_buttons(&status, busy, has_server);
+    let (mut save_token, mut clear_token, mut reconnect, mut resume) = (false, false, false, false);
+    ui::section(ui, "Задачи с сервера", |ui| {
+        egui::Grid::new("remote").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+            ui.label("Адрес сервера");
+            let w = (ui.available_width() - 20.0).max(240.0);
+            ui.add_sized(
+                [w, 24.0],
+                egui::TextEdit::singleline(&mut app.draft.runner_server).hint_text("https://… или http://адрес в локальной сети; пусто — режим выключен"),
+            );
+            ui.end_row();
+            ui.label("Токен раннера");
+            ui.horizontal(|ui| {
+                ui.add_sized([260.0, 24.0], egui::TextEdit::singleline(&mut app.token_draft).password(true));
+                save_token = ui.add_enabled(!app.token_draft.trim().is_empty(), egui::Button::new("Сохранить токен")).clicked();
+                if has_token {
+                    clear_token = ui.button("Удалить токен").clicked();
+                }
+                let (text, color) = if has_token { ("токен сохранён", OK) } else { ("токен не задан", MUTED) };
+                ui.label(RichText::new(text).color(color).size(12.5));
+            });
+            ui.end_row();
+        });
+        ui.add_space(4.0);
+        let color = match status.level() {
+            StatusLevel::Ok => OK,
+            StatusLevel::Warn => ACCENT,
+            StatusLevel::Bad => BAD,
+            StatusLevel::Off => MUTED,
+        };
+        ui.add(egui::Label::new(RichText::new(status.text()).color(color)).wrap());
+        if pending {
+            ui.label(RichText::new("адрес применится, когда закончится задача с сервера").color(ACCENT).size(12.5));
+        }
+        ui.horizontal(|ui| {
+            if let Some(active) = buttons.reconnect {
+                let btn = ui.add_enabled(active, egui::Button::new("Переподключить"));
+                reconnect = btn.on_disabled_hover_text("Дождитесь конца задачи с сервера — переподключение её отменило бы").clicked();
+            }
+            if buttons.resume {
+                resume = ui.button("Продолжить").clicked();
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Приложение само забирает задачи с сервера, когда своя очередь пуста и не на паузе. Не запускайте одновременно cs2-cli runner в той же папке.",
+            )
+            .color(MUTED)
+            .size(12.5),
+        );
+    });
+    if save_token {
+        // черновик стирается при любом исходе; ошибка не содержит значения токена
+        let draft = std::mem::take(&mut app.token_draft);
+        match app.remote.save_token(draft.trim()) {
+            Ok(()) => app.status.push("токен раннера сохранён"),
+            Err(e) => app.status.push(&format!("токен не сохранён: {e}")),
+        }
+    }
+    if clear_token {
+        match app.remote.clear_token() {
+            Ok(()) => app.status.push("токен раннера удалён"),
+            Err(e) => app.status.push(&format!("токен не удалён: {e}")),
+        }
+    }
+    if reconnect {
+        app.remote.restart();
+    }
+    if resume {
+        app.resume_queue();
+    }
+}
+
 /// Подсказка при первом запуске: три шага до первого ролика, с галочками по мере заполнения.
 fn first_run(app: &App, ui: &mut Ui) {
     let d = &app.draft;
@@ -216,4 +316,24 @@ fn path_row(ui: &mut Ui, w: f32, label: &str, value: &mut String, ok: impl Fn(&P
         ui.label(RichText::new(format!("✖ {bad_hint}")).color(BAD));
     }
     ui.end_row();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_buttons_follow_the_status() {
+        let online = RemoteStatus::Online { server_version: "1".into() };
+        assert_eq!(
+            remote_buttons(&RemoteStatus::Off, false, false),
+            RemoteButtons { reconnect: None, resume: false },
+            "без адреса кнопки «Переподключить» нет"
+        );
+        assert_eq!(remote_buttons(&online, false, true), RemoteButtons { reconnect: Some(true), resume: false });
+        assert_eq!(remote_buttons(&online, true, true), RemoteButtons { reconnect: Some(false), resume: false }, "пока идёт задача сервера, кнопка неактивна");
+        let paused = RemoteStatus::Paused { code: "X".into(), message: "m".into() };
+        assert!(remote_buttons(&paused, false, true).resume, "при паузе раннера есть «Продолжить»");
+        assert!(!remote_buttons(&online, false, true).resume);
+    }
 }

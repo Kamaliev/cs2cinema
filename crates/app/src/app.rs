@@ -190,6 +190,8 @@ pub struct App {
     pub queue: Queue,
     /// Режим раннера: поток, который берёт задачи сервера и отдаёт их очереди (пуст, пока адрес сервера не задан).
     pub remote: RemoteRunner,
+    /// Токен, набранный на странице «Настройки»: живёт только до нажатия «Сохранить токен» и нигде не показывается.
+    pub token_draft: String,
     /// О том, что смена адреса сервера ждёт конца задачи, строка состояния уже сказала.
     pending_noted: bool,
     rx: Receiver<Msg>,
@@ -263,6 +265,7 @@ impl App {
             precheck_busy: false,
             queue,
             remote,
+            token_draft: String::new(),
             pending_noted: false,
             rx,
             tx,
@@ -542,9 +545,10 @@ impl App {
         self.set_tray_tooltip(None);
     }
 
-    /// «Продолжить» после отмены: пауза снимается, очередь идёт дальше (D-13).
+    /// «Продолжить» после отмены: пауза снимается, очередь идёт дальше (D-13); пауза раннера снимается тоже.
     pub fn resume_queue(&mut self) {
         self.queue.resume();
+        self.remote.resume_paused();
     }
 
     /// Разобрать демку; для файла страница матча открывается без FACEIT-шапки.
@@ -717,6 +721,20 @@ impl App {
             if nav_item(ui, self.page == page, glyph, title, badge) {
                 self.page = page;
             }
+        }
+        if !self.s.runner_server.trim().is_empty() {
+            let status = self.remote.status();
+            let color = match status.level() {
+                remote::control::StatusLevel::Ok => ui::OK,
+                remote::control::StatusLevel::Warn => ui::ACCENT,
+                remote::control::StatusLevel::Bad => ui::BAD,
+                remote::control::StatusLevel::Off => ui::MUTED,
+            };
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new(status.short()).color(color).size(12.0));
+            });
         }
         if let Some(r) = self.update.clone() {
             ui.add_space(16.0);

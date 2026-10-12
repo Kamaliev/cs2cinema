@@ -25,8 +25,8 @@ use pipeline::record::failure;
 use pipeline::record::log::one_line;
 use pipeline::{FailCode, RecordFailure, RecordState, RunError};
 use wire::{
-    Assignment, DirectiveAction, Failure, FinishRequest, HelloRequest, Holding, JobState, Outcome,
-    Phase, ReleaseRequest, fail,
+    Assignment, DirectiveAction, Failure, FinishRequest, HelloRequest, Outcome, Phase,
+    ReleaseRequest, fail,
 };
 
 pub use exec::{Executor, InspectSettings, PipelineExecutor, Task};
@@ -35,6 +35,7 @@ pub use policy::{Disposition, Flags, PausePolicy, PauseReason, dispose, failure_
 pub use state::{HeldJob, ResultFile, RunnerState, Stage};
 pub use tee::{FORCE_AFTER, SeqSource, Shared, Tee, Uplink};
 pub use transfer::{StopWhy, TransferEnd, sha256_file};
+pub use wire::{Holding, JobState};
 
 use transfer::{Verdict, judge};
 
@@ -59,6 +60,43 @@ pub enum Admission {
 
 /// Ворота допуска: раннер спрашивает их перед каждым `claim` и ещё раз сразу после выдачи.
 pub type Gate = Arc<dyn Fn() -> Admission + Send + Sync>;
+
+/// Событие раннера для наблюдателя (окно приложения). Строки уже очищены: значения токена в них нет.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunnerEvent {
+    /// Сервер ответил на `hello`: раннер на связи.
+    Connected { server_version: String },
+    /// Задач нет (long-poll закончился пустым).
+    Idle,
+    /// Ворота допуска закрыты; причина по-русски.
+    Gated(String),
+    /// Раннер взялся за задачу (одно событие на удержание, в том числе после перезапуска).
+    Working { job_id: i64, epoch: i64 },
+    /// Задача закрыта на сервере.
+    Settled {
+        job_id: i64,
+        epoch: i64,
+        state: JobState,
+    },
+    /// Задача возвращена в очередь сервера (`release`).
+    Released { job_id: i64, epoch: i64 },
+    /// Задача брошена: сервер её не признал, отозвал или не принял итог.
+    Dropped {
+        job_id: i64,
+        epoch: i64,
+        reason: String,
+    },
+    /// Раннер встал на паузу после повторяющихся неисправностей.
+    Paused(PauseReason),
+    /// Ошибка связи; следующая попытка через `retry_secs`.
+    NetError { message: String, retry_secs: u64 },
+    /// Раннер остановлен тем, что повторами не лечится (токен не принят, протокол не совпал).
+    Fatal(String),
+}
+
+/// Наблюдатель: получает событие и удерживаемую задачу на этот момент. Зовётся из потока раннера, поэтому
+/// не должен блокироваться надолго.
+pub type Observer = Arc<dyn Fn(&RunnerEvent, Option<Holding>) + Send + Sync>;
 
 /// Настройки раннера.
 #[derive(Clone)]
@@ -88,6 +126,8 @@ pub struct Config {
     pub max_demo_bytes: u64,
     /// Ворота допуска: `Closed(причина)` — новых задач не брать; `None` — брать всегда, как `cs2-cli runner`.
     pub admission: Option<Gate>,
+    /// Наблюдатель состояния раннера (связь, работа, итог); `None` — события никому не отправляются.
+    pub observer: Option<Observer>,
 }
 
 impl Config {
@@ -107,6 +147,7 @@ impl Config {
             release_cooldown: RELEASE_COOLDOWN,
             max_demo_bytes: MAX_DEMO_BYTES,
             admission: None,
+            observer: None,
         }
     }
 }
@@ -126,6 +167,7 @@ impl std::fmt::Debug for Config {
             .field("release_cooldown", &self.release_cooldown)
             .field("max_demo_bytes", &self.max_demo_bytes)
             .field("admission", &self.admission.is_some())
+            .field("observer", &self.observer.is_some())
             .finish()
     }
 }
@@ -289,6 +331,8 @@ pub struct Runner {
     pause_hello: Option<Instant>,
     /// Когда раннер последний раз сообщил серверу, что ворота закрыты; сбрасывается, когда они открылись.
     gate_hello: Option<Instant>,
+    /// Задача, о которой наблюдателю уже сказано `Working`: повторный `drive` после ошибки связи не повторяет.
+    announced: Option<Holding>,
     /// Раньше этого момента новый `claim` не делается (пауза после `release`).
     cooldown_until: Option<Instant>,
 }
@@ -322,6 +366,7 @@ impl Runner {
             resume: Arc::new(AtomicBool::new(false)),
             pause_hello: None,
             gate_hello: None,
+            announced: None,
             cooldown_until: None,
             fatal: None,
         })
@@ -378,6 +423,67 @@ impl Runner {
             (Tick::Released { .. }, Some(reason)) => Tick::Paused(reason.clone()),
             (tick, _) => tick,
         })
+    }
+
+    /// Удерживаемая сейчас задача и эпоха её выдачи (то же, что в `runner_state.json`).
+    pub fn holding(&self) -> Option<Holding> {
+        self.state.job.as_ref().map(|j| Holding {
+            job_id: j.server_job_id,
+            epoch: j.epoch,
+        })
+    }
+
+    /// Строка для наблюдателя: значение токена заменено на `***`, переводы строк убраны.
+    fn scrub(&self, text: &str) -> String {
+        let secret = self.cfg.token.secret();
+        if secret.is_empty() {
+            one_line(text)
+        } else {
+            one_line(&text.replace(secret, "***"))
+        }
+    }
+
+    /// Сообщает событие наблюдателю с удерживаемой задачей. Без наблюдателя ничего не делает; во всех строковых
+    /// полях значение токена вычеркнуто, как в `runner.log`. Зовётся после записи `runner_state.json`, чтобы
+    /// удержание в событии совпадало с файлом.
+    fn emit(&self, event: RunnerEvent) {
+        let Some(observer) = &self.cfg.observer else {
+            return;
+        };
+        let event = match event {
+            RunnerEvent::Connected { server_version } => RunnerEvent::Connected {
+                server_version: self.scrub(&server_version),
+            },
+            RunnerEvent::Gated(why) => RunnerEvent::Gated(self.scrub(&why)),
+            RunnerEvent::Dropped {
+                job_id,
+                epoch,
+                reason,
+            } => RunnerEvent::Dropped {
+                job_id,
+                epoch,
+                reason: self.scrub(&reason),
+            },
+            RunnerEvent::Paused(r) => RunnerEvent::Paused(PauseReason {
+                code: self.scrub(&r.code),
+                message: self.scrub(&r.message),
+                hint: self.scrub(&r.hint),
+                ..r
+            }),
+            RunnerEvent::NetError {
+                message,
+                retry_secs,
+            } => RunnerEvent::NetError {
+                message: self.scrub(&message),
+                retry_secs,
+            },
+            RunnerEvent::Fatal(text) => RunnerEvent::Fatal(self.scrub(&text)),
+            e @ (RunnerEvent::Idle
+            | RunnerEvent::Working { .. }
+            | RunnerEvent::Settled { .. }
+            | RunnerEvent::Released { .. }) => e,
+        };
+        observer(&event, self.holding());
     }
 
     /// Решение ворот; без ворот — всегда открыто.
@@ -484,8 +590,14 @@ impl Runner {
                 Ok(Tick::Settled { .. } | Tick::Dropped { .. } | Tick::Released { .. }) => {
                     pause = 0
                 }
-                Ok(Tick::Paused(_) | Tick::Gated(_)) => {
+                Ok(Tick::Paused(reason)) => {
                     pause = 0;
+                    self.emit(RunnerEvent::Paused(reason));
+                    self.sleep(1);
+                }
+                Ok(Tick::Gated(why)) => {
+                    pause = 0;
+                    self.emit(RunnerEvent::Gated(why));
                     self.sleep(1);
                 }
                 Ok(Tick::Stopped) => {
@@ -493,6 +605,7 @@ impl Runner {
                 }
                 Ok(Tick::Idle) => {
                     pause = 0;
+                    self.emit(RunnerEvent::Idle);
                     // Long-poll уже ждал на сервере; без него (poll_secs = 0) не крутимся вхолостую.
                     if self.cfg.poll_secs == Some(0) {
                         self.sleep(1);
@@ -508,12 +621,19 @@ impl Runner {
                 Err(e) => {
                     self.log.line(&format!("ошибка: {e}"));
                     pause = (pause * 2).clamp(1, 30);
+                    self.emit(RunnerEvent::NetError {
+                        message: e,
+                        retry_secs: pause,
+                    });
                     self.sleep(pause);
                 }
             }
         }
         match self.fatal.take() {
-            Some(e) => Err(e),
+            Some(e) => {
+                self.emit(RunnerEvent::Fatal(e.clone()));
+                Err(e)
+            }
             None => Ok(()),
         }
     }
@@ -551,15 +671,7 @@ impl Runner {
     }
 
     fn hello(&mut self) -> Result<(), String> {
-        let holding: Vec<Holding> = self
-            .state
-            .job
-            .iter()
-            .map(|j| Holding {
-                job_id: j.server_job_id,
-                epoch: j.epoch,
-            })
-            .collect();
+        let holding: Vec<Holding> = self.holding().into_iter().collect();
         let req = HelloRequest {
             protocol: wire::PROTOCOL_VERSION,
             name: self.cfg.name.clone(),
@@ -585,6 +697,9 @@ impl Runner {
         ));
         self.poll_secs = Some(reply.poll_secs);
         self.heartbeat_secs = reply.heartbeat_secs;
+        self.emit(RunnerEvent::Connected {
+            server_version: reply.server_version.clone(),
+        });
 
         let Some(id) = self.state.job.as_ref().map(|j| j.server_job_id) else {
             return Ok(());
@@ -632,7 +747,13 @@ impl Runner {
             "задача #{id}: {reason}; файлы задачи удалены из outbox"
         ));
         self.remove_files(&job);
-        self.persist()
+        self.persist()?;
+        self.emit(RunnerEvent::Dropped {
+            job_id: id,
+            epoch: job.epoch,
+            reason: reason.to_owned(),
+        });
+        Ok(())
     }
 
     /// Удаляет скачанную демку (и недокачанную) внутри рабочей папки раннера: сервер хранит её сам.
@@ -700,6 +821,15 @@ impl Runner {
     /// Ведёт удерживаемую задачу по этапам с того, на котором она записана. Пульс (`Uplink`) идёт на всё время
     /// удержания задачи; после него `seq` попадает в состояние (Pitfall 2).
     fn drive(&mut self) -> Result<Tick, String> {
+        if let Some(h) = self.holding()
+            && self.announced != Some(h)
+        {
+            self.announced = Some(h);
+            self.emit(RunnerEvent::Working {
+                job_id: h.job_id,
+                epoch: h.epoch,
+            });
+        }
         let mut uplink = None;
         let result = self.drive_stages(&mut uplink);
         self.stop_uplink(&mut uplink);
@@ -1120,6 +1250,11 @@ impl Runner {
                 self.log.line(&format!("задача #{id}: {}", state.as_str()));
                 self.remove_finished(&held);
                 self.persist()?;
+                self.emit(RunnerEvent::Settled {
+                    job_id: id,
+                    epoch: held.epoch,
+                    state,
+                });
                 Ok(Some(Tick::Settled { job_id: id, state }))
             }
             TransferEnd::Stopped => {
@@ -1166,6 +1301,10 @@ impl Runner {
                 if !self.cfg.release_cooldown.is_zero() {
                     self.cooldown_until = Some(Instant::now() + self.cfg.release_cooldown);
                 }
+                self.emit(RunnerEvent::Released {
+                    job_id: id,
+                    epoch: held.epoch,
+                });
                 Ok(Tick::Released { job_id: id })
             }
             // Чужая эпоха или закрытая задача: возвращать нечего, дело сделано.
@@ -1221,6 +1360,11 @@ impl Runner {
                 }
                 self.state.job = None;
                 self.persist()?;
+                self.emit(RunnerEvent::Settled {
+                    job_id: id,
+                    epoch: held.epoch,
+                    state: reply.state,
+                });
                 Ok(Tick::Settled {
                     job_id: id,
                     state: reply.state,

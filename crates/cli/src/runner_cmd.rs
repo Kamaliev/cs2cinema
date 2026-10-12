@@ -286,6 +286,7 @@ pub fn runner_cmd() -> ExitCode {
         release_cooldown: runner::RELEASE_COOLDOWN,
         max_demo_bytes: args.max_demo_bytes,
         admission: None,
+        observer: None,
     };
     let mut runner = match Runner::new(cfg, Arc::new(exec)) {
         Ok(r) => r,

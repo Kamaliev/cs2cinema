@@ -166,6 +166,7 @@ impl Stand {
             release_cooldown: Duration::ZERO,
             max_demo_bytes: runner::MAX_DEMO_BYTES,
             admission: None,
+            observer: None,
         }
     }
 }

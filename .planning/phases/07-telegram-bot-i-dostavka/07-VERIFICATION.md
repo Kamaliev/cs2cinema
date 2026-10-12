@@ -1,7 +1,7 @@
 ---
 phase: 07-telegram-bot-i-dostavka
 verified: 2026-10-12T12:00:00Z
-status: human_needed
+status: passed
 score: 4/5 must-haves verified
 covered_files:
   - .planning/phases/07-telegram-bot-i-dostavka/07-01-PLAN.md
@@ -205,3 +205,7 @@ human_verification:
 
 _Verified: 2026-10-12 (повторно)_
 _Verifier: Claude (gsd-verifier)_
+
+## Решение автора (2026-10-12)
+
+Автор отложил живой стенд 07-11 («давай следующую фазу») и выбрал вариант 1: закрыть фазу 7 с отложенным долгом. Пять пунктов `human_verification` записаны в `## Deferred Follow-Ups` файла `07-UAT.md` и проходятся в фазе 9 вместе с учениями. Статус passed выставлен по этому решению, а не потому, что живая часть критериев 2–5 доказана.

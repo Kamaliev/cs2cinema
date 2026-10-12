@@ -618,3 +618,46 @@ fn resend_of_a_sent_video_is_left_to_the_delivery_thread() {
     assert_eq!(st.tg_job(id).delivery, "sent");
     assert_eq!(videos_to(&st, FRIEND), 2);
 }
+
+/// WR-09: отчёт админу не теряется, если сообщение точно не ушло: отметка снимается и тик повторяет отправку.
+#[test]
+fn admin_report_is_retried_when_the_send_definitely_failed() {
+    let st = BotStand::start();
+    st.add_admin(ADMIN, "автор");
+    st.add_friend(FRIEND, "вася");
+    let id = queue_job(&st, FRIEND, "s1mple");
+    let io = || TgError::Io {
+        sent: false,
+        detail: "нет сети".to_owned(),
+    };
+    // Первое сообщение тика уходит другу, второе админу: оба не доходят.
+    st.tg.fail_next("send_message", io());
+    st.tg.fail_next("send_message", io());
+    fail_job(
+        &st,
+        id,
+        wire::Failure {
+            code: wire::fail::PLAYER_NOT_FOUND.to_owned(),
+            class: "other".to_owned(),
+            state: "precheck".to_owned(),
+            hint: String::new(),
+            message: "игрок не найден".to_owned(),
+            tail: String::new(),
+            elapsed_ms: 1000,
+        },
+    );
+    st.step();
+    assert!(
+        st.tg.texts_to(ADMIN).is_empty(),
+        "отчёт ещё не дошёл: {:?}",
+        st.tg.texts_to(ADMIN)
+    );
+    assert!(st.tg_job(id).admin_reported_ms.is_none(), "отметка снята");
+
+    st.step();
+    let admin = st.tg.texts_to(ADMIN);
+    assert_eq!(admin.len(), 1, "отчёт пришёл со второй попытки: {admin:?}");
+    assert!(st.tg_job(id).admin_reported_ms.is_some());
+    st.step();
+    assert_eq!(st.tg.texts_to(ADMIN).len(), 1, "и больше не дублируется");
+}

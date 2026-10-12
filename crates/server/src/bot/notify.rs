@@ -489,22 +489,44 @@ fn tell_admins_failure(bot: &Bot, tj: &TgJob, job: &JobRow) {
     let admins = match users::list_users(db) {
         Ok(list) => list,
         Err(e) => {
+            // Отчёт не отправлен: право на него возвращается, тик повторит (WR-09).
+            let _ = store::unclaim_admin_report(db, tj.job_id);
             bot.log()
                 .warn(&format!("бот: не прочитал список админов: {e}"));
             return;
         }
     };
     let text = failure_text_for_admin(bot, job);
+    let mut recipients = 0;
+    // Сообщение дошло или могло дойти, либо адресат закрыт: повторять нечего.
+    let mut settled = 0;
     for admin in admins.iter().filter(|u| u.role == "admin" && u.is_active()) {
         let Some(chat) = admin.tg_id else { continue };
+        recipients += 1;
         // Ошибка одного админа не мешает остальным; в журнал — только очищенный текст.
-        if let Err(e) = bot.tg().send_message(chat, &text) {
-            bot.log().warn(&format!(
-                "бот: отчёт о сбое задачи #{} админу не отправлен: {}",
-                tj.job_id,
-                bot.core().redactor().clean(&e.to_string(), 200)
-            ));
+        match bot.tg().send_message(chat, &text) {
+            Ok(_) => settled += 1,
+            Err(e) => {
+                if e.maybe_delivered() || e.is_forbidden() {
+                    settled += 1;
+                }
+                bot.log().warn(&format!(
+                    "бот: отчёт о сбое задачи #{} админу не отправлен: {}",
+                    tj.job_id,
+                    bot.core().redactor().clean(&e.to_string(), 200)
+                ));
+            }
         }
+    }
+    if recipients == 0 {
+        // Повтор ничего не изменит, пока оператор не заведёт админа с Telegram-id: отметка остаётся.
+        bot.log().warn(&format!(
+            "бот: отчёт о сбое задачи #{} некому отправить: нет активного админа с Telegram-id",
+            tj.job_id
+        ));
+    } else if settled == 0 {
+        // Ни одно сообщение точно не ушло (сеть, 429): отчёт не теряем, тик повторит (WR-09).
+        let _ = store::unclaim_admin_report(db, tj.job_id);
     }
 }
 

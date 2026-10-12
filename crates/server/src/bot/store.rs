@@ -314,6 +314,18 @@ pub fn claim_admin_report(db: &Db, job_id: i64, now_ms: i64) -> Result<bool> {
     })
 }
 
+/// Возвращает право на отчёт админам, если ни одно сообщение точно не ушло: тик повторит отправку.
+pub fn unclaim_admin_report(db: &Db, job_id: i64) -> Result<()> {
+    db.write(|tx| {
+        tx.execute(
+            "UPDATE tg_jobs SET admin_reported_ms = NULL WHERE job_id = ?1",
+            [job_id],
+        )
+        .map(|_| ())
+        .map_err(db_err)
+    })
+}
+
 /// Запоминает текст сообщения статуса и время, раньше которого его не правят.
 pub fn note_status(db: &Db, job_id: i64, text: &str, next_edit_ms: i64, now_ms: i64) -> Result<()> {
     db.write(|tx| {

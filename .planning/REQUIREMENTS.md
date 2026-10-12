@@ -58,7 +58,7 @@
 
 ### Эксплуатация (OPS)
 
-- [ ] **OPS-01**: Уборщик чистит демки, результаты, `.part`, рабочую папку bot-api и сырые дубли на раннере
+- [x] **OPS-01**: Уборщик чистит демки, результаты, `.part`, рабочую папку bot-api и сырые дубли на раннере
 - [ ] **OPS-02**: Документация развёртывания: compose для `telegram-bot-api`, systemd-юнит, Tailscale или Caddy, резервные копии
 - [ ] **OPS-03**: Сквозной тест с фейковым Telegram и `FakeHost`; сборка сервера на Linux в CI
 - [ ] **OPS-04**: Учения: убить раннер посреди записи, обрыв загрузки, перезапуск сервера, отмена при офлайн-раннере, 500 МБ через прокси, несовпадение версий
@@ -123,7 +123,7 @@
 | APP-02 | Phase 8 | Complete |
 | APP-03 | Phase 8 | Complete |
 | APP-04 | Phase 8 | Complete |
-| OPS-01 | Phase 9 | Pending |
+| OPS-01 | Phase 9 | Complete |
 | OPS-02 | Phase 9 | Pending |
 | OPS-03 | Phase 9 | Pending |
 | OPS-04 | Phase 9 | Pending |

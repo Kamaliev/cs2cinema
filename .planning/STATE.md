@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 09
 current_phase_name: Уборка, развёртывание и учения
 status: executing
-stopped_at: Completed 09-01-PLAN.md
-last_updated: "2026-10-12T18:38:20.859Z"
+stopped_at: Completed 09-02-PLAN.md
+last_updated: "2026-10-12T18:55:30.181Z"
 last_activity: 2026-10-12
 last_activity_desc: Phase 09 execution started
-state_head: c2efd7c0293e6d18519ba55fc5b1410daa572863
+state_head: dd195e89a1bc5e46100fe46f49631211fe191811
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 43
-  completed_plans: 35
+  completed_plans: 36
   percent: 80
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-12)
 ## Current Position
 
 Phase: 09 (Уборка, развёртывание и учения) — EXECUTING
-Plan: 3 of 10
+Plan: 4 of 10
 Status: Ready to execute
 Last activity: 2026-10-12 — Phase 09 execution started
 
@@ -129,6 +129,7 @@ Progress: [████████░░] 80%
 | Phase 08 P06 | 13 min | 3 tasks | 3 files |
 | Phase 09 P03 | 20 min | 3 tasks | 3 files |
 | Phase 09 P01 | 36min+ | 3 tasks | 9 files |
+| Phase 09 P02 | 35 min | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -256,6 +257,7 @@ Recent decisions affecting current work:
 - [Phase 09]: 09-03: подтверждённый результат отличается от неподтверждённого меткой out/srv{N}.accepted, а не возрастом; повтор finish один раз перед drop_job — метка переживает обрыв и порчу runner_state.json, сервер остаётся единственным судьёй приёма
 - [Phase 09]: 09-03: сроки уборки раннера — константы runner::sweep (72 ч папки дублей без подтверждения, 24 ч демки), не поля Config — литералы Config в cs2-cli и тестах не меняются
 - [Phase 09]: 09-01: потерянная на последней выдаче задача ждёт свой раннер окно lease_ttl + startup_grace (WR-02); красный CI на ubuntu лечится в тестовой подготовке (права 0600), а не в загрузчике
+- [Phase 09]: 09-02: сроки хранения по умолчанию 24/72/24/168/6/6 ч и 600 с — RESEARCH A1; автор подтверждает их в Task 1 плана 09-08; уборщик — поток serve с двухшаговым удалением через files.deleted_at
 
 ### Pending Todos
 
@@ -286,6 +288,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-12T18:38:20.682Z
-Stopped at: Completed 09-01-PLAN.md
+Last session: 2026-10-12T18:55:29.976Z
+Stopped at: Completed 09-02-PLAN.md
 Resume file: None

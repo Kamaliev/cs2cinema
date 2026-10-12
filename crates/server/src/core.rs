@@ -679,12 +679,20 @@ impl Core {
                 });
             }
 
+            // WR-02: задача, потерявшая аренду на последней разрешённой выдаче, ждёт своего раннера окно
+            // `lease_ttl + startup_grace` (он вернёт её через `hello`); сам владелец, просящий новую задачу, уже
+            // свободен — для него задача ядовита сразу. Без окна чужой `claim` ронял бы задачу, раннер которой
+            // просто перезапускается.
+            let return_window = now - (self.limits.lease_ttl_ms + self.limits.startup_grace_ms);
             let poisoned: Vec<(i64, i64)> = {
                 let mut st = tx
-                    .prepare("SELECT id, grants FROM jobs WHERE state = 'queued' AND grants >= ?1 ORDER BY id")
+                    .prepare(
+                        "SELECT id, grants FROM jobs WHERE state = 'queued' AND grants >= ?1 \
+                         AND (lease_lost = 0 OR runner_id IS NULL OR runner_id = ?2 OR updated_at <= ?3) ORDER BY id",
+                    )
                     .map_err(db_err)?;
                 let rows = st
-                    .query_map([max], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .query_map(params![max, runner_id, return_window], |r| Ok((r.get(0)?, r.get(1)?)))
                     .map_err(db_err)?;
                 rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?
             };

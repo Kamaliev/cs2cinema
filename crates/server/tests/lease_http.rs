@@ -195,6 +195,40 @@ fn poison_demo_fails_after_max_grants_over_http() {
 }
 
 #[test]
+fn lost_lease_on_the_last_grant_survives_another_runners_claim_over_http() {
+    let srv = clocked();
+    let clock = srv.clock();
+    let id = srv.submit(&fake_demo(4096), "poison");
+    let token_a = srv.add_runner("a");
+    let token_b = srv.add_runner("b");
+    for round in 1..=3 {
+        let (status, got) = srv.claim(&token_a, 0);
+        assert_eq!(status, 200, "выдача {round}");
+        assert_eq!(got.unwrap().epoch, round);
+        clock.advance(Duration::from_secs(46));
+        srv.sweep();
+    }
+    assert_eq!(srv.job(id).state, JobState::Queued);
+
+    // Чужой раннер просит задачу: задача на последней выдаче ждёт своего владельца.
+    let (status, got) = srv.claim(&token_b, 0);
+    assert_eq!(status, 204, "выдавать нечего");
+    assert!(got.is_none());
+    let job = srv.job(id);
+    assert_eq!(job.state, JobState::Queued, "чужой claim не роняет задачу");
+    assert!(job.lease_lost);
+
+    // Владелец вернулся через hello и получил задачу обратно.
+    let held = vec![Holding { job_id: id, epoch: 3 }];
+    let (status, body) = srv.hello(&token_a, &hello_req(held));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(action_of(&hello_reply(&body), id), DirectiveAction::Keep);
+    let job = srv.job(id);
+    assert!(!job.lease_lost);
+    assert_eq!((job.epoch, job.grants), (3, 3));
+}
+
+#[test]
 fn release_over_http_requeues_the_job() {
     let srv = clocked();
     let id = srv.submit(&fake_demo(4096), "s1mple");

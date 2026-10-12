@@ -256,6 +256,75 @@ fn job_granted_max_times_fails_with_too_many_grants() {
     assert_eq!(job.grants, 3);
 }
 
+/// Задача, трижды выданная раннеру `a`; после третьей выдачи аренда потеряна (`lease_lost`), задача в очереди.
+fn job_lost_on_the_last_grant(core: &Core, clock: &ManualClock, dir: &TestDir, a: i64) -> i64 {
+    let id = submit(core, dir, "poison");
+    for round in 1..=3 {
+        let got = core.claim(a).unwrap().expect("выдача");
+        assert_eq!((got.job_id, got.epoch), (id, round));
+        secs(clock, 46);
+        core.sweep().unwrap();
+    }
+    let job = core.job(id).unwrap().unwrap();
+    assert_eq!(job.state, JobState::Queued, "после третьей потери задача в очереди");
+    assert_eq!(job.grants, 3);
+    assert!(job.lease_lost, "аренда потеряна, а не снята");
+    assert_eq!(job.runner_id, Some(a), "раннер-владелец помнится");
+    id
+}
+
+#[test]
+fn lost_lease_on_the_last_grant_waits_for_its_runner() {
+    let (core, clock, dir) = core_with_clock(Limits::default());
+    let a = runner(&core, "a");
+    let b = runner(&core, "b");
+    let id = job_lost_on_the_last_grant(&core, &clock, &dir, a);
+
+    // Чужой раннер просит задачу: задача ждёт своего раннера, а не падает.
+    let report = core.claim_report(b).unwrap();
+    assert!(report.failed.is_empty(), "чужой claim не роняет задачу: {:?}", report.failed);
+    assert!(report.assignment.is_none(), "выдавать больше нечего");
+    assert_eq!(state(&core, id), JobState::Queued);
+
+    // Владелец вернулся через hello и получил задачу обратно.
+    let hello = core
+        .hello(
+            a,
+            &HelloRequest {
+                protocol: wire::PROTOCOL_VERSION,
+                name: "a".to_owned(),
+                app_version: String::new(),
+                status: String::new(),
+                holding: vec![Holding { job_id: id, epoch: 3 }],
+            },
+        )
+        .unwrap();
+    assert_eq!(hello.directives[0].job_id, id);
+    assert_eq!(hello.directives[0].action, wire::DirectiveAction::Keep);
+    let job = core.job(id).unwrap().unwrap();
+    assert!(!job.lease_lost, "аренда возвращена");
+    assert_eq!((job.epoch, job.grants), (3, 3));
+    assert_eq!(job.runner_id, Some(a));
+    assert!(job.state.is_leased(), "задача снова за раннером: {:?}", job.state);
+}
+
+#[test]
+fn lost_lease_on_the_last_grant_fails_after_the_return_window() {
+    let (core, clock, dir) = core_with_clock(Limits::default());
+    let a = runner(&core, "a");
+    let b = runner(&core, "b");
+    let id = job_lost_on_the_last_grant(&core, &clock, &dir, a);
+
+    // Окно возврата — 45 + 90 с; через 136 с раннер уже не вернётся.
+    secs(&clock, 136);
+    let report = core.claim_report(b).unwrap();
+    assert_eq!(report.failed, vec![id]);
+    let job = core.job(id).unwrap().unwrap();
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.fail_code.as_deref(), Some("TOO_MANY_GRANTS"));
+    assert!(job.fail_message.unwrap().contains("3 раз"));
+}
+
 #[test]
 fn release_returns_the_job_and_can_refund_the_grant() {
     let (core, _clock, dir) = core_with_clock(Limits::default());

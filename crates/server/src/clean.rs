@@ -145,7 +145,6 @@ impl Core {
     ) -> Result<Cleaned> {
         let now = self.clock().now_ms();
         let mut out = Cleaned::default();
-        let _ = botapi_root;
         for e in self.mark_expired(r, now, mode)? {
             match mode {
                 CleanMode::Apply => self.remove_expired(&e, &mut out),
@@ -158,6 +157,9 @@ impl Core {
         }
         self.clean_parts(r, now, mode, &mut out)?;
         self.clean_leftovers(r, now, mode, &mut out)?;
+        if let Some(root) = botapi_root {
+            clean_botapi(root, now, r.botapi_ms, mode, &mut out);
+        }
         Ok(out)
     }
 
@@ -328,10 +330,10 @@ impl Core {
         let blobs = self.data_dir().join("blobs");
         for (sub, kind) in [("incoming", "demo"), ("results", "result")] {
             for (id, dir) in numeric_dirs(&blobs.join(sub)) {
-                if let Some((state, _)) = self.job_state(id)? {
-                    if !is_terminal(&state) {
-                        continue;
-                    }
+                if let Some((state, _)) = self.job_state(id)?
+                    && !is_terminal(&state)
+                {
+                    continue;
                 }
                 if self.has_live_file(id, kind)? {
                     continue;
@@ -458,4 +460,75 @@ fn dir_stats(dir: &Path) -> Option<(i64, u64)> {
         None => mtime_ms(&std::fs::symlink_metadata(dir).ok()?)?,
     };
     Some((newest, bytes))
+}
+
+/// Самый глубокий уровень файла от корня bot-api: `<корень>/<папка бота>/documents/<файл>`.
+const BOTAPI_MAX_DEPTH: u32 = 3;
+
+/// Рабочая папка `telegram-bot-api`: удаляет старые обычные файлы в подпапках `documents` и `videos` на глубине
+/// не больше трёх уровней. Каталоги, `td.binlog`, базы и ссылки не трогаются; каждый кандидат после
+/// `canonicalize` обязан лежать внутри канонического корня. Пути и имена (в имени папки бота токен) нигде не
+/// печатаются: ошибки — только счётчик. Корня нет — проход пропускается.
+fn clean_botapi(root: &Path, now: i64, botapi_ms: i64, mode: CleanMode, out: &mut Cleaned) {
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return;
+    };
+    botapi_walk(&root, &root, 0, now, botapi_ms, mode, out);
+}
+
+fn botapi_walk(
+    root: &Path,
+    dir: &Path,
+    depth: u32,
+    now: i64,
+    botapi_ms: i64,
+    mode: CleanMode,
+    out: &mut Cleaned,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        out.errors += 1;
+        return;
+    };
+    let in_media_dir = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "documents" || n == "videos");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `symlink_metadata`, не `metadata`: ссылки не разворачиваются ни для файлов, ни для каталогов.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            out.errors += 1;
+            continue;
+        };
+        let kind = meta.file_type();
+        if kind.is_dir() {
+            if depth + 1 < BOTAPI_MAX_DEPTH {
+                botapi_walk(root, &path, depth + 1, now, botapi_ms, mode, out);
+            }
+            continue;
+        }
+        if !kind.is_file() || !in_media_dir || !is_old(&meta, now, botapi_ms) {
+            continue;
+        }
+        match std::fs::canonicalize(&path) {
+            Ok(real) if real.starts_with(root) => {}
+            Ok(_) => continue,
+            Err(_) => {
+                out.errors += 1;
+                continue;
+            }
+        }
+        if mode == CleanMode::Apply {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    out.errors += 1;
+                    continue;
+                }
+            }
+        }
+        out.botapi_files += 1;
+        out.freed_bytes += meta.len();
+    }
 }

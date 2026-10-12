@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 08
 current_phase_name: Режим раннера в приложении
 status: executing
-stopped_at: Completed 08-05-PLAN.md
-last_updated: "2026-10-12T13:41:10.578Z"
+stopped_at: Completed 08-06-PLAN.md
+last_updated: "2026-10-12T13:55:25.053Z"
 last_activity: 2026-10-12
 last_activity_desc: Phase 08 execution started
-state_head: aa6024b074295306dda5e6dabea7d5a77922e2ff
+state_head: 9500cd53abac5f3b95c29adebb6f02de2d244b7b
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 33
-  completed_plans: 32
+  completed_plans: 33
   percent: 60
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-11)
 ## Current Position
 
 Phase: 08 (Режим раннера в приложении) — EXECUTING
-Plan: 4 of 6
+Plan: 6 of 6 (все планы фазы выполнены, ждёт проверки фазы)
 Status: Ready to execute
 Last activity: 2026-10-12 — Phase 08 execution started
 
@@ -125,6 +125,7 @@ Progress: [██████░░░░] 60%
 | Phase 08 P03 | 45min | 3 tasks | 4 files |
 | Phase 08 P04 | 12 min | 3 tasks | 7 files |
 | Phase 08 P05 | 25 min | 2 tasks | 7 files |
+| Phase 08 P06 | 13 min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -243,6 +244,7 @@ Recent decisions affecting current work:
 - [Phase 08]: 08-04: токен только в файле token каталога раннера: пустой файл, icacls /inheritance:r /grant:r (на не-Windows 0600), потом значение; при отказе токена нет (D-02)
 - [Phase 08]: 08-05: заголовок «Задача с сервера #N» строится из числа в external_ref, текст от друга в него не попадает
 - [Phase 08]: 08-05: у удержанной раннером карточки нет «Повторить», «Заново», «Открыть папку», «Удалить»; «Отменить» остаётся (отмена идёт на сервер)
+- [Phase 08]: 08-06: без папки задачи (убит до того, как пайплайн её назвал) раннер начинает запись заново с предпроверкой демки ровно один раз; тест фиксирует это поведение
 
 ### Pending Todos
 
@@ -272,6 +274,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-12T13:41:10.430Z
-Stopped at: Completed 08-05-PLAN.md
+Last session: 2026-10-12T13:55:12.926Z
+Stopped at: Completed 08-06-PLAN.md
 Resume file: None

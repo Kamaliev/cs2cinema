@@ -13,7 +13,7 @@ use super::{Bot, BotSettings, notify, store};
 use crate::Result;
 use crate::core::{DedupKey, JobRow, Submit, player_key};
 use crate::db::db_err;
-use crate::tg::Message;
+use crate::tg::{Message, TgError};
 use crate::users::{self, User};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::{Component, Path, PathBuf};
@@ -74,6 +74,9 @@ const BAD_NAME: &str = "Нужен файл .dem или .dem.zst.";
 const PATH_REJECTED: &str = "не удалось принять файл: проверка пути не пройдена";
 const PATH_REJECTED_TEXT: &str =
     "Не удалось принять файл: он лежит не там, где ожидалось. Попробуйте прислать его ещё раз.";
+
+/// Сколько раз приём одной строки откладывается из-за временных сбоев, прежде чем её отвергнут.
+const MAX_INGEST_ATTEMPTS: i64 = 4;
 
 /// Игрок задачи (D-02): непустая подпись переопределяет сохранённого игрока.
 /// Ник из подписи или остатка после ссылки проходит ту же проверку, что `/player` (WR-04): длинный или с
@@ -510,6 +513,41 @@ fn reject(bot: &Bot, row: &store::InboxRow, reason: &str) -> Result<bool> {
     )
 }
 
+/// Сбой, после которого повтор позже имеет смысл: bot-api перезапускается, таймаут, `429`, ошибка сервера Telegram.
+fn is_transient(e: &TgError) -> bool {
+    match e {
+        TgError::Timeout { .. } | TgError::Io { .. } => true,
+        TgError::Api { code, .. } => *code == 429 || *code >= 500,
+    }
+}
+
+/// Через сколько повторять: `retry_after` от Telegram, иначе 30 с, 2 мин, 8 мин (но не дольше 10 мин).
+fn backoff_ms(attempts: i64, e: &TgError) -> i64 {
+    if let TgError::Api { retry_after: Some(s), .. } = e {
+        return (*s as i64).clamp(1, 600) * 1000;
+    }
+    (30_000_i64 << (2 * attempts.clamp(0, 3))).min(600_000)
+}
+
+/// Ошибка `getFile`: временную откладывает (строка снова `pending` с отсрочкой), пока попытки не кончились; остальное и
+/// исчерпанные попытки отвергает с понятным другу текстом (WR-05).
+fn defer_or_reject(bot: &Bot, row: &store::InboxRow, e: &TgError) -> Result<bool> {
+    let db = bot.core().db();
+    let attempts = store::inbox_attempts(db, row.id)?;
+    if is_transient(e) && attempts + 1 < MAX_INGEST_ATTEMPTS {
+        let now = bot.now_ms();
+        store::defer_inbox(db, row.id, now + backoff_ms(attempts, e), now)?;
+        bot.log().warn(&format!(
+            "бот: getFile не удался ({}), приём строки #{} отложен, попытка {}",
+            bot.core().redactor().clean(&e.to_string(), 200),
+            row.id,
+            attempts + 1
+        ));
+        return Ok(true);
+    }
+    reject(bot, row, &format!("Telegram не отдал файл ({e})"))
+}
+
 /// Ответ в сообщение статуса (правка), а если его нет — новым сообщением.
 fn status(bot: &Bot, row: &store::InboxRow, text: &str) {
     match row.status_message_id {
@@ -773,7 +811,7 @@ pub fn ingest_once(bot: &Bot) -> Result<bool> {
     };
     let got = match bot.tg().get_file(&file_id) {
         Ok(f) => f,
-        Err(e) => return reject(bot, &row, &format!("Telegram не отдал файл ({e})")),
+        Err(e) => return defer_or_reject(bot, &row, &e),
     };
     let local = match got
         .file_path

@@ -157,9 +157,9 @@ pub fn claim_pending(db: &Db, now_ms: i64) -> Result<Option<InboxRow>> {
         let row = tx
             .query_row(
                 &format!(
-                    "SELECT {INBOX_COLUMNS} FROM tg_inbox WHERE state = 'pending' ORDER BY id LIMIT 1"
+                    "SELECT {INBOX_COLUMNS} FROM tg_inbox WHERE state = 'pending' AND next_try_ms <= ?1 ORDER BY id LIMIT 1"
                 ),
-                [],
+                [now_ms],
                 inbox_from_row,
             )
             .optional()
@@ -175,6 +175,29 @@ pub fn claim_pending(db: &Db, now_ms: i64) -> Result<Option<InboxRow>> {
         row.state = "downloading".to_owned();
         row.updated_at = now_ms;
         Ok(Some(row))
+    })
+}
+
+/// Сколько раз приём этой строки уже откладывался (WR-05, WR-07).
+pub fn inbox_attempts(db: &Db, row_id: i64) -> Result<i64> {
+    db.read(|c| {
+        c.query_row("SELECT attempts FROM tg_inbox WHERE id = ?1", [row_id], |r| {
+            r.get(0)
+        })
+        .map_err(db_err)
+    })
+}
+
+/// Строка возвращается в `pending` до `next_try_ms`: временный сбой, повторную отправку файла друг делать не должен.
+pub fn defer_inbox(db: &Db, row_id: i64, next_try_ms: i64, now_ms: i64) -> Result<()> {
+    db.write(|tx| {
+        tx.execute(
+            "UPDATE tg_inbox SET state = 'pending', attempts = attempts + 1, next_try_ms = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![row_id, next_try_ms, now_ms],
+        )
+        .map(|_| ())
+        .map_err(db_err)
     })
 }
 

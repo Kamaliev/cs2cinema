@@ -18,7 +18,7 @@ pub fn db_err(e: rusqlite::Error) -> String {
     format!("база данных: {e}")
 }
 
-// Версии схемы: 1 — пользователи, раннеры, задачи и файлы; 2 — таблицы Telegram-бота.
+// Версии схемы: 1 — пользователи, раннеры, задачи и файлы; 2 — таблицы Telegram-бота; 3 — попытки и отсрочка приёма.
 // Новая версия — только новым шагом в конце списка и только добавлением колонок или таблиц.
 // Элемент k поднимает схему до версии k+1; шаг идёт в одной транзакции со своим `user_version`.
 const MIGRATIONS: &[&str] = &["
@@ -139,6 +139,9 @@ CREATE TABLE tg_files (
 );
 ALTER TABLE users ADD COLUMN removed_at INTEGER;
 CREATE INDEX files_sha256 ON files(sha256);
+", "
+ALTER TABLE tg_inbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tg_inbox ADD COLUMN next_try_ms INTEGER NOT NULL DEFAULT 0;
 "];
 
 /// Версия схемы, которую создаёт и ожидает эта сборка (число шагов `MIGRATIONS`).

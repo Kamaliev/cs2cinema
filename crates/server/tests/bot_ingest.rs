@@ -663,3 +663,51 @@ fn bad_caption_nick_is_refused_with_a_reason_not_truncated() {
     assert!(inbox(&st).is_empty(), "во входящие ничего не попало");
     assert_eq!(st.tg.get_file_calls(), 0);
 }
+
+/// WR-05: временный сбой `getFile` не закрывает входящее навсегда: строка ждёт и принимается позже; постоянный отказ
+/// закрывает её сразу, а после нескольких неудач подряд закрывается и временный.
+#[test]
+fn transient_get_file_errors_are_retried_later_permanent_ones_are_not() {
+    use server::tg::TgError;
+    let st = BotStand::start();
+    st.add_friend(FRIEND, "вася");
+    let bytes = demo_bytes();
+    put(&st, "f1", "u1", &bytes);
+    let len = Some(bytes.len() as u64);
+
+    st.tg.fail_next(
+        "get_file",
+        TgError::Io {
+            sent: false,
+            detail: "bot-api перезапускается".to_owned(),
+        },
+    );
+    push(&st, FRIEND, "f1", "u1", "match.dem", len, "s1mple");
+    st.step();
+    assert_eq!(inbox(&st)[0].state, "pending", "строка ждёт, а не отвергнута");
+    assert!(jobs(&st).is_empty());
+    assert!(!chat_text(&st, FRIEND).contains("Не получилось принять"));
+
+    // До срока повтора файл не трогают, после срока принимают.
+    st.step();
+    assert_eq!(st.tg.get_file_calls(), 1);
+    st.clock().advance(std::time::Duration::from_secs(60));
+    st.step();
+    assert_eq!(inbox(&st)[0].state, "queued");
+    assert_eq!(jobs(&st).len(), 1);
+
+    // Постоянный отказ (файл не найден) закрывает строку сразу.
+    put(&st, "f2", "u2", &bytes);
+    st.tg.fail_next(
+        "get_file",
+        TgError::Api {
+            code: 400,
+            description: "Bad Request: file not found".to_owned(),
+            retry_after: None,
+        },
+    );
+    push(&st, FRIEND, "f2", "u2", "match.dem", len, "zywoo");
+    st.step();
+    assert_eq!(inbox(&st)[1].state, "rejected");
+    assert!(chat_text(&st, FRIEND).contains("Не получилось принять файл"));
+}

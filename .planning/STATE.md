@@ -5,17 +5,17 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 09
 current_phase_name: Уборка, развёртывание и учения
 status: executing
-stopped_at: Completed 09-03-PLAN.md
-last_updated: "2026-10-12T17:57:22.977Z"
+stopped_at: Completed 09-01-PLAN.md
+last_updated: "2026-10-12T18:38:20.859Z"
 last_activity: 2026-10-12
 last_activity_desc: Phase 09 execution started
-state_head: 0200547d2cfe3122b7821d06f27d999ad2af9459
+state_head: c2efd7c0293e6d18519ba55fc5b1410daa572863
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 43
-  completed_plans: 34
-  percent: 79
+  completed_plans: 35
+  percent: 80
 ---
 
 # Project State
@@ -30,11 +30,11 @@ See: .planning/PROJECT.md (updated 2026-10-12)
 ## Current Position
 
 Phase: 09 (Уборка, развёртывание и учения) — EXECUTING
-Plan: 2 of 10
+Plan: 3 of 10
 Status: Ready to execute
 Last activity: 2026-10-12 — Phase 09 execution started
 
-Progress: [████████░░] 79%
+Progress: [████████░░] 80%
 
 ## Performance Metrics
 
@@ -128,6 +128,7 @@ Progress: [████████░░] 79%
 | Phase 08 P05 | 25 min | 2 tasks | 7 files |
 | Phase 08 P06 | 13 min | 3 tasks | 3 files |
 | Phase 09 P03 | 20 min | 3 tasks | 3 files |
+| Phase 09 P01 | 36min+ | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -254,6 +255,7 @@ Recent decisions affecting current work:
 - [Phase 08]: 08-06: без папки задачи (убит до того, как пайплайн её назвал) раннер начинает запись заново с предпроверкой демки ровно один раз; тест фиксирует это поведение
 - [Phase 09]: 09-03: подтверждённый результат отличается от неподтверждённого меткой out/srv{N}.accepted, а не возрастом; повтор finish один раз перед drop_job — метка переживает обрыв и порчу runner_state.json, сервер остаётся единственным судьёй приёма
 - [Phase 09]: 09-03: сроки уборки раннера — константы runner::sweep (72 ч папки дублей без подтверждения, 24 ч демки), не поля Config — литералы Config в cs2-cli и тестах не меняются
+- [Phase 09]: 09-01: потерянная на последней выдаче задача ждёт свой раннер окно lease_ttl + startup_grace (WR-02); красный CI на ubuntu лечится в тестовой подготовке (права 0600), а не в загрузчике
 
 ### Pending Todos
 
@@ -284,6 +286,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-12T17:57:22.711Z
-Stopped at: Completed 09-03-PLAN.md
+Last session: 2026-10-12T18:38:20.682Z
+Stopped at: Completed 09-01-PLAN.md
 Resume file: None

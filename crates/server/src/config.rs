@@ -491,7 +491,7 @@ pub fn validate(c: &Config) -> Result<()> {
 }
 
 /// Абсолютный путь: на Windows принимается и вид «/var/lib/…» (корень bot-api может жить в другой системе).
-fn is_abs(p: &std::path::Path) -> bool {
+pub(crate) fn is_abs(p: &std::path::Path) -> bool {
     p.is_absolute() || p.has_root()
 }
 

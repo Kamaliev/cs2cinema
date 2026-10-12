@@ -435,7 +435,8 @@ fn safe_local_path(
     expected_size: u64,
 ) -> std::result::Result<PathBuf, &'static str> {
     let p = Path::new(file_path);
-    if !p.is_absolute() {
+    // То же правило, что у настройки: на Windows «/var/lib/…» из bot-api в другой системе тоже подходит.
+    if !crate::config::is_abs(p) {
         return Err("путь не абсолютный");
     }
     let rel = p
@@ -790,4 +791,49 @@ pub fn ingest_once(bot: &Bot) -> Result<bool> {
         return reject_duplicate(bot, &row, &dup);
     }
     queue_row(bot, &row, job_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cs2c-ingest-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// CR-01: bot-api в другой системе отдаёт «/var/lib/…», на Windows такой путь не «абсолютный» по `Path`,
+    /// но настройка его принимает, значит и проверка пути обязана принимать.
+    #[cfg(windows)]
+    #[test]
+    fn unix_style_path_from_foreign_bot_api_is_accepted_on_windows() {
+        let local = temp_root("unix");
+        std::fs::create_dir_all(local.join("x").join("documents")).unwrap();
+        let file = local.join("x").join("documents").join("f.dem");
+        std::fs::write(&file, b"12345").unwrap();
+        let mut s = BotSettings::new(&local, PathBuf::from("/var/lib/bot-api"));
+        s.files_root_local = local.clone();
+        let got = safe_local_path(&s, "/var/lib/bot-api/x/documents/f.dem", 5).unwrap();
+        assert_eq!(got, file);
+        assert_eq!(
+            safe_local_path(&s, "/var/lib/other/x/documents/f.dem", 5),
+            Err("путь вне корня")
+        );
+        let _ = std::fs::remove_dir_all(&local);
+    }
+
+    #[test]
+    fn relative_path_and_parent_components_are_rejected() {
+        let local = temp_root("rel");
+        let s = BotSettings::new(&local, local.clone());
+        assert_eq!(safe_local_path(&s, "x/f.dem", 1), Err("путь не абсолютный"));
+        let escape = format!("{}/../f.dem", local.display());
+        assert_eq!(
+            safe_local_path(&s, &escape, 1),
+            Err("недопустимые компоненты пути")
+        );
+        let _ = std::fs::remove_dir_all(&local);
+    }
 }

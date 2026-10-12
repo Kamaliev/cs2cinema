@@ -368,28 +368,50 @@ fn retry_cmd(bot: &Bot, user: &User, chat_id: i64, args: &str) -> String {
         Ok(n) => n,
         Err(e) => return format!("Не удалось повторить задачу #{id}: {e}"),
     };
+    let now = bot.now_ms();
+    // Строка `tg_jobs` создаётся ДО любых вызовов Telegram: без неё доставка и уведомления задачу не видят, и
+    // остановка процесса в окне сетевого вызова оставила бы готовый ролик без получателя (CR-02).
+    let row = NewTgJob {
+        job_id: new_id,
+        chat_id,
+        user_id: user.id,
+        status_message_id: None,
+        status_text: "",
+        // Пока уходит подтверждение, тик не шлёт своё сообщение статуса.
+        next_edit_ms: now + bot.settings().status_edit_ms,
+    };
+    if let Err(e) = store::insert_tg_job(bot.core().db(), &row, now) {
+        // Без `tg_jobs` результат никому не придёт: задачу лучше не держать в очереди.
+        if let Err(c) = bot.core().cancel(new_id, true) {
+            bot.log().warn(&format!(
+                "бот: не удалось снять задачу #{new_id} после сбоя записи: {c}"
+            ));
+        }
+        bot.log().warn(&format!(
+            "бот: не удалось записать задачу #{new_id} повтора: {e}"
+        ));
+        return format!("Не получилось поставить задачу заново: {e}. Попробуйте ещё раз.");
+    }
     let ahead = bot.core().jobs_ahead(new_id).unwrap_or(0);
     let text = format!(
         "Задача #{new_id} — повтор задачи #{id}, {}.",
         ahead_phrase(ahead)
     );
-    let now = bot.now_ms();
-    let message_id = bot.say(chat_id, &text);
-    let row = NewTgJob {
-        job_id: new_id,
-        chat_id,
-        user_id: user.id,
-        status_message_id: message_id,
-        // Если сообщение не ушло, тик пришлёт его сам: пустой текст отличается от любого статуса.
-        status_text: if message_id.is_some() { &text } else { "" },
-        next_edit_ms: if message_id.is_some() {
-            now + bot.settings().status_edit_ms
-        } else {
-            0
-        },
-    };
-    if let Err(e) = store::insert_tg_job(bot.core().db(), &row, now) {
-        return format!("Задача #{new_id} поставлена, но ход её в чате показывать не смогу: {e}");
+    // Если сообщение не ушло, `status_message_id` остаётся пустым и тик пришлёт статус сам.
+    if let Some(mid) = bot.say(chat_id, &text) {
+        let at = bot.now_ms();
+        if let Err(e) = store::set_status_message(
+            bot.core().db(),
+            new_id,
+            mid,
+            &text,
+            at + bot.settings().status_edit_ms,
+            at,
+        ) {
+            bot.log().warn(&format!(
+                "бот: не удалось запомнить сообщение статуса задачи #{new_id}: {e}"
+            ));
+        }
     }
     bot.log().info(&format!(
         "бот: задача #{id} повторена как #{new_id} по сохранённой демке"

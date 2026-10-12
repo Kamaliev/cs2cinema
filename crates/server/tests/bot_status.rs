@@ -624,3 +624,37 @@ fn retry_respects_limits_and_ownership() {
     let reply = ask(&st, ADMIN, "/retry 1");
     assert!(reply.contains("Это не ваша задача"), "{reply}");
 }
+
+/// CR-02: строка `tg_jobs` создаётся до вызова Telegram. Подтверждение не ушло, а задача уже в очереди и
+/// записана для доставки; статус пришлёт тик.
+#[test]
+fn retry_records_the_delivery_row_even_when_the_confirmation_is_lost() {
+    let st = BotStand::start();
+    st.add_friend(A, "вася");
+    st.send_demo(A, "s1mple");
+    st.step();
+    let token = st.runner_token();
+    st.finish_failed(1, &token, "RECORD_TIMEOUT");
+    st.step();
+
+    st.tg.fail_next(
+        "send_message",
+        TgError::Io {
+            sent: false,
+            detail: "обрыв".to_owned(),
+        },
+    );
+    say(&st, A, "/retry");
+    st.step();
+    assert_eq!(job_state(&st, 2), JobState::Queued);
+    let tj = st.tg_job(2);
+    assert_eq!(tj.chat_id, A);
+    assert!(tj.status_message_id.is_none(), "подтверждение не дошло");
+
+    secs(&st, 60);
+    st.step();
+    assert!(
+        st.tg_job(2).status_message_id.is_some(),
+        "тик сам присылает сообщение статуса"
+    );
+}

@@ -1,0 +1,173 @@
+# Вариант В: cs2-server, локальный telegram-bot-api, его уборщик и Caddy одним docker compose.
+# Запуск (README.md рядом):  cp .env.example .env  ->  заполнить четыре значения  ->  docker compose up -d --build
+# Секреты берутся только из .env (права 0600, в git не попадает). В этом файле их нет.
+name: cs2-server
+
+services:
+  # Разовая подготовка папок на хосте: Docker создаёт отсутствующие папки от root, а cs2-server работает
+  # под uid 1500 (см. Dockerfile) и иначе не смог бы писать в данные. Выполняется и завершается.
+  prepare:
+    image: alpine:3.20
+    restart: "no"
+    network_mode: none
+    volumes:
+      - /var/lib/cs2-server:/var/lib/cs2-server
+      - /var/lib/telegram-bot-api:/var/lib/telegram-bot-api
+      - /var/backups/cs2-server:/var/backups/cs2-server
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p /var/lib/cs2-server/blobs/results /var/lib/telegram-bot-api /var/backups/cs2-server
+        chown 1500:1500 /var/lib/cs2-server /var/lib/cs2-server/blobs /var/lib/cs2-server/blobs/results /var/backups/cs2-server
+        chown 101:101 /var/lib/telegram-bot-api
+        chmod 0755 /var/lib/cs2-server /var/lib/cs2-server/blobs /var/lib/cs2-server/blobs/results /var/lib/telegram-bot-api
+        chmod 0700 /var/backups/cs2-server
+
+  # Владелец сети для cs2-server. Адрес bot-api в настройках сервера обязан быть loopback
+  # (http://127.0.0.1:порт, иначе сервер не стартует), поэтому cs2-server делит сетевое пространство
+  # с этой службой: для него bot-api доступен как 127.0.0.1:8081. Порты обеих служб публикуются здесь.
+  telegram-bot-api:
+    # После первого успешного запуска закрепить дайджестом (docs/deploy/README.md, раздел 4).
+    image: aiogram/telegram-bot-api:latest
+    restart: unless-stopped
+    depends_on:
+      prepare:
+        condition: service_completed_successfully
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?укажите TELEGRAM_API_ID в файле .env}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?укажите TELEGRAM_API_HASH в файле .env}
+      TELEGRAM_LOCAL: "1"
+      # Уровень 1: при более подробном журнале в нём появляются адреса запросов с токеном бота.
+      TELEGRAM_VERBOSITY: "1"
+    networks:
+      default:
+        # Под этим именем Caddy находит cs2-server (порт 8080 принадлежит сети этой службы).
+        aliases:
+          - cs2-server
+    ports:
+      # Docker обходит ufw: публиковать только на loopback. 8080 — cs2-server (проверки curl, учения),
+      # 8081 — bot-api (проверки хоста).
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8081:8081"
+    volumes:
+      # Рабочая папка bot-api; путь одинаков на хосте и в обоих контейнерах, поэтому bot_api_files_root_local не нужен.
+      - /var/lib/telegram-bot-api:/var/lib/telegram-bot-api
+      # Ролики для sendVideo по file://; только чтение.
+      - /var/lib/cs2-server/blobs/results:/var/lib/cs2-server/blobs/results:ro
+    healthcheck:
+      # Готов, когда на порту отвечает хоть какой-то HTTP (даже 404): busybox wget -S печатает заголовок ответа.
+      test: ["CMD-SHELL", "wget -S -O /dev/null http://127.0.0.1:8081/ 2>&1 | grep -q 'HTTP/'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  cs2-server:
+    build:
+      context: ../..
+      dockerfile: docs/deploy/docker/Dockerfile
+    image: cs2-server:local
+    container_name: cs2-server
+    restart: unless-stopped
+    # Сеть — у telegram-bot-api (см. выше); ports и networks здесь указывать нельзя.
+    network_mode: "service:telegram-bot-api"
+    depends_on:
+      telegram-bot-api:
+        condition: service_healthy
+        # Пересоздали bot-api — сервер перезапускается вместе с ним (иначе он держит старую сеть).
+        restart: true
+    user: "1500:1500"
+    # Группа пользователя bot-api (uid 101): чтение файлов, которые он кладёт в свою рабочую папку.
+    group_add:
+      - "101"
+    # Токен бота — только из .env; в файле настроек и в командной строке его нет.
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?укажите TELEGRAM_BOT_TOKEN в файле .env}
+      CS2_SERVER_DATA_DIR: /var/lib/cs2-server
+      CS2_SERVER_CONFIG: /etc/cs2-server/cs2-server.json
+      CS2_SERVER_BOT_API_URL: http://127.0.0.1:8081
+      CS2_SERVER_BOT_API_FILES_ROOT: /var/lib/telegram-bot-api
+    # Адрес для Caddy задан флагом, а не переменной, чтобы служебные команды (exec ... user add) не печатали
+    # предупреждение «не loopback». Снаружи контейнера порт виден только Caddy и loopback хоста.
+    command: ["serve", "--bind", "0.0.0.0:8080"]
+    volumes:
+      - /var/lib/cs2-server:/var/lib/cs2-server
+      - /var/lib/telegram-bot-api:/var/lib/telegram-bot-api
+      - /var/backups/cs2-server:/var/backups/cs2-server
+      - ./cs2-server.json:/etc/cs2-server/cs2-server.json:ro
+    stop_grace_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      # Журнал заменяет journalctl: объём с запасом на учение 08.
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  # Уборщик рабочей папки bot-api под тем же uid, что и сам bot-api (101): права на создаваемые им файлы
+  # у других пользователей могут не позволять удаление. Раз в 10 минут стирает обычные файлы старше
+  # 6 часов (срок retention_botapi_hours по умолчанию) только в documents/ и videos/ на глубине
+  # <папка-токена>/documents|videos/<файл>. Сети у контейнера нет.
+  botapi-janitor:
+    image: alpine:3.20
+    restart: unless-stopped
+    user: "101:101"
+    network_mode: none
+    depends_on:
+      prepare:
+        condition: service_completed_successfully
+    volumes:
+      - /var/lib/telegram-bot-api:/var/lib/telegram-bot-api
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          find /var/lib/telegram-bot-api -mindepth 3 -maxdepth 3 -type f \( -path '*/documents/*' -o -path '*/videos/*' \) -mmin +360 -delete
+          sleep 600
+        done
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # HTTPS для раннера: сертификат Caddy получает сам (нужна DNS-запись A на этот хост и свободные 80/443).
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - cs2-server
+    environment:
+      CS2_DOMAIN: ${CS2_DOMAIN:-}
+    ports:
+      # Единственные порты, открытые наружу.
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Состояние Caddy (сертификаты): без тома при пересоздании контейнера они запрашиваются заново.
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy_data:
+  caddy_config:

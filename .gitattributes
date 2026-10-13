@@ -6,3 +6,7 @@ docs/deploy/* text eol=lf
 
 # Скрипты учений запускаются в Git Bash и на Linux-хосте: только LF
 docs/drills/*.sh text eol=lf
+
+# Вариант В (всё в Docker): Dockerfile, compose, Caddyfile и .env.example читаются Linux-хостом и контейнерами: только LF
+docs/deploy/docker/* text eol=lf
+.dockerignore text eol=lf

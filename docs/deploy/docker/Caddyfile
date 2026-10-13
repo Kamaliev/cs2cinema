@@ -1,0 +1,20 @@
+{
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 5m
+			write 5m
+			idle 2m
+		}
+	}
+}
+
+# Домен приходит из .env (CS2_DOMAIN). Адрес cs2-server — имя в сети compose (README, «Как это устроено»).
+{$CS2_DOMAIN} {
+	request_body {
+		max_size 10MB
+	}
+	reverse_proxy cs2-server:8080 {
+		flush_interval -1
+	}
+}

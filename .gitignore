@@ -5,3 +5,6 @@
 /out
 /maps
 __pycache__/
+
+# вариант В (docs/deploy/docker): секреты стенда
+docs/deploy/docker/.env

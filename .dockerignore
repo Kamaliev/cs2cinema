@@ -1,0 +1,17 @@
+# Контекст сборки docs/deploy/docker/Dockerfile — корень репозитория. Без этого файла в него попали бы
+# гигабайты: target, демки, готовые ролики, карты.
+.git/
+.gitattributes
+target/
+**/target/
+.planning/
+.claude/
+.idea/
+out/
+maps/
+acceptance/
+*.dem
+*.dem.zst
+*.mp4
+# секреты варианта В не должны попасть в образ
+**/.env

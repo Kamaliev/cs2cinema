@@ -1,0 +1,29 @@
+прогон CI «chain» (09-04, первый зелёный прогон job chain) на main — ЗЕЛЁНЫЙ
+
+workflow: CI (.github/workflows/ci.yml)
+run_id: 38425807557
+html_url: https://github.com/Kamaliev/cs2cinema/actions/runs/38425807557
+head_sha: 3f688759e0cddce0cb0f13f8778e3be72baa2c42
+status: completed
+создан: 2026-10-13T15:52:47Z
+завершён: 2026-10-13T15:58:53Z
+conclusion: success
+
+задачи:
+  test (ubuntu-latest) conclusion: success (15:52:51Z — 15:55:00Z, 2 мин 9 с)
+  test (windows-latest) conclusion: success (15:52:51Z — 15:58:52Z, 6 мин 1 с)
+  chain (ubuntu) conclusion: success (15:52:51Z — 15:55:20Z)
+
+job chain (ubuntu):
+  длительность: 2 мин 29 с
+  шаги «Dependency guard» и «Chain test» — success
+  «Chain test» — это cargo test --release -p runner --test chain: сквозная цепочка (демка друга через бота и сервер возвращается роликом) и сломанная демка (понятная фраза другу и отчёт админу)
+
+артефакты (2):
+  cs2-server-linux-x64    3191762 байт  2026-10-13T15:54:57Z  (присутствует)
+  cs2-cli-windows-x64     3640870 байт  2026-10-13T15:58:48Z
+
+замечания:
+  - перезапусков не было: все три job прошли с первой попытки;
+  - флейк win_session (stand_in_launcher_game_and_console_flow_through_one_session) в этом прогоне не проявился;
+  - head_sha совпадает с коммитом, который автор опубликовал после проверки раздела «перед push 09-04» (origin/main == 3f68875, origin/main..HEAD = 0).

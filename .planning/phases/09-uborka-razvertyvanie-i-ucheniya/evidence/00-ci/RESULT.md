@@ -11,3 +11,4 @@ date: 2026-10-12
 - prepush-scan.txt — поиск секретов перед публикацией; класс exact-values автор опубликовал без проверки (файла образцов нет), решение автора записано в файле
 - run-0-red.txt — первая попытка, прогон 38289485363 на b14970a: красный (ubuntu: тест bot_url_must_be_local_http; windows: код 1, причина не установлена)
 - run-1.txt — зелёный прогон 38291001638 на a8420b5: оба job success, артефакты cs2-server-linux-x64 и cs2-cli-windows-x64
+- run-chain.txt — первый зелёный прогон job chain

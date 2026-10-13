@@ -5,11 +5,11 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 09
 current_phase_name: Уборка, развёртывание и учения
 status: executing
-stopped_at: Completed 09-07-PLAN.md
-last_updated: "2026-10-13T16:28:20.679Z"
+stopped_at: "09-08 на паузе: Task 1 решён (caddy, cs2-server в Docker, сроки A1, учение 08 compressed), Task 2 ждёт стенд автора"
+last_updated: "2026-10-13T16:40:12.429Z"
 last_activity: 2026-10-13
 last_activity_desc: Phase 09 execution started
-state_head: 25cc1f5c4028c2cadcdc5ba182bf91c61076fb62
+state_head: bb5fd258fc4cb5b13331a471fcdb7755341652cb
 progress:
   total_phases: 5
   completed_phases: 4
@@ -300,6 +300,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-13T16:28:04.915Z
-Stopped at: Completed 09-07-PLAN.md
-Resume file: None
+Last session: 2026-10-13T16:40:12.242Z
+Stopped at: 09-08 на паузе: Task 1 решён (caddy, cs2-server в Docker, сроки A1, учение 08 compressed), Task 2 ждёт стенд автора
+Resume file: .planning/phases/09-uborka-razvertyvanie-i-ucheniya/09-STAND.md

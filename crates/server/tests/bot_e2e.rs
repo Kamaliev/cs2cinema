@@ -261,6 +261,13 @@ fn failure_report_reaches_friend_and_admin_through_the_running_server() {
         srv.sink_text()
     );
     let job_id = srv.running().core().jobs().unwrap()[0].id;
+    // Задача появляется в `Receiving`, пока демка копируется из bot-api; claim имеет смысл только после `Queued`.
+    assert!(
+        wait_until(10, || srv.job(job_id).state == JobState::Queued),
+        "задача не дошла до очереди: {:?}; журнал: {}",
+        srv.job(job_id).state,
+        srv.sink_text()
+    );
 
     // Фейковый раннер по HTTP берёт задачу и сообщает о сбое запуска игры.
     let token = srv.add_runner("e2e-fail-runner");

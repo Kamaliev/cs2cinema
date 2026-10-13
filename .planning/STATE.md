@@ -5,16 +5,16 @@ milestone_name: Сервер и Telegram-бот
 current_phase: 09
 current_phase_name: Уборка, развёртывание и учения
 status: executing
-stopped_at: Completed 09-05-PLAN.md
-last_updated: "2026-10-12T19:06:35.616Z"
-last_activity: 2026-10-12
+stopped_at: Completed 09-04-PLAN.md
+last_updated: "2026-10-13T16:01:03.136Z"
+last_activity: 2026-10-13
 last_activity_desc: Phase 09 execution started
-state_head: 46698d04250199b6f8a0d5583890b5474365b655
+state_head: 62ff8ffbac843185a16eb0be818d6da4fd249344
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 43
-  completed_plans: 37
+  completed_plans: 38
   percent: 80
 ---
 
@@ -30,9 +30,9 @@ See: .planning/PROJECT.md (updated 2026-10-12)
 ## Current Position
 
 Phase: 09 (Уборка, развёртывание и учения) — EXECUTING
-Plan: 5 of 10
+Plan: 2 of 10
 Status: Ready to execute
-Last activity: 2026-10-12 — Phase 09 execution started
+Last activity: 2026-10-13 — Phase 09 execution started
 
 Progress: [████████░░] 80%
 
@@ -131,6 +131,7 @@ Progress: [████████░░] 80%
 | Phase 09 P01 | 36min+ | 3 tasks | 9 files |
 | Phase 09 P02 | 35 min | 3 tasks | 8 files |
 | Phase 09 P05 | 40 min | 3 tasks | 12 files |
+| Phase 09 P04 | n/a | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -261,6 +262,7 @@ Recent decisions affecting current work:
 - [Phase 09]: 09-02: сроки хранения по умолчанию 24/72/24/168/6/6 ч и 600 с — RESEARCH A1; автор подтверждает их в Task 1 плана 09-08; уборщик — поток serve с двухшаговым удалением через files.deleted_at
 - [Phase 09]: 09-05: доступ раннера по Tailscale Serve (основной) или Caddy с доменом, проверка plain_http_allowed не ослаблена; секреты и адрес bot-api только в /etc/cs2-server/env
 - [Phase 09]: 09-05: копии базы подкомандой backup через VACUUM INTO; WR-03 фазы 5 закрыт документом, http.rs не менялся
+- [Phase 09]: 09-04: сквозной тест цепочки лежит в runner/tests/chain.rs (server -> runner запрещён deps.rs); подменены только Telegram и внешние процессы
 
 ### Pending Todos
 
@@ -291,6 +293,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-12T19:06:35.428Z
-Stopped at: Completed 09-05-PLAN.md
+Last session: 2026-10-13T16:01:02.947Z
+Stopped at: Completed 09-04-PLAN.md
 Resume file: None

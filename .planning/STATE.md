@@ -303,3 +303,5 @@ Items acknowledged and deferred at milestone close, most recent first:
 Last session: 2026-10-13T16:40:12.242Z
 Stopped at: 09-08 на паузе: Task 1 решён (caddy, cs2-server в Docker, сроки A1, учение 08 compressed), Task 2 ждёт стенд автора
 Resume file: .planning/phases/09-uborka-razvertyvanie-i-ucheniya/09-STAND.md
+
+Docker-вариант развёртывания (вариант В: всё в Docker, docs/deploy/docker/) подготовлен по просьбе автора 2026-10-13; план 09-08 по-прежнему на паузе на Task 2.

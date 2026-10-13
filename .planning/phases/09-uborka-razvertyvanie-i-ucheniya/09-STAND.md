@@ -77,3 +77,36 @@
 - дайджесты образов (`telegram-bot-api`, `alpine`, образ `cs2-server`, Caddy);
 - A2 раскладка папки bot-api; A3 права и судьба `botapi-janitor`; A6 условия Tailscale (для варианта `caddy` не применимо, будет отмечено); A8 токен в журнале bot-api; A10 переменные образа; A12 копирование при `sendVideo`; строка `bot_send_as` и решение по метаданным видео (`width`, `height`, `duration`);
 - фактические отклонения от документа (в том числе итоговое состояние пунктов чек-листа выше).
+
+## Вариант В: всё в Docker (сделано по просьбе автора 2026-10-13)
+
+Автор попросил: «сделай docker compose чтобы я просто указал .env токен бота и он сам собрался и запустился с локальным апи бота телеграмма». Это отклонение от документа 09-05 (`cs2-server` под systemd, бинарник из CI): сервер собирается из исходников репозитория в образ и работает в контейнере. Документ развёртывания `docs/deploy/README.md` и его заготовки не менялись, кроме короткой заметки со ссылкой в разделе 8. Новая папка — `docs/deploy/docker/`.
+
+Файлы (коммиты 3482d39, 17ddec8, a846bf9):
+
+| Файл | Назначение |
+|------|------------|
+| `docs/deploy/docker/Dockerfile` | сборка `cargo build --release -p server` на `rust:1-bookworm`, рабочий образ `debian:bookworm-slim` (glibc), пользователь uid/gid 1500, `ca-certificates` |
+| `docs/deploy/docker/docker-compose.yml` | службы `prepare` (папки хоста), `telegram-bot-api`, `cs2-server`, `botapi-janitor`, `caddy` |
+| `docs/deploy/docker/Caddyfile` | вариант Б раздела 8 с `{$CS2_DOMAIN}` и `reverse_proxy cs2-server:8080`, те же таймауты и предел тела 10 МБ |
+| `docs/deploy/docker/cs2-server.json` | копия настроек (сроки A1); `bind` остаётся `127.0.0.1:8080`, адрес для Caddy задан флагом `serve --bind 0.0.0.0:8080` |
+| `docs/deploy/docker/.env.example` | четыре ключа без значений: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `CS2_DOMAIN` |
+| `docs/deploy/docker/README.md` | быстрый старт, эксплуатация, соответствие учений |
+| `.dockerignore` (корень) | контекст сборки без `target`, `.git`, `.planning`, демок |
+| `.gitignore`, `.gitattributes` | `docs/deploy/docker/.env` не коммитится; LF для файлов варианта |
+| `crates/server/tests/deploy_docs.rs` | пять новых проверок compose, Dockerfile, `.env.example`, Caddyfile |
+
+Отступления от задания, принятые при проверке исходников сервера:
+
+- Адрес bot-api. Проверка `check_base_url` принимает только `127.0.0.1`, `localhost` и `[::1]`, поэтому `http://telegram-bot-api:8081` сервер отвергнет. Код не менялся: `cs2-server` работает с `network_mode: "service:telegram-bot-api"` (общая сеть), а порты обеих служб опубликованы у `telegram-bot-api`; Caddy находит сервер по псевдониму сети `cs2-server`. Из-за этого `ports` у `cs2-server` нет, а `depends_on` с `restart: true` перезапускает сервер вместе с bot-api.
+- Секреты. Вместо `env_file: .env` переменные передаются поимённо через `${...}` из `.env` (токен бота — только `cs2-server`, `api_id` и `api_hash` — только bot-api); пустое значение останавливает `up` понятным сообщением.
+- Папки хоста готовит разовая служба `prepare` (иначе Docker создаёт их от root, а сервер идёт под uid 1500). Группа 101 добавлена серверу (`group_add`) для чтения файлов bot-api.
+
+Соответствие эксплуатации (подробно — `docs/deploy/docker/README.md`, раздел «Учения»):
+
+- Журнал: `docker compose logs -t cs2-server` вместо `journalctl -u cs2-server`; `collect-server.sh` не работает, улики хоста снимаются руками. Журнал контейнера: 5 файлов по 100 МБ.
+- Перезапуск: `docker compose restart cs2-server`; убийство: `docker kill -s KILL cs2-server`; Docker поднимает контейнер почти сразу (не через пять секунд, как systemd) — фактическое время записать в `notes.txt`.
+- Резервные копии: `docker compose exec -T cs2-server cs2-server --config /etc/cs2-server/cs2-server.json backup /var/backups/cs2-server --keep 7` и запись в `/etc/cron.d/cs2-server-backup` вместо таймера systemd; `list-timers` в улики не попадёт, замену назвать в `notes.txt`.
+- Межсетевой экран: Docker обходит `ufw`; наружу публикуются только 80 и 443 у Caddy, остальное на `127.0.0.1` (охраняет тест `docker_compose_opens_only_caddy_ports_to_the_world`). `check-host.sh` в этом варианте даёт ложные «ПРОБЛЕМА» (проверяет systemd), снимать `docker compose ps` и `ss -tlnp`.
+
+Проверено без Docker (на машине Docker и WSL нет): разбор compose и Dockerfile тестом `deploy_docs` (12 тестов зелёные), проверка, что настройки варианта В и адрес bot-api проходят загрузчик настроек сервера. Не проверено: сборка образа, `docker compose config`, запуск, права на папки и файлы bot-api (A2/A3), готовность bot-api по `wget -S` в проверке здоровья, `read_only: true` у сервера. Это первое, что смотреть на стенде при `docker compose up -d --build`.

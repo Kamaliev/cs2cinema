@@ -6,10 +6,10 @@ current_phase: 09
 current_phase_name: Уборка, развёртывание и учения
 status: executing
 stopped_at: "09-08 на паузе: Task 1 решён (caddy, cs2-server в Docker, сроки A1, учение 08 compressed), Task 2 ждёт стенд автора"
-last_updated: "2026-10-14T10:12:49.798Z"
+last_updated: "2026-10-14T13:25:32.695Z"
 last_activity: 2026-10-13
 last_activity_desc: Phase 09 execution started
-state_head: b85ada50d712bd8fc582b8410a38f08ad2f7dcd3
+state_head: 0622398e45697fbfcf3509eea2d4e0a2885d2951
 progress:
   total_phases: 5
   completed_phases: 4
@@ -293,6 +293,7 @@ None yet.
 | 3 | Вариант В без Caddy: HTTPS даёт внешний Traefik автора (внешняя docker-сеть, labels у telegram-bot-api) | 2026-10-14 | 3f42d8c | — |
 | 4 | Баннер «Продолжить» виден в режиме раннера (пауза после отмены блокировала приём задач с сервера без кнопки) | 2026-10-14 | 6835796 | — |
 | 5 | Автообновление приложения: установка без кнопки при простое, проверка раз в 6 часов; релиз v1.2.0 | 2026-10-14 | b85ada5 | — |
+| 6 | Общий установщик: install.ps1 ставит HLAE 2.192.7 и ffmpeg 9.0.2 вместе с приложением; приложение находит встроенный HLAE и его ffmpeg | 2026-10-14 | 0622398 | — |
 
 ## Deferred Items
 

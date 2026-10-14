@@ -1,11 +1,12 @@
 # Вариант В: всё в Docker
 
 Один `.env` с токеном бота, одна команда `docker compose up -d --build`: из исходников репозитория собирается
-`cs2-server`, рядом поднимаются локальный `telegram-bot-api`, его уборщик и Caddy с HTTPS для раннера.
-Основной документ развёртывания (`../README.md`, сервер под systemd) этим вариантом не заменяется: берите один из двух.
-Оба сразу на одном хосте не работают: у них один и тот же порт `127.0.0.1:8080`.
+`cs2-server`, рядом поднимаются локальный `telegram-bot-api` и его уборщик. HTTPS для раннера даёт Traefik, который
+уже работает на хосте: compose не поднимает свой прокси, а подключает сервер к внешней docker-сети Traefik и описывает
+маршрут labels. Основной документ развёртывания (`../README.md`, сервер под systemd) этим вариантом не заменяется:
+берите один из двух. Оба сразу на одном хосте не работают: у них один и тот же порт `127.0.0.1:8080`.
 
-Файлы рядом: `Dockerfile`, `docker-compose.yml`, `Caddyfile`, `cs2-server.json`, `.env.example`.
+Файлы рядом: `Dockerfile`, `docker-compose.yml`, `cs2-server.json`, `.env.example`.
 В корне репозитория лежит `.dockerignore` (без него в контекст сборки попали бы `target`, демки и `.git`).
 Файлы проверяет тест `crates/server/tests/deploy_docs.rs`.
 
@@ -17,7 +18,10 @@
  +--------------------- Linux-хост, docker compose --------v----------------------------+
  | cs2-server (uid 1500): бот, HTTP для раннеров :8080, поток уборки, server.db          |
  | botapi-janitor: стирает старые файлы рабочей папки bot-api                            |
- | caddy: 80/443 наружу, HTTPS, reverse_proxy на cs2-server:8080                         |
+ +--------------------------------------^------------------------------------------------+
+                                        | внешняя docker-сеть Traefik, cs2-server:8080
+ +--------------------------------------+------------------------------------------------+
+ | Traefik автора (свой стек): 80/443 наружу, HTTPS, маршрут по labels                   |
  +--------------------------------------^------------------------------------------------+
                                         | HTTPS, https://<ваш-домен>
  +------------- Windows, машина автора ------------+
@@ -25,14 +29,15 @@
  +--------------------------------------------------+
 ```
 
-Наружу открыты только 22 (SSH), 80 и 443 (Caddy). Сервер (8080) и bot-api (8081) опубликованы лишь на `127.0.0.1` хоста.
+Наружу открыты только 22 (SSH), 80 и 443 (Traefik). Сервер (8080) и bot-api (8081) опубликованы лишь на `127.0.0.1` хоста.
 
 ## Что нужно на хосте
 
 - x86-64 Linux, `git`, Docker и плагин Compose версии 2.20 или новее (`docker compose version`).
-- DNS-запись типа A: ваш домен указывает на публичный адрес хоста. Она должна быть готова до первого запуска Caddy,
-  иначе сертификат не выдаётся.
-- Свободные порты 80 и 443 (на хосте не должно быть другого веб-сервера).
+- Работающий Traefik (v2 или v3) с провайдером Docker, точкой входа HTTPS и certresolver; он один держит 80 и 443.
+  Compose подключается к его docker-сети: узнайте её имя (`docker network ls`), имя точки входа и certresolver из
+  его настроек. Без Traefik бот работает, но раннер к серверу не подключится (раздел «Проба без домена»).
+- DNS-запись типа A: ваш домен указывает на публичный адрес хоста, иначе Traefik не получит сертификат.
 - Бот от `@BotFather`, `api_id` и `api_hash` с `my.telegram.org` («API development tools»), как в разделе 3 основного документа.
 - Rust, ffmpeg и прочее на хосте не нужны: сборка идёт внутри Docker.
 
@@ -43,10 +48,11 @@
 sudo GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/Kamaliev/cs2cinema.git /opt/cs2cinema
 cd /opt/cs2cinema/docs/deploy/docker
 
-# 2. Настройки: четыре значения.
+# 2. Настройки: токены Telegram, домен и три значения из вашего Traefik.
 sudo cp .env.example .env
 sudo chmod 600 .env
-sudo nano .env        # TELEGRAM_BOT_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH, CS2_DOMAIN
+sudo nano .env        # TELEGRAM_BOT_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH, CS2_DOMAIN,
+                      # TRAEFIK_NETWORK, TRAEFIK_ENTRYPOINT (пусто = websecure), TRAEFIK_CERTRESOLVER
 
 # 3. Один раз: бот выходит из облачного Bot API (локальный telegram-bot-api не работает с ботом,
 #    который числится на сервере Telegram). Токен идёт через stdin curl, а не через командную строку.
@@ -67,6 +73,8 @@ sudo docker compose logs -f cs2-server
 сервера. `docker compose ps` показывает её завершённой, это нормально.
 
 Если пропущено значение в `.env`, Compose останавливается сразу с понятным сообщением («укажите TELEGRAM_BOT_TOKEN в файле .env»).
+Если сети с именем из `TRAEFIK_NETWORK` нет, Compose тоже останавливается («network … declared as external, but could not be found»):
+сеть создаёт стек Traefik, здесь её не создают.
 Если ваш пользователь в группе `docker`, `sudo` перед `docker` не нужен.
 
 ## Пользователи и раннер
@@ -97,10 +105,14 @@ ctl job list
 ## Проверка развёртывания
 
 ```bash
-sudo docker compose ps                                  # cs2-server, telegram-bot-api (healthy), botapi-janitor, caddy
+sudo docker compose ps                                  # cs2-server, telegram-bot-api (healthy), botapi-janitor
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8080/v1/runner/hello   # 401: сервер отвечает, нужен токен
-sudo ss -tlnp | grep -E ':(80|443|8080|8081)\b'         # 8080 и 8081 только на 127.0.0.1
+sudo ss -tlnp | grep -E ':(80|443|8080|8081)\b'         # 80 и 443 у Traefik; 8080 и 8081 только на 127.0.0.1
+sudo docker network inspect <TRAEFIK_NETWORK> --format '{{range .Containers}}{{.Name}} {{end}}'   # есть telegram-bot-api
 ```
+
+Маршрут виден в панели Traefik (если она включена) как `cs2-server@docker`; в журнале Traefik не должно быть строк
+про `cs2-server` с `error`.
 
 Снаружи, с другой машины, должны быть закрыты 8080 и 8081 (раздел 11 основного документа: `nmap -Pn -p- <адрес>`,
 `Test-NetConnection <адрес> -Port 8080`). С машины раннера:
@@ -109,7 +121,8 @@ sudo ss -tlnp | grep -E ':(80|443|8080|8081)\b'         # 8080 и 8081 толь�
 curl.exe -s -o NUL -w "%{http_code}" -X POST https://<ваш-домен>/v1/runner/hello
 ```
 
-Ответ `401` значит: сервер достижим по HTTPS и требует токен.
+Ответ `401` значит: сервер достижим по HTTPS и требует токен. Ответ `404` значит, что Traefik не нашёл маршрут
+(раздел «Если что-то не так»).
 
 Скрипт `../check-host.sh` рассчитан на сервер под systemd и здесь неприменим как есть (он проверяет `systemctl is-active cs2-server`
 и таймер копий); вместо него — команды выше.
@@ -119,8 +132,17 @@ curl.exe -s -o NUL -w "%{http_code}" -X POST https://<ваш-домен>/v1/runn
 - **Сеть.** Сервер принимает адрес bot-api только вида `http://127.0.0.1:порт` (проверка в `check_base_url`: это сделано,
   чтобы токен бота не уходил по сети). Поэтому контейнер `cs2-server` работает с `network_mode: "service:telegram-bot-api"`,
   то есть делит сеть с bot-api, и для него bot-api — это `127.0.0.1:8081`. Следствия: публикация портов обеих служб
-  записана у `telegram-bot-api`, а Caddy находит сервер по имени `cs2-server` (его даёт псевдоним сети у `telegram-bot-api`).
+  записана у `telegram-bot-api`, и labels для Traefik тоже у него: провайдер Docker берёт адрес контейнера-владельца сети,
+  а порт `8080` в этой сети слушает `cs2-server` (`loadbalancer.server.port: 8080`). Контейнер подключён к двум сетям,
+  поэтому `traefik.docker.network` называет, из какой брать адрес. В сети Traefik у него псевдоним `cs2-server`: если ваш
+  Traefik настроен файлом, а не labels, адрес сервера для него `http://cs2-server:8080`.
   Сервер слушает `0.0.0.0:8080` внутри этой сети; на хосте порт виден только на `127.0.0.1:8080`.
+- **Что делает прокси.** Маршрут `Host(<CS2_DOMAIN>)` на точке входа `TRAEFIK_ENTRYPOINT` с TLS от `TRAEFIK_CERTRESOLVER`
+  и промежуточный слой `buffering` с пределом тела запроса 10 МБ (кусок результата — 8 МиБ, служебные запросы меньше);
+  запрос и ответ до 10 МБ держатся в памяти, на диск не пишутся (ответы сервера не больше 8 МиБ: демка отдаётся кусками).
+  Таймауты у Traefik общие на точку входа (`respondingTimeouts` в его статической настройке), по маршруту их не задать:
+  `readTimeout` должен быть не меньше 5 минут (у Traefik v3 по умолчанию 60 секунд; кусок 8 МиБ по медленному каналу
+  может не уложиться, раннер тогда повторит кусок с нового смещения), `idleTimeout` больше long-poll (25 секунд).
 - **Пользователь.** Процесс сервера идёт под uid/gid 1500 (пользователь `cs2-server` в образе). Файлы данных на хосте
   принадлежат этому числу. Контейнер bot-api работает под uid 101 и читает папку результатов: каталоги 0755, файлы 0644 (umask
   контейнера 0022). Чтобы сервер читал файлы, которые кладёт bot-api, ему добавлена группа 101 (`group_add`).
@@ -187,7 +209,8 @@ sudo docker compose start cs2-server
 | состояние | `sudo docker compose ps` |
 | журнал сервера (вместо `journalctl -u cs2-server`) | `sudo docker compose logs -t cs2-server` |
 | журнал вживую, последние 100 строк | `sudo docker compose logs -f -t --tail 100 cs2-server` |
-| журналы bot-api и Caddy | `sudo docker compose logs -t telegram-bot-api` и `... caddy` |
+| журнал bot-api | `sudo docker compose logs -t telegram-bot-api` |
+| журнал прокси | в стеке Traefik: `docker logs -t <контейнер traefik>` (журнал доступа — если включён у вас) |
 | перезапуск сервера | `sudo docker compose restart cs2-server` |
 | остановить всё (данные остаются) | `sudo docker compose stop` |
 | снова запустить | `sudo docker compose up -d` |
@@ -211,8 +234,9 @@ sudo ufw allow 80,443/tcp
 sudo ufw enable
 ```
 
+Порты 80 и 443 держит Traefik из своего стека; этот compose наружу не публикует ничего.
 Docker обходит `ufw` для опубликованных портов (он пишет собственные правила). Поэтому защита держится не на `ufw`, а на
-привязке `127.0.0.1:...` в `docker-compose.yml`: все порты, кроме 80 и 443 у Caddy, опубликованы только на loopback.
+привязке `127.0.0.1:...` в `docker-compose.yml`: все порты здесь опубликованы только на loopback.
 Не добавляйте в compose записи вида `8080:8080`: сервер оказался бы в интернете без прокси и таймаутов (раздел 14 основного документа).
 
 ## Учения (docs/drills) в этом варианте
@@ -229,7 +253,7 @@ Docker обходит `ufw` для опубликованных портов (о
 | `systemctl show -p Restart cs2-server` | `docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' cs2-server` (ожидается `unless-stopped`) |
 | `ps -o rss= -p "$(systemctl show -p MainPID --value cs2-server)"` (учение 05) | `docker stats --no-stream cs2-server`; в улики запишите, каким способом снято |
 | `sudo ls -l /var/lib/cs2-server/blobs/results/<N>/` | то же: папка на хосте та же |
-| `journalctl` для Caddy (учение 05) | `docker compose logs -t caddy` |
+| `journalctl` для Caddy (учение 05) | журнал Traefik из его стека: `docker logs -t --since "<начало>" <контейнер traefik>`; адреса заменить, как в протоколе |
 
 `docs/drills/collect-server.sh` в этом варианте не работает (он читает `journalctl`, `systemctl` и пути вида `/opt/cs2-bot-api`).
 Улики хоста снимайте руками в `~/raw/<учение>/`:
@@ -248,17 +272,13 @@ ctl job show <N> > ~/raw/<учение>/job-show-<N>.txt
 
 ## Проба без домена
 
-Можно поднять сервер и бота без Caddy:
-
-```bash
-cd /opt/cs2cinema/docs/deploy/docker
-sudo docker compose up -d --build cs2-server telegram-bot-api botapi-janitor
-```
-
-`CS2_DOMAIN` при этом пустым оставить можно. Бот работает полностью. Раннер ходит на сервер только по HTTPS, кроме адресов
+Сервер и бот поднимаются и без Traefik, но `.env` всё равно должен быть заполнен целиком (compose проверяет значения
+и ищет сеть `TRAEFIK_NETWORK` при любом запуске). Если Traefik ещё нет, создайте пустую сеть с тем же именем
+(`sudo docker network create <TRAEFIK_NETWORK>`) и запустите как обычно: labels без Traefik ничего не делают.
+Бот работает полностью. Раннер ходит на сервер только по HTTPS, кроме адресов
 этого же компьютера и частной сети; порт 8080 опубликован лишь на loopback хоста. Поэтому без домена раннер подключается
 через SSH-туннель с машины раннера: `ssh -N -L 8080:127.0.0.1:8080 <пользователь>@<хост>`, адрес сервера для раннера
-в этом случае `http://127.0.0.1:8080` (открытый `http://` на localhost раннер принимает). Для настоящей работы нужен Caddy и домен.
+в этом случае `http://127.0.0.1:8080` (открытый `http://` на localhost раннер принимает). Для настоящей работы нужны Traefik и домен.
 
 ## Секреты: чего не делать
 
@@ -278,5 +298,9 @@ sudo docker compose up -d --build cs2-server telegram-bot-api botapi-janitor
 | «бот не запустился: локальный telegram-bot-api не отвечает (getMe)» | не выполнен шаг 3 (выход из облачного Bot API) или не прошло десять минут; либо bot-api ещё не поднялся (сервер перезапустится сам) |
 | «файл настроек … не удалось открыть (PermissionDenied)» | файл `cs2-server.json` с правами 0600 у другого владельца: `chmod 644` или `chown 1500:1500` |
 | «Permission denied» при записи в `/var/lib/cs2-server` | каталог остался от установки под systemd и принадлежит другому uid: `sudo chown -R 1500:1500 /var/lib/cs2-server` |
-| Caddy не получает сертификат | DNS-запись A домена, открытые порты 80/443, `docker compose logs caddy`; при пустом `CS2_DOMAIN` Caddy не стартует |
+| Compose: «network … declared as external, but could not be found» | имя в `TRAEFIK_NETWORK` не совпадает с сетью Traefik (`docker network ls`), либо стек Traefik не запущен |
+| с машины раннера `404` вместо `401` | Traefik не видит маршрут: `telegram-bot-api` не в сети Traefik (`docker network inspect`), `traefik.docker.network` не та сеть, неверное имя точки входа, или у Traefik провайдер Docker выключен; журнал Traefik |
+| «Gateway Timeout» или `502` с машины раннера | Traefik подключён к другой сети, чем в `traefik.docker.network`; либо `cs2-server` не запущен (`docker compose ps`) |
+| сертификат не выдаётся | DNS-запись A домена, порты 80/443 у Traefik, имя `TRAEFIK_CERTRESOLVER` как в его настройке; журнал Traefik |
+| раннер жалуется на обрыв загрузки куска | `readTimeout` точки входа Traefik меньше 5 минут («Как это устроено», «Что делает прокси») |
 | сервер не читает файл, скачанный bot-api | права файла в `/var/lib/telegram-bot-api/<токен>/documents`: нужен доступ на чтение для группы 101 или всем |

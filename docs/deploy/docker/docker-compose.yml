@@ -1,5 +1,6 @@
-# Вариант В: cs2-server, локальный telegram-bot-api, его уборщик и Caddy одним docker compose.
-# Запуск (README.md рядом):  cp .env.example .env  ->  заполнить четыре значения  ->  docker compose up -d --build
+# Вариант В: cs2-server, локальный telegram-bot-api и его уборщик одним docker compose.
+# HTTPS даёт уже работающий на хосте Traefik автора (внешняя docker-сеть и labels у владельца сети, см. README.md рядом).
+# Запуск:  cp .env.example .env  ->  заполнить значения  ->  docker compose up -d --build
 # Секреты берутся только из .env (права 0600, в git не попадает). В этом файле их нет.
 name: cs2-server
 
@@ -27,7 +28,9 @@ services:
 
   # Владелец сети для cs2-server. Адрес bot-api в настройках сервера обязан быть loopback
   # (http://127.0.0.1:порт, иначе сервер не стартует), поэтому cs2-server делит сетевое пространство
-  # с этой службой: для него bot-api доступен как 127.0.0.1:8081. Порты обеих служб публикуются здесь.
+  # с этой службой: для него bot-api доступен как 127.0.0.1:8081. Порты обеих служб публикуются здесь,
+  # и labels для Traefik тоже здесь: Traefik берёт адрес контейнера, которому принадлежит сеть, а порт 8080
+  # в этой сети слушает cs2-server.
   telegram-bot-api:
     # После первого успешного запуска закрепить дайджестом (docs/deploy/README.md, раздел 4).
     image: aiogram/telegram-bot-api:latest
@@ -43,14 +46,36 @@ services:
       TELEGRAM_VERBOSITY: "1"
     networks:
       default:
-        # Под этим именем Caddy находит cs2-server (порт 8080 принадлежит сети этой службы).
+        # Под этим именем cs2-server виден в сети compose (порт 8080 принадлежит сети этой службы).
+        aliases:
+          - cs2-server
+      # Внешняя сеть Traefik автора (создана его стеком, здесь только подключение). Под тем же именем
+      # cs2-server:8080 доступен и Traefik, если он настроен файлом, а не labels.
+      traefik:
         aliases:
           - cs2-server
     ports:
       # Docker обходит ufw: публиковать только на loopback. 8080 — cs2-server (проверки curl, учения),
-      # 8081 — bot-api (проверки хоста).
+      # 8081 — bot-api (проверки хоста). Наружу cs2-server отдаёт только Traefik.
       - "127.0.0.1:8080:8080"
       - "127.0.0.1:8081:8081"
+    labels:
+      traefik.enable: "true"
+      # Контейнер в двух сетях: Traefik должен брать адрес из своей.
+      traefik.docker.network: ${TRAEFIK_NETWORK:?укажите TRAEFIK_NETWORK в файле .env}
+      traefik.http.routers.cs2-server.rule: "Host(`${CS2_DOMAIN:?укажите CS2_DOMAIN в файле .env}`)"
+      traefik.http.routers.cs2-server.entrypoints: ${TRAEFIK_ENTRYPOINT:-websecure}
+      traefik.http.routers.cs2-server.tls: "true"
+      traefik.http.routers.cs2-server.tls.certresolver: ${TRAEFIK_CERTRESOLVER:?укажите TRAEFIK_CERTRESOLVER в файле .env}
+      traefik.http.routers.cs2-server.middlewares: cs2-server-body
+      traefik.http.routers.cs2-server.service: cs2-server
+      # Порт cs2-server в общей сети (у самого bot-api порт 8081, его наружу не отдавать).
+      traefik.http.services.cs2-server.loadbalancer.server.port: "8080"
+      # Предел тела запроса 10 МБ (кусок результата — 8 МиБ, служебные запросы меньше), как было у Caddy.
+      # Запрос и ответ (не больше 8 МиБ: демка отдаётся кусками) остаются в памяти, на диск не пишутся.
+      traefik.http.middlewares.cs2-server-body.buffering.maxrequestbodybytes: "10485760"
+      traefik.http.middlewares.cs2-server-body.buffering.memrequestbodybytes: "10485760"
+      traefik.http.middlewares.cs2-server-body.buffering.memresponsebodybytes: "10485760"
     volumes:
       # Рабочая папка bot-api; путь одинаков на хосте и в обоих контейнерах, поэтому bot_api_files_root_local не нужен.
       - /var/lib/telegram-bot-api:/var/lib/telegram-bot-api
@@ -76,7 +101,7 @@ services:
     image: cs2-server:local
     container_name: cs2-server
     restart: unless-stopped
-    # Сеть — у telegram-bot-api (см. выше); ports и networks здесь указывать нельзя.
+    # Сеть — у telegram-bot-api (см. выше); ports, networks и labels здесь указывать нельзя.
     network_mode: "service:telegram-bot-api"
     depends_on:
       telegram-bot-api:
@@ -94,8 +119,8 @@ services:
       CS2_SERVER_CONFIG: /etc/cs2-server/cs2-server.json
       CS2_SERVER_BOT_API_URL: http://127.0.0.1:8081
       CS2_SERVER_BOT_API_FILES_ROOT: /var/lib/telegram-bot-api
-    # Адрес для Caddy задан флагом, а не переменной, чтобы служебные команды (exec ... user add) не печатали
-    # предупреждение «не loopback». Снаружи контейнера порт виден только Caddy и loopback хоста.
+    # Адрес для Traefik задан флагом, а не переменной, чтобы служебные команды (exec ... user add) не печатали
+    # предупреждение «не loopback». Снаружи контейнера порт виден только Traefik и loopback хоста.
     command: ["serve", "--bind", "0.0.0.0:8080"]
     volumes:
       - /var/lib/cs2-server:/var/lib/cs2-server
@@ -145,29 +170,8 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # HTTPS для раннера: сертификат Caddy получает сам (нужна DNS-запись A на этот хост и свободные 80/443).
-  caddy:
-    image: caddy:2
-    restart: unless-stopped
-    depends_on:
-      - cs2-server
-    environment:
-      CS2_DOMAIN: ${CS2_DOMAIN:-}
-    ports:
-      # Единственные порты, открытые наружу.
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      # Состояние Caddy (сертификаты): без тома при пересоздании контейнера они запрашиваются заново.
-      - caddy_data:/data
-      - caddy_config:/config
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-volumes:
-  caddy_data:
-  caddy_config:
+networks:
+  # Сеть Traefik автора: compose её не создаёт и не удаляет. Имя — в .env (docker network ls).
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:?укажите TRAEFIK_NETWORK в файле .env}

@@ -13,7 +13,6 @@ const CHECK_HOST: &str = include_str!("../../../docs/deploy/check-host.sh");
 // Вариант В: всё в Docker (docs/deploy/docker).
 const D_COMPOSE: &str = include_str!("../../../docs/deploy/docker/docker-compose.yml");
 const D_DOCKERFILE: &str = include_str!("../../../docs/deploy/docker/Dockerfile");
-const D_CADDYFILE: &str = include_str!("../../../docs/deploy/docker/Caddyfile");
 const D_ENV_EXAMPLE: &str = include_str!("../../../docs/deploy/docker/.env.example");
 const D_README: &str = include_str!("../../../docs/deploy/docker/README.md");
 const D_IGNORE: &str = include_str!("../../../.dockerignore");
@@ -222,18 +221,17 @@ fn looks_like_bot_token(word: &str) -> bool {
 }
 
 #[test]
-fn docker_compose_opens_only_caddy_ports_to_the_world() {
+fn docker_compose_publishes_ports_only_on_loopback() {
+    // 80 и 443 держит Traefik автора из своего стека; этот compose наружу не публикует ничего.
     let ports = compose_ports(D_COMPOSE);
     assert!(
-        ports.len() >= 4,
+        ports.len() >= 2,
         "разбор ports: нашёл {} записей: {ports:?}",
         ports.len()
     );
     for (service, port) in &ports {
-        let loopback = port.starts_with("127.0.0.1:");
-        let caddy_web = service == "caddy" && (port == "80:80" || port == "443:443");
         assert!(
-            loopback || caddy_web,
+            port.starts_with("127.0.0.1:"),
             "служба {service} публикует порт {port} не на loopback: Docker обходит ufw"
         );
     }
@@ -245,15 +243,13 @@ fn docker_compose_opens_only_caddy_ports_to_the_world() {
             "у владельца сети нет «{needle}»"
         );
     }
-    for web in ["80:80", "443:443"] {
-        assert!(
-            ports.iter().any(|(s, p)| s == "caddy" && p == web),
-            "у caddy нет «{web}»"
-        );
-    }
     assert!(
         !ports.iter().any(|(s, _)| s == "cs2-server"),
         "cs2-server делит сеть с bot-api: порты у него указывать нельзя"
+    );
+    assert!(
+        !D_COMPOSE.contains("caddy"),
+        "Caddy убран: HTTPS даёт внешний Traefik"
     );
 }
 
@@ -269,8 +265,7 @@ fn docker_compose_wires_server_to_loopback_bot_api_and_keeps_secrets_out() {
         "/var/lib/telegram-bot-api:/var/lib/telegram-bot-api",
         "./cs2-server.json:/etc/cs2-server/cs2-server.json:ro",
         "dockerfile: docs/deploy/docker/Dockerfile",
-        "image: caddy:2",
-        "caddy_data:/data",
+        "external: true",
         "max-size",
         "botapi-janitor",
         "user: \"101:101\"",
@@ -336,7 +331,7 @@ fn docker_compose_wires_server_to_loopback_bot_api_and_keeps_secrets_out() {
     assert_eq!(c.retention_demo_hours, 24, "сроки хранения A1");
     assert!(
         D_COMPOSE.contains("\"serve\", \"--bind\", \"0.0.0.0:8080\""),
-        "команда запуска должна задавать адрес для Caddy"
+        "команда запуска должна задавать адрес для Traefik"
     );
 }
 
@@ -382,7 +377,7 @@ fn docker_image_is_glibc_with_fixed_user_and_clean_env_example() {
         );
     }
 
-    // .env.example: четыре ключа и ни одного значения; настоящий .env в git не попадает.
+    // .env.example: семь ключей и ни одного значения; настоящий .env в git не попадает.
     let keys: Vec<&str> = D_ENV_EXAMPLE
         .lines()
         .map(str::trim)
@@ -394,9 +389,12 @@ fn docker_image_is_glibc_with_fixed_user_and_clean_env_example() {
             "TELEGRAM_BOT_TOKEN=",
             "TELEGRAM_API_ID=",
             "TELEGRAM_API_HASH=",
-            "CS2_DOMAIN="
+            "CS2_DOMAIN=",
+            "TRAEFIK_NETWORK=",
+            "TRAEFIK_ENTRYPOINT=",
+            "TRAEFIK_CERTRESOLVER="
         ],
-        ".env.example: ровно четыре ключа и без значений"
+        ".env.example: ровно семь ключей и без значений"
     );
     assert!(
         GITIGNORE
@@ -407,19 +405,32 @@ fn docker_image_is_glibc_with_fixed_user_and_clean_env_example() {
 }
 
 #[test]
-fn docker_caddyfile_and_readme_keep_the_proxy_rules() {
+fn docker_traefik_labels_and_readme_keep_the_proxy_rules() {
+    // Маршрут для внешнего Traefik описан labels у владельца сети (telegram-bot-api): домен из .env,
+    // порт cs2-server, TLS от certresolver автора и предел тела запроса 10 МБ (кусок результата — 8 МиБ).
     for needle in [
-        "{$CS2_DOMAIN}",
-        "reverse_proxy cs2-server:8080",
-        "flush_interval -1",
-        "max_size 10MB",
-        "read_header 10s",
-        "read_body 5m",
-        "write 5m",
-        "idle 2m",
+        "traefik.enable: \"true\"",
+        "traefik.docker.network: ${TRAEFIK_NETWORK:?",
+        "traefik.http.routers.cs2-server.rule: \"Host(`${CS2_DOMAIN:?",
+        "traefik.http.routers.cs2-server.entrypoints: ${TRAEFIK_ENTRYPOINT:-websecure}",
+        "traefik.http.routers.cs2-server.tls.certresolver: ${TRAEFIK_CERTRESOLVER:?",
+        "traefik.http.routers.cs2-server.middlewares: cs2-server-body",
+        "traefik.http.services.cs2-server.loadbalancer.server.port: \"8080\"",
+        "traefik.http.middlewares.cs2-server-body.buffering.maxrequestbodybytes: \"10485760\"",
+        "name: ${TRAEFIK_NETWORK:?",
     ] {
-        assert!(D_CADDYFILE.contains(needle), "в Caddyfile нет «{needle}»");
+        assert!(D_COMPOSE.contains(needle), "в compose нет «{needle}»");
     }
+    // Labels лежат у telegram-bot-api, а не у cs2-server: у него network_mode service и своей сети нет.
+    let cs2_section = D_COMPOSE
+        .split("\n  cs2-server:\n")
+        .nth(1)
+        .and_then(|s| s.split("\n  botapi-janitor:\n").next())
+        .expect("в compose нет службы cs2-server");
+    assert!(
+        !cs2_section.contains("labels:") && !cs2_section.contains("networks:"),
+        "у cs2-server не должно быть labels и networks: сеть у telegram-bot-api"
+    );
     for needle in [
         "docker compose up -d --build",
         "cp .env.example .env",
@@ -430,6 +441,9 @@ fn docker_caddyfile_and_readme_keep_the_proxy_rules() {
         "restart cs2-server",
         "cron",
         "ufw",
+        "TRAEFIK_NETWORK",
+        "traefik.docker.network",
+        "readTimeout",
     ] {
         assert!(
             D_README.contains(needle),
@@ -458,7 +472,6 @@ fn docker_files_have_unix_line_endings() {
     for (name, text) in [
         ("docker/docker-compose.yml", D_COMPOSE),
         ("docker/Dockerfile", D_DOCKERFILE),
-        ("docker/Caddyfile", D_CADDYFILE),
         ("docker/.env.example", D_ENV_EXAMPLE),
         (".dockerignore", D_IGNORE),
     ] {

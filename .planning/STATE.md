@@ -6,10 +6,10 @@ current_phase: 09
 current_phase_name: Уборка, развёртывание и учения
 status: executing
 stopped_at: "09-08 на паузе: Task 1 решён (caddy, cs2-server в Docker, сроки A1, учение 08 compressed), Task 2 ждёт стенд автора"
-last_updated: "2026-10-14T13:25:32.695Z"
+last_updated: "2026-10-14T13:56:23.310Z"
 last_activity: 2026-10-13
 last_activity_desc: Phase 09 execution started
-state_head: 0622398e45697fbfcf3509eea2d4e0a2885d2951
+state_head: 6ff82e9f5e018adc2c1f7eab1794764d6e06818d
 progress:
   total_phases: 5
   completed_phases: 4
@@ -294,6 +294,7 @@ None yet.
 | 4 | Баннер «Продолжить» виден в режиме раннера (пауза после отмены блокировала приём задач с сервера без кнопки) | 2026-10-14 | 6835796 | — |
 | 5 | Автообновление приложения: установка без кнопки при простое, проверка раз в 6 часов; релиз v1.2.0 | 2026-10-14 | b85ada5 | — |
 | 6 | Общий установщик: install.ps1 ставит HLAE 2.192.7 и ffmpeg 9.0.2 вместе с приложением; приложение находит встроенный HLAE и его ffmpeg | 2026-10-14 | 0622398 | — |
+| 7 | Регистрация раннера через Telegram: заявка с хешем токена, код у админа (/runner код), кнопка в приложении | 2026-10-14 | 6ff82e9 | — |
 
 ## Deferred Items
 

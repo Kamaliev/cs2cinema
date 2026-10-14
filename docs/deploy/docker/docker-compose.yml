@@ -96,7 +96,8 @@ services:
 
   cs2-server:
     build:
-      context: ../..
+      # Корень репозитория (docs/deploy/docker -> три уровня вверх); Dockerfile задан относительно него.
+      context: ../../..
       dockerfile: docs/deploy/docker/Dockerfile
     image: cs2-server:local
     container_name: cs2-server

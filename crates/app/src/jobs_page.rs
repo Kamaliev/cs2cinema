@@ -10,6 +10,7 @@ use store::{Job, JobKind, JobStatus};
 use crate::{
     app::{App, Page, THUMB},
     queue::{self, PauseReason, QueueView},
+    remote::RemoteStatus,
     ui::{self, ACCENT, BAD, MUTED, OK},
 };
 
@@ -72,10 +73,12 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
         );
         ui.add_space(8.0);
     }
-    // очередь стоит после отмены или прерванной задачи, пока пользователь не нажмёт «Продолжить» (D-13, D-16)
+    // очередь стоит после отмены или прерванной задачи, пока пользователь не нажмёт «Продолжить» (D-13, D-16).
+    // В режиме раннера локальных задач нет, но пауза не даёт брать задачи с сервера: баннер нужен и тогда.
     let waiting = app.jobs.list.iter().filter(|j| j.status == JobStatus::Queued).count();
+    let runner_on = !matches!(app.remote.status(), RemoteStatus::Off);
     let paused = app.queue.view().paused;
-    if let Some(reason) = paused.filter(|_| waiting > 0) {
+    if let Some(reason) = paused.filter(|_| waiting > 0 || runner_on) {
         egui::Frame::new().stroke(egui::Stroke::new(1.0_f32, ACCENT)).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(
             ui,
             |ui| {
@@ -425,8 +428,12 @@ pub fn hold_text(until: std::time::Instant, now: std::time::Instant) -> String {
 
 /// Текст баннера паузы очереди: называет причину (D-16).
 pub fn pause_banner(reason: &PauseReason, waiting: usize) -> String {
-    let n = ui::plural(waiting, "задача", "задачи", "задач");
     let sep = if matches!(reason, PauseReason::Cancelled) { ":" } else { " —" };
+    if waiting == 0 {
+        // режим раннера: локальной очереди нет, стоит приём задач с сервера
+        return format!("{}{sep} задачи с сервера не берутся", queue::pause_text(reason));
+    }
+    let n = ui::plural(waiting, "задача", "задачи", "задач");
     format!("{}{sep} {n} ждут", queue::pause_text(reason))
 }
 
@@ -616,6 +623,7 @@ mod tests {
     fn pause_banner_names_the_reason() {
         assert_eq!(pause_banner(&PauseReason::Cancelled, 1), "Очередь на паузе после отмены: 1 задача ждут");
         assert_eq!(pause_banner(&PauseReason::Cancelled, 2), "Очередь на паузе после отмены: 2 задачи ждут");
+        assert_eq!(pause_banner(&PauseReason::Cancelled, 0), "Очередь на паузе после отмены: задачи с сервера не берутся");
         assert_eq!(pause_banner(&PauseReason::Interrupted, 1), "Очередь на паузе: задача прервана закрытием приложения — 1 задача ждут");
         assert_eq!(pause_banner(&PauseReason::Interrupted, 2), "Очередь на паузе: задача прервана закрытием приложения — 2 задачи ждут");
     }

@@ -449,6 +449,30 @@ pub struct HelloRequest {
     pub holding: Vec<Holding>,
 }
 
+/// Начало токена раннера: `cs2r_` и 64 строчных hex. Токен для заявки через Telegram придумывает сам раннер
+/// по этому же образцу, сервер узнаёт его по `sha256`.
+pub const TOKEN_PREFIX: &str = "cs2r_";
+
+/// Тело `POST /v1/runner/pair`: заявка на подключение раннера через Telegram. Токен раннер придумывает сам и
+/// хранит у себя; серверу уходит только его `sha256`. Сервер отвечает кодом, который админ называет боту
+/// (`/runner код`), и после этого токен принимается.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PairRequest {
+    /// Предлагаемое имя раннера: латиница, цифры, `_` и `-`, до 32 знаков; админ может назвать своё.
+    #[serde(default)]
+    pub name: String,
+    /// `sha256` токена: 64 строчных hex.
+    pub token_hash: String,
+}
+
+/// Ответ на заявку: код для админа и срок его действия.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PairReply {
+    /// Код заявки: 6 цифр.
+    pub code: String,
+    pub expires_in_secs: u64,
+}
+
 /// Что делать раннеру с удерживаемой задачей.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -520,6 +544,8 @@ pub mod codes {
 pub mod paths {
     pub const CLAIM: &str = "/v1/runner/claim";
     pub const HELLO: &str = "/v1/runner/hello";
+    /// Заявка на подключение раннера через Telegram (без токена в заголовке).
+    pub const PAIR: &str = "/v1/runner/pair";
 
     /// Адрес действия над задачей: `/v1/jobs/{id}/{action}`.
     pub fn job(id: i64, action: &str) -> String {

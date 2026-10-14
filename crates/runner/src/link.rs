@@ -12,7 +12,7 @@ use ureq::Body;
 use ureq::http::Response;
 use wire::{
     ApiError, Assignment, ClaimRequest, FinishReply, FinishRequest, HelloReply, HelloRequest,
-    ProgressReply, ProgressRequest, ReleaseRequest, headers, paths,
+    PairReply, PairRequest, ProgressReply, ProgressRequest, ReleaseRequest, headers, paths,
 };
 
 /// Срок установления соединения.
@@ -252,6 +252,19 @@ impl Link {
             .timeout_global(Some(Duration::from_secs(secs)))
             .build();
         self.ok(rq.send_json(body))
+    }
+
+    /// `POST /v1/runner/pair`: заявка на подключение через Telegram. Заголовка `Authorization` нет: сервер
+    /// токен ещё не знает, в теле только его хеш.
+    pub fn pair(&self, req: &PairRequest) -> Result<PairReply, LinkError> {
+        let rq = self
+            .agent
+            .post(&self.url(paths::PAIR))
+            .config()
+            .timeout_global(Some(Duration::from_secs(SHORT_SECS)))
+            .build();
+        let mut resp = self.ok(rq.send_json(req))?;
+        self.json(&mut resp)
     }
 
     /// `POST /v1/runner/hello`.

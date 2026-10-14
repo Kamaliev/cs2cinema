@@ -125,6 +125,7 @@ fn route(
     match (method, path) {
         (Method::Post, wire::paths::CLAIM) => claim(ctx, rq, trace),
         (Method::Post, wire::paths::HELLO) => hello(ctx, rq, trace),
+        (Method::Post, wire::paths::PAIR) => pair(ctx, rq),
         (_, p) if p.starts_with("/v1/jobs/") => job_action(ctx, rq, method, p, trace),
         _ => Err(Reject::new(codes::NOT_FOUND, "нет такого адреса")),
     }
@@ -439,6 +440,35 @@ fn hello(ctx: &Ctx, rq: &mut Request, trace: &mut Trace) -> Result<Reply, Reject
         }
     }
     Reply::json(200, &reply)
+}
+
+/// `POST /v1/runner/pair`: заявка на подключение через Telegram, без токена. Серверу приходит только хеш
+/// придуманного раннером токена; в ответ — код, который админ называет боту (`/runner код`).
+fn pair(ctx: &Ctx, rq: &mut Request) -> Result<Reply, Reject> {
+    let req: wire::PairRequest = read_json(rq, MAX_JSON)?;
+    let name = req.name.trim();
+    let name = if name.is_empty() { "runner" } else { name };
+    match auth::request_pairing(ctx.core.db(), name, &req.token_hash, ctx.core.clock().now_ms()) {
+        Ok(p) => {
+            ctx.log.info(&format!(
+                "заявка раннера «{}» на подключение через Telegram принята, ждёт кода у админа",
+                p.name
+            ));
+            Reply::json(
+                200,
+                &wire::PairReply {
+                    code: p.code,
+                    expires_in_secs: (auth::PAIR_TTL_MS / 1000) as u64,
+                },
+            )
+        }
+        Err(auth::PairError::TooMany) => Err(Reject::new(
+            codes::OVERLOADED,
+            auth::PairError::TooMany.to_string(),
+        )),
+        Err(auth::PairError::Invalid(why)) => Err(Reject::new(codes::BAD_REQUEST, why)),
+        Err(auth::PairError::Db(e)) => Err(Reject::from(e)),
+    }
 }
 
 /// `POST /v1/runner/claim?wait=N`: раннер просит задачу; сервер ждёт её до `min(N, longpoll_secs)` секунд.

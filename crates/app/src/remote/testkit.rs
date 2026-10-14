@@ -630,6 +630,7 @@ impl AppStand {
                 heartbeat: Some(Duration::from_millis(200)),
                 debounce: Duration::from_millis(50),
                 release_cooldown: Duration::ZERO,
+                pair_retry: Duration::from_millis(200),
             },
         });
         remote.apply(&address);

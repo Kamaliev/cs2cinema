@@ -9,6 +9,7 @@
 
 pub mod exec;
 pub mod link;
+pub mod pair;
 pub mod policy;
 pub mod state;
 pub mod sweep;

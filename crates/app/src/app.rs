@@ -851,6 +851,10 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll();
         self.remote.tick();
+        if self.remote.pairing().is_some() {
+            // ждём одобрения кода в Telegram: повтор входа и счётчик минут идут из `tick`, окну нужны кадры
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
         if self.remote.pending() {
             if !self.pending_noted {
                 self.pending_noted = true;

@@ -1,17 +1,21 @@
-//! Команды бота: `/start`, `/help`, `/player`, ход задач (`/status`, `/queue`), управление ими (`/cancel`, `/retry`, `/resend`)
-//! и белый список (`/adduser`, `/removeuser`, `/users`).
+//! Команды бота: `/start`, `/help`, `/player`, ход задач (`/status`, `/queue`), управление ими (`/cancel`, `/retry`, `/resend`),
+//! белый список (`/adduser`, `/removeuser`, `/users`) и раннеры (`/runner`, `/runners`).
 //!
 //! Роль берётся только из базы (`User::role`). Команды админа проверяют её до любого изменения; `/adduser`
-//! создаёт только участника, поэтому повысить права через чат нельзя.
+//! создаёт только участника, поэтому повысить права через чат нельзя. Токен раннера через чат не проходит:
+//! `/runner код` лишь одобряет заявку, в которой серверу известен только хеш токена.
 
 use super::ingest::{self, ACTIVE_STATES, ahead_phrase};
 use super::store::{self, NewTgJob};
 use super::{Bot, deliver, notify};
+use crate::auth;
 use crate::core::{DedupKey, is_steam64, player_key};
 use crate::users::{self, User};
 use wire::{CancelMode, JobState};
 
 const ADMIN_ONLY: &str = "Эта команда только для администратора.";
+const RUNNER_FORMAT: &str = "Формат: /runner код [имя] — подключить раннер по коду из приложения (Настройки → «Подключить через Telegram»); \
+                             /runner revoke имя — отозвать токен. Список: /runners";
 const ADDUSER_FORMAT: &str =
     "Формат: /adduser Telegram-ID [имя]. Например: /adduser 123456789 петя";
 const REMOVEUSER_FORMAT: &str = "Формат: /removeuser Telegram-ID. Например: /removeuser 123456789";
@@ -48,6 +52,8 @@ pub fn menu() -> Vec<(String, String)> {
         ("adduser", "Добавить друга (админ)"),
         ("removeuser", "Убрать друга (админ)"),
         ("users", "Список друзей (админ)"),
+        ("runner", "Подключить раннер по коду (админ)"),
+        ("runners", "Список раннеров (админ)"),
     ]
     .into_iter()
     .map(|(c, d)| (c.to_owned(), d.to_owned()))
@@ -130,10 +136,93 @@ fn help_text(user: &User) -> String {
             "\n\nУправление списком:\n\
              /adduser Telegram-ID [имя] — добавить друга\n\
              /removeuser Telegram-ID — убрать друга\n\
-             /users — показать список",
+             /users — показать список\n\n\
+             Раннеры (компьютеры, которые пишут ролики):\n\
+             /runner код [имя] — подключить раннер по коду из приложения\n\
+             /runner revoke имя — отозвать токен раннера\n\
+             /runners — список раннеров",
         );
     }
     t
+}
+
+/// Сколько прошло с момента `ms` назад: по-русски, грубо.
+fn ago(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    match secs {
+        0..60 => "меньше минуты назад".to_owned(),
+        60..3600 => format!("{} мин назад", secs / 60),
+        3600..86_400 => format!("{} ч назад", secs / 3600),
+        _ => format!("{} дн назад", secs / 86_400),
+    }
+}
+
+/// `/runner код [имя]` одобряет заявку приложения (раннер создаётся с хешем из заявки), `/runner revoke имя`
+/// отзывает токен. Сам токен в чат не попадает и серверу неизвестен.
+fn runner_cmd(bot: &Bot, args: &str) -> String {
+    let (head, rest) = match args.split_once(char::is_whitespace) {
+        Some((h, r)) => (h, r.trim()),
+        None => (args, ""),
+    };
+    if head.is_empty() {
+        return RUNNER_FORMAT.to_owned();
+    }
+    let db = bot.core().db();
+    if head.eq_ignore_ascii_case("revoke") {
+        if rest.is_empty() {
+            return RUNNER_FORMAT.to_owned();
+        }
+        return match auth::revoke_runner(db, rest, bot.now_ms()) {
+            Ok(()) => {
+                bot.log()
+                    .info(&format!("бот: токен раннера «{rest}» отозван админом"));
+                format!(
+                    "Токен раннера «{rest}» отозван: его задачи вернутся в очередь, а приложению понадобится новый код."
+                )
+            }
+            Err(e) => format!("Не отозвал: {e}"),
+        };
+    }
+    let name = (!rest.is_empty()).then_some(rest);
+    match auth::approve_pairing(db, head, name, bot.now_ms()) {
+        Ok(r) => {
+            bot.log().info(&format!(
+                "бот: раннер «{}» подключён по коду (отпечаток {})",
+                r.name, r.fingerprint
+            ));
+            format!(
+                "Раннер «{}» подключён (отпечаток {}). Приложение выйдет на связь само в течение минуты.",
+                r.name, r.fingerprint
+            )
+        }
+        Err(e) => format!("Не подключил: {e}"),
+    }
+}
+
+fn runners_cmd(bot: &Bot) -> String {
+    let list = match auth::list_runners(bot.core().db()) {
+        Ok(l) => l,
+        Err(e) => return format!("Не удалось получить список: {e}"),
+    };
+    if list.is_empty() {
+        return "Раннеров нет. Подключить: в приложении «Подключить через Telegram», затем /runner код.".to_owned();
+    }
+    let now = bot.now_ms();
+    let lines: Vec<String> = list
+        .iter()
+        .map(|r| {
+            let state = if r.revoked_at.is_some() {
+                "отозван".to_owned()
+            } else {
+                match r.last_seen_at {
+                    Some(t) => format!("на связи {}", ago(now - t)),
+                    None => "ещё не входил".to_owned(),
+                }
+            };
+            format!("{} — отпечаток {} — {state}", r.name, r.fingerprint)
+        })
+        .collect();
+    format!("Раннеры ({}):\n{}", list.len(), lines.join("\n"))
 }
 
 /// `/player`: без аргумента показывает игрока, с аргументом запоминает.
@@ -470,10 +559,12 @@ pub fn handle(bot: &Bot, user: &User, chat_id: i64, text: &str) {
         "cancel" => cancel_cmd(bot, user, chat_id, &args),
         "retry" => retry_cmd(bot, user, chat_id, &args),
         "resend" => resend_cmd(bot, user, &args),
-        "adduser" | "removeuser" | "users" if !is_admin(user) => ADMIN_ONLY.to_owned(),
+        "adduser" | "removeuser" | "users" | "runner" | "runners" if !is_admin(user) => ADMIN_ONLY.to_owned(),
         "adduser" => adduser_cmd(bot, &args),
         "removeuser" => removeuser_cmd(bot, &args),
         "users" => users_cmd(bot),
+        "runner" => runner_cmd(bot, &args),
+        "runners" => runners_cmd(bot),
         _ => "Не знаю такой команды. Список команд и порядок работы: /help".to_owned(),
     };
     // Пустой ответ — команда уже ответила сама (сообщением статуса новой задачи) или тик скажет вместо неё.
@@ -514,6 +605,15 @@ mod tests {
         ] {
             assert!(valid_player(bad).is_err(), "{bad:?} должен отклоняться");
         }
+    }
+
+    #[test]
+    fn ago_is_coarse_and_never_negative() {
+        assert_eq!(ago(-5_000), "меньше минуты назад");
+        assert_eq!(ago(59_000), "меньше минуты назад");
+        assert_eq!(ago(5 * 60_000), "5 мин назад");
+        assert_eq!(ago(3 * 3_600_000), "3 ч назад");
+        assert_eq!(ago(2 * 86_400_000), "2 дн назад");
     }
 
     #[test]

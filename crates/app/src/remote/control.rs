@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use pipeline::{host::Host, inspect::InspectLimits};
@@ -143,12 +143,43 @@ pub struct RemoteTuning {
     pub heartbeat: Option<Duration>,
     pub debounce: Duration,
     pub release_cooldown: Duration,
+    /// Как часто раннер повторяет вход, пока ждёт одобрения кода в Telegram.
+    pub pair_retry: Duration,
 }
 
 impl Default for RemoteTuning {
     fn default() -> Self {
-        RemoteTuning { poll_secs: Some(5), heartbeat: None, debounce: Duration::from_secs(2), release_cooldown: runner::RELEASE_COOLDOWN }
+        RemoteTuning {
+            poll_secs: Some(5),
+            heartbeat: None,
+            debounce: Duration::from_secs(2),
+            release_cooldown: runner::RELEASE_COOLDOWN,
+            pair_retry: Duration::from_secs(5),
+        }
     }
+}
+
+/// Заявка на подключение через Telegram, которую ждёт раннер: код показан в окне, пока действует.
+#[derive(Debug, Clone)]
+pub struct PairingState {
+    pub code: String,
+    /// Когда код перестаёт действовать.
+    pub until: Instant,
+    /// Когда повторить вход на сервер.
+    next_retry: Instant,
+}
+
+impl PairingState {
+    /// Сколько минут код ещё действует (с округлением вверх).
+    pub fn minutes_left(&self) -> u64 {
+        self.until.saturating_duration_since(Instant::now()).as_secs().div_ceil(60)
+    }
+}
+
+/// Имя раннера для заявки из имени компьютера: только латиница, цифры, `_` и `-`, до 32 знаков; пустое — `cs2cinema`.
+pub fn runner_name(raw: &str) -> String {
+    let name: String = raw.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')).take(32).collect();
+    if name.is_empty() { "cs2cinema".to_owned() } else { name }
 }
 
 /// Всё, что нужно раннеру приложения снаружи.
@@ -281,12 +312,58 @@ pub struct RemoteRunner {
     server: String,
     /// Адрес, который ждёт закрытия карточки сервера: остановка раннера при идущей карточке отменила бы её.
     pending: Option<String>,
+    /// Заявка через Telegram, которая ждёт одобрения кода.
+    pairing: Option<PairingState>,
 }
 
 impl RemoteRunner {
     pub fn new(deps: RemoteDeps) -> RemoteRunner {
         let shared = Arc::new(Shared { status: Mutex::new((0, RemoteStatus::Off)), version: Mutex::new(String::new()) });
-        RemoteRunner { deps, shared, handle: None, server: String::new(), pending: None }
+        RemoteRunner { deps, shared, handle: None, server: String::new(), pending: None, pairing: None }
+    }
+
+    /// Подключение через Telegram: новый токен уходит в файл с суженным доступом ещё до заявки, серверу — только
+    /// его хеш. Возвращает код для админа (`/runner код`). Пока код не одобрен, сервер отвечает «токен не принят»,
+    /// и `tick` повторяет вход каждые `pair_retry`; не дошло до одобрения за срок кода — заявка закрывается.
+    /// Заявка не ушла — файл токена стирается, состояние снова «нет токена». Значение токена в ошибках не печатается.
+    pub fn pair(&mut self, server: &str) -> Result<String, String> {
+        let value = runner::pair::new_token()?;
+        token::save(&*self.deps.host, &self.deps.dir, &value)?;
+        match runner::pair::request(server, &runner_name(&self.deps.name), &value) {
+            Ok(p) => {
+                let now = Instant::now();
+                self.pairing = Some(PairingState { code: p.code.clone(), until: now + p.expires_in, next_retry: now + self.deps.tuning.pair_retry });
+                self.restart();
+                Ok(p.code)
+            }
+            Err(e) => {
+                let _ = token::clear(&self.deps.dir);
+                self.restart();
+                Err(e)
+            }
+        }
+    }
+
+    /// Заявка, которая ждёт одобрения в Telegram.
+    pub fn pairing(&self) -> Option<&PairingState> {
+        self.pairing.as_ref()
+    }
+
+    /// Ждёт ли раннер одобрения кода: до него «токен не принят» — ожидаемое состояние, а не ошибка.
+    fn pairing_step(&mut self) {
+        let Some(p) = &self.pairing else { return };
+        let now = Instant::now();
+        let status = self.status();
+        let connected = matches!(status, RemoteStatus::Online { .. } | RemoteStatus::Gated { .. } | RemoteStatus::Working { .. });
+        if connected || now >= p.until {
+            self.pairing = None;
+            (self.deps.repaint)();
+        } else if status == RemoteStatus::TokenRejected && now >= p.next_retry && !self.is_running() {
+            if let Some(p) = &mut self.pairing {
+                p.next_retry = now + self.deps.tuning.pair_retry;
+            }
+            self.restart();
+        }
     }
 
     /// Применить адрес сервера: пусто — раннер выключен, иначе поток раннера (пере)запускается.
@@ -301,7 +378,7 @@ impl RemoteRunner {
         self.start(server);
     }
 
-    /// Раз в кадр окна. Сюда же приходит применение отложенного адреса.
+    /// Раз в кадр окна. Сюда же приходит применение отложенного адреса и повтор входа при заявке через Telegram.
     pub fn tick(&mut self) {
         if let Some(server) = self.pending.clone() {
             if !self.busy() {
@@ -309,6 +386,7 @@ impl RemoteRunner {
                 self.start(server);
             }
         }
+        self.pairing_step();
         if self.handle.as_ref().is_some_and(|h| h.finished()) && self.server.is_empty() {
             self.handle = None;
         }
@@ -692,9 +770,73 @@ mod tests {
                     heartbeat: Some(Duration::from_millis(200)),
                     debounce: Duration::from_millis(50),
                     release_cooldown: Duration::ZERO,
+                    pair_retry: Duration::from_millis(200),
                 },
             }
         }
+    }
+
+    /// Крутит `tick`, пока `cond` не выполнится или не пройдёт `secs` секунд.
+    fn tick_until(remote: &mut RemoteRunner, secs: u64, mut cond: impl FnMut(&RemoteRunner) -> bool) -> bool {
+        let until = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < until {
+            remote.tick();
+            if cond(remote) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn runner_name_is_made_safe_for_the_server() {
+        assert_eq!(runner_name("DESKTOP-ABC_1"), "DESKTOP-ABC_1");
+        assert_eq!(runner_name("мой пк"), "cs2cinema");
+        assert_eq!(runner_name("my pc!"), "mypc");
+        assert_eq!(runner_name(&"x".repeat(40)).len(), 32);
+    }
+
+    #[test]
+    fn pairing_through_telegram_connects_once_the_admin_approves() {
+        let stand = Stand::start();
+        let fx = Fixture::new(&stand, false, instant_local(), |_, _, _| Err(RunError::from("карточка в этом тесте не ожидалась")));
+        let mut remote = RemoteRunner::new(fx.deps());
+        remote.apply(&stand.base);
+        assert!(wait_until(5, || remote.status() == RemoteStatus::NoToken), "{:?}", remote.status());
+
+        let code = remote.pair(&stand.base).expect("заявка принята сервером");
+        assert_eq!(code.len(), 6, "{code}");
+        assert!(remote.has_token(), "токен записан в файл до заявки");
+        assert!(remote.pairing().is_some());
+        assert!(
+            tick_until(&mut remote, 10, |r| r.status() == RemoteStatus::TokenRejected),
+            "до одобрения сервер токен не принимает: {:?}",
+            remote.status()
+        );
+        assert!(remote.pairing().is_some(), "отказ до одобрения заявку не закрывает");
+
+        let core = stand.core();
+        let runner = server::auth::approve_pairing(core.db(), &code, Some("paired"), core.clock().now_ms()).unwrap();
+        assert_eq!(runner.name, "paired", "стенд уже держит раннера «tester», заявка одобрена под другим именем");
+        assert!(
+            tick_until(&mut remote, 15, |r| matches!(r.status(), RemoteStatus::Online { .. })),
+            "после /runner код раннер выходит на связь сам: {:?}",
+            remote.status()
+        );
+        assert!(remote.pairing().is_none(), "подключились — заявка закрыта");
+    }
+
+    #[test]
+    fn failed_pairing_request_leaves_no_token_behind() {
+        let stand = Stand::start();
+        let fx = Fixture::new(&stand, false, instant_local(), |_, _, _| Err(RunError::from("карточка в этом тесте не ожидалась")));
+        let mut remote = RemoteRunner::new(fx.deps());
+        remote.apply(&stand.base);
+        let err = remote.pair("http://127.0.0.1:1").expect_err("сервера на этом порту нет");
+        assert!(!err.contains("cs2r_"), "значение токена в ошибке не печатается: {err}");
+        assert!(!remote.has_token(), "файл токена стёрт");
+        assert!(remote.pairing().is_none());
     }
 
     fn view(running: bool, paused: bool, hold: bool) -> QueueView {

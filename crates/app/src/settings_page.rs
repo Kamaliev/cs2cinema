@@ -194,7 +194,9 @@ fn remote_section(app: &mut App, ui: &mut Ui) {
     let status = app.remote.status();
     let (busy, pending, has_token) = (app.remote.busy(), app.remote.pending(), app.remote.has_token());
     let buttons = remote_buttons(&status, busy, has_server);
-    let (mut save_token, mut clear_token, mut reconnect, mut resume) = (false, false, false, false);
+    let connected = matches!(status, RemoteStatus::Online { .. } | RemoteStatus::Gated { .. } | RemoteStatus::Working { .. });
+    let pairing = app.remote.pairing().cloned();
+    let (mut save_token, mut clear_token, mut reconnect, mut resume, mut pair) = (false, false, false, false, false);
     ui::section(ui, "Задачи с сервера", |ui| {
         egui::Grid::new("remote").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
             ui.label("Адрес сервера");
@@ -215,6 +217,24 @@ fn remote_section(app: &mut App, ui: &mut Ui) {
                 ui.label(RichText::new(text).color(color).size(12.5));
             });
             ui.end_row();
+            ui.label("Через Telegram");
+            ui.horizontal(|ui| {
+                let can_pair = has_server && !busy && !connected && pairing.is_none();
+                pair = ui
+                    .add_enabled(can_pair, egui::Button::new("Подключить через Telegram"))
+                    .on_hover_text("Приложение само придумает токен и покажет код; код отправьте боту командой /runner код (только админ)")
+                    .on_disabled_hover_text(if has_server { "Раннер уже на связи или ждёт код" } else { "Сначала сохраните адрес сервера" })
+                    .clicked();
+                if let Some(p) = &pairing {
+                    let cmd = format!("/runner {}", p.code);
+                    ui.label(RichText::new(&cmd).monospace().strong());
+                    if ui.button("Копировать").clicked() {
+                        ui.ctx().copy_text(cmd);
+                    }
+                    ui.label(RichText::new(format!("отправьте боту; код действует ещё {} мин", p.minutes_left())).color(MUTED).size(12.5));
+                }
+            });
+            ui.end_row();
         });
         ui.add_space(4.0);
         let color = match status.level() {
@@ -223,7 +243,12 @@ fn remote_section(app: &mut App, ui: &mut Ui) {
             StatusLevel::Bad => BAD,
             StatusLevel::Off => MUTED,
         };
-        ui.add(egui::Label::new(RichText::new(status.text()).color(color)).wrap());
+        // пока ждём код, отказ сервера — ожидаемое состояние, а не ошибка
+        let (text, color) = match (&pairing, &status) {
+            (Some(_), RemoteStatus::TokenRejected | RemoteStatus::Starting) => ("Жду, когда админ отправит боту команду /runner с кодом…".to_owned(), ACCENT),
+            _ => (status.text(), color),
+        };
+        ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
         if pending {
             ui.label(RichText::new("адрес применится, когда закончится задача с сервера").color(ACCENT).size(12.5));
         }
@@ -256,6 +281,13 @@ fn remote_section(app: &mut App, ui: &mut Ui) {
         match app.remote.clear_token() {
             Ok(()) => app.status.push("токен раннера удалён"),
             Err(e) => app.status.push(&format!("токен не удалён: {e}")),
+        }
+    }
+    if pair {
+        let server = app.s.runner_server.clone();
+        match app.remote.pair(&server) {
+            Ok(code) => app.status.push(&format!("отправьте боту: /runner {code}")),
+            Err(e) => app.status.push(&format!("заявка не отправлена: {e}")),
         }
     }
     if reconnect {

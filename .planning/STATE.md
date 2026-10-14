@@ -6,10 +6,10 @@ current_phase: 09
 current_phase_name: Уборка, развёртывание и учения
 status: executing
 stopped_at: "09-08 на паузе: Task 1 решён (caddy, cs2-server в Docker, сроки A1, учение 08 compressed), Task 2 ждёт стенд автора"
-last_updated: "2026-10-13T18:56:36.843Z"
+last_updated: "2026-10-14T09:08:28.549Z"
 last_activity: 2026-10-13
 last_activity_desc: Phase 09 execution started
-state_head: 22d313f496fedbab5afebda9a7bfdfaca67c9022
+state_head: 3f42d8ca94b740127e35e5e2b59f1d3f5f21ef00
 progress:
   total_phases: 5
   completed_phases: 4
@@ -290,6 +290,7 @@ None yet.
 |---|-------------|------|--------|-----------|
 | 261011-hb5 | Фикс проверки стабильности дубля: пересверка размера после ffprobe и сверка validated-дублей с диском после закрытия игры | 2026-10-11 | e1be156 | [261011-hb5-fiks-proverki-stabilnosti-dublya-perepro](./quick/261011-hb5-fiks-proverki-stabilnosti-dublya-perepro/) |
 | 2 | bot_e2e: ждать Queued перед claim (гонка на Windows CI) | 2026-10-13 | 22d313f | — |
+| 3 | Вариант В без Caddy: HTTPS даёт внешний Traefik автора (внешняя docker-сеть, labels у telegram-bot-api) | 2026-10-14 | 3f42d8c | — |
 
 ## Deferred Items
 

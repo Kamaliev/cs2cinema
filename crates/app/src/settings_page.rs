@@ -164,7 +164,7 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
         let note = app.update_note.clone();
         ui::section(ui, "Приложение", |ui| {
             ui.checkbox(&mut d.minimize_to_tray, "Крестик сворачивает в трей");
-            ui.checkbox(&mut d.auto_update, "Проверять обновления при запуске");
+            ui.checkbox(&mut d.auto_update, "Обновляться автоматически (проверка при запуске и раз в 6 часов; ставится, когда нет задач)");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(format!("Версия: {}", crate::update::current().unwrap_or("dev")));

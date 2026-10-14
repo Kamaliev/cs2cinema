@@ -7,7 +7,7 @@ use std::{
         Arc,
         mpsc::{Receiver, Sender, channel},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use cs2::{PlayerId, report::Report};
@@ -183,6 +183,9 @@ pub struct App {
     pub store: Store,
     pub update: Option<update::Release>,
     pub update_note: Option<String>,
+    /// Когда последний раз спрашивали GitHub о новой версии: при включённом автообновлении проверка повторяется
+    /// раз в `UPDATE_PERIOD`, потому что в режиме раннера приложение живёт неделями без перезапуска.
+    update_checked: Option<Instant>,
     /// Последний отчёт кнопки «Проверить окружение» в настройках.
     pub precheck: Option<Result<pipeline::precheck::Report, String>>,
     pub precheck_busy: bool,
@@ -261,6 +264,7 @@ impl App {
             store,
             update: None,
             update_note: None,
+            update_checked: None,
             precheck: None,
             precheck_busy: false,
             queue,
@@ -325,12 +329,24 @@ impl App {
     }
 
     pub fn check_updates(&mut self) {
+        self.update_checked = Some(Instant::now());
         if update::current().is_none() {
             self.update_note = Some("dev-сборка: обновления недоступны".into());
             return;
         }
         self.update_note = Some("проверяю…".into());
         self.spawn(|r| r.send(Msg::UpdateFound(update::check())));
+    }
+
+    /// Можно ли сейчас подменить exe и перезапуститься: ничего не записывается, задачи сервера нет, окно не занято.
+    fn idle_for_update(&self) -> bool {
+        !self.status.busy && self.queue.view().running.is_none() && !matches!(self.remote.status(), remote::RemoteStatus::Working { .. })
+    }
+
+    /// Скачать релиз, подменить exe и перезапуститься (ответ придёт сообщением `Updated`).
+    fn install_update(&mut self, r: update::Release) {
+        self.status.start(&format!("Обновляюсь до {}…", r.tag));
+        self.spawn(move |r2| r2.send(Msg::Updated(update::install(&r))));
     }
 
     /// «Проверить окружение» в настройках: тот же `precheck::run` и те же входы, что у задачи (D-01),
@@ -679,7 +695,12 @@ impl App {
                 Msg::UpdateFound(r) => match r {
                     Ok(Some(rel)) => {
                         self.update_note = Some(format!("доступна {}", rel.tag));
-                        self.update = Some(rel);
+                        // автообновление: без вопросов, если ничего не идёт; иначе остаётся карточка с кнопкой
+                        if self.s.auto_update && self.idle_for_update() {
+                            self.install_update(rel);
+                        } else {
+                            self.update = Some(rel);
+                        }
                     }
                     Ok(None) => self.update_note = Some("у вас последняя версия".into()),
                     Err(e) => self.update_note = Some(format!("не удалось проверить: {e}")),
@@ -741,8 +762,8 @@ impl App {
             ui::card(ui, |ui| {
                 ui.label(ui::b(format!("Новая версия {}", r.tag)).color(ui::OK));
                 if ui.add_enabled(!self.status.busy, egui::Button::new("Обновить")).clicked() {
-                    self.status.start("Скачиваю обновление…");
-                    self.spawn(move |r2| r2.send(Msg::Updated(update::install(&r))));
+                    self.update = None;
+                    self.install_update(r);
                 }
             });
         }
@@ -869,8 +890,19 @@ impl eframe::App for App {
         if self.status.busy || self.matches.loading || self.matches.requested.len() > self.matches.stats.len() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
+        // автообновление у долго живущего окна (режим раннера): повторная проверка раз в `UPDATE_PERIOD`;
+        // кадр раз в минуту нужен, чтобы срок проверялся и без событий от пользователя
+        if self.s.auto_update && update::current().is_some() {
+            if self.update.is_none() && !self.status.busy && self.update_checked.is_none_or(|t| t.elapsed() >= UPDATE_PERIOD) {
+                self.check_updates();
+            }
+            ctx.request_repaint_after(Duration::from_secs(60));
+        }
     }
 }
+
+/// Как часто автообновление спрашивает GitHub о новой версии.
+const UPDATE_PERIOD: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Пять задач приёмки по набору и статистике матчей: каждая — запись про игрока из настроек, все на разных картах (ACC-01).
 /// Чистая: ничего не ставит; любая неполадка набора — ошибка по-русски, и тогда не ставится ни одна задача.

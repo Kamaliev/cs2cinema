@@ -11,11 +11,19 @@
 
 ### Вариант А. Готовый exe (проще всего)
 
-Одной командой в PowerShell (скачает последний релиз, проверит хэш, добавит `cs2-cli` в PATH):
+Одной командой в PowerShell — ставит сразу всё для ролика: последний релиз приложения, **HLAE** и **ffmpeg**
+(каждый архив проверяется по SHA-256, права администратора не нужны):
 
 ```powershell
 irm https://raw.githubusercontent.com/Kamaliev/cs2cinema/main/install.ps1 | iex
 ```
+
+Куда что ложится: приложение — `%LOCALAPPDATA%\cs2cinema` (папка добавляется в PATH, в меню Пуск появляется
+«CS2 Cinema»), HLAE 2.192.7 — `%LOCALAPPDATA%\cs2cinema\hlae`, ffmpeg 9.0.2 (сборка gyan.dev essentials, с NVENC) —
+`%LOCALAPPDATA%\cs2cinema\hlae\ffmpeg\bin`, он же прописан HLAE в `ffmpeg\ffmpeg.ini`. Приложение само берёт этот HLAE
+и этот ffmpeg (склейка, превью), если папка HLAE в настройках пуста; `cs2-cli` получает ffmpeg через PATH, если своего
+там не было. Повторный запуск команды обновляет приложение, а HLAE и ffmpeg перекачивает только при смене версии в
+`install.ps1`. Нужны только приложение (HLAE и ffmpeg уже свои): `$env:CS2CINEMA_NO_TOOLS = "1"` перед командой.
 
 Или вручную:
 

@@ -460,10 +460,12 @@ impl App {
             .filter(|j| j.status == store::JobStatus::Done && !self.jobs.thumbs.contains_key(&j.id) && !self.jobs.thumb_requested.contains(&j.id))
             .filter_map(|j| j.result.clone().filter(|p| p.extension().is_some_and(|e| e == "mp4") && p.is_file()).map(|p| (j.id, p)))
             .collect();
+        let (ffmpeg, _) = settings::ffmpeg_tools(&self.s.hlae_dir);
         for (id, path) in want {
             self.jobs.thumb_requested.insert(id);
+            let ffmpeg = ffmpeg.clone();
             self.spawn(move |r| {
-                if let Some(rgba) = thumbnail(&path) {
+                if let Some(rgba) = thumbnail(&ffmpeg, &path) {
                     r.send(Msg::Thumb { id, size: THUMB, rgba });
                 }
             });
@@ -820,9 +822,10 @@ fn nav_item(ui: &mut egui::Ui, selected: bool, glyph: &str, title: &str, badge: 
     resp.clicked()
 }
 
-/// Кадр ролика (6-я секунда — после заставки) в RGBA размером `THUMB` — через ffmpeg из PATH
-/// и `Host::run`: с дедлайном (TMO-03), зависший ffmpeg не копит потоки превью. Кадр уходит во временный файл.
-fn thumbnail(path: &Path) -> Option<Vec<u8>> {
+/// Кадр ролика (6-я секунда — после заставки) в RGBA размером `THUMB` — через `ffmpeg` (рядом с HLAE или из PATH,
+/// см. `settings::ffmpeg_tools`) и `Host::run`: с дедлайном (TMO-03), зависший ffmpeg не копит потоки превью.
+/// Кадр уходит во временный файл.
+fn thumbnail(ffmpeg: &Path, path: &Path) -> Option<Vec<u8>> {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let tmp = std::env::temp_dir().join(format!("cs2cinema-thumb-{}-{nanos}.rgba", std::process::id()));
     let args = ["-nostdin", "-v", "error", "-y", "-ss", "6", "-i"].map(String::from).into_iter().chain([
@@ -837,7 +840,7 @@ fn thumbnail(path: &Path) -> Option<Vec<u8>> {
         "rgba".into(),
         tmp.to_string_lossy().into_owned(),
     ]);
-    let cmd = pipeline::host::CmdSpec { program: "ffmpeg".into(), args: args.collect(), cwd: None, deadline: pipeline::Deadlines::default().thumbnail };
+    let cmd = pipeline::host::CmdSpec { program: ffmpeg.to_path_buf(), args: args.collect(), cwd: None, deadline: pipeline::Deadlines::default().thumbnail };
     let ok = pipeline::host::default_host().run(&cmd, &|| false, &mut |_| {}).is_ok_and(|o| o.code == Some(0));
     let rgba = if ok { std::fs::read(&tmp).ok().filter(|b| b.len() == THUMB[0] * THUMB[1] * 4) } else { None };
     let _ = std::fs::remove_file(&tmp);

@@ -60,8 +60,31 @@ pub fn find_cs2() -> Option<PathBuf> {
     libs.into_iter().map(|l| l.join(REL)).find(|p| p.join("game/bin/win64").is_dir())
 }
 
-/// Ищет папку с `HLAE.exe`: типичные места, затем неглубокий обход дисков и профиля пользователя.
+/// HLAE, который ставит `install.ps1` вместе с приложением: `%LOCALAPPDATA%\cs2cinema\hlae`.
+/// `None` — там нет `HLAE.exe` (поставлено только приложение или HLAE у пользователя свой).
+pub fn bundled_hlae() -> Option<PathBuf> {
+    let dir = data_dir().join("hlae");
+    dir.join("HLAE.exe").is_file().then_some(dir)
+}
+
+/// ffmpeg и ffprobe для склейки и превью: те, что лежат рядом с HLAE (`ffmpeg\bin` в его папке —
+/// так их кладёт `install.ps1`, и этим же ffmpeg пишет HLAE), иначе `ffmpeg`/`ffprobe` из PATH.
+pub fn ffmpeg_tools(hlae_dir: &str) -> (PathBuf, PathBuf) {
+    let bin = Path::new(hlae_dir).join("ffmpeg").join("bin");
+    let (ffmpeg, ffprobe) = (bin.join("ffmpeg.exe"), bin.join("ffprobe.exe"));
+    if !hlae_dir.trim().is_empty() && ffmpeg.is_file() && ffprobe.is_file() {
+        (ffmpeg, ffprobe)
+    } else {
+        (PathBuf::from("ffmpeg"), PathBuf::from("ffprobe"))
+    }
+}
+
+/// Ищет папку с `HLAE.exe`: сначала поставленный установщиком, затем типичные места и неглубокий
+/// обход дисков и профиля пользователя.
 pub fn find_hlae() -> Option<PathBuf> {
+    if let Some(p) = bundled_hlae() {
+        return Some(p);
+    }
     fn has_hlae(d: &Path) -> bool {
         d.join("HLAE.exe").is_file()
     }
@@ -153,8 +176,16 @@ impl Settings {
         data_dir().join("settings.json")
     }
 
+    /// Читает `settings.json`; папка HLAE не задана — берётся HLAE из установщика, если он есть
+    /// (так первый запуск после `install.ps1` обходится без поиска по дискам).
     pub fn load() -> Self {
-        std::fs::read_to_string(Self::file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+        let mut s: Settings = std::fs::read_to_string(Self::file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        if s.hlae_dir.trim().is_empty() {
+            if let Some(p) = bundled_hlae() {
+                s.hlae_dir = p.to_string_lossy().into_owned();
+            }
+        }
+        s
     }
 
     pub fn save(&self) {
@@ -182,6 +213,21 @@ mod tests {
         assert!(old.afxerror_ignore.is_empty(), "старый файл без поля — пустой список");
         let new: Settings = serde_json::from_str(r#"{"afxerror_ignore":["shader cache","audio"]}"#).unwrap();
         assert_eq!(new.afxerror_ignore, vec!["shader cache".to_owned(), "audio".to_owned()]);
+    }
+
+    #[test]
+    fn ffmpeg_next_to_hlae_wins_over_path() {
+        let root = std::env::temp_dir().join(format!("cs2cinema-ffmpeg-tools-{}", std::process::id()));
+        let bin = root.join("ffmpeg").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let hlae = root.to_string_lossy().into_owned();
+        assert_eq!(ffmpeg_tools(&hlae), (PathBuf::from("ffmpeg"), PathBuf::from("ffprobe")), "без файлов — из PATH");
+        std::fs::write(bin.join("ffmpeg.exe"), b"").unwrap();
+        assert_eq!(ffmpeg_tools(&hlae).0, PathBuf::from("ffmpeg"), "одного ffmpeg без ffprobe мало");
+        std::fs::write(bin.join("ffprobe.exe"), b"").unwrap();
+        assert_eq!(ffmpeg_tools(&hlae), (bin.join("ffmpeg.exe"), bin.join("ffprobe.exe")));
+        assert_eq!(ffmpeg_tools("").0, PathBuf::from("ffmpeg"), "папка HLAE не задана — из PATH");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

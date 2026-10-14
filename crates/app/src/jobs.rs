@@ -194,6 +194,7 @@ pub fn finish(store: &Store, id: i64, result: &Result<JobOutcome, RunError>) -> 
 
 /// Настройки приложения в настройки задачи `pipeline`: пути, кадр и остальное поле в поле.
 pub fn job_config(s: &Settings) -> JobConfig {
+    let (ffmpeg, ffprobe) = crate::settings::ffmpeg_tools(&s.hlae_dir);
     JobConfig {
         hlae_dir: PathBuf::from(&s.hlae_dir),
         cs2_dir: PathBuf::from(&s.cs2_dir),
@@ -208,8 +209,8 @@ pub fn job_config(s: &Settings) -> JobConfig {
         frame: s.frame_size(),
         time_margin: s.time_margin,
         afxerror_ignore: s.afxerror_ignore.clone(),
-        ffmpeg: PathBuf::from("ffmpeg"),
-        ffprobe: PathBuf::from("ffprobe"),
+        ffmpeg,
+        ffprobe,
         demo_limits: Default::default(),
     }
 }

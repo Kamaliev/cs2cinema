@@ -302,6 +302,7 @@ ctl job show <N> > ~/raw/<учение>/job-show-<N>.txt
 | «бот не запустился: локальный telegram-bot-api не отвечает (getMe)» | не выполнен шаг 3 (выход из облачного Bot API) или не прошло десять минут; либо bot-api ещё не поднялся (сервер перезапустится сам) |
 | «файл настроек … не удалось открыть (PermissionDenied)» | файл `cs2-server.json` с правами 0600 у другого владельца: `chmod 644` или `chown 1500:1500` |
 | «Permission denied» при записи в `/var/lib/cs2-server` | каталог остался от установки под systemd и принадлежит другому uid: `sudo chown -R 1500:1500 /var/lib/cs2-server` |
+| «бот: исходный файл задачи #N в папке bot-api удалит уборщик» | штатно: каталог `documents/` создаёт bot-api (uid 101), у `cs2-server` (uid 1500) нет права удалять в нём; файл стирает `botapi-janitor` в течение ~6 часов. Вручную: `sudo find /var/lib/telegram-bot-api -type f -path '*/documents/*' -delete` |
 | Compose: «network … declared as external, but could not be found» | имя в `TRAEFIK_NETWORK` не совпадает с сетью Traefik (`docker network ls`), либо стек Traefik не запущен |
 | с машины раннера `404` вместо `401` | Traefik не видит маршрут: `telegram-bot-api` не в сети Traefik (`docker network inspect`), `traefik.docker.network` не та сеть, неверное имя точки входа, или у Traefik провайдер Docker выключен; журнал Traefik |
 | «Gateway Timeout» или `502` с машины раннера | Traefik подключён к другой сети, чем в `traefik.docker.network`; либо `cs2-server` не запущен (`docker compose ps`) |

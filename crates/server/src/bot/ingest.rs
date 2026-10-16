@@ -923,10 +923,18 @@ fn ingest_row(bot: &Bot, mut row: store::InboxRow) -> Result<bool> {
     };
     // Копия уже на сервере: оригинал bot-api больше не нужен. Ошибка удаления не фатальна.
     if let Err(e) = std::fs::remove_file(&local) {
-        bot.log().warn(&format!(
-            "бот: не удалось удалить исходный файл задачи #{job_id} из папки bot-api: {:?}",
-            e.kind()
-        ));
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            // Файл создал bot-api (uid 101), каталог ему принадлежит и сервису недоступен на запись:
+            // это штатно для docker-варианта, файл уберёт `botapi-janitor` (docs/deploy/docker/README.md).
+            bot.log().info(&format!(
+                "бот: исходный файл задачи #{job_id} в папке bot-api удалит уборщик (у сервера нет прав на запись в каталог)"
+            ));
+        } else {
+            bot.log().warn(&format!(
+                "бот: не удалось удалить исходный файл задачи #{job_id} из папки bot-api: {:?}",
+                e.kind()
+            ));
+        }
     }
     // Слой 2: тот же хеш и игрок, но под другим `file_unique_id` — новая копия лишняя.
     if let Some(dup) = other_duplicate(bot, &ingested.sha256, &key, job_id, row.user_id)? {

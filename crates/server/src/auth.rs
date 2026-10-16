@@ -100,14 +100,25 @@ fn insert_runner(
     hash: &str,
     now_ms: i64,
 ) -> Result<Runner> {
-    let taken: Option<i64> = tx
-        .query_row("SELECT id FROM runners WHERE name = ?1", [name], |r| {
-            r.get(0)
-        })
+    let taken: Option<(i64, Option<i64>)> = tx
+        .query_row(
+            "SELECT id, revoked_at FROM runners WHERE name = ?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .optional()
         .map_err(db_err)?;
-    if taken.is_some() {
-        return Err(format!("раннер «{name}» уже есть"));
+    match taken {
+        None => {}
+        // Имя отозванного раннера свободно: старая запись остаётся в журнале под служебным именем.
+        Some((id, Some(_))) => {
+            tx.execute(
+                "UPDATE runners SET name = ?2 WHERE id = ?1",
+                params![id, format!("{name}#отозван-{id}")],
+            )
+            .map_err(db_err)?;
+        }
+        Some((_, None)) => return Err(format!("раннер «{name}» уже есть")),
     }
     tx.execute(
         "INSERT INTO runners(name, token_hash, created_at) VALUES (?1, ?2, ?3)",
@@ -255,14 +266,8 @@ pub fn request_pairing(
 
 /// Одобряет заявку по коду: раннер создаётся с хешем из заявки под её именем или именем `name`.
 /// Занятое имя оставляет заявку ждать — админ повторит команду с другим именем.
-pub fn approve_pairing(
-    db: &Db,
-    code: &str,
-    name: Option<&str>,
-    now_ms: i64,
-) -> Result<Runner> {
-    const NO_SUCH: &str =
-        "заявки с таким кодом нет или код устарел — нажмите в приложении «Подключить через Telegram» ещё раз";
+pub fn approve_pairing(db: &Db, code: &str, name: Option<&str>, now_ms: i64) -> Result<Runner> {
+    const NO_SUCH: &str = "заявки с таким кодом нет или код устарел — нажмите в приложении «Подключить через Telegram» ещё раз";
     if code.len() != PAIR_CODE_LEN || !code.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!("код заявки — {PAIR_CODE_LEN} цифр"));
     }
@@ -382,6 +387,18 @@ mod tests {
     }
 
     #[test]
+    fn revoked_runner_name_can_be_registered_again() {
+        let db = Db::in_memory().unwrap();
+        let (_, old) = add_runner(&db, "PC", 100).unwrap();
+        assert!(add_runner(&db, "PC", 101).unwrap_err().contains("уже есть"));
+        revoke_runner(&db, "PC", 102).unwrap();
+        let (_, new) = add_runner(&db, "PC", 103).unwrap();
+        assert!(authenticate(&db, &old, 104).is_err());
+        assert_eq!(authenticate(&db, &new, 104).unwrap().name, "PC");
+        assert_eq!(list_runners(&db).unwrap().len(), 2);
+    }
+
+    #[test]
     fn add_list_authenticate_and_revoke() {
         let db = Db::in_memory().unwrap();
         let (runner, token) = add_runner(&db, "main", 100).unwrap();
@@ -426,9 +443,15 @@ mod tests {
         let p = request_pairing(&db, "my-pc", &hash, 1_000).unwrap();
         assert_eq!(p.code.len(), 6);
         assert!(p.code.bytes().all(|b| b.is_ascii_digit()));
-        assert_eq!((p.name.as_str(), p.expires_at), ("my-pc", 1_000 + PAIR_TTL_MS));
+        assert_eq!(
+            (p.name.as_str(), p.expires_at),
+            ("my-pc", 1_000 + PAIR_TTL_MS)
+        );
         assert!(
-            matches!(authenticate(&db, &token, 1_500), Err(AuthError::Unknown { .. })),
+            matches!(
+                authenticate(&db, &token, 1_500),
+                Err(AuthError::Unknown { .. })
+            ),
             "до одобрения токен не принимается"
         );
 

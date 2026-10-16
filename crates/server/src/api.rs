@@ -448,7 +448,12 @@ fn pair(ctx: &Ctx, rq: &mut Request) -> Result<Reply, Reject> {
     let req: wire::PairRequest = read_json(rq, MAX_JSON)?;
     let name = req.name.trim();
     let name = if name.is_empty() { "runner" } else { name };
-    match auth::request_pairing(ctx.core.db(), name, &req.token_hash, ctx.core.clock().now_ms()) {
+    match auth::request_pairing(
+        ctx.core.db(),
+        name,
+        &req.token_hash,
+        ctx.core.clock().now_ms(),
+    ) {
         Ok(p) => {
             ctx.log.info(&format!(
                 "заявка раннера «{}» на подключение через Telegram принята, ждёт кода у админа",

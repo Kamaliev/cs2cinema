@@ -266,7 +266,11 @@ fn job_lost_on_the_last_grant(core: &Core, clock: &ManualClock, dir: &TestDir, a
         core.sweep().unwrap();
     }
     let job = core.job(id).unwrap().unwrap();
-    assert_eq!(job.state, JobState::Queued, "после третьей потери задача в очереди");
+    assert_eq!(
+        job.state,
+        JobState::Queued,
+        "после третьей потери задача в очереди"
+    );
     assert_eq!(job.grants, 3);
     assert!(job.lease_lost, "аренда потеряна, а не снята");
     assert_eq!(job.runner_id, Some(a), "раннер-владелец помнится");
@@ -282,7 +286,11 @@ fn lost_lease_on_the_last_grant_waits_for_its_runner() {
 
     // Чужой раннер просит задачу: задача ждёт своего раннера, а не падает.
     let report = core.claim_report(b).unwrap();
-    assert!(report.failed.is_empty(), "чужой claim не роняет задачу: {:?}", report.failed);
+    assert!(
+        report.failed.is_empty(),
+        "чужой claim не роняет задачу: {:?}",
+        report.failed
+    );
     assert!(report.assignment.is_none(), "выдавать больше нечего");
     assert_eq!(state(&core, id), JobState::Queued);
 
@@ -295,7 +303,10 @@ fn lost_lease_on_the_last_grant_waits_for_its_runner() {
                 name: "a".to_owned(),
                 app_version: String::new(),
                 status: String::new(),
-                holding: vec![Holding { job_id: id, epoch: 3 }],
+                holding: vec![Holding {
+                    job_id: id,
+                    epoch: 3,
+                }],
             },
         )
         .unwrap();
@@ -305,7 +316,11 @@ fn lost_lease_on_the_last_grant_waits_for_its_runner() {
     assert!(!job.lease_lost, "аренда возвращена");
     assert_eq!((job.epoch, job.grants), (3, 3));
     assert_eq!(job.runner_id, Some(a));
-    assert!(job.state.is_leased(), "задача снова за раннером: {:?}", job.state);
+    assert!(
+        job.state.is_leased(),
+        "задача снова за раннером: {:?}",
+        job.state
+    );
 }
 
 #[test]

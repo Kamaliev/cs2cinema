@@ -52,7 +52,10 @@ fn strict_link_is_queued_without_get_file() {
         Some(format!("https://www.faceit.com/en/cs2/room/{ID}").as_str())
     );
     let text = chat_text(&st);
-    assert!(text.contains(&format!("#{}", all[0].id)), "номер задачи: {text}");
+    assert!(
+        text.contains(&format!("#{}", all[0].id)),
+        "номер задачи: {text}"
+    );
     assert_eq!(st.tg.get_file_calls(), 0, "по ссылке getFile не вызывается");
 }
 
@@ -77,8 +80,14 @@ fn non_room_links_are_refused_with_an_explanation() {
             reply.contains("Это не ссылка на комнату матча FACEIT"),
             "{n}: {reply}"
         );
-        assert!(reply.contains("https://www.faceit.com/ru/cs2/room/"), "пример: {reply}");
-        assert!(!reply.contains("evil.com"), "присланная строка не повторяется: {reply}");
+        assert!(
+            reply.contains("https://www.faceit.com/ru/cs2/room/"),
+            "пример: {reply}"
+        );
+        assert!(
+            !reply.contains("evil.com"),
+            "присланная строка не повторяется: {reply}"
+        );
         assert!(!reply.contains("players/s1mple"), "{reply}");
     }
     assert!(jobs(&st).is_empty(), "задач нет");

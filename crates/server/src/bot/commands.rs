@@ -559,7 +559,9 @@ pub fn handle(bot: &Bot, user: &User, chat_id: i64, text: &str) {
         "cancel" => cancel_cmd(bot, user, chat_id, &args),
         "retry" => retry_cmd(bot, user, chat_id, &args),
         "resend" => resend_cmd(bot, user, &args),
-        "adduser" | "removeuser" | "users" | "runner" | "runners" if !is_admin(user) => ADMIN_ONLY.to_owned(),
+        "adduser" | "removeuser" | "users" | "runner" | "runners" if !is_admin(user) => {
+            ADMIN_ONLY.to_owned()
+        }
         "adduser" => adduser_cmd(bot, &args),
         "removeuser" => removeuser_cmd(bot, &args),
         "users" => users_cmd(bot),

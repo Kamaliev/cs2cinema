@@ -219,7 +219,10 @@ fn lost_lease_on_the_last_grant_survives_another_runners_claim_over_http() {
     assert!(job.lease_lost);
 
     // Владелец вернулся через hello и получил задачу обратно.
-    let held = vec![Holding { job_id: id, epoch: 3 }];
+    let held = vec![Holding {
+        job_id: id,
+        epoch: 3,
+    }];
     let (status, body) = srv.hello(&token_a, &hello_req(held));
     assert_eq!(status, 200, "{body}");
     assert_eq!(action_of(&hello_reply(&body), id), DirectiveAction::Keep);

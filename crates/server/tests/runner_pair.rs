@@ -36,7 +36,8 @@ fn hello_status(st: &BotStand, token: &str) -> u16 {
 
 /// Заявка приложения: серверу уходит только хеш токена.
 fn pair(st: &BotStand, name: &str, token: &str) -> Resp {
-    let body = serde_json::json!({ "name": name, "token_hash": auth::hash_token(token) }).to_string();
+    let body =
+        serde_json::json!({ "name": name, "token_hash": auth::hash_token(token) }).to_string();
     st.server.send(wire::paths::PAIR, None, Some(&body))
 }
 
@@ -57,7 +58,11 @@ fn admin_connects_a_runner_by_code_from_the_chat() {
         !r.body.contains(&token),
         "токен в ответе сервера не появляется"
     );
-    assert_eq!(hello_status(&st, &token), 401, "до одобрения токен не принимается");
+    assert_eq!(
+        hello_status(&st, &token),
+        401,
+        "до одобрения токен не принимается"
+    );
 
     // Друг (не админ) одобрить не может.
     say(&st, FRIEND, &format!("/runner {}", reply.code));
@@ -72,8 +77,16 @@ fn admin_connects_a_runner_by_code_from_the_chat() {
     // Без кода — формат; чужой код — отказ.
     say(&st, ADMIN, "/runner");
     st.step();
-    assert!(last_text(&st, ADMIN).starts_with("Формат:"), "{}", last_text(&st, ADMIN));
-    let wrong = if reply.code == "000000" { "000001" } else { "000000" };
+    assert!(
+        last_text(&st, ADMIN).starts_with("Формат:"),
+        "{}",
+        last_text(&st, ADMIN)
+    );
+    let wrong = if reply.code == "000000" {
+        "000001"
+    } else {
+        "000000"
+    };
     say(&st, ADMIN, &format!("/runner {wrong}"));
     st.step();
     assert!(
@@ -88,7 +101,11 @@ fn admin_connects_a_runner_by_code_from_the_chat() {
     st.step();
     let ok = last_text(&st, ADMIN);
     assert!(ok.contains("Раннер «my-pc» подключён"), "{ok}");
-    assert_eq!(hello_status(&st, &token), 200, "после одобрения токен принимается");
+    assert_eq!(
+        hello_status(&st, &token),
+        200,
+        "после одобрения токен принимается"
+    );
     let core = st.server.running().core();
     let runners = auth::list_runners(core.db()).unwrap();
     assert_eq!(runners.len(), 1);
@@ -101,20 +118,39 @@ fn admin_connects_a_runner_by_code_from_the_chat() {
     // Повторное одобрение того же кода — заявки больше нет.
     say(&st, ADMIN, &format!("/runner {}", reply.code));
     st.step();
-    assert!(last_text(&st, ADMIN).contains("Не подключил"), "{}", last_text(&st, ADMIN));
+    assert!(
+        last_text(&st, ADMIN).contains("Не подключил"),
+        "{}",
+        last_text(&st, ADMIN)
+    );
 
     // Список и отзыв.
     say(&st, ADMIN, "/runners");
     st.step();
     let list = last_text(&st, ADMIN);
-    assert!(list.contains("my-pc") && list.contains("отпечаток") && list.contains("на связи"), "{list}");
+    assert!(
+        list.contains("my-pc") && list.contains("отпечаток") && list.contains("на связи"),
+        "{list}"
+    );
     say(&st, ADMIN, "/runner revoke my-pc");
     st.step();
-    assert!(last_text(&st, ADMIN).contains("отозван"), "{}", last_text(&st, ADMIN));
-    assert_eq!(hello_status(&st, &token), 401, "отозванный токен не принимается");
+    assert!(
+        last_text(&st, ADMIN).contains("отозван"),
+        "{}",
+        last_text(&st, ADMIN)
+    );
+    assert_eq!(
+        hello_status(&st, &token),
+        401,
+        "отозванный токен не принимается"
+    );
     say(&st, ADMIN, "/runners");
     st.step();
-    assert!(last_text(&st, ADMIN).contains("отозван"), "{}", last_text(&st, ADMIN));
+    assert!(
+        last_text(&st, ADMIN).contains("отозван"),
+        "{}",
+        last_text(&st, ADMIN)
+    );
 
     // Кривая заявка — 400 без следа в базе.
     let bad = st.server.send(
@@ -140,14 +176,22 @@ fn pairing_code_expires_and_a_busy_name_can_be_renamed_by_the_admin() {
     // Имя занято: заявка ждёт, админ называет другое.
     say(&st, ADMIN, &format!("/runner {code}"));
     st.step();
-    assert!(last_text(&st, ADMIN).contains("уже есть"), "{}", last_text(&st, ADMIN));
+    assert!(
+        last_text(&st, ADMIN).contains("уже есть"),
+        "{}",
+        last_text(&st, ADMIN)
+    );
     assert_eq!(hello_status(&st, &token), 401);
 
     // Срок вышел — код не действует.
     st.clock().advance(Duration::from_secs(11 * 60));
     say(&st, ADMIN, &format!("/runner {code} second"));
     st.step();
-    assert!(last_text(&st, ADMIN).contains("устарел"), "{}", last_text(&st, ADMIN));
+    assert!(
+        last_text(&st, ADMIN).contains("устарел"),
+        "{}",
+        last_text(&st, ADMIN)
+    );
     assert_eq!(hello_status(&st, &token), 401);
 
     // Новая заявка тем же токеном и одобрение под своим именем.
@@ -156,6 +200,10 @@ fn pairing_code_expires_and_a_busy_name_can_be_renamed_by_the_admin() {
     let code = serde_json::from_str::<PairReply>(&r.body).unwrap().code;
     say(&st, ADMIN, &format!("/runner {code} second"));
     st.step();
-    assert!(last_text(&st, ADMIN).contains("Раннер «second» подключён"), "{}", last_text(&st, ADMIN));
+    assert!(
+        last_text(&st, ADMIN).contains("Раннер «second» подключён"),
+        "{}",
+        last_text(&st, ADMIN)
+    );
     assert_eq!(hello_status(&st, &token), 200);
 }

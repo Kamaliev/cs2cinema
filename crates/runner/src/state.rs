@@ -69,6 +69,9 @@ pub struct HeldJob {
     /// запроса, поэтому после перезапуска раннер повторит `release`, а не станет запускать исполнителя заново.
     #[serde(default)]
     pub pending_release: Option<String>,
+    /// Настройки монтажа пользователя из выдачи (`Assignment.options`); старый файл состояния их не знает.
+    #[serde(default)]
+    pub options: serde_json::Map<String, serde_json::Value>,
 }
 
 impl HeldJob {
@@ -95,6 +98,7 @@ impl HeldJob {
             pending: None,
             sha_retries: 0,
             pending_release: None,
+            options: a.options.clone(),
         }
     }
 }
@@ -218,6 +222,7 @@ mod tests {
                 pending: None,
                 sha_retries: 1,
                 pending_release: Some("FOREIGN_GAME_RUNNING: игра запущена".to_owned()),
+                options: serde_json::json!({"fps": 30}).as_object().cloned().unwrap_or_default(),
             }),
             last_seq: 42,
         }

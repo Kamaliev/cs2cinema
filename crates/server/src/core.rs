@@ -292,7 +292,7 @@ impl Core {
                 params![s.user_id, by, orig, steam, player, now],
             )
             .map_err(db_err)?;
-            Ok(tx.last_insert_rowid())
+            snapshot_options(tx, s.user_id)
         })
     }
 
@@ -319,7 +319,7 @@ impl Core {
                 params![s.user_id, by, orig, canonical, steam, player, now],
             )
             .map_err(db_err)?;
-            Ok::<i64, String>(tx.last_insert_rowid())
+            snapshot_options(tx, s.user_id).map_err(String::from)
         })?;
         self.wake();
         Ok(id)
@@ -426,7 +426,7 @@ impl Core {
                     params![s.user_id, by, orig, canonical, steam, player, now],
                 )
                 .map_err(db_err)?;
-                Ok::<i64, String>(tx.last_insert_rowid())
+                snapshot_options(tx, s.user_id).map_err(String::from)
             })?;
             self.wake();
             return Ok(id);
@@ -440,7 +440,7 @@ impl Core {
                 params![s.user_id, by, orig, steam, player, now],
             )
             .map_err(db_err)?;
-            Ok::<i64, String>(tx.last_insert_rowid())
+            snapshot_options(tx, s.user_id).map_err(String::from)
         })?;
         match self.blobs.link_demo(demo_job_id, id, &known) {
             Ok(got) => {
@@ -1244,6 +1244,20 @@ impl Core {
     }
 }
 
+/// Запоминает в только что созданной задаче настройки её автора: снимок на момент отправки, чтобы правка
+/// настроек уже после отправки не меняла поставленную в очередь задачу. Возвращает номер задачи.
+fn snapshot_options(tx: &Connection, user_id: Option<i64>) -> Result<i64> {
+    let id = tx.last_insert_rowid();
+    if let Some(uid) = user_id {
+        tx.execute(
+            "UPDATE jobs SET options = COALESCE((SELECT settings FROM users WHERE id = ?2), '') WHERE id = ?1",
+            params![id, uid],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(id)
+}
+
 /// Выдача для раннера по строке задачи и её демке.
 fn assignment_of(c: &Connection, job: &JobRow) -> Result<Assignment> {
     let id = job.id;
@@ -1272,8 +1286,17 @@ fn assignment_of(c: &Connection, job: &JobRow) -> Result<Assignment> {
             name: job.player_name.clone(),
         },
         requested_by: job.requested_by.clone(),
-        options: serde_json::Map::new(),
+        // сохранённое при постановке, поверх умолчаний реестра: новые настройки доходят и до старых задач в очереди
+        options: wire::settings::resolve(&job_options(c, id)?),
     })
+}
+
+/// Снимок настроек задачи (сырая строка); пусто — автор ничего не менял.
+fn job_options(c: &Connection, id: i64) -> Result<String> {
+    c.query_row("SELECT options FROM jobs WHERE id = ?1", [id], |r| r.get(0))
+        .optional()
+        .map(Option::unwrap_or_default)
+        .map_err(db_err)
 }
 
 fn not_found() -> Reject {

@@ -19,7 +19,7 @@ pub fn db_err(e: rusqlite::Error) -> String {
 }
 
 // Версии схемы: 1 — пользователи, раннеры, задачи и файлы; 2 — таблицы Telegram-бота; 3 — попытки и отсрочка приёма;
-// 4 — заявки раннеров на подключение через Telegram.
+// 4 — заявки раннеров на подключение через Telegram; 5 — настройки монтажа пользователя и их снимок в задаче.
 // Новая версия — только новым шагом в конце списка и только добавлением колонок или таблиц.
 // Элемент k поднимает схему до версии k+1; шаг идёт в одной транзакции со своим `user_version`.
 const MIGRATIONS: &[&str] = &["
@@ -151,6 +151,9 @@ CREATE TABLE runner_pairings (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
 );
+", "
+ALTER TABLE users ADD COLUMN settings TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN options TEXT NOT NULL DEFAULT '';
 "];
 
 /// Версия схемы, которую создаёт и ожидает эта сборка (число шагов `MIGRATIONS`).

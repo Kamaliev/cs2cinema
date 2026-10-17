@@ -76,6 +76,7 @@ fn task(demo: &str) -> Task {
         hero_name: "s1mple".to_owned(),
         resume: false,
         out_dir: None,
+        options: Default::default(),
     }
 }
 
@@ -721,4 +722,26 @@ fn resumed_task_has_no_preflight_and_reports_no_map() {
     assert_eq!(inspect_runs(&host), 0, "при продолжении предпроверки нет");
     let seen = rec.0.lock().unwrap().clone();
     assert!(!seen.iter().any(|l| l.starts_with("карта ")), "{seen:?}");
+}
+
+#[test]
+fn user_options_override_montage_settings_but_keep_machine_ones() {
+    let dir = TestDir::new("exec-options");
+    let host = FakeHost::new(Scenario::happy(1).program("cs2-cli", &[OK_REPLY], exit0()));
+    let seen = Arc::new(Mutex::new(None));
+    let sink = seen.clone();
+    let exec = executor(&host, &dir).with_job_fn(move |_, spec, _| {
+        *sink.lock().unwrap() = Some(spec.cfg.clone());
+        Err("стоп".into())
+    });
+    let mut t = task(dir.path.join("remote/srv7.dem").to_str().unwrap());
+    t.options = serde_json::json!({"detailed": true, "flybys": false, "fps": 30, "resolution": 1080})
+        .as_object()
+        .cloned()
+        .unwrap();
+    let _ = exec.run(&t, &Quiet);
+    let cfg = seen.lock().unwrap().clone().expect("run_job был вызван");
+    assert!(cfg.detailed && !cfg.flybys && cfg.walls);
+    assert_eq!((cfg.fps, cfg.frame), (30, (1920, 1080)));
+    assert_eq!(cfg.hlae_dir, healthy_config(&dir).hlae_dir, "пути раннера остались его");
 }

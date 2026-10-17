@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Настройки ролика</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-secondary-bg-color, #f1f1f4);
+    --card: var(--tg-theme-bg-color, #fff);
+    --text: var(--tg-theme-text-color, #111);
+    --hint: var(--tg-theme-hint-color, #7a7a85);
+    --accent: var(--tg-theme-button-color, #2481cc);
+    --accent-text: var(--tg-theme-button-text-color, #fff);
+    --line: color-mix(in srgb, var(--hint) 25%, transparent);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.35 -apple-system, "Segoe UI", Roboto, sans-serif; padding: 12px 16px calc(24px + env(safe-area-inset-bottom)); }
+  h1 { font-size: 20px; margin: 8px 0 4px; }
+  .sub { color: var(--hint); font-size: 14px; margin: 0 0 12px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--hint); margin: 20px 12px 6px; font-weight: 600; }
+  .card { background: var(--card); border-radius: 12px; overflow: hidden; }
+  .row { display: flex; align-items: center; gap: 12px; padding: 12px 14px; min-height: 56px; }
+  .row + .row { border-top: 1px solid var(--line); }
+  .row .txt { flex: 1; min-width: 0; }
+  .row .t { font-weight: 500; }
+  .row .h { color: var(--hint); font-size: 13px; margin-top: 2px; }
+  .row.col { flex-direction: column; align-items: stretch; gap: 8px; }
+  label.row { cursor: pointer; }
+  .sw { position: relative; width: 50px; height: 30px; flex: none; }
+  .sw input { position: absolute; inset: 0; opacity: 0; margin: 0; width: 100%; height: 100%; cursor: pointer; }
+  .sw i { position: absolute; inset: 0; border-radius: 15px; background: color-mix(in srgb, var(--hint) 45%, transparent); transition: background .15s; pointer-events: none; }
+  .sw i::after { content: ""; position: absolute; top: 3px; left: 3px; width: 24px; height: 24px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.3); transition: transform .15s; }
+  .sw input:checked + i { background: var(--accent); }
+  .sw input:checked + i::after { transform: translateX(20px); }
+  .seg { display: flex; background: var(--bg); border-radius: 9px; padding: 2px; }
+  .seg button { flex: 1; border: 0; background: none; color: var(--text); font: inherit; padding: 8px 4px; border-radius: 7px; cursor: pointer; }
+  .seg button.on { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+  .reset { display: block; margin: 20px auto 0; background: none; border: 0; color: var(--accent); font: inherit; padding: 10px; cursor: pointer; }
+  #status { position: fixed; left: 50%; bottom: calc(16px + env(safe-area-inset-bottom)); transform: translate(-50%, 20px); background: #222c; color: #fff; padding: 8px 14px; border-radius: 18px; font-size: 14px; opacity: 0; transition: .2s; pointer-events: none; }
+  #status.show { opacity: 1; transform: translate(-50%, 0); }
+  #status.err { background: #c0392bee; }
+  #msg { text-align: center; color: var(--hint); padding: 40px 16px; }
+</style>
+</head>
+<body>
+<h1>Настройки ролика</h1>
+<p class="sub">Применяются к новым задачам. Поставленные в очередь уже взяли настройки на момент отправки.</p>
+<div id="app"><div id="msg">Загрузка…</div></div>
+<button class="reset" id="reset" hidden>Сбросить всё к умолчаниям</button>
+<div id="status"></div>
+<script>
+(function () {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) { tg.ready(); tg.expand(); }
+  var initData = tg ? tg.initData : "";
+  var app = document.getElementById("app");
+  var statusEl = document.getElementById("status");
+  var resetBtn = document.getElementById("reset");
+  var schema = null, values = {};
+  var timer = null;
+
+  function toast(text, err) {
+    statusEl.textContent = text;
+    statusEl.className = "show" + (err ? " err" : "");
+    clearTimeout(timer);
+    timer = setTimeout(function () { statusEl.className = ""; }, err ? 3500 : 1200);
+  }
+  function haptic() { try { tg.HapticFeedback.selectionChanged(); } catch (e) {} }
+
+  function call(method, body) {
+    return fetch("/app/api/settings", {
+      method: method,
+      headers: { "Authorization": "tma " + initData, "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        if (!r.ok) throw new Error(j.message || ("ошибка " + r.status));
+        return j;
+      });
+    });
+  }
+
+  // Одна правка уходит сразу: экран без кнопки «Сохранить». Откат при ошибке возвращает прежнее значение.
+  function change(key, value) {
+    var prev = values[key];
+    values[key] = value;
+    render();
+    haptic();
+    var patch = {}; patch[key] = value;
+    call("PUT", patch).then(function (j) {
+      values = j.values; render(); toast("Сохранено");
+    }).catch(function (e) {
+      values[key] = prev; render(); toast(e.message, true);
+    });
+  }
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function item(it) {
+    var txt = el("div", "txt");
+    txt.appendChild(el("div", "t", it.title));
+    if (it.hint) txt.appendChild(el("div", "h", it.hint));
+    if (it.kind === "toggle") {
+      var row = el("label", "row");
+      var sw = el("span", "sw");
+      var input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = !!values[it.key];
+      input.addEventListener("change", function () { change(it.key, input.checked); });
+      sw.appendChild(input); sw.appendChild(el("i"));
+      row.appendChild(txt); row.appendChild(sw);
+      return row;
+    }
+    var col = el("div", "row col");
+    col.appendChild(txt);
+    var seg = el("div", "seg");
+    it.options.forEach(function (o) {
+      var b = el("button", values[it.key] === o.value ? "on" : "", o.title);
+      b.type = "button";
+      b.addEventListener("click", function () { if (values[it.key] !== o.value) change(it.key, o.value); });
+      seg.appendChild(b);
+    });
+    col.appendChild(seg);
+    return col;
+  }
+
+  function render() {
+    app.textContent = "";
+    schema.groups.forEach(function (g) {
+      if (!g.items.length) return;
+      app.appendChild(el("h2", null, g.title));
+      var card = el("div", "card");
+      g.items.forEach(function (it) { card.appendChild(item(it)); });
+      app.appendChild(card);
+    });
+    resetBtn.hidden = false;
+  }
+
+  resetBtn.addEventListener("click", function () {
+    var patch = {};
+    schema.groups.forEach(function (g) { g.items.forEach(function (it) { patch[it.key] = null; }); });
+    call("PUT", patch).then(function (j) { values = j.values; render(); toast("Сброшено"); })
+      .catch(function (e) { toast(e.message, true); });
+  });
+
+  if (!initData) {
+    app.textContent = "";
+    app.appendChild(el("div", null, "Откройте этот экран из чата с ботом: команда /settings.")).id = "msg";
+    return;
+  }
+  call("GET").then(function (j) { schema = j.schema; values = j.values; render(); })
+    .catch(function (e) { app.textContent = ""; app.appendChild(el("div", null, e.message)).id = "msg"; });
+})();
+</script>
+</body>
+</html>

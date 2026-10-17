@@ -185,6 +185,8 @@ pub trait Tg: Send + Sync {
     fn get_updates(&self, offset: i64, timeout_secs: u64) -> Result<Vec<Update>, TgError>;
     /// Возвращает `message_id` отправленного сообщения. Текст без `parse_mode`.
     fn send_message(&self, chat_id: i64, text: &str) -> Result<i64, TgError>;
+    /// Сообщение с одной кнопкой, которая открывает Mini App по адресу `url` (https).
+    fn send_web_app_button(&self, chat_id: i64, text: &str, button: &str, url: &str) -> Result<i64, TgError>;
     fn edit_message_text(&self, chat_id: i64, message_id: i64, text: &str) -> Result<(), TgError>;
     fn get_file(&self, file_id: &str) -> Result<TgFile, TgError>;
     fn send_video(&self, chat_id: i64, video: &InputFile, caption: &str) -> Result<Sent, TgError>;

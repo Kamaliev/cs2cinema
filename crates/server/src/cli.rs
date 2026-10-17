@@ -57,7 +57,7 @@ cs2-server — сервер очереди монтажа
   CS2_SERVER_MAX_DEMO_MIB, CS2_SERVER_MAX_RESULT_MIB, TELEGRAM_BOT_TOKEN
   (или CS2_SERVER_TELEGRAM_BOT_TOKEN), STATE_DIRECTORY (папка данных по умолчанию).
 Бот (включается адресом bot_api_url; остальное — ключи файла настроек того же имени):
-  CS2_SERVER_BOT_API_URL, CS2_SERVER_BOT_API_FILES_ROOT, CS2_SERVER_BOT_API_FILES_ROOT_LOCAL,
+  CS2_SERVER_BOT_API_URL, CS2_SERVER_PUBLIC_URL (https-адрес для экрана настроек), CS2_SERVER_BOT_API_FILES_ROOT, CS2_SERVER_BOT_API_FILES_ROOT_LOCAL,
   CS2_SERVER_BOT_API_RESULTS_PREFIX, CS2_SERVER_BOT_SEND_AS (video | document),
   CS2_SERVER_BOT_USER_MAX_ACTIVE, CS2_SERVER_BOT_ADMIN_MAX_ACTIVE, CS2_SERVER_BOT_QUEUE_MAX_ACTIVE,
   CS2_SERVER_BOT_STATUS_EDIT_SECS, CS2_SERVER_BOT_TRANSFER_TIMEOUT_MINS.
@@ -233,6 +233,10 @@ fn show_config(loaded: &config::Loaded) {
     println!(
         "bot_api_url = {}",
         c.bot_api_url.as_deref().unwrap_or("не задан")
+    );
+    println!(
+        "public_url = {}",
+        c.public_url.as_deref().unwrap_or("не задан")
     );
     println!("bot_api_files_root = {}", path(&c.bot_api_files_root));
     println!(

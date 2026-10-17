@@ -287,6 +287,7 @@ fn task_of(held: &HeldJob, attempt: u32, resumed_dir: Option<PathBuf>) -> Task {
         hero_name: held.hero_name.clone(),
         resume: resumed_dir.is_some(),
         out_dir: resumed_dir,
+        options: held.options.clone(),
     }
 }
 

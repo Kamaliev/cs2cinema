@@ -20,6 +20,7 @@ pub mod rules;
 pub mod secret;
 pub mod tg;
 pub mod users;
+pub mod webapp;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -154,6 +155,7 @@ pub fn serve_with_bot(
         core: core.clone(),
         log: log.clone(),
         shutdown: shutdown.clone(),
+        webapp: cfg.telegram_bot_token.clone().map(webapp::Auth::new),
     };
     let handler: http::Handler = Arc::new(move |rq| api::handle(&ctx, rq));
     let shutdown_flag = shutdown.clone();

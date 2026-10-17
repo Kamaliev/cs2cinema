@@ -77,6 +77,8 @@ pub struct BotSettings {
     /// Незнакомцу отвечают не чаще раза за столько миллисекунд.
     pub stranger_reply_ms: i64,
     pub poll_timeout_secs: u64,
+    /// Публичный https-адрес сервера без хвостового слэша: по нему Telegram открывает экран настроек.
+    pub public_url: Option<String>,
 }
 
 impl BotSettings {
@@ -100,6 +102,7 @@ impl BotSettings {
             queue_max_active: 10,
             stranger_reply_ms: 600_000,
             poll_timeout_secs: 25,
+            public_url: None,
         }
     }
 }

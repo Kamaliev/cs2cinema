@@ -44,6 +44,7 @@ pub fn menu() -> Vec<(String, String)> {
         ("start", "Как пользоваться ботом"),
         ("help", "Справка"),
         ("player", "Игрок по умолчанию"),
+        ("settings", "Настройки ролика"),
         ("status", "Мои задачи"),
         ("queue", "Очередь"),
         ("cancel", "Отменить задачу"),
@@ -547,6 +548,27 @@ fn resend_cmd(bot: &Bot, user: &User, args: &str) -> String {
     deliver::resend(bot, user, job.id)
 }
 
+/// `/settings`: кнопка, открывающая экран настроек (Mini App). Пока у сервера нет публичного https-адреса
+/// (`public_url`), кнопки нет — бот показывает текущие значения текстом и говорит, чего не хватает.
+fn settings_cmd(bot: &Bot, user: &User, chat_id: i64) -> String {
+    let values = match users::user_settings(bot.core().db(), user.id) {
+        Ok(v) => v,
+        Err(e) => return format!("Не смог прочитать настройки: {e}"),
+    };
+    let current = wire::settings::describe(&values).join("\n");
+    let Some(base) = &bot.settings().public_url else {
+        return format!(
+            "Ваши настройки ролика:\n{current}\n\nЭкран с галками пока недоступен: администратору нужно задать public_url (https-адрес сервера)."
+        );
+    };
+    let text = format!("Ваши настройки ролика:\n{current}\n\nИзменить можно на экране настроек — они применятся к новым задачам.");
+    if let Err(e) = bot.tg().send_web_app_button(chat_id, &text, "Открыть настройки", &format!("{base}/app/settings")) {
+        bot.log().warn(&format!("бот: не удалось отправить кнопку настроек: {e}"));
+        return "Не удалось отправить кнопку настроек, попробуйте ещё раз.".to_owned();
+    }
+    String::new()
+}
+
 /// Выполняет команду и отвечает в чат.
 pub fn handle(bot: &Bot, user: &User, chat_id: i64, text: &str) {
     let (cmd, args) = parse(text);
@@ -554,6 +576,7 @@ pub fn handle(bot: &Bot, user: &User, chat_id: i64, text: &str) {
         "start" => start_text(user),
         "help" => help_text(user),
         "player" => player_cmd(bot, user, &args),
+        "settings" => settings_cmd(bot, user, chat_id),
         "status" => notify::status_reply(bot, user),
         "queue" => notify::queue_reply(bot, user),
         "cancel" => cancel_cmd(bot, user, chat_id, &args),

@@ -11,6 +11,7 @@
   "max_result_mib": 2000,
   "telegram_bot_token": null,
   "bot_api_url": null,
+  "public_url": null,
   "bot_api_files_root": "/var/lib/telegram-bot-api",
   "bot_api_files_root_local": null,
   "bot_api_results_prefix": null,

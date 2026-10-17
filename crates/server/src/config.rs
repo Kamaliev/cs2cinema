@@ -35,6 +35,9 @@ pub struct Config {
     pub telegram_bot_token: Option<Secret>,
     /// Адрес локального `telegram-bot-api` (`http://127.0.0.1:порт`); нет — бот не запускается.
     pub bot_api_url: Option<String>,
+    /// Публичный https-адрес сервера для Telegram Mini App (экран настроек, `/settings`); нет — команда
+    /// покажет настройки текстом без кнопки. Telegram открывает Mini App только по https.
+    pub public_url: Option<String>,
     /// Корень файлов `telegram-bot-api`, как его возвращает `getFile` (обязателен при включённом боте).
     pub bot_api_files_root: Option<PathBuf>,
     /// Тот же корень на стороне сервера; нет — равен `bot_api_files_root`.
@@ -80,6 +83,7 @@ impl Default for Config {
             max_result_mib: 2000,
             telegram_bot_token: None,
             bot_api_url: None,
+            public_url: None,
             bot_api_files_root: None,
             bot_api_files_root_local: None,
             bot_api_results_prefix: None,
@@ -117,6 +121,7 @@ impl Config {
             s.results_prefix = p.clone();
         }
         s.send_as = self.bot_send_as;
+        s.public_url = self.public_url.as_ref().map(|u| u.trim_end_matches('/').to_owned());
         s.status_edit_ms = self.bot_status_edit_secs as i64 * 1000;
         s.user_max_active = self.bot_user_max_active as i64;
         s.admin_max_active = self.bot_admin_max_active as i64;
@@ -196,6 +201,7 @@ struct FileConfig {
     max_result_mib: Option<u64>,
     telegram_bot_token: Option<String>,
     bot_api_url: Option<String>,
+    public_url: Option<String>,
     bot_api_files_root: Option<PathBuf>,
     bot_api_files_root_local: Option<PathBuf>,
     bot_api_results_prefix: Option<PathBuf>,
@@ -313,6 +319,9 @@ pub fn load(flags: &Flags, env: &dyn Fn(&str) -> Option<String>) -> Result<Loade
         if let Some(v) = f.bot_api_url.filter(|v| !v.is_empty()) {
             c.bot_api_url = Some(v);
         }
+        if let Some(v) = f.public_url.filter(|v| !v.is_empty()) {
+            c.public_url = Some(v);
+        }
         if let Some(v) = f.bot_api_files_root.filter(|v| !v.as_os_str().is_empty()) {
             c.bot_api_files_root = Some(v);
         }
@@ -415,6 +424,9 @@ pub fn load(flags: &Flags, env: &dyn Fn(&str) -> Option<String>) -> Result<Loade
     if let Some(v) = env("CS2_SERVER_BOT_API_URL").filter(|v| !v.is_empty()) {
         c.bot_api_url = Some(v);
     }
+    if let Some(v) = env("CS2_SERVER_PUBLIC_URL").filter(|v| !v.is_empty()) {
+        c.public_url = Some(v);
+    }
     if let Some(v) = env("CS2_SERVER_BOT_API_FILES_ROOT").filter(|v| !v.is_empty()) {
         c.bot_api_files_root = Some(PathBuf::from(v));
     }
@@ -507,6 +519,11 @@ pub fn validate(c: &Config) -> Result<()> {
     }
     if !(1..=256).contains(&c.threads) {
         return Err("threads: нужно число от 1 до 256".to_owned());
+    }
+    if let Some(u) = &c.public_url
+        && (!u.starts_with("https://") || u.len() <= "https://".len() || u.chars().any(|ch| ch.is_whitespace() || ch.is_control()))
+    {
+        return Err("public_url: нужен адрес вида https://cs2.example.com (Telegram открывает Mini App только по https)".to_owned());
     }
     if c.heartbeat_secs < 1 {
         return Err("heartbeat_secs: нужно не меньше 1".to_owned());

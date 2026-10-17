@@ -117,6 +117,32 @@ pub fn find_user_by_tg(db: &Db, tg_id: i64) -> Result<Option<User>> {
     })
 }
 
+/// Полные настройки монтажа пользователя: сохранённое поверх умолчаний реестра (`wire::settings`).
+pub fn user_settings(db: &Db, user_id: i64) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let raw: Option<String> = db.read(|c| {
+        c.query_row("SELECT settings FROM users WHERE id = ?1", [user_id], |r| r.get(0))
+            .optional()
+            .map_err(db_err)
+    })?;
+    Ok(wire::settings::resolve(&raw.unwrap_or_default()))
+}
+
+/// Меняет настройки пользователя (`{"ключ": значение}`, `null` — сбросить) и возвращает полный набор после правки.
+/// Проверка и слияние целиком в `wire::settings`; чтение и запись — одной транзакцией, чтобы две правки подряд не потерялись.
+pub fn patch_user_settings(db: &Db, user_id: i64, patch: &serde_json::Value) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let raw = db.write(|tx| {
+        let old: String = tx
+            .query_row("SELECT settings FROM users WHERE id = ?1", [user_id], |r| r.get(0))
+            .optional()
+            .map_err(db_err)?
+            .ok_or_else(|| "нет такого пользователя".to_owned())?;
+        let new = wire::settings::apply_patch(&old, patch)?;
+        tx.execute("UPDATE users SET settings = ?2 WHERE id = ?1", params![user_id, new]).map_err(db_err)?;
+        Ok::<String, String>(new)
+    })?;
+    Ok(wire::settings::resolve(&raw))
+}
+
 pub fn find_user_by_id(db: &Db, id: i64) -> Result<Option<User>> {
     db.read(|c| {
         c.query_row(

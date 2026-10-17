@@ -6,6 +6,7 @@
 //! Коды сбоев раннера (`FailCode` v1.0) ходят строкой, чтобы этот крейт не зависел от `pipeline`.
 
 pub mod faceit;
+pub mod settings;
 
 use serde::{Deserialize, Serialize};
 

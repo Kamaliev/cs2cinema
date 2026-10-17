@@ -43,6 +43,8 @@ pub struct Task {
     pub resume: bool,
     /// Папка результата прошлой попытки, если она известна.
     pub out_dir: Option<PathBuf>,
+    /// Настройки монтажа пользователя (`wire::settings`); пусто — умолчания.
+    pub options: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Исполнитель задачи.
@@ -232,6 +234,9 @@ impl PipelineExecutor {
 
     /// Один вызов `run_job` под защитой от паники.
     fn call_job(&self, task: &Task, resume: bool, p: &dyn Progress) -> Result<Outcome, RunError> {
+        // потолки чтения демки в run_job те же, что у дочерней предпроверки (флаги раннера)
+        let mut cfg = JobConfig { demo_limits: self.inspect.limits.demo, ..self.cfg.clone() };
+        apply_options(&mut cfg, task);
         let spec = JobSpec {
             job_id: task.job_id,
             attempt: task.attempt,
@@ -243,8 +248,7 @@ impl PipelineExecutor {
             known_demo: None,
             last_good: None,
             out_dir: if resume { task.out_dir.clone() } else { None },
-            // потолки чтения демки в run_job те же, что у дочерней предпроверки (флаги раннера)
-            cfg: JobConfig { demo_limits: self.inspect.limits.demo, ..self.cfg.clone() },
+            cfg,
         };
         let job_fn = &self.job_fn;
         match catch_unwind(AssertUnwindSafe(|| job_fn(&*self.host, &spec, p))) {
@@ -262,6 +266,18 @@ impl PipelineExecutor {
             }
         }
     }
+}
+
+/// Накладывает на машинные настройки раннера (пути, запас по времени, кодер) то, что выбрал пользователь:
+/// содержание ролика, fps и разрешение.
+fn apply_options(cfg: &mut JobConfig, task: &Task) {
+    let m = wire::settings::Montage::from_options(&task.options);
+    cfg.detailed = m.detailed;
+    cfg.flybys = m.flybys;
+    cfg.walls = m.walls;
+    cfg.chronological = m.chronological;
+    cfg.fps = m.fps;
+    cfg.frame = m.frame();
 }
 
 /// Сбой скачивания демки FACEIT с фиксированной фразой (без адресов и ключа).

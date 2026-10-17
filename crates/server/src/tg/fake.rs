@@ -42,6 +42,8 @@ struct State {
     /// Сообщения бота: чат, номер, текущий текст — в порядке отправки.
     messages: Vec<(i64, i64, String)>,
     videos: Vec<SentFile>,
+    /// Кнопки Mini App: чат, подпись, адрес.
+    web_app_buttons: Vec<(i64, String, String)>,
     calls: Vec<Call>,
     failures: HashMap<String, VecDeque<TgError>>,
     last_offset: i64,
@@ -228,6 +230,11 @@ impl FakeTelegram {
             .collect()
     }
 
+    /// Кнопки Mini App, которые бот отправил: чат, подпись, адрес.
+    pub fn web_app_buttons(&self) -> Vec<(i64, String, String)> {
+        self.st().web_app_buttons.clone()
+    }
+
     pub fn videos(&self) -> Vec<SentFile> {
         self.st().videos.clone()
     }
@@ -375,6 +382,16 @@ impl Tg for FakeTelegram {
         st.next_message_id += 1;
         let id = st.next_message_id;
         st.messages.push((chat_id, id, text.to_owned()));
+        Ok(id)
+    }
+
+    fn send_web_app_button(&self, chat_id: i64, text: &str, button: &str, url: &str) -> Result<i64, TgError> {
+        self.enter("send_web_app_button", Some(chat_id), text)?;
+        let mut st = self.st();
+        st.next_message_id += 1;
+        let id = st.next_message_id;
+        st.messages.push((chat_id, id, text.to_owned()));
+        st.web_app_buttons.push((chat_id, button.to_owned(), url.to_owned()));
         Ok(id)
     }
 

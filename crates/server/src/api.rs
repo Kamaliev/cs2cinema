@@ -29,6 +29,8 @@ pub struct Ctx {
     pub core: Core,
     pub log: Log,
     pub shutdown: Arc<AtomicBool>,
+    /// Проверка входа Mini App; `None` — токена бота нет, экран настроек выключен.
+    pub webapp: Option<crate::webapp::Auth>,
 }
 
 /// Готовый ответ: статус, заголовки и необязательное тело (JSON, кусок файла или только длина для `HEAD`).
@@ -60,6 +62,11 @@ impl Reply {
             file: None,
             head_len: None,
         }
+    }
+
+    fn with_body(mut self, body: String) -> Reply {
+        self.body = Some(body);
+        self
     }
 
     fn no_content() -> Reply {
@@ -127,6 +134,21 @@ fn route(
         (Method::Post, wire::paths::HELLO) => hello(ctx, rq, trace),
         (Method::Post, wire::paths::PAIR) => pair(ctx, rq),
         (_, p) if p.starts_with("/v1/jobs/") => job_action(ctx, rq, method, p, trace),
+        (Method::Get, "/app/settings") => Ok(Reply::bare(200)
+            .with_body(crate::webapp::SETTINGS_PAGE.to_owned())
+            .with_header("Content-Type", "text/html; charset=utf-8")
+            .with_header("Cache-Control", "no-store")),
+        (Method::Get, "/app/api/settings") => {
+            let user = webapp_user(ctx, rq)?;
+            webapp_values(ctx, user.id, true)
+        }
+        (Method::Put, "/app/api/settings") => {
+            let user = webapp_user(ctx, rq)?;
+            let patch: serde_json::Value = read_json(rq, MAX_JSON)?;
+            crate::users::patch_user_settings(ctx.core.db(), user.id, &patch)
+                .map_err(|e| Reject::new(codes::BAD_REQUEST, e))?;
+            webapp_values(ctx, user.id, false)
+        }
         _ => Err(Reject::new(codes::NOT_FOUND, "нет такого адреса")),
     }
 }
@@ -525,6 +547,43 @@ fn wait_secs(url: &str, limit: u64) -> Result<u64, Reject> {
 }
 
 /// Узнаёт раннера по `Authorization: Bearer {токен}`; тело не трогает.
+/// Пользователь Mini App по заголовку `Authorization: tma <initData>`: подпись Telegram, затем белый список.
+fn webapp_user(ctx: &Ctx, rq: &Request) -> Result<crate::users::User, Reject> {
+    let Some(auth) = &ctx.webapp else {
+        return Err(Reject::new(codes::NOT_FOUND, "экран настроек выключен: у сервера нет токена бота"));
+    };
+    let header = rq
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))
+        .map(|h| h.value.as_str().to_owned());
+    let init = header
+        .as_deref()
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("tma"))
+        .map(|(_, rest)| rest.trim());
+    let Some(init) = init else {
+        return Err(unauthorized("откройте экран из чата с ботом: команда /settings"));
+    };
+    let tg_id = auth
+        .verify(init, ctx.core.clock().now_ms() / 1000)
+        .map_err(unauthorized)?;
+    match crate::users::find_user_by_tg(ctx.core.db(), tg_id)? {
+        Some(u) if u.is_active() => Ok(u),
+        _ => Err(unauthorized("бот работает только для друзей автора")),
+    }
+}
+
+/// Ответ Mini App: значения (и описание экрана при первой загрузке).
+fn webapp_values(ctx: &Ctx, user_id: i64, with_schema: bool) -> Result<Reply, Reject> {
+    let values = crate::users::user_settings(ctx.core.db(), user_id)?;
+    let mut body = serde_json::json!({ "values": values });
+    if with_schema {
+        body["schema"] = wire::settings::schema();
+    }
+    Ok(Reply::json(200, &body)?.with_header("Cache-Control", "no-store"))
+}
+
 pub fn authenticate(ctx: &Ctx, rq: &Request) -> Result<Runner, Reject> {
     let header = rq
         .headers()
@@ -623,7 +682,10 @@ fn respond(rq: Request, reply: Reply) {
         let _ = rq.respond(r);
     } else if let Some(body) = reply.body {
         let mut r = Response::from_string(body).with_status_code(reply.status);
-        if let Some(h) = header("Content-Type", "application/json") {
+        // страницы Mini App задают свой Content-Type; у JSON-ответов он по умолчанию json
+        if !reply.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
+            && let Some(h) = header("Content-Type", "application/json")
+        {
             r = r.with_header(h);
         }
         for h in extra {

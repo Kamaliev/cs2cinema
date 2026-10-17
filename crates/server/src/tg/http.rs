@@ -336,6 +336,20 @@ impl Tg for HttpTg {
         Ok(m.message_id)
     }
 
+    fn send_web_app_button(&self, chat_id: i64, text: &str, button: &str, url: &str) -> Result<i64, TgError> {
+        let m: MessageId = self.call(
+            &self.control,
+            None,
+            "sendMessage",
+            json!({
+                "chat_id": chat_id,
+                "text": text,
+                "reply_markup": {"inline_keyboard": [[{"text": button, "web_app": {"url": url}}]]}
+            }),
+        )?;
+        Ok(m.message_id)
+    }
+
     fn edit_message_text(&self, chat_id: i64, message_id: i64, text: &str) -> Result<(), TgError> {
         let _: Value = self.call(
             &self.control,
